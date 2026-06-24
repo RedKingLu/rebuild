@@ -1,0 +1,13 @@
+<svg width="1200" height="300" viewBox="0 0 1200 300" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="rebuild logo">
+  <rect width="1200" height="300" rx="40" fill="white"/>
+  <g transform="translate(60 45) scale(0.41)">
+    <rect width="512" height="512" rx="112" fill="#2563EB"/>
+    <path d="M150 148H310C350 148 382 180 382 220C382 260 350 292 310 292H222" stroke="white" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M150 148V364" stroke="white" stroke-width="42" stroke-linecap="round"/>
+    <path d="M224 292L350 364" stroke="white" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M326 164L382 220L326 276" stroke="#DBEAFE" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="310" y="142" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="82" font-weight="800" fill="#0F172A">rebuild</text>
+  <text x="314" y="200" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="30" font-weight="500" fill="#64748B">软件重构与迁移平台</text>
+  <path d="M314 226H600" stroke="#2563EB" stroke-width="8" stroke-linecap="round"/>
+</svg>

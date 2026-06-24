@@ -1,0 +1,9 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="rebuild logo icon">
+  <rect width="512" height="512" rx="112" fill="#2563EB"/>
+  <path d="M150 148H310C350 148 382 180 382 220C382 260 350 292 310 292H222" stroke="white" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M150 148V364" stroke="white" stroke-width="42" stroke-linecap="round"/>
+  <path d="M224 292L350 364" stroke="white" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M326 164L382 220L326 276" stroke="#DBEAFE" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="150" cy="148" r="18" fill="#DBEAFE"/>
+  <circle cx="150" cy="364" r="18" fill="#DBEAFE"/>
+</svg>
