@@ -25,11 +25,11 @@
 Agent 使用本 Skill 前，必须先读取：
 
 ```text
-/home/king/rebuild/AGENTS.md                                          ✅ 已正式化（待审核）
+/home/king/rebuild/AGENTS.md                                          ✅ accepted
 /home/king/rebuild/交接/当前/                                           ← 当前任务入口
-/home/king/rebuild/文档/00-项目治理/00-项目总览.md                       ✅ 已正式化（待审核）
-/home/king/rebuild/文档/00-项目治理/01-决策记录.md                       ✅ 已正式化（待审核）
-/home/king/rebuild/文档/00-项目治理/02-术语表.md                         ✅ 已正式化（待审核）
+/home/king/rebuild/文档/00-项目治理/00-项目总览.md                       ✅ accepted
+/home/king/rebuild/文档/00-项目治理/01-决策记录.md                       ✅ accepted
+/home/king/rebuild/文档/00-项目治理/02-术语表.md                         ✅ accepted
 ```
 
 如果上述文档缺失，必须读取对应草稿或交接说明，并在输出中标注：
@@ -95,7 +95,7 @@ API 契约编写
 /home/king/rebuild/文档/00-项目治理/01-决策记录.md     ← D-010 列有完整 R 阶段
 ```
 
-如果 `07-R阶段总计划.md` 尚未创建，以 D-010 和当前交接材料为准。
+如果 `06-R阶段总计划.md` 尚未创建，以 D-010 和当前交接材料为准。
 
 输出：
 
