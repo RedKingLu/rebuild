@@ -1,0 +1,45 @@
+# === 临时/协作/证据区域（不纳入版本控制） ===
+交接/
+产物/
+证据/
+工作区/
+
+# === 密钥与配置 ===
+.env
+*.key
+*.secret
+*.pem
+credentials.*
+*_credentials.*
+*.token
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# === Node ===
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Docker ===
+docker-compose.override.yml
+
+# === 日志 ===
+*.log
+logs/
