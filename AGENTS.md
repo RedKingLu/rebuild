@@ -6,7 +6,7 @@
 > 当前版本：V26.1.1
 > 来源草稿：`产物/草稿/AGENTS-v0.2.md`
 > 本次处理人 / Agent：Claude (deepseek-v4-pro) / R4-2 收口
-> 最后更新时间：2026-06-25（R4-2 收口：瘦身为硬规则入口，工作流移至 Skill；R4 修复轮：§10 新增第 17 条引用 D-074 最小前后端联调要求）
+> 最后更新时间：2026-06-25（R4-2 收口：瘦身为硬规则入口，工作流移至 Skill；R4 修复轮：§10 新增第 17 条引用 D-074 最小前后端联调要求；R5-1：新增 §12 进度追踪强制要求 + §10 第 18 条禁止事项，原 §12→§13）
 > 审核状态：经用户审核通过（2026-06-25）
 > 文档定位：rebuild 根目录 Agent 执行准则入口。定义硬规则、禁止事项、必读路径。**不包含工作流细节**——工作流、模板、检查清单全部由 Skill 承载。
 > 关联决策：D-007、D-065（薄编排/NIH 约束）、D-067（模块建设三步法）、D-073（平台助手）
@@ -212,6 +212,7 @@ Skill     = 可复用执行方法 / 模板 / 检查清单 / 操作流程
 15. 用用户举例替代完整范围判断
 16. 因内容长而省略关键检查
 17. （R5 起）只写 service/API 而无任何页面或入口实际调用，却把"已写接口"当作"已联调"标记阶段完成（详述源：决策记录 D-074；阶段规则见 06-R阶段总计划 §3.2.1）
+18. （R5-1 起）在未更新 证据/进度追踪/ 功能表、阻塞项、待确认项、施工记录和验收证据索引的情况下标记阶段 accepted（详述源：AGENTS.md §12；追踪规则见 证据/进度追踪/06-状态口径与更新规则.md）
 ```
 
 ---
@@ -233,10 +234,87 @@ Skill     = 可复用执行方法 / 模板 / 检查清单 / 操作流程
 
 ---
 
-## 12. 本文档自维护规则
+## 12. 模型配置与 ModelGateway 使用规范（R5-3 起）
+
+### 12.1 密钥安全（硬规则，不可绕过）
+
+模型 API Key **仅从环境变量读取**，不得以任何形式硬编码在代码、配置文件、文档中。
+
+- Key 存放位置：`backend/.env`（已被 `.gitignore` 保护，不纳入版本控制）
+- 配置文件中只存 Provider 非敏感信息（名称/endpoint/模型列表/能力标签），Key 必须走 env
+- API 响应只返 `credential_status`（`configured` / `missing` / `invalid` / `redacted`），不返 Key 值
+- 所有报告、日志、Trace、Audit、前端、截图中的 Key 统一标记为 `[REDACTED]`
+
+### 12.2 服务商接入方式
+
+平台支持用户接入自有模型服务商，通过两个文件配合：
+
+1. **`backend/app/config/model_profiles.yaml`**：非敏感配置
+   - Provider 定义（provider_id / provider_name / endpoint_openai / endpoint_anthropic / env_key_var）
+   - ModelProfile 定义（model_name / display_name / capability_tags / cost_tier / supports_streaming 等）
+   - ModelStrategy 定义（优先级 / fallback / retry / trace_policy）
+   - 绝对不写 Key
+
+2. **`backend/.env`**：敏感凭据
+   - 环境变量名对应 Provider 的 `env_key_var`
+   - 标准格式：`{PROVIDER}_API_KEY`（如 `DEEPSEEK_API_KEY`、`AGNES_API_KEY`）
+   - 通用兜底：`LLM_API_KEY`（仅单 Provider 本地开发兜底，须显式标记 `generic_fallback`）
+
+### 12.3 API 格式支持
+
+ModelGateway 同时支持 OpenAI 和 Anthropic API 格式：
+- 每个 Provider 可分别配置 `endpoint_openai` 和 `endpoint_anthropic`
+- `api_format` 字段默认为 `openai`，可选 `anthropic`
+- LiteLLM Adapter 自动处理格式转换和模型名前缀规范化（`openai/` / `anthropic/`）
+
+### 12.4 Agent 接手模型相关任务时的标准流程
+
+```text
+1. 读取 backend/app/config/model_profiles.yaml 了解已配置 Provider/Profile/Strategy
+2. 检查 backend/.env 中对应环境变量是否已填写（仅判断存在性，不读取值）
+3. 通过 GET /api/model/providers 查看 Provider 配置状态（credential_status）
+4. 通过 POST /api/model/self-test 验证连通性
+5. 所有模型调用必须经 ModelGateway → LiteLLM Adapter，不得直连 Provider
+6. 不得在聊天/报告/日志/截图/Trace/Audit 中输出 Key 值
+```
+
+---
+
+## 13. 进度追踪强制要求（R5-1 起）
+
+### 12.1 追踪目录
+
+`证据/进度追踪/` 是进度追踪与防最小化施工辅助体系。详细规则见 `证据/进度追踪/README.md` 和 `06-状态口径与更新规则.md`。
+
+### 12.2 强制更新
+
+每个 R 阶段方案、施工、验收、收口时，**必须**检查并更新以下追踪文件：
+
+| 文件 | 更新内容 |
+|------|---------|
+| `01-功能表.md` | 能力状态、证据路径、缺口 |
+| `02-阻塞项.md` | 发现/解决的阻塞 |
+| `03-待确认项.md` | 发现/确认的待确认项 |
+| `04-施工记录.md` | 本阶段每轮施工/验收动作 |
+| `05-验收与证据索引.md` | 验收证据索引 |
+
+### 12.3 阶段收口硬 Gate
+
+**若未更新功能表、阻塞项、待确认项、施工记录和验收证据索引，阶段不得标记 accepted。**
+
+收口前必须执行追踪一致性检查（清单见 `06-状态口径与更新规则.md` §3）。
+
+### 12.4 防最小化施工
+
+10 条红线见 `证据/进度追踪/06-状态口径与更新规则.md` §4。核心原则：不得用 placeholder/mock/service-only/build-only 冒充 implemented/accepted；不得将本阶段可完成能力无理由标记 future；不得在未更新追踪材料的情况下结束阶段。
+
+---
+
+## 13. 本文档自维护规则
 
 1. AGENTS.md 只含硬规则——工作流/模板/检查清单变更只改 Skill，不改本文档
 2. 硬规则修改（C2 及以上）须经用户审核，更新头部修订说明
 3. 版本号 V26.1.1 保持不变（除非正式发布新基线）
 4. 阶段状态不写死在本文档——以 `交接/当前/` 最新材料为准
 5. 与决策记录冲突时以决策记录为准，登记冲突为待确认项
+6. 进度追踪规则（§12）的详述源为 `证据/进度追踪/`，本文档只定义硬 Gate，不复制追踪操作细节

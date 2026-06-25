@@ -1,0 +1,124 @@
+# R5 ModelGateway — Model Profiles & Provider Registry
+# Non-sensitive configuration only. Keys MUST come from environment variables.
+# See: D-032 (密钥脱敏), D-039 (ModelGateway + LiteLLM SDK Adapter)
+
+providers:
+  - provider_id: "deepseek-official"
+    provider_name: "DeepSeek"
+    provider_type: "openai_compatible"
+    api_format: "openai"
+    endpoint_openai: "https://api.deepseek.com"
+    endpoint_anthropic: "https://api.deepseek.com/anthropic"
+    env_key_var: "DEEPSEEK_API_KEY"
+    models:
+      - model_name: "deepseek-v4-flash"
+        display_name: "DeepSeek V4 Flash"
+        capability_tags: ["chat", "streaming", "coding", "review"]
+        cost_tier: "low"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "1M tokens"
+        recommended_use: "日常编码、快速评审、高吞吐场景"
+      - model_name: "deepseek-v4-pro"
+        display_name: "DeepSeek V4 Pro"
+        capability_tags: ["chat", "streaming", "coding", "review", "fusion"]
+        cost_tier: "medium"
+        supports_streaming: true
+        supports_tool_calling: true
+        is_fusion_capable: true
+        context_window_note: "1M tokens"
+        recommended_use: "复杂分析、架构决策、Fusion 评审"
+
+  - provider_id: "maas-icompify"
+    provider_name: "MaaS (icompify)"
+    provider_type: "openai_compatible"
+    api_format: "openai"
+    endpoint_openai: "http://maas.icompify.com:32788/v1"
+    endpoint_anthropic: "http://maas.icompify.com:32788/anthropic"
+    env_key_var: "LLM_API_KEY"
+    models:
+      - model_name: "deepseek-v4-pro"
+        display_name: "DeepSeek V4 Pro (MaaS)"
+        capability_tags: ["chat", "streaming", "coding", "review", "fusion"]
+        cost_tier: "medium"
+        supports_streaming: true
+        supports_tool_calling: true
+        is_fusion_capable: true
+        context_window_note: "1M tokens"
+        recommended_use: "复杂分析、架构决策、Fusion 评审"
+      - model_name: "deepseek-v4-flash"
+        display_name: "DeepSeek V4 Flash (MaaS)"
+        capability_tags: ["chat", "streaming", "coding", "review"]
+        cost_tier: "low"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "1M tokens"
+        recommended_use: "日常编码、快速评审"
+      - model_name: "kimi-k2.6"
+        display_name: "Kimi K2.6 (MaaS)"
+        capability_tags: ["chat", "streaming", "coding", "long_context"]
+        cost_tier: "medium"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "128K+ tokens"
+        recommended_use: "长上下文分析、代码审查"
+      - model_name: "minimax-m3"
+        display_name: "MiniMax M3 (MaaS)"
+        capability_tags: ["chat", "streaming"]
+        cost_tier: "low"
+        supports_streaming: true
+        supports_tool_calling: false
+        context_window_note: "32K tokens"
+        recommended_use: "轻量对话、快速问答"
+      - model_name: "qwen3.5"
+        display_name: "Qwen 3.5 (MaaS)"
+        capability_tags: ["chat", "streaming", "coding"]
+        cost_tier: "low"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "128K tokens"
+        recommended_use: "通用编码、文档生成"
+      - model_name: "glm-5.2"
+        display_name: "GLM 5.2 (MaaS)"
+        capability_tags: ["chat", "streaming", "long_context"]
+        cost_tier: "medium"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "128K tokens"
+        recommended_use: "长文本理解、知识密集型任务"
+
+  - provider_id: "agnes-ai"
+    provider_name: "AgnesAI"
+    provider_type: "openai_compatible"
+    api_format: "openai"
+    endpoint_openai: "https://apihub.agnes-ai.com/v1"
+    env_key_var: "AGNES_API_KEY"
+    models:
+      - model_name: "agnes-2.0-flash"
+        display_name: "Agnes 2.0 Flash"
+        capability_tags: ["chat", "streaming"]
+        cost_tier: "low"
+        supports_streaming: true
+        supports_tool_calling: false
+        context_window_note: "32K tokens"
+        recommended_use: "轻量对话、快速问答"
+
+strategies:
+  - strategy_id: "system-default"
+    scope: "system"
+    default_profile_ref: "deepseek-official/deepseek-v4-flash"
+    fallback_profile_refs:
+      - "maas-icompify/deepseek-v4-flash"
+      - "agnes-ai/agnes-2.0-flash"
+    fallback_policy: "sequential"
+    retry_policy:
+      max_retries: 3
+      retry_delay_sec: 2.0
+      backoff: "exponential"
+    cost_budget_policy:
+      enabled: false
+    fusion_allowed: true
+    streaming_allowed: true
+    tool_calling_allowed: true
+    trace_policy: "always"
+    audit_policy: "on_error_or_high_risk"

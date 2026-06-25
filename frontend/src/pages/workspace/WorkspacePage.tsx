@@ -81,7 +81,7 @@ export function WorkspacePage() {
         <span className="row" style={{ marginLeft: 'auto', gap: 8, flexShrink: 0 }}>
           <StatusChip dot="var(--blue)" label={run?.current_stage ? `阶段 ${STAGE_LABELS[run.current_stage].split(' ')[0]}` : '阶段 未启动'} tone="blue" />
           <StatusChip dot={run?.active_gate ? 'var(--amber)' : 'var(--green)'} label={run?.active_gate ? '等待 Gate' : '无待决 Gate'} tone={run?.active_gate ? 'amber' : 'grey'} />
-          <StatusChip dot="var(--amber)" label="网关 · ModelGateway" tone="violet" title="LLM 网关与模型状态：当前为 Mock，未接真实 ModelGateway（R5 接入）" />
+          <ModelGatewayChip />
           <ExecModeSwitch />
           <button className="btn sm ghost" title="切换主题" style={{ flexShrink: 0 }} onClick={() => useSettingsStore.getState().setTheme(useSettingsStore.getState().theme === 'light' ? 'dark' : 'light')}>
             {useSettingsStore.getState().theme === 'light' ? '☾' : '☀'}
@@ -246,6 +246,36 @@ function StatusChip({ dot, label, tone, title }: { dot: string; label: string; t
     <span className={`tag ${tone}`} title={title} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
       <span style={{ width: 7, height: 7, borderRadius: '50%', background: dot, flexShrink: 0 }} />{label}
     </span>
+  );
+}
+
+// R5: ModelGateway chip — real status from /api/model/status
+function ModelGatewayChip() {
+  const [status, setStatus] = useState<string>('loading');
+  const [detail, setDetail] = useState<string>('');
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/model/status')
+      .then(r => r.json())
+      .then(d => {
+        if (cancelled) return;
+        const s = d.data?.overall_status || 'unknown';
+        setStatus(s);
+        const c = d.data?.configured_providers || 0;
+        const t = d.data?.total_providers || 0;
+        setDetail(`${c}/${t} provider${t > 1 ? 's' : ''}`);
+      })
+      .catch(() => { if (!cancelled) { setStatus('not_connected'); setDetail('后端不可达'); } });
+    return () => { cancelled = true; };
+  }, []);
+  const colorMap: Record<string, string> = { available: 'var(--green)', not_configured: 'var(--orange)', not_connected: 'var(--red)', degraded: 'var(--amber)', loading: 'var(--gray)' };
+  return (
+    <StatusChip
+      dot={colorMap[status] || 'var(--gray)'}
+      label={`网关 · ${detail || status}`}
+      tone={status === 'available' ? 'green' : status === 'not_configured' ? 'amber' : 'grey'}
+      title={`ModelGateway: ${status} · 来源: /api/model/status`}
+    />
   );
 }
 

@@ -9,7 +9,8 @@ export type IconKey =
   | 'mock' | 'placeholder' | 'notConnected' | 'future' | 'blocked'
   | 'warning' | 'success' | 'error' | 'search' | 'files' | 'git'
   | 'remote' | 'agent' | 'chevronRight' | 'chevronLeft'
-  | 'panelRight' | 'panelLeft' | 'panelBottom' | 'add' | 'externalLink';
+  | 'panelRight' | 'panelLeft' | 'panelBottom' | 'add' | 'externalLink'
+  | 'robot' | 'delete' | 'key' | 'refresh' | 'edit' | 'import' | 'send' | 'plug' | 'close';
 
 interface Props {
   name: IconKey;
@@ -96,6 +97,25 @@ export function Icon({ name, size = 20, className, style }: Props) {
     case 'warning': return svg(<><path d="M12 2L2 20h20L12 2z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/><path d="M12 9v4M12 17h0" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
     case 'success': return svg(<><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M8 12l3 3 5-5" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
     case 'error': return svg(<><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M15 9l-6 6M9 9l6 6" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
+    // ── R5-4 追加（线性风格，与图标库一致） ──
+    case 'robot':
+      return svg(<><rect x="4" y="8" width="16" height="11" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M12 4v4" fill="none" stroke="currentColor" strokeWidth="1.8"/><circle cx="12" cy="3.5" r="1.3" fill="none" stroke="currentColor" strokeWidth="1.8"/><circle cx="9" cy="13" r="1.2" fill="currentColor"/><circle cx="15" cy="13" r="1.2" fill="currentColor"/><path d="M9.5 16.5h5" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M2 12v3M22 12v3" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
+    case 'delete':
+      return svg(<><path d="M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2M6 7l1 13a1 1 0 001 1h8a1 1 0 001-1l1-13" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M10 11v6M14 11v6" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
+    case 'key':
+      return svg(<><circle cx="8" cy="8" r="4" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M11 11l9 9M17 17l2-2M20 14l-2 2" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
+    case 'refresh':
+      return svg(<><path d="M21 12a9 9 0 11-2.64-6.36M21 3v5h-5" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
+    case 'edit':
+      return svg(<><path d="M12 20h9" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M16.5 3.5a2.12 2.12 0 013 3L7 19l-4 1 1-4 12.5-12.5z" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
+    case 'import':
+      return svg(<><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" fill="none" stroke="currentColor" strokeWidth="1.8"/><polyline points="7,10 12,15 17,10" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M12 15V3" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
+    case 'send':
+      return svg(<><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/></>);
+    case 'plug':
+      return svg(<><path d="M9 2v6M15 2v6M7 8h10v3a5 5 0 01-10 0V8zM12 16v6" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
+    case 'close':
+      return svg(<A d="M18 6L6 18M6 6l12 12"/>);
     default: return svg(<circle cx="12" cy="12" r="3" fill="currentColor"/>);
   }
 }

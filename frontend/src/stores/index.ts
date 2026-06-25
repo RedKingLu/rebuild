@@ -162,18 +162,44 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
 }));
 
 // === Settings Store ===
+// 字号通过整体界面缩放实现（现有样式多为 px 内联，故用根 zoom 全局缩放，
+// 既改变字号也按比例缩放间距/图标，是最稳健的全局"字号"控制）。持久化到 localStorage。
+const FONT_SCALE_KEY = 'rb_font_scale';
+function readFontScale(): number {
+  if (typeof localStorage === 'undefined') return 1;
+  const v = parseFloat(localStorage.getItem(FONT_SCALE_KEY) || '1');
+  return Number.isFinite(v) && v >= 0.8 && v <= 1.4 ? v : 1;
+}
+function applyFontScale(n: number) {
+  if (typeof document !== 'undefined') {
+    // zoom 在 Chromium/WebKit/新版 Firefox 均支持；缩放整个界面字号
+    (document.documentElement.style as CSSStyleDeclaration & { zoom?: string }).zoom = String(n);
+  }
+}
+
 interface SettingsState {
   theme: 'light' | 'dark';
   collapsed: boolean;
+  fontScale: number; // 0.9 小 / 1.0 标准 / 1.1 大 / 1.25 特大
   setTheme: (t: 'light' | 'dark') => void;
   toggleCollapsed: () => void;
+  setFontScale: (n: number) => void;
 }
 export const useSettingsStore = create<SettingsState>((set) => ({
   theme: 'light',
   collapsed: false,
+  fontScale: readFontScale(),
   setTheme: (t) => { document.documentElement.setAttribute('data-theme', t); set({ theme: t }); },
   toggleCollapsed: () => set(s => ({ collapsed: !s.collapsed })),
+  setFontScale: (n) => {
+    applyFontScale(n);
+    if (typeof localStorage !== 'undefined') localStorage.setItem(FONT_SCALE_KEY, String(n));
+    set({ fontScale: n });
+  },
 }));
+
+// 启动即应用已保存字号
+applyFontScale(readFontScale());
 
 // === File Store ===
 interface FileState { tree: FileRoot[]; }

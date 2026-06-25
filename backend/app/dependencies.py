@@ -27,6 +27,14 @@ class Services:
         self._aet_service = None
         self._workspace_service = None
         self._event_service = None
+        self._model_gateway = None
+
+    @property
+    def model_gateway(self):
+        if self._model_gateway is None:
+            from app.services.model_gateway import get_model_gateway
+            self._model_gateway = get_model_gateway()
+        return self._model_gateway
 
     @property
     def trace_writer(self):

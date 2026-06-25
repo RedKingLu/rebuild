@@ -23,12 +23,24 @@ def test_evidence_empty(client):
     assert resp.status_code == 200
 
 
-def test_models_not_connected(client):
+def test_models_real_after_r5(client):
+    """R5 起模型域已真实化：/api/model/providers 返回真实 Provider（configured/available）。
+
+    （此前 R4 期断言 not_connected/future 已随 R5-3 模型域真实化而更新——R5-4 修复 C-1。）
+    """
     resp = client.get("/api/model/providers")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["meta"]["source_status"] == "not_connected"
-    assert data["meta"]["capability_status"] == "future"
+    providers = data["data"]["providers"]
+    assert len(providers) >= 1
+    # 真实域：每个 provider 有 credential_status 与能力标记，且不回显 Key
+    for p in providers:
+        assert "credential_status" in p
+        assert "capability_marker" in p
+        assert "api_key" not in p
+    # meta 不再是 not_connected/future（模型域已真实接入）
+    assert data["meta"]["source_status"] != "not_connected"
+    assert data["meta"]["capability_status"] != "future"
 
 
 def test_resources_not_connected(client):

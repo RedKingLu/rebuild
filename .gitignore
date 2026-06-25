@@ -43,3 +43,7 @@ docker-compose.override.yml
 # === 日志 ===
 *.log
 logs/
+
+# 用户导入供应商（仅非敏感配置，Key 不落盘）
+backend/app/config/user_providers.yaml
+backend/app/config/user_strategies.yaml

@@ -1,31 +1,330 @@
+/** ModelsPage — R5-4 重设计：模型与供应商管理。
+ *
+ * 遵循 文档/06-UX与前端/06-模型资源可视化与真实能力标记（14 能力标记/脱敏/mock 区分）
+ * 与 07-视觉系统与前端文案（中文优先）。参照 产物/草稿 截图 1/2/4。
+ * 平台助手已移至全局浮动弹窗（PlatformAssistant），本页不再内嵌助手对话。
+ */
+import { useState, useEffect, useCallback } from 'react';
+import {
+  listProviders, listProfiles, listStrategies,
+  selfTest, listCalls, deleteProvider, setCredential, getUsage,
+  CAPABILITY_MARKERS,
+  type ProviderInfo, type ModelProfileInfo, type StrategyInfo,
+  type SelfTestResult, type CallLogEntry, type UsageInfo,
+} from '../../services/modelService';
+import { AddProviderModal } from '../../components/models/AddProviderModal';
+import { StrategyEditModal } from '../../components/models/StrategyEditModal';
+import { Icon } from '../../components/ui/Icon';
+
+const COST_TIER_LABEL: Record<string, string> = { low: '低成本', medium: '中等', high: '高成本' };
+const CRED_LABEL: Record<string, string> = {
+  configured: '已配置', missing: '未配置', invalid: '凭据无效', redacted: '已脱敏', not_checked: '未检测',
+};
+const KEY_SOURCE_LABEL: Record<string, string> = {
+  env: '环境变量', generic_fallback: '通用兜底', in_memory: '进程内存（重启失效）', none: '无',
+};
+
+// 真实能力标记徽章（颜色+中文文字双通道，06 §18）
+function CapabilityBadge({ marker }: { marker: string }) {
+  const m = CAPABILITY_MARKERS[marker] || CAPABILITY_MARKERS.unknown;
+  return (
+    <span className="tag" style={{ backgroundColor: m.color, color: '#fff', fontSize: 12 }}>{m.label}</span>
+  );
+}
+
+type Tab = 'providers' | 'catalog' | 'strategies' | 'usage';
+
 export function ModelsPage() {
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [profiles, setProfiles] = useState<ModelProfileInfo[]>([]);
+  const [strategies, setStrategies] = useState<StrategyInfo[]>([]);
+  const [calls, setCalls] = useState<CallLogEntry[]>([]);
+  const [usage, setUsage] = useState<UsageInfo | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, SelfTestResult>>({});
+  const [testing, setTesting] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>('providers');
+  const [showAdd, setShowAdd] = useState(false);
+  const [editStrategy, setEditStrategy] = useState<StrategyInfo | null>(null);
+  const [catalogFilter, setCatalogFilter] = useState<string>('');
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [provResp, profResp, stratResp, callsResp, usageResp] = await Promise.all([
+        listProviders(), listProfiles(), listStrategies(), listCalls(50), getUsage(),
+      ]);
+      setProviders(provResp.data?.providers || []);
+      setProfiles(profResp.data?.profiles || []);
+      setStrategies(stratResp.data?.strategies || []);
+      setCalls(callsResp.data?.calls || []);
+      setUsage(usageResp.data || null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '加载模型数据失败');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
+
+  const handleSelfTest = async (providerId: string) => {
+    setTesting(providerId);
+    try {
+      const resp = await selfTest(providerId);
+      setTestResults(prev => ({ ...prev, [providerId]: resp.data as SelfTestResult }));
+      await fetchData();
+    } catch (e) {
+      setTestResults(prev => ({ ...prev, [providerId]: { provider_id: providerId, status: 'error', error_message: String(e) } as SelfTestResult }));
+    } finally {
+      setTesting(null);
+    }
+  };
+
+  const handleDelete = async (p: ProviderInfo) => {
+    if (!confirm(`确认删除供应商「${p.provider_name}」？（仅删除用户导入的供应商）`)) return;
+    await deleteProvider(p.provider_id);
+    await fetchData();
+  };
+
+  const handleSetKey = async (p: ProviderInfo) => {
+    const key = prompt(`为「${p.provider_name}」设置 API Key（仅注入进程内存，永不落盘）：`);
+    if (!key) return;
+    await setCredential(p.provider_id, key);
+    await fetchData();
+  };
+
+  const configuredCount = providers.filter(p => p.credential_status === 'configured').length;
+  const reachableCount = providers.filter(p => p.capability_marker === 'real_available').length;
+  const defaultStrategy = strategies.find(s => s.strategy_id === 'system-default');
+
+  if (loading) return <div className="card"><p>正在加载模型数据…</p></div>;
+  if (error) return <div className="card"><p className="err">错误：{error}</p><button className="btn sm" onClick={fetchData}>重试</button></div>;
+
   return (
     <div>
-      <div className="spread"><h1>模型</h1><button className="btn sm">＋ 新建</button></div>
-      <p className="sub">ModelGateway 抽象 + LiteLLM SDK Adapter（D-039, D-065）。密钥脱敏存储，前端不回显原值。</p>
-      <span className="tag placeholder-tag" style={{ marginBottom: 12 }}>占位</span>
-      <div className="statgrid">
-        <div className="card statcard">
-          <b>Provider</b>
-          <div className="snum">0<small> / 0</small></div>
-          <div className="slabel">可用 / 总数</div>
-          <span className="tag grey">未接真实服务</span>
-        </div>
-        <div className="card statcard">
-          <b>ModelProfile</b>
-          <div className="snum">0<small> / 0</small></div>
-          <div className="slabel">启用 / 总数</div>
-          <span className="tag grey">未接真实服务</span>
-        </div>
+      {/* 头部 */}
+      <div className="spread">
+        <h1>模型与供应商</h1>
+        <span className="sub" style={{ fontSize: 13 }}>
+          ModelGateway + LiteLLM 适配层（D-039）· 数据来源：<code>/api/model/*</code>（真实接入）
+        </span>
       </div>
-      <div className="card" style={{ marginTop: 14 }}>
-        <b>模型管理</b>
-        <div className="empty">
-          <p className="sub">模型 Provider / Profile / Binding / Usage / Failover 管理将在 R5（模型网关与模型策略）阶段施工。</p>
-          <span className="tag placeholder-tag">占位</span>
-          <span className="tag not-connected-tag" style={{ marginLeft: 8 }}>未接真实服务</span>
-        </div>
+
+      {/* 概览统计（同时作为 tab 切换入口，点击跳转对应面板） */}
+      <div className="statgrid" style={{ marginTop: 10 }}>
+        <StatCard active={tab === 'providers'} onClick={() => setTab('providers')}
+          title="供应商" value={`${configuredCount}`} suffix={` / ${providers.length}`}
+          label={`已配置 / 总数 · ${reachableCount} 个已连通`} />
+        <StatCard active={tab === 'catalog'} onClick={() => setTab('catalog')}
+          title="模型" value={`${profiles.length}`} label="可用模型 Profile（点击查看目录）" />
+        <StatCard active={tab === 'strategies'} onClick={() => setTab('strategies')}
+          title="默认模型" value={defaultStrategy?.default_profile_ref || '—'} valueSize={14}
+          label="系统默认策略（点击查看）" />
+        <StatCard active={tab === 'usage'} onClick={() => setTab('usage')}
+          title="调用记录" value={`${usage?.total_calls ?? calls.length}`} suffix=" / 内存"
+          label="进程内 · 重启丢失（点击查看用量）" />
       </div>
+
+      {/* 操作条：仅保留当前面板标题 + 动作（tab 切换已由上方四个统计框承担） */}
+      <div className="row" style={{ marginTop: 14, marginBottom: 10, alignItems: 'center' }}>
+        <b style={{ fontSize: 14 }}>
+          {{ providers: '服务商', catalog: '模型目录', strategies: '模型策略', usage: '用量与调用' }[tab]}
+        </b>
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          {tab === 'providers' && <button className="btn sm" onClick={() => setShowAdd(true)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="add" size={14} />添加供应商</button>}
+          <button className="btn sm ghost" onClick={fetchData} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="refresh" size={14} />刷新</button>
+        </span>
+      </div>
+
+      {/* 服务商 */}
+      {tab === 'providers' && (
+        <div className="grid" style={{ gap: 10 }}>
+          {providers.map(p => {
+            const tr = testResults[p.provider_id];
+            return (
+              <div key={p.provider_id} className="card" style={{ padding: 14 }}>
+                <div className="spread">
+                  <div className="row" style={{ gap: 8 }}>
+                    <span style={{ width: 30, height: 30, borderRadius: 8, background: 'var(--surface-2)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700 }}>
+                      {p.provider_name.charAt(0).toUpperCase()}
+                    </span>
+                    <div>
+                      <b>{p.provider_name}</b>
+                      {p.origin === 'user' && <span className="tag" style={{ marginLeft: 6, fontSize: 11, background: 'var(--surface-2)', color: 'var(--fg)' }}>用户导入</span>}
+                      {p.homepage && <div className="sub" style={{ fontSize: 11 }}><a href={p.homepage} target="_blank" rel="noreferrer">{p.homepage}</a></div>}
+                    </div>
+                  </div>
+                  <CapabilityBadge marker={p.capability_marker} />
+                </div>
+
+                <div className="sub" style={{ fontSize: 12, marginTop: 6 }}>
+                  {p.provider_type} · {p.api_format === 'anthropic' ? 'Anthropic 格式' : 'OpenAI 格式'} · {p.model_count} 个模型
+                  · 凭据：{CRED_LABEL[p.credential_status] || p.credential_status}
+                  {p.key_source && <>（{KEY_SOURCE_LABEL[p.key_source] || p.key_source}）</>}
+                </div>
+                <div className="sub" style={{ fontSize: 11, marginTop: 2, wordBreak: 'break-all' }}>
+                  OpenAI 端点：{p.endpoint_openai || '—'}{p.endpoint_anthropic && <> · Anthropic：{p.endpoint_anthropic}</>}
+                </div>
+                {p.note && <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>备注：{p.note}</div>}
+                {p.last_checked_at && <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>最近自测：{p.last_checked_at}</div>}
+                {tr && (
+                  <div style={{ marginTop: 6, fontSize: 12 }}>
+                    {tr.status === 'reachable' ? '✅ 已连通' : `❌ ${tr.status}`}
+                    {tr.latency_ms > 0 && ` · ${tr.latency_ms}ms`}
+                    {tr.error_message && <span className="err"> · {tr.error_message}</span>}
+                  </div>
+                )}
+
+                <div className="row" style={{ marginTop: 10, gap: 6 }}>
+                  <button className="btn sm" onClick={() => handleSelfTest(p.provider_id)} disabled={testing === p.provider_id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <Icon name="plug" size={14} />{testing === p.provider_id ? '测试中…' : '连通自测'}
+                  </button>
+                  <button className="btn sm ghost" onClick={() => handleSetKey(p)} title="设置 Key（仅进程内存）" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="key" size={14} />设置 Key</button>
+                  {p.origin === 'user' && <button className="btn sm ghost" onClick={() => handleDelete(p)} title="删除（仅用户导入）" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="delete" size={14} />删除</button>}
+                </div>
+              </div>
+            );
+          })}
+          {providers.length === 0 && (
+            <div className="empty"><p className="sub">暂无供应商。点击右上角「+ 添加供应商」导入，或在 backend/.env 配置内置供应商的 Key。</p></div>
+          )}
+        </div>
+      )}
+
+      {/* 模型目录 */}
+      {tab === 'catalog' && (
+        <div>
+          {/* 顶部供应商筛选（横向） */}
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+            <span className="sub" style={{ fontSize: 12, marginRight: 4 }}>供应商：</span>
+            <button className={`btn sm ${catalogFilter === '' ? '' : 'ghost'}`} onClick={() => setCatalogFilter('')}>全部</button>
+            {providers.map(p => (
+              <button key={p.provider_id} className={`btn sm ${catalogFilter === p.provider_id ? '' : 'ghost'}`}
+                onClick={() => setCatalogFilter(p.provider_id)}>{p.provider_name}</button>
+            ))}
+          </div>
+          {/* 模型卡片网格 */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 10, alignContent: 'start' }}>
+            {profiles.filter(p => !catalogFilter || p.provider_id === catalogFilter).map(p => (
+              <div key={p.profile_id} className="card" style={{ padding: 12 }}>
+                <div className="spread">
+                  <b>{p.display_name}</b>
+                  <CapabilityBadge marker={p.status === 'configured' ? 'configured_not_verified' : 'not_connected'} />
+                </div>
+                <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>{p.model_name} · {COST_TIER_LABEL[p.cost_tier] || p.cost_tier}</div>
+                <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                  {p.capability_tags.map(t => (
+                    <span key={t} className="tag" style={{ fontSize: 10, background: 'var(--surface-2)', color: 'var(--fg)' }}>{t}</span>
+                  ))}
+                  {p.is_fusion_capable && (
+                    <span className="tag" title="能力标记：该模型可参与「聚合(Fusion)」多模型审议。聚合的配置与触发在独立的「聚合」页（默认关闭，R13 真实化），此处仅标记能力，不在模型页配置。"
+                      style={{ fontSize: 10, background: 'var(--violet, #8b5cf6)', color: '#fff' }}>可参与聚合(Fusion)</span>
+                  )}
+                </div>
+                {p.recommended_use && <div className="sub" style={{ fontSize: 11, marginTop: 6 }}>推荐：{p.recommended_use}</div>}
+                {p.context_window_note && <div className="sub" style={{ fontSize: 11 }}>上下文：{p.context_window_note}</div>}
+              </div>
+            ))}
+            {profiles.filter(p => !catalogFilter || p.provider_id === catalogFilter).length === 0 && (
+              <div className="empty"><p className="sub">该供应商暂无模型。</p></div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 策略 */}
+      {tab === 'strategies' && (
+        <div className="grid" style={{ gap: 10 }}>
+          {strategies.map(s => (
+            <div key={s.strategy_id} className="card" style={{ padding: 12 }}>
+              <div className="spread">
+                <b>{s.strategy_id === 'system-default' ? '系统默认策略' : s.strategy_id}</b>
+                <div className="row" style={{ gap: 6 }}>
+                  <span className="tag" style={{ fontSize: 11 }}>{s.scope === 'system' ? '系统级' : s.scope}</span>
+                  <button className="btn sm ghost" onClick={() => setEditStrategy(s)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="edit" size={13} />编辑</button>
+                </div>
+              </div>
+              <div className="sub" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.7 }}>
+                默认模型：{s.default_profile_ref || '—'}<br />
+                Fallback（{s.fallback_policy === 'sequential' ? '顺序' : s.fallback_policy}）：{s.fallback_profile_refs.join('、') || '—'}<br />
+                流式：{s.streaming_allowed ? '允许' : '禁用'} · Fusion：{s.fusion_allowed ? '允许' : '禁用'} · 工具调用：{s.tool_calling_allowed ? '允许' : '禁用'}<br />
+                Trace 策略：{s.trace_policy} · 审计策略：{s.audit_policy}
+              </div>
+              <div className="sub" style={{ fontSize: 11, marginTop: 6, color: 'var(--amber)' }}>
+                注：编辑开放「默认模型 + Fallback 链」；Fallback 为「选择期」回退（默认模型不可用时按链路选择），调用期为单供应商重试。阶段级 override 属 R9。
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 用量与调用 */}
+      {tab === 'usage' && (
+        <div>
+          {/* 真实用量统计 */}
+          <div className="statgrid" style={{ marginBottom: 12 }}>
+            <div className="card statcard"><b>总请求</b><div className="snum">{usage?.total_calls ?? 0}</div><div className="slabel">完成 {usage?.completed_calls ?? 0} · 失败 {usage?.failed_calls ?? 0}</div></div>
+            <div className="card statcard"><b>消耗 Token</b><div className="snum">{(usage?.total_tokens ?? 0).toLocaleString()}</div><div className="slabel">输入 {(usage?.prompt_tokens ?? 0).toLocaleString()} · 输出 {(usage?.completion_tokens ?? 0).toLocaleString()}</div></div>
+            <div className="card statcard"><b>总成本</b><div className="snum" style={{ fontSize: 15 }}>暂不可用</div><div className="slabel">{usage?.cost_unavailable_reason || '无计价数据'}</div></div>
+            <div className="card statcard"><b>数据持久化</b><div className="snum" style={{ fontSize: 15 }}>内存</div><div className="slabel">volatile · 重启丢失（持久化属 R8+）</div></div>
+          </div>
+
+          {/* 按供应商/模型 */}
+          {usage && usage.by_provider.length > 0 && (
+            <div className="card" style={{ padding: 12, marginBottom: 12 }}>
+              <b style={{ fontSize: 13 }}>按供应商 / 模型统计</b>
+              <div className="sub" style={{ fontSize: 12, marginTop: 6 }}>
+                {usage.by_provider.map(b => <div key={b.provider_id}>供应商 {b.provider_id}：{b.calls} 次调用 · {b.total_tokens.toLocaleString()} tokens</div>)}
+                {usage.by_model.map(b => <div key={b.model}>模型 {b.model}：{b.calls} 次 · {b.total_tokens.toLocaleString()} tokens</div>)}
+              </div>
+            </div>
+          )}
+
+          {/* 请求日志 */}
+          <div className="sub" style={{ fontSize: 11, marginBottom: 8 }}>⚠ 调用记录为进程内存（volatile），重启后端后丢失。</div>
+          {calls.length === 0 ? (
+            <div className="empty"><p className="sub">暂无调用记录。尝试连通自测或使用平台助手。</p></div>
+          ) : (
+            <div className="grid" style={{ gap: 8 }}>
+              {calls.map(c => (
+                <div key={c.model_call_id} className="card" style={{ padding: 10, fontSize: 12 }}>
+                  <div className="spread">
+                    <code>{c.model_call_id}</code>
+                    <span className="tag" style={{ background: c.status === 'completed' ? 'var(--green)' : 'var(--red)', color: '#fff' }}>{c.status === 'completed' ? '成功' : c.status}</span>
+                  </div>
+                  <div className="sub">
+                    {c.selected_model} · {c.provider_id} · 来源 {c.source} · {c.latency_ms}ms
+                    {c.usage_summary?.total_tokens > 0 && ` · ${c.usage_summary.total_tokens} tokens`}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {showAdd && <AddProviderModal onClose={() => setShowAdd(false)} onCreated={fetchData} />}
+      {editStrategy && <StrategyEditModal strategy={editStrategy} profiles={profiles} onClose={() => setEditStrategy(null)} onSaved={fetchData} />}
     </div>
+  );
+}
+
+// 可点击的统计卡 —— 兼作 tab 切换入口（active 时高亮边框）
+function StatCard({ active, onClick, title, value, suffix, valueSize, label }: {
+  active: boolean; onClick: () => void; title: string; value: string; suffix?: string; valueSize?: number; label: string;
+}) {
+  return (
+    <button className="card statcard" onClick={onClick}
+      style={{
+        textAlign: 'left', cursor: 'pointer', border: active ? '2px solid var(--accent-ink)' : '1px solid var(--line)',
+        background: active ? 'var(--blue-bg, var(--surface-2))' : 'var(--surface)', width: '100%',
+      }}>
+      <b>{title}</b>
+      <div className="snum" style={valueSize ? { fontSize: valueSize } : undefined}>{value}{suffix && <small>{suffix}</small>}</div>
+      <div className="slabel">{label}</div>
+    </button>
   );
 }

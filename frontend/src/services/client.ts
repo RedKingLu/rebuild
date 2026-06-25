@@ -67,3 +67,14 @@ export function patch<T>(path: string, body?: unknown): Promise<ApiEnvelope<T>> 
     body: body ? JSON.stringify(body) : undefined,
   });
 }
+
+export function del<T>(path: string): Promise<ApiEnvelope<T>> {
+  return request<T>(path, { method: 'DELETE' });
+}
+
+export function put<T>(path: string, body?: unknown): Promise<ApiEnvelope<T>> {
+  return request<T>(path, {
+    method: 'PUT',
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}

@@ -1,49 +1,508 @@
-"""Model, Resource, and Integration placeholder API routes.
+"""Model Gateway API routes — R5 full implementation.
 
-R4: All endpoints return not_connected / future status.
-No real model calls, resource lookups, or integration actions.
+Endpoints:
+  GET  /api/model/status       — aggregate gateway status
+  GET  /api/model/providers    — provider list with credential_status
+  GET  /api/model/profiles     — model profile list
+  GET  /api/model/strategies   — model strategy list
+  POST /api/model/self-test    — connectivity self-test
+  POST /api/model/call         — model call via ModelGateway
+  GET  /api/model/calls        — in-memory call log (volatile)
+  POST /api/assistant/chat     — platform assistant chat
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from app.dependencies import get_services
 from app.schemas.common import SuccessEnvelope, Meta
-from app.schemas.model import ModelProviderResponse, ModelProfileResponse, ModelBindingResponse
-from app.schemas.resource import ResourceResponse, ResourceRegistryResponse
-from app.schemas.integration import IntegrationResponse, GitStatusResponse, SourceImportRequest, SourceImportResponse
+from app.schemas.model import (
+    ProviderListData, ProviderResponse,
+    ModelProfileListData, ModelProfileResponse,
+    StrategyListData, StrategyResponse,
+    ModelStatusResponse,
+    SelfTestRequest, SelfTestResponse,
+    ModelCallRequest, ModelCallResponse, UsageSummaryResponse,
+    CallLogListData, CallLogEntry,
+    AssistantChatRequest, AssistantChatResponse,
+    ModelBindingResponse,
+    CreateProviderRequest, SetCredentialRequest,
+    UsageResponse, UsageByProvider, UsageByModel,
+    UpdateStrategyRequest,
+)
 
-
-# === Model routes ===
 model_router = APIRouter(prefix="/model", tags=["models"])
+assistant_router = APIRouter(prefix="/assistant", tags=["assistant"])
 
+
+def _gateway():
+    return get_services().model_gateway
+
+
+def _provider_resp(p: dict) -> ProviderResponse:
+    """从 gateway 的 provider dict 构建响应（含真实能力标记，不含 Key）。"""
+    return ProviderResponse(
+        provider_id=p["provider_id"],
+        provider_name=p["provider_name"],
+        provider_type=p["provider_type"],
+        api_format=p["api_format"],
+        endpoint_openai=p.get("endpoint_openai", ""),
+        endpoint_anthropic=p.get("endpoint_anthropic", ""),
+        credential_status=p["credential_status"],
+        key_source=p.get("key_source", ""),
+        status=p["status"],
+        model_count=p.get("model_count", 0),
+        origin=p.get("origin", "seed"),
+        note=p.get("note", ""),
+        homepage=p.get("homepage", ""),
+        last_checked_at=p.get("last_checked_at", ""),
+        capability_marker=p.get("capability_marker", "not_checked"),
+        source_status=p["credential_status"],
+        capability_status="available" if p["credential_status"] == "configured" else "not_connected",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Model Status
+# ═══════════════════════════════════════════════════════════════════════
+
+@model_router.get("/status")
+async def model_status():
+    gw = _gateway()
+    status = gw.get_status()
+    trace = get_services().trace_writer
+    trace.write("state_change", action="model_status", summary=f"overall={status.overall_status}")
+    return SuccessEnvelope(
+        data=status.__dict__,
+        meta=Meta(source_status=status.overall_status, capability_status="available"),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Providers
+# ═══════════════════════════════════════════════════════════════════════
 
 @model_router.get("/providers")
 async def list_providers():
-    get_services().trace_writer.write("state_change", action="list_providers", summary="Model providers (placeholder)")
+    gw = _gateway()
+    providers = gw.list_providers()
+    resp = [_provider_resp(p) for p in providers]
+    get_services().trace_writer.write("state_change", action="list_providers",
+                                       summary=f"{len(resp)} providers")
     return SuccessEnvelope(
-        data={"providers": []},
-        meta=Meta(source_status="not_connected", capability_status="future",
-                   not_connected_reason="ModelGateway planned for R5"),
+        data=ProviderListData(providers=resp).model_dump(),
+        meta=Meta(source_status="configured" if resp else "not_configured",
+                   capability_status="available"),
     )
 
+
+@model_router.post("/providers")
+async def create_provider(req: CreateProviderRequest):
+    """导入用户自定义供应商。
+
+    非敏感配置持久化到 user_providers.yaml；api_key（如提供）仅注入进程内存
+    （volatile，永不落盘，AGENTS.md §12.1）。
+    """
+    gw = _gateway()
+    pid = (req.provider_id or req.provider_name or "").strip().lower().replace(" ", "-")
+    if not pid:
+        return SuccessEnvelope(
+            data=None,
+            meta=Meta(source_status="invalid", capability_status="available",
+                       not_connected_reason="provider_name 不能为空"),
+        )
+    config = {
+        "provider_id": pid,
+        "provider_name": req.provider_name,
+        "provider_type": req.provider_type,
+        "api_format": req.api_format,
+        "endpoint_openai": req.endpoint_openai,
+        "endpoint_anthropic": req.endpoint_anthropic,
+        "env_key_var": req.env_key_var,
+        "note": req.note,
+        "homepage": req.homepage,
+        "models": [m.model_dump() for m in req.models],
+    }
+    try:
+        p = gw.add_provider(config, api_key=req.api_key)
+    except ValueError as e:
+        return SuccessEnvelope(
+            data=None,
+            meta=Meta(source_status="conflict", capability_status="available",
+                       not_connected_reason=str(e)),
+        )
+    get_services().trace_writer.write("state_change", action="create_provider",
+                                       summary=f"provider={pid} key={'in_memory' if req.api_key else 'none'}")
+    return SuccessEnvelope(
+        data=_provider_resp(p).model_dump(),
+        meta=Meta(source_status=p["credential_status"], capability_status="available"),
+    )
+
+
+@model_router.delete("/providers/{provider_id}")
+async def delete_provider(provider_id: str):
+    """删除用户导入的供应商（内置不可删）。"""
+    gw = _gateway()
+    ok = gw.remove_provider(provider_id)
+    get_services().trace_writer.write("state_change", action="delete_provider",
+                                       summary=f"provider={provider_id} removed={ok}")
+    return SuccessEnvelope(
+        data={"removed": ok},
+        meta=Meta(source_status="removed" if ok else "not_found",
+                   capability_status="available",
+                   not_connected_reason="" if ok else "供应商不存在或为内置（不可删）"),
+    )
+
+
+@model_router.post("/providers/{provider_id}/credential")
+async def set_provider_credential(provider_id: str, req: SetCredentialRequest):
+    """为供应商（重新）设置 Key——仅进程内存，volatile，永不落盘。响应不回显 Key。"""
+    gw = _gateway()
+    p = gw.set_credential(provider_id, req.api_key)
+    if not p:
+        return SuccessEnvelope(
+            data=None,
+            meta=Meta(source_status="not_found", capability_status="available"),
+        )
+    get_services().trace_writer.write("state_change", action="set_credential",
+                                       summary=f"provider={provider_id} credential updated")
+    return SuccessEnvelope(
+        data=_provider_resp(p).model_dump(),
+        meta=Meta(source_status=p["credential_status"], capability_status="available"),
+    )
+
+
+@model_router.get("/providers/{provider_id}")
+async def get_provider(provider_id: str):
+    gw = _gateway()
+    p = gw.get_provider(provider_id)
+    if not p:
+        return SuccessEnvelope(
+            data=None,
+            meta=Meta(source_status="not_found", capability_status="available"),
+        )
+    return SuccessEnvelope(
+        data=_provider_resp(p).model_dump(),
+        meta=Meta(source_status=p["credential_status"], capability_status="available"),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Model Profiles
+# ═══════════════════════════════════════════════════════════════════════
 
 @model_router.get("/profiles")
-async def list_profiles():
+async def list_profiles(provider_id: str = Query(default="", description="Filter by provider")):
+    gw = _gateway()
+    profiles = gw.list_profiles(provider_id if provider_id else None)
+    resp = [
+        ModelProfileResponse(
+            profile_id=p["profile_id"],
+            provider_id=p["provider_id"],
+            model_name=p["model_name"],
+            display_name=p["display_name"],
+            capability_tags=p["capability_tags"],
+            cost_tier=p["cost_tier"],
+            supports_streaming=p["supports_streaming"],
+            supports_tool_calling=p["supports_tool_calling"],
+            is_fusion_capable=p["is_fusion_capable"],
+            context_window_note=p["context_window_note"],
+            recommended_use=p["recommended_use"],
+            not_recommended_use=p["not_recommended_use"],
+            status=p["status"],
+            source_status=p["status"],
+            capability_status="available" if p["status"] == "configured" else "not_connected",
+        )
+        for p in profiles
+    ]
     return SuccessEnvelope(
-        data={"profiles": []},
-        meta=Meta(source_status="not_connected", capability_status="future"),
+        data=ModelProfileListData(profiles=resp).model_dump(),
+        meta=Meta(source_status="configured" if resp else "not_configured",
+                   capability_status="available"),
     )
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# Model Strategies
+# ═══════════════════════════════════════════════════════════════════════
+
+@model_router.get("/strategies")
+async def list_strategies():
+    gw = _gateway()
+    strategies = gw.list_strategies()
+    resp = [
+        StrategyResponse(
+            strategy_id=s["strategy_id"],
+            scope=s["scope"],
+            default_profile_ref=s["default_profile_ref"],
+            fallback_profile_refs=s["fallback_profile_refs"],
+            fallback_policy=s["fallback_policy"],
+            retry_policy=s["retry_policy"],
+            cost_budget_policy=s["cost_budget_policy"],
+            fusion_allowed=s["fusion_allowed"],
+            streaming_allowed=s["streaming_allowed"],
+            tool_calling_allowed=s["tool_calling_allowed"],
+            trace_policy=s["trace_policy"],
+            audit_policy=s["audit_policy"],
+        )
+        for s in strategies
+    ]
+    return SuccessEnvelope(
+        data=StrategyListData(strategies=resp).model_dump(),
+        meta=Meta(source_status="available", capability_status="available"),
+    )
+
+
+@model_router.put("/strategies/{strategy_id}")
+async def update_strategy(strategy_id: str, req: UpdateStrategyRequest):
+    """编辑策略：默认模型 + fallback 链（覆盖落盘 user_strategies.yaml，非敏感）。"""
+    gw = _gateway()
+    s = gw.update_strategy(strategy_id, req.default_profile_ref, req.fallback_profile_refs)
+    if not s:
+        return SuccessEnvelope(data=None, meta=Meta(source_status="not_found", capability_status="available"))
+    get_services().trace_writer.write("state_change", action="update_strategy",
+                                      summary=f"strategy={strategy_id} default={s.get('default_profile_ref','')}")
+    return SuccessEnvelope(
+        data=StrategyResponse(
+            strategy_id=s["strategy_id"], scope=s["scope"],
+            default_profile_ref=s["default_profile_ref"], fallback_profile_refs=s["fallback_profile_refs"],
+            fallback_policy=s["fallback_policy"], retry_policy=s["retry_policy"],
+            cost_budget_policy=s["cost_budget_policy"], fusion_allowed=s["fusion_allowed"],
+            streaming_allowed=s["streaming_allowed"], tool_calling_allowed=s["tool_calling_allowed"],
+            trace_policy=s["trace_policy"], audit_policy=s["audit_policy"],
+        ).model_dump(),
+        meta=Meta(source_status="available", capability_status="available"),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Self-test
+# ═══════════════════════════════════════════════════════════════════════
+
+# Simple in-process rate limiter for self-test (C-2: minimal, not full rate-limit)
+_last_self_test: dict[str, float] = {}
+_SELF_TEST_COOLDOWN_SEC = 30.0
+
+
+@model_router.post("/self-test")
+async def self_test(req: SelfTestRequest):
+    import time as _time
+
+    # Rate limit check (C-2: process-internal cooldown only)
+    now = _time.monotonic()
+    cooldown_key = f"{req.provider_id}:{req.profile_id or 'default'}"
+    if cooldown_key in _last_self_test:
+        elapsed = now - _last_self_test[cooldown_key]
+        if elapsed < _SELF_TEST_COOLDOWN_SEC:
+            remaining = round(_SELF_TEST_COOLDOWN_SEC - elapsed, 0)
+            return SuccessEnvelope(
+                data=SelfTestResponse(
+                    provider_id=req.provider_id,
+                    status="rate_limited",
+                    error_message=f"Self-test cooldown. Try again in {remaining}s.",
+                ).model_dump(),
+                meta=Meta(source_status="rate_limited", capability_status="available"),
+            )
+
+    _last_self_test[cooldown_key] = now
+
+    gw = _gateway()
+    result = await gw.self_test(req.provider_id, req.profile_id)
+
+    # Write trace
+    trace = get_services().trace_writer
+    trace.write("model_call", action="self_test",
+                summary=f"provider={req.provider_id} status={result['status']}")
+
+    return SuccessEnvelope(
+        data=SelfTestResponse(
+            provider_id=result.get("provider_id", ""),
+            profile_id=result.get("profile_id", ""),
+            model=result.get("model", ""),
+            status=result["status"],
+            latency_ms=result.get("latency_ms", 0),
+            credential_status=result.get("credential_status", "missing"),
+            error_category=result.get("error_category", ""),
+            error_message=result.get("error_message", ""),
+            checked_at=result.get("checked_at", ""),
+            call_id=result.get("call_id", ""),
+        ).model_dump(),
+        meta=Meta(source_status=result["status"], capability_status="available"),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Model Call
+# ═══════════════════════════════════════════════════════════════════════
+
+@model_router.post("/call")
+async def model_call(req: ModelCallRequest):
+    gw = _gateway()
+    result = await gw.call(
+        messages=req.messages,
+        user_override=req.user_override,
+        strategy_id=req.strategy_id,
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        stream=req.stream,
+        source=req.source,
+    )
+
+    # Write trace
+    trace = get_services().trace_writer
+    trace.write("model_call", action="model_call",
+                summary=f"status={result['status']} profile={result.get('profile_id','')}")
+
+    if result["status"] == "completed":
+        source_status = "configured"
+    elif result["status"] == "blocked":
+        source_status = result.get("error_category", "not_configured")
+    else:
+        source_status = result.get("error_category", "error")
+
+    return SuccessEnvelope(
+        data=ModelCallResponse(
+            call_id=result.get("call_id", ""),
+            status=result["status"],
+            content=result.get("content", ""),
+            model=result.get("model", ""),
+            profile_id=result.get("profile_id", ""),
+            provider_id=result.get("provider_id", ""),
+            selection_reason=result.get("selection_reason", ""),
+            latency_ms=result.get("latency_ms", 0),
+            error_category=result.get("error_category", ""),
+            error_message=result.get("error_message", ""),
+            usage_summary=UsageSummaryResponse(**result.get("usage_summary", {})),
+            retry_count=result.get("retry_count", 0),
+            fallback_used=result.get("fallback_used", False),
+        ).model_dump(),
+        meta=Meta(source_status=source_status, capability_status="available"),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Call Log
+# ═══════════════════════════════════════════════════════════════════════
+
+@model_router.get("/calls")
+async def list_calls(limit: int = Query(default=50, le=200)):
+    gw = _gateway()
+    calls = gw.list_calls(limit=limit)
+    resp = [
+        CallLogEntry(
+            model_call_id=c["model_call_id"],
+            provider_id=c.get("provider_id", ""),
+            profile_id=c.get("profile_id", ""),
+            strategy_id=c.get("strategy_id", ""),
+            selected_model=c.get("selected_model", ""),
+            selection_reason=c.get("selection_reason", ""),
+            status=c["status"],
+            latency_ms=c.get("latency_ms", 0),
+            error_category=c.get("error_category", ""),
+            retry_count=c.get("retry_count", 0),
+            fallback_used=c.get("fallback_used", False),
+            usage_summary=UsageSummaryResponse(**c.get("usage_summary", {})),
+            source=c.get("source", "api"),
+            created_at=c.get("created_at", ""),
+            completed_at=c.get("completed_at", ""),
+        )
+        for c in calls
+    ]
+    return SuccessEnvelope(
+        data=CallLogListData(calls=resp).model_dump(),
+        meta=Meta(source_status="available", capability_status="available",
+                   persistence="volatile"),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Usage 聚合（进程内 call log，volatile）
+# ═══════════════════════════════════════════════════════════════════════
+
+@model_router.get("/usage")
+async def get_usage():
+    """真实用量聚合（token 真实，成本无计价数据→标记不可用，见 06 §9）。"""
+    gw = _gateway()
+    u = gw.get_usage()
+    return SuccessEnvelope(
+        data=UsageResponse(
+            total_calls=u["total_calls"],
+            completed_calls=u["completed_calls"],
+            failed_calls=u["failed_calls"],
+            prompt_tokens=u["prompt_tokens"],
+            completion_tokens=u["completion_tokens"],
+            total_tokens=u["total_tokens"],
+            cost_available=u["cost_available"],
+            cost_unavailable_reason=u["cost_unavailable_reason"],
+            by_provider=[UsageByProvider(**x) for x in u["by_provider"]],
+            by_model=[UsageByModel(**x) for x in u["by_model"]],
+            volatile=u["volatile"],
+        ).model_dump(),
+        meta=Meta(source_status="available", capability_status="available",
+                   persistence="volatile"),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Platform Assistant Chat
+# ═══════════════════════════════════════════════════════════════════════
+
+@assistant_router.post("/chat")
+async def assistant_chat(req: AssistantChatRequest):
+    """Platform assistant chat — calls ModelGateway, not Provider directly.
+
+    D-073: Assistant reuses ModelGateway; self-test only affects assistant session;
+    does not change default ModelStrategy; does NOT perform platform operations on behalf of user.
+    """
+    gw = _gateway()
+    result = await gw.call(
+        messages=[{"role": "user", "content": req.message}],
+        user_override=req.profile_id,
+        strategy_id="system-default",
+        max_tokens=2048,
+        temperature=0.7,
+        stream=False,
+        source="platform_assistant",
+    )
+
+    trace = get_services().trace_writer
+    trace.write("model_call", action="assistant_chat",
+                summary=f"status={result['status']} profile={result.get('profile_id','')}")
+
+    return SuccessEnvelope(
+        data=AssistantChatResponse(
+            reply=result.get("content", ""),
+            model=result.get("model", ""),
+            profile_id=result.get("profile_id", ""),
+            provider_id=result.get("provider_id", ""),
+            latency_ms=result.get("latency_ms", 0),
+            status=result["status"],
+            error_message=result.get("error_message", ""),
+            source="ModelGateway",
+        ).model_dump(),
+        meta=Meta(source_status=result["status"], capability_status="available"),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Legacy / Future endpoints
+# ═══════════════════════════════════════════════════════════════════════
 
 @model_router.get("/projects/{project_id}/binding")
 async def get_model_binding(project_id: str):
+    """Project-level model binding — future (R8 project settings)."""
     return SuccessEnvelope(
         data=ModelBindingResponse(),
-        meta=Meta(source_status="not_connected", capability_status="future"),
+        meta=Meta(source_status="not_connected", capability_status="future",
+                   not_connected_reason="Project model binding planned for R8"),
     )
 
 
-# === Resource routes ===
+# ═══════════════════════════════════════════════════════════════════════
+# Resource routes (placeholder — R6)
+# ═══════════════════════════════════════════════════════════════════════
+
+from app.schemas.resource import ResourceResponse, ResourceRegistryResponse
+
 resource_router = APIRouter(prefix="/resources", tags=["resources"])
 
 
@@ -65,7 +524,12 @@ async def get_registry():
     )
 
 
-# === Integration routes ===
+# ═══════════════════════════════════════════════════════════════════════
+# Integration routes (placeholder — R7)
+# ═══════════════════════════════════════════════════════════════════════
+
+from app.schemas.integration import IntegrationResponse, GitStatusResponse, SourceImportRequest, SourceImportResponse
+
 integration_router = APIRouter(prefix="/projects/{project_id}/integrations", tags=["integrations"])
 
 
