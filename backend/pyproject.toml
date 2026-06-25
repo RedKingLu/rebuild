@@ -1,0 +1,37 @@
+[project]
+name = "rebuild-backend"
+version = "0.1.0"
+description = "rebuild platform backend — software reconstruction & migration platform"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "sse-starlette>=2.0.0",
+]
+
+# Dev dependencies use PEP 735 dependency-groups (NOT optional-dependencies).
+# Rationale: `uv sync --dev` and `uv run` target dependency-groups, and uv
+# installs the `dev` group into the project venv by default. Putting these
+# under [project.optional-dependencies] (an extra) made `uv sync --dev` a
+# no-op, so pytest was never installed in .venv and tests silently fell back
+# to a global interpreter. See R4-4 acceptance finding C-A.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app", "tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

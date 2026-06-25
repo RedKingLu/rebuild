@@ -1,17 +1,54 @@
+import { useEffect, useState } from 'react';
 import { useProjectStore } from '../../stores';
 import { useNavigate } from 'react-router-dom';
 import { STAGE_LABELS } from '../../types';
+import type { Project } from '../../types';
+import { fetchProjectsWithSource } from '../../services/projectService';
+
+// R4 最小前后端联调（C-B）：本页在挂载时真实调用后端 GET /api/projects，
+// 成功则展示后端数据并标注 source_status；后端不可用时优雅回退到本地 mock，
+// 页面不崩溃。刻意使用 page-local state（非 store selector），规避 R3-4 的
+// React19 选择器新引用无限渲染问题。
+type ConnState = 'loading' | 'connected' | 'fallback';
 
 export function ProjectListPage() {
-  const projects = useProjectStore(s => s.projects);
+  const mockProjects = useProjectStore(s => s.projects);
+  const [projects, setProjects] = useState<Project[]>(mockProjects);
+  const [conn, setConn] = useState<ConnState>('loading');
+  const [sourceStatus, setSourceStatus] = useState<string>('');
   const nav = useNavigate();
   const openWs = (pid: string) => window.open(`/projects/${pid}/workspace`, '_blank');
+
+  useEffect(() => {
+    let active = true;
+    fetchProjectsWithSource()
+      .then(({ projects: list, sourceStatus: src }) => {
+        if (!active) return;
+        setProjects(list);
+        setSourceStatus(src);
+        setConn('connected');
+      })
+      .catch(() => {
+        if (!active) return;
+        setProjects(mockProjects);
+        setConn('fallback');
+      });
+    return () => { active = false; };
+    // 仅挂载时拉取一次；mockProjects 为 store 稳定引用，作为回退基线。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const sourceTag =
+    conn === 'loading' ? <span className="tag">加载中…</span>
+    : conn === 'connected'
+      ? <span className="tag violet">后端接口数据 · /api/projects（source_status: {sourceStatus}）</span>
+      : <span className="tag amber">后端未连接 · 显示本地 mock 回退</span>;
 
   return (
     <div>
       <div className="spread"><h1>项目</h1><button className="btn" onClick={() => nav('/projects/new')}>＋ 新建项目</button></div>
       <p className="sub">项目对象绑定独立 Project Workspace；创建后经首次引导进入工作区。点击"进入工作区"在新标签页打开。</p>
-      <span className="tag violet" style={{ marginBottom: 12 }}>Mock 数据</span>
+      <div style={{ marginBottom: 12 }}>{sourceTag}</div>
 
       {!projects.length && <div className="empty">暂无项目</div>}
 
