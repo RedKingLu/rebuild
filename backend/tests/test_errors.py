@@ -43,11 +43,13 @@ def test_models_real_after_r5(client):
     assert data["meta"]["capability_status"] != "future"
 
 
-def test_resources_not_connected(client):
+def test_resources_connected(client):
+    """R6: Resource Registry returns real data with source_status=real."""
     resp = client.get("/api/resources")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["meta"]["source_status"] == "not_connected"
+    assert data["source_status"] == "real"
+    assert data["total"] > 0  # Seed data loaded
 
 
 def test_integrations_not_connected(client):

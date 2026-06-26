@@ -75,6 +75,12 @@ class AuditWriter:
         results.reverse()
         return results[:limit]
 
+    def list_all(self) -> list[dict]:
+        """Return all audit entries (most recent first). For test verification."""
+        results = list(self._audits)
+        results.reverse()
+        return results
+
     def clear(self):
         """Clear all audits (for test isolation)."""
         self._audits.clear()

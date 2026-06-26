@@ -15,6 +15,7 @@ export interface ProviderInfo {
   api_format: string;
   endpoint_openai: string;
   endpoint_anthropic: string;
+  env_key_var: string;
   credential_status: string;
   key_source: string;
   status: string;
@@ -94,9 +95,16 @@ export interface CallLogEntry {
   error_category: string;
   retry_count: number;
   fallback_used: boolean;
-  usage_summary: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  usage_summary: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    cache_hit_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
   source: string;
   created_at: string;
+  completed_at?: string;
 }
 
 export interface AssistantChatResult {
@@ -140,8 +148,15 @@ export function selfTest(providerId: string, profileId?: string): Promise<{ data
   });
 }
 
-export function listCalls(limit = 50): Promise<{ data: { calls: CallLogEntry[]; volatile: boolean; note: string } }> {
-  return get<{ calls: CallLogEntry[]; volatile: boolean; note: string }>(`/model/calls?limit=${limit}`);
+export function listCalls(limit = 10, offset = 0): Promise<{ data: { calls: CallLogEntry[]; total: number; limit: number; offset: number } }> {
+  return get<{ calls: CallLogEntry[]; total: number; limit: number; offset: number }>(`/model/calls?limit=${limit}&offset=${offset}`);
+}
+
+export interface CallLogPage {
+  calls: CallLogEntry[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export function assistantChat(message: string, profileId?: string): Promise<{ data: AssistantChatResult }> {
@@ -185,11 +200,14 @@ export interface UsageInfo {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cache_hit_tokens: number;
+  cache_read_tokens: number;
+  cache_hit_rate: number;
   cost_available: boolean;
   cost_unavailable_reason: string;
   by_provider: { provider_id: string; calls: number; total_tokens: number }[];
   by_model: { model: string; calls: number; total_tokens: number }[];
-  volatile: boolean;
+  persisted: boolean;
 }
 
 export function createProvider(input: CreateProviderInput): Promise<{ data: ProviderInfo | null }> {
@@ -212,6 +230,29 @@ export function getUsage(): Promise<{ data: UsageInfo }> {
 
 export function updateStrategy(strategyId: string, body: { default_profile_ref?: string; fallback_profile_refs?: string[] }): Promise<{ data: StrategyInfo | null }> {
   return put<StrategyInfo | null>(`/model/strategies/${encodeURIComponent(strategyId)}`, body);
+}
+
+export function createStrategy(body: { strategy_id: string; default_profile_ref?: string; fallback_profile_refs?: string[] }): Promise<{ data: StrategyInfo | null; meta?: { not_connected_reason?: string } }> {
+  return post<StrategyInfo | null>('/model/strategies', body);
+}
+
+export function deleteStrategy(strategyId: string): Promise<{ data: { removed: boolean } }> {
+  return del<{ removed: boolean }>(`/model/strategies/${encodeURIComponent(strategyId)}`);
+}
+
+export interface UpdateProviderInput {
+  provider_name?: string;
+  api_format?: string;
+  endpoint_openai?: string;
+  endpoint_anthropic?: string;
+  env_key_var?: string;
+  note?: string;
+  homepage?: string;
+  models?: ImportModelInput[];
+}
+
+export function updateProvider(providerId: string, input: UpdateProviderInput): Promise<{ data: ProviderInfo | null }> {
+  return put<ProviderInfo | null>(`/model/providers/${encodeURIComponent(providerId)}`, input);
 }
 
 // ── 真实能力标记（14 种，文档/06-UX与前端/06 §2/§18） ──────────────────

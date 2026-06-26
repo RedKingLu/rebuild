@@ -1,8 +1,12 @@
 import { useProjectStore, useRunStore } from '../../stores';
 import { useNavigate } from 'react-router-dom';
 import { STAGE_LABELS } from '../../types';
-import { MockBadge } from '../../components/ui/StatusBadge';
 import { Icon, type IconKey } from '../../components/ui/Icon';
+import { MockBadge } from '../../components/ui/StatusBadge';
+import { useState, useEffect } from 'react';
+import { listResources } from '../../services/resourceService';
+import { listAgents } from '../../services/agentService';
+import { getModelStatus } from '../../services/modelService';
 
 export function OverviewPage() {
   const projects = useProjectStore(s => s.projects);
@@ -10,20 +14,31 @@ export function OverviewPage() {
   const nav = useNavigate();
   const running = runs.filter(r => r.run_status === 'running').length;
 
+  const [resCount, setResCount] = useState(0);
+  const [knowledgeCount, setKnowledgeCount] = useState(0);
+  const [agentCount, setAgentCount] = useState(0);
+  const [modelCount, setModelCount] = useState(0);
+  const [knowledgeItems, setKnowledgeItems] = useState<{name:string;desc:string}[]>([]);
+
+  useEffect(() => {
+    Promise.all([
+      listResources().then(r => setResCount(r.total || r.resources?.length || 0)).catch(() => {}),
+      listResources({ type: 'knowledge' }).then(r => {
+        setKnowledgeCount(r.total || r.resources?.length || 0);
+        setKnowledgeItems((r.resources || []).slice(0, 6).map(k => ({ name: k.name, desc: k.description?.slice(0, 80) || '暂无摘要' })));
+      }).catch(() => {}),
+      listAgents().then(r => setAgentCount(r.total || r.agents?.length || 0)).catch(() => {}),
+      getModelStatus().then(r => setModelCount((r as any)?.data?.total_profiles || 0)).catch(() => {}),
+    ]);
+  }, []);
+
   const openWs = (pid: string) => window.open(`/projects/${pid}/workspace`, '_blank');
 
   const stats = [
     { a: running, b: projects.length, label: '项目（运行 / 总数）', go: '/projects' },
-    { a: 0, b: 0, label: '资源（启用 / 总数）', go: '/resources' },
-    { a: 0, b: 0, label: '模型（可用 / 总数）', go: '/models' },
-    { a: 0, b: 0, label: '集成（启用 / 总数）', go: '/integrations' },
-  ];
-
-  const knowledge = [
-    { ic: '🚀', title: '平台入门', desc: 'rebuild 平台概览、P0–P6 主轴、Evidence / Artifact / Trace 心智' },
-    { ic: '📘', title: '新手教程', desc: '从新建迁移项目到交付的完整流程' },
-    { ic: '🧭', title: '信创迁移指南', desc: '.NET / SQL Server → 麒麟 / 达梦 的迁移要点与清单' },
-    { ic: '📑', title: 'Evidence 契约速查', desc: 'Evidence v0 字段、类型与引用关系' },
+    { a: agentCount, b: resCount, label: '资源（Agent / 总数）', go: '/resources' },
+    { a: 0, b: modelCount, label: '模型（可用 / 总数）', go: '/models' },
+    { a: knowledgeCount, b: 0, label: '知识库（文档）', go: '/knowledge' },
   ];
 
   // P0–P6 模板预设（导航至创建向导；非真实编排）
@@ -50,7 +65,7 @@ export function OverviewPage() {
     <div>
       <h1>概览</h1>
       <p className="sub">面向软件重构与迁移的工程平台 · 首期聚焦信创迁移 · 用户主路径 P0–P6</p>
-      <span className="tag violet" style={{ marginBottom: 8 }}>Mock 数据</span>
+      <span className="tag" style={{ marginBottom: 8, background: 'var(--green)', color: '#fff' }}>真实数据</span>
 
       {/* Stat Grid */}
       <div className="statgrid">
@@ -67,18 +82,21 @@ export function OverviewPage() {
         <div className="card">
           <div className="spread"><b>最近知识</b><button className="btn sm ghost" onClick={() => nav('/knowledge')}>知识库</button></div>
           <div style={{ marginTop: 4 }}>
-            {knowledge.map((k, i) => (
+            {knowledgeItems.length > 0 ? knowledgeItems.map((k, i) => (
               <div key={i} className="listrow">
                 <div className="row" style={{ flexWrap: 'nowrap' }}>
-                  <div className="ic">{k.ic}</div>
+                  <div className="ic">📄</div>
                   <div>
-                    <div className="ttl">{k.title} <span className="tag blue">平台常驻</span></div>
+                    <div className="ttl">{k.name}</div>
                     <div className="meta">{k.desc}</div>
                   </div>
                 </div>
-                <MockBadge level="placeholder" />
               </div>
-            ))}
+            )) : (
+              <div className="listrow">
+                <div className="meta">知识库为空，<a href="#" onClick={(e) => { e.preventDefault(); nav('/knowledge'); }}>前往上传</a></div>
+              </div>
+            )}
           </div>
         </div>
 

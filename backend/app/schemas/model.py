@@ -56,12 +56,26 @@ class CreateProviderRequest(BaseModel):
 
 
 class SetCredentialRequest(BaseModel):
-    """为已有供应商（重新）设置 Key——仅进程内存，volatile。"""
+    """为已有供应商（重新）设置 Key。"""
     api_key: str
 
 
+class UpdateProviderRequest(BaseModel):
+    """更新供应商配置（FB-005）。仅允许更新非敏感配置字段。"""
+    provider_name: Optional[str] = None
+    api_format: Optional[str] = None       # openai / anthropic
+    endpoint_openai: Optional[str] = None
+    endpoint_anthropic: Optional[str] = None
+    env_key_var: Optional[str] = None
+    note: Optional[str] = None
+    homepage: Optional[str] = None
+    models: Optional[list[ImportModelInput]] = None  # 全量替换模型列表
+
+
 class UpdateStrategyRequest(BaseModel):
-    """编辑策略：默认模型 + fallback 链（R5 仅开放这两项）。"""
+    """编辑/创建策略：默认模型 + fallback 链（R5 仅开放这两项）。
+    strategy_id 仅在创建时必填；编辑时忽略（使用路径参数）。"""
+    strategy_id: str = ""  # 创建时必填
     default_profile_ref: Optional[str] = None
     fallback_profile_refs: Optional[list[str]] = None
 
@@ -87,11 +101,14 @@ class UsageResponse(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_hit_rate: float = 0.0
     cost_available: bool = False
     cost_unavailable_reason: str = ""
     by_provider: list[UsageByProvider] = Field(default_factory=list)
     by_model: list[UsageByModel] = Field(default_factory=list)
-    volatile: bool = True
+    persisted: bool = True
 
 
 class ProviderListData(BaseModel):
@@ -242,8 +259,11 @@ class CallLogEntry(BaseModel):
 
 class CallLogListData(BaseModel):
     calls: list[CallLogEntry] = Field(default_factory=list)
-    volatile: bool = True
-    note: str = "In-memory only. Restarting the server will clear this log."
+    total: int = 0
+    limit: int = 10
+    offset: int = 0
+    persisted: bool = True
+    note: str = "DB persisted. Data survives server restart."
 
 
 # ── Platform Assistant chat ──────────────────────────────────────────

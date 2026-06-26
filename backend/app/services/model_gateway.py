@@ -21,6 +21,7 @@ from app.providers.provider_registry import (
     normalize_model_name,
     _resolve_api_key,
 )
+from app.core.audit_writer import AuditWriter
 
 logger = logging.getLogger("rebuild.model_gateway")
 
@@ -86,6 +87,54 @@ class ModelGateway:
     def list_strategies(self) -> list[dict]:
         return [_strategy_to_dict(s) for s in self._registry.list_strategies()]
 
+    # ── Key resolution (credential_ref → env fallback) ─────────────────
+
+    def _resolve_key(self, provider: ProviderInfo, explicit_provider: bool = False) -> tuple:
+        """Resolve API key: try credential_ref (DB encrypted via BYOK), then env fallback.
+
+        Args:
+            provider: Provider info from registry (has credential_ref field from R6)
+            explicit_provider: True if user explicitly specified this provider/model.
+                When True AND credential_ref is missing, do NOT fall back silently
+                — return None to force clear error.
+        Returns:
+            (key_value: str | None, key_source: str)
+        """
+        # Try credential_ref first (R6 BYOK path)
+        if provider.credential_ref:
+            try:
+                from app.core.database import get_session
+                from app.services.credential_service import CredentialService
+                db = get_session()
+                try:
+                    csvc = CredentialService(db)
+                    plaintext = csvc.decrypt(provider.credential_ref)
+                    if plaintext:
+                        logger.info(
+                            f"Resolved key via credential_ref for {provider.provider_id}"
+                        )
+                        return plaintext, "credential_ref"
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.warning(
+                    f"credential_ref resolution failed for {provider.provider_id}: {e}"
+                )
+            # If explicit provider has credential_ref but decryption fails, don't fallback
+            if explicit_provider:
+                return None, "credential_ref_decrypt_failed"
+
+        # Fall back to env var (legacy, clearly marked)
+        key_val, key_source = _resolve_api_key(provider.env_key_var, provider.provider_id)
+        if key_val:
+            return key_val, f"env_fallback:{key_source}"
+
+        # Explicit provider with no key at all → clear error
+        if explicit_provider:
+            return None, "explicit_provider_no_key"
+
+        return None, "none"
+
     # ── Model call ────────────────────────────────────────────────────
 
     async def call(
@@ -110,8 +159,9 @@ class ModelGateway:
         if not profile or not provider:
             return _call_error("not_configured", "No configured model available", reason)
 
-        # 2. Get API key (in-memory only, never persisted)
-        key_val, key_source = _resolve_api_key(provider.env_key_var, provider.provider_id)
+        # 2. Get API key — try credential_ref first, then env fallback
+        explicit_provider = user_override is not None
+        key_val, key_source = self._resolve_key(provider, explicit_provider)
         if not key_val:
             return _call_error("credential_missing", f"No API key configured for {provider.provider_id}", reason)
 
@@ -137,7 +187,7 @@ class ModelGateway:
             stream=stream,
         )
 
-        # 6. Record call log
+        # 6. Record call log — persist to DB (FB-006) + in-memory
         latency = (time.monotonic() - t0) * 1000
         call_record = {
             "model_call_id": result.call_id,
@@ -157,6 +207,7 @@ class ModelGateway:
             "completed_at": _now_iso(),
         }
         self._calls.append(call_record)
+        self._persist_call(call_record)
 
         return {
             "call_id": result.call_id,
@@ -239,10 +290,65 @@ class ModelGateway:
             "call_id": result.call_id,
         }
 
-    # ── Call log ──────────────────────────────────────────────────────
+    # ── Call log (FB-006: DB-persisted, fallback to in-memory) ────────
 
-    def list_calls(self, limit: int = 50) -> list[dict]:
-        return list(reversed(self._calls))[:limit]
+    def _persist_call(self, record: dict) -> None:
+        """Persist a call record to the DB (best-effort, non-blocking)."""
+        try:
+            from app.core.database import get_session
+            from app.models.call_log import CallLog
+            from datetime import datetime, timezone
+            db = get_session()
+            try:
+                usage = record.get("usage_summary", {}) or {}
+                cl = CallLog(
+                    model_call_id=record["model_call_id"],
+                    provider_id=record.get("provider_id", ""),
+                    profile_id=record.get("profile_id", ""),
+                    strategy_id=record.get("strategy_id", "system-default"),
+                    selected_model=record.get("selected_model", ""),
+                    selection_reason=record.get("selection_reason", ""),
+                    status=record.get("status", "unknown"),
+                    latency_ms=record.get("latency_ms", 0),
+                    error_category=record.get("error_category", ""),
+                    retry_count=record.get("retry_count", 0),
+                    fallback_used=int(record.get("fallback_used", False)),
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0),
+                    source=record.get("source", "api"),
+                )
+                db.add(cl)
+                db.commit()
+            except Exception:
+                db.rollback()
+            finally:
+                db.close()
+        except Exception:
+            pass  # best-effort — in-memory log is still available
+
+    def list_calls(self, limit: int = 10, offset: int = 0) -> tuple[list[dict], int]:
+        """List calls from DB with pagination (FB-M). Returns (records, total_count)."""
+        try:
+            from app.core.database import get_session
+            from app.models.call_log import CallLog
+            db = get_session()
+            try:
+                total = db.query(CallLog).count()
+                rows = (
+                    db.query(CallLog)
+                    .order_by(CallLog.created_at.desc())
+                    .offset(offset)
+                    .limit(limit)
+                    .all()
+                )
+                return [r.to_dict() for r in rows], total
+            finally:
+                db.close()
+        except Exception:
+            # DB unavailable — fallback to in-memory
+            mem = list(reversed(self._calls))
+            return mem[offset:offset + limit], len(mem)
 
     def get_call(self, call_id: str) -> Optional[dict]:
         for c in self._calls:
@@ -260,33 +366,110 @@ class ModelGateway:
     def remove_provider(self, provider_id: str) -> bool:
         return self._registry.remove_user_provider(provider_id)
 
-    def set_credential(self, provider_id: str, api_key: str) -> Optional[dict]:
-        provider = self._registry.set_credential(provider_id, api_key)
+    def update_provider(self, provider_id: str, **kwargs) -> Optional[dict]:
+        """更新供应商非敏感配置（FB-005）。"""
+        provider = self._registry.update_provider(provider_id, **kwargs)
         return _provider_to_dict(provider) if provider else None
+
+    def set_credential(self, provider_id: str, api_key: str) -> Optional[dict]:
+        """设置供应商凭据：同时注入进程内存 + BYOK 加密持久化到 DB（FB-002 修复）。
+
+        1. 进程内存注入（volatile，保障当前进程立即可用）；
+        2. BYOK 持久化：创建/更新 Credential 记录（AES-256-GCM 加密落 DB），
+           并设置 provider.credential_ref 指向该记录。
+        后续 _resolve_key 优先走 credential_ref 解密路径。
+        """
+        provider = self._registry.set_credential(provider_id, api_key)
+        if not provider:
+            return None
+
+        # BYOK 持久化：将 Key 加密存入 Credential 表，设置 credential_ref
+        try:
+            from app.core.database import get_session
+            from app.services.credential_service import CredentialService
+            from app.schemas.credential import CredentialCreate
+            db = get_session()
+            try:
+                csvc = CredentialService(db)
+                cred_data = CredentialCreate(
+                    name=f"provider:{provider_id}",
+                    provider_ref=provider_id,
+                    plaintext_key=api_key,
+                    key_source="user",
+                )
+                cred = csvc.create(cred_data)
+                provider.credential_ref = cred.credential_id
+                provider.key_source = "credential_ref"
+                logger.info(
+                    f"BYOK persisted for {provider_id}: credential_ref={cred.credential_id}"
+                )
+            finally:
+                db.close()
+        except Exception as e:
+            # BYOK 持久化失败不阻断——Key 仍在进程内存中可用
+            logger.warning(f"BYOK persist failed for {provider_id}: {e}")
+
+        return _provider_to_dict(provider)
 
     def update_strategy(self, strategy_id: str, default_profile_ref: Optional[str] = None,
                         fallback_profile_refs: Optional[list] = None) -> Optional[dict]:
         st = self._registry.update_strategy(strategy_id, default_profile_ref, fallback_profile_refs)
         return _strategy_to_dict(st) if st else None
 
+    def create_strategy(self, strategy_id: str, default_profile_ref: Optional[str] = None,
+                        fallback_profile_refs: Optional[list] = None) -> dict:
+        """创建新策略（FB-004 新增）。"""
+        st = self._registry.create_strategy(strategy_id, default_profile_ref, fallback_profile_refs)
+        return _strategy_to_dict(st)
+
+    def delete_strategy(self, strategy_id: str) -> bool:
+        """删除策略（FB-007 新增）。"""
+        return self._registry.delete_strategy(strategy_id)
+
     # ── 用量聚合（来自进程内 call log，volatile） ──────────────────────
 
     def get_usage(self) -> dict:
-        """从进程内 call log 聚合真实用量。
+        """从 DB call_log + 进程内 call log 聚合真实用量（FB-M 修复：DB 持久化统计）。
 
-        token 计数为真实值（来自 LiteLLM usage）；成本无计价数据，标记不可用。
-        持久化用量库/趋势属 R8+（无真实数据时不臆造，见 06 §9）。
+        token 计数为真实值；缓存命中暂为占位（LiteLLM 未暴露 cache 指标时显示 0）。
         """
-        total_calls = len(self._calls)
-        completed = [c for c in self._calls if c.get("status") == "completed"]
-        failed = [c for c in self._calls if c.get("status") not in ("completed", None)]
-        prompt = sum(c.get("usage_summary", {}).get("prompt_tokens", 0) for c in self._calls)
-        completion = sum(c.get("usage_summary", {}).get("completion_tokens", 0) for c in self._calls)
-        total_tokens = sum(c.get("usage_summary", {}).get("total_tokens", 0) for c in self._calls)
+        # Merge DB + in-memory records (dedup by model_call_id)
+        all_calls: dict[str, dict] = {}
+        try:
+            from app.core.database import get_session
+            from app.models.call_log import CallLog
+            db = get_session()
+            try:
+                rows = db.query(CallLog).all()
+                for r in rows:
+                    all_calls[r.model_call_id] = r.to_dict()
+            finally:
+                db.close()
+        except Exception:
+            pass
+        # In-memory records (may have calls not yet flushed to DB)
+        for c in self._calls:
+            cid = c.get("model_call_id", "")
+            if cid and cid not in all_calls:
+                all_calls[cid] = c
+
+        calls = list(all_calls.values())
+        total_calls = len(calls)
+        completed = [c for c in calls if c.get("status") == "completed"]
+        failed = [c for c in calls if c.get("status") not in ("completed", None)]
+        prompt = sum(c.get("usage_summary", {}).get("prompt_tokens", 0) for c in calls)
+        completion = sum(c.get("usage_summary", {}).get("completion_tokens", 0) for c in calls)
+        total_tokens = sum(c.get("usage_summary", {}).get("total_tokens", 0) for c in calls)
+        # Cache tokens — LiteLLM may report these; default 0 if not available
+        cache_hit_tokens = sum(c.get("usage_summary", {}).get("cache_hit_tokens", 0) for c in calls)
+        cache_read_tokens = sum(c.get("usage_summary", {}).get("cache_read_input_tokens", 0) for c in calls)
+
+        # Cache hit rate (0-100, percentage of prompt tokens that were cache hits)
+        cache_hit_rate = round((cache_hit_tokens / prompt * 100), 1) if prompt > 0 else 0.0
 
         by_provider: dict[str, dict] = {}
         by_model: dict[str, dict] = {}
-        for c in self._calls:
+        for c in calls:
             pid = c.get("provider_id", "") or "—"
             mid = c.get("selected_model", "") or "—"
             bp = by_provider.setdefault(pid, {"provider_id": pid, "calls": 0, "total_tokens": 0})
@@ -303,11 +486,14 @@ class ModelGateway:
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "total_tokens": total_tokens,
+            "cache_hit_tokens": cache_hit_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_hit_rate": cache_hit_rate,
             "cost_available": False,
-            "cost_unavailable_reason": "无 Provider 计价数据；持久化用量与成本统计属 R8+",
+            "cost_unavailable_reason": "无 Provider 计价数据",
             "by_provider": list(by_provider.values()),
             "by_model": list(by_model.values()),
-            "volatile": True,
+            "persisted": True,
         }
 
 
