@@ -75,7 +75,7 @@ export function Icon({ name, size = 20, className, style }: Props) {
     case 'files':
       return svg(<><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-8l-2-2H5a2 2 0 00-2 2z" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M9 12h6M9 16h3" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
     case 'git':
-      return svg(<><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M3 12c0-4.97 4.03-9 9-9M21 12c0 4.97-4.03 9-9 9" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M12 3v3M12 18v3" fill="none" stroke="currentColor" strokeWidth="1.8"/><circle cx="12" cy="6" r="1" fill="currentColor"/><circle cx="12" cy="18" r="1" fill="currentColor"/></>);
+      return svg(<><circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" strokeWidth="1.7"/><circle cx="16" cy="16" r="2" fill="none" stroke="currentColor" strokeWidth="1.7"/><circle cx="16" cy="6" r="2" fill="none" stroke="currentColor" strokeWidth="1.7"/><path d="M8 8l3.5-1.5 3 1.5" fill="none" stroke="currentColor" strokeWidth="1.7"/><path d="M14 7.5v7l-4 2" fill="none" stroke="currentColor" strokeWidth="1.7"/></>);
     case 'remote':
       return svg(<><path d="M20 17.58A5 5 0 0018 8h-1.26A8 8 0 104 16.25" fill="none" stroke="currentColor" strokeWidth="1.8"/><polyline points="16,16 12,12 8,16" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M12 12v9" fill="none" stroke="currentColor" strokeWidth="1.8"/></>);
     case 'agent':

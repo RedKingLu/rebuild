@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     # Source resources base directory (skills, agents, mcp, resources, cases, knowledge)
     source_dir: str = "/home/king/rebuild/source"
 
+    # R7 GitHub OAuth
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    github_redirect_uri: str = "http://localhost:8765/api/integrations/git/oauth/github/callback"
+    frontend_url: str = "http://localhost:5173"
+
     @property
     def data_path(self) -> Path:
         return Path(self.data_dir).resolve()

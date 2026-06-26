@@ -1,6 +1,6 @@
 /** Project API service. */
 
-import { get, post, patch } from './client';
+import { get, post, patch, del } from './client';
 import type { Project } from '../types';
 
 interface ProjectListResponse {
@@ -25,11 +25,17 @@ export async function fetchProject(id: string): Promise<Project> {
   return resp.data;
 }
 
-export async function createProject(name: string, description = '', sourceType = 'local_dir'): Promise<Project> {
+export async function createProject(params: {
+  name: string;
+  description?: string;
+  source_type?: string;
+  source_config?: Record<string, unknown>;
+}): Promise<Project> {
   const resp = await post<Project>('/projects', {
-    name,
-    description,
-    source_type: sourceType,
+    name: params.name,
+    description: params.description ?? '',
+    source_type: params.source_type ?? 'local_dir',
+    source_config: params.source_config ?? {},
   });
   return resp.data;
 }
@@ -41,4 +47,8 @@ export async function updateProject(id: string, fields: Record<string, unknown>)
 
 export async function archiveProject(id: string): Promise<void> {
   await post(`/projects/${id}/archive`);
+}
+
+export async function deleteProject(id: string): Promise<void> {
+  await del(`/projects/${id}`);
 }

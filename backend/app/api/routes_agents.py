@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.database import get_session
+from app.core.database import get_db
 from app.schemas.agent import AgentCreate, AgentUpdate, AgentResponse, AgentListData
 from app.services.agent_service import AgentService
 from app.schemas.common import SuccessEnvelope
@@ -11,7 +11,7 @@ from app.schemas.common import SuccessEnvelope
 agent_router = APIRouter(prefix="/agents", tags=["agents"])
 
 
-def get_service(db: Session = Depends(get_session)) -> AgentService:
+def get_service(db: Session = Depends(get_db)) -> AgentService:
     return AgentService(db)
 
 

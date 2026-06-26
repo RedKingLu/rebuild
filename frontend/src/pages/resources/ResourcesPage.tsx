@@ -34,8 +34,12 @@ type Tab = 'agents' | 'skills' | 'mcp' | 'other';
 
 const TYPE_GROUPS: Record<string, string[]> = {
   mcp: ['mcp'],
-  other: ['tool', 'hook', 'policy', 'deterministic_transformer', 'execution_provider', 'template'],
+  other: ['tool', 'hook', 'policy', 'deterministic_transformer', 'execution_provider', 'template', 'case', 'expert_agent'],
 };
+
+// R7: Added 'case' (案例) and 'expert_agent' (专家Agent) to other tab.
+// 'template' and 'deterministic_transformer' were already present.
+// All 12 resource types from the backend registry are now accessible.
 
 const AGENT_CATEGORY_LABEL: Record<string, string> = { system: '系统内置', expert: '专家' };
 const STATUS_LABEL: Record<string, string> = { active: '活跃', draft: '草稿', disabled: '已禁用', deprecated: '已废弃' };

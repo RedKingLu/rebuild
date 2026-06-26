@@ -52,9 +52,15 @@ class Services:
 
     @property
     def project_service(self):
+        # DEPRECATED: ProjectService is now DB-backed per-request.
+        # Routes should use ProjectService(db) directly via Depends(get_session).
+        # Kept for backward compatibility with workspace_service, routes_runs,
+        # and routes_workspace which call svc.project_service.get(project_id).
         if self._project_service is None:
             from app.services.project_service import ProjectService
-            self._project_service = ProjectService(self)
+            from app.core.database import get_session
+            db = get_session()
+            self._project_service = ProjectService(db)
         return self._project_service
 
     @property

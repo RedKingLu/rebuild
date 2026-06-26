@@ -387,11 +387,15 @@ class TestCallLog:
         assert gw._calls == []
 
     def test_call_log_after_call(self):
+        import uuid
         from app.services.model_gateway import ModelGateway
         gw = ModelGateway()
-        # Add record both in-memory (for backward compat) and persist to DB
+        # Add record both in-memory (for backward compat) and persist to DB.
+        # Use a unique id so the record is freshly inserted (newest) and not
+        # subject to a primary-key collision across repeated test runs.
+        cid = f"test-{uuid.uuid4().hex[:8]}"
         record = {
-            "model_call_id": "test-001",
+            "model_call_id": cid,
             "provider_id": "deepseek-official",
             "profile_id": "deepseek-official/deepseek-v4-flash",
             "strategy_id": "system-default",
@@ -407,9 +411,10 @@ class TestCallLog:
         }
         gw._calls.append(record)
         gw._persist_call(record)
-        calls = gw.list_calls()
-        assert len(calls) >= 1
-        assert any(c["model_call_id"] == "test-001" for c in calls)
+        # FB-M: list_calls returns (records, total)
+        calls, total = gw.list_calls(limit=100)
+        assert total >= 1
+        assert any(c["model_call_id"] == cid for c in calls)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -501,7 +506,9 @@ class TestModelAPI:
         data = resp.json()
         # Calls may be empty or have prior test calls
         assert "calls" in data["data"]
-        assert data["data"]["volatile"] is True
+        # FB-006: call log is DB-persisted (survives restart), not volatile in-memory
+        assert data["data"]["persisted"] is True
+        assert data["data"]["volatile"] is False
 
     def test_get_single_provider(self, client):
         resp = client.get("/api/model/providers/deepseek-official")
@@ -685,7 +692,9 @@ class TestProviderAPIImport:
         assert "total_calls" in data
         assert "total_tokens" in data
         assert data["cost_available"] is False  # 无计价数据，诚实标记
-        assert data["volatile"] is True
+        # FB-006: usage aggregated from DB-persisted call log, not volatile
+        assert data["persisted"] is True
+        assert data["volatile"] is False
 
     def test_set_credential_no_key_in_response(self, client):
         # 先建一个用户 provider

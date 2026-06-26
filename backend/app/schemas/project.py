@@ -8,12 +8,19 @@ from app.schemas.common import Meta, GraphPlaceholderFields
 class ProjectCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     description: str = ""
-    source_type: Literal["local_dir", "git", "zip", "github"] = "local_dir"
+    source_type: Literal["local_dir", "git", "zip", "github", "manual"] = "local_dir"
+    source_config: Optional[dict] = None
 
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+
+
+class ProjectSourceUpdate(BaseModel):
+    """Schema for updating project source type and configuration."""
+    source_type: Literal["local_dir", "git", "zip", "github", "manual"]
+    source_config: Optional[dict] = None
 
 
 class ProjectResponse(BaseModel):
@@ -26,6 +33,7 @@ class ProjectResponse(BaseModel):
     active_gate: Optional[str] = None
     evidence_gap_count: int = 0
     source_type: str = "local_dir"
+    source_config: Optional[dict] = None
     workspace_status: str = "ready"
     onboarding_done: bool = False
     updated_at: str = ""

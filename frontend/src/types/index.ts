@@ -26,8 +26,10 @@ export interface Project {
   active_gate: string | null;
   evidence_gap_count: number;
   source_type: SourceType;
+  source_config?: Record<string, unknown>;
   workspace_status: 'ready' | 'unavailable' | 'blocked';
-  updated_at: string;
+  created_at?: string;
+  updated_at?: string;
   onboarding_done: boolean;
   mock_level: MockLevel;
 }

@@ -1,0 +1,80 @@
+# rebuild — 平台容器化编排（Phase C1 基础编排 + C2 沙箱 scaffold）
+#
+# 快速启动：
+#   cp .env.example .env   # 按需填入非敏感配置；密钥仍走各自的安全通道
+#   docker compose up --build
+#   前端 http://localhost:8080   后端 http://localhost:8000/api/health
+#
+# 默认用 SQLite（命名卷持久化），开箱即用、零外部依赖。
+# 需要 PostgreSQL 时启用 profile：  docker compose --profile pg up --build
+# 并在 .env 中设置 DATABASE_URL=postgresql+psycopg://rebuild:rebuild@db:5432/rebuild
+
+services:
+  backend:
+    build:
+      context: ./backend
+    image: rebuild-backend:local
+    environment:
+      # 容器内路径；env_prefix=REBUILD_（见 backend/app/core/config.py）。
+      REBUILD_DATA_DIR: /app/.data
+      REBUILD_DATABASE_URL: ${REBUILD_DATABASE_URL:-sqlite:////app/.data/rebuild.db}
+      REBUILD_CORS_ORIGINS: ${REBUILD_CORS_ORIGINS:-http://localhost:8080}
+      REBUILD_FRONTEND_URL: ${REBUILD_FRONTEND_URL:-http://localhost:8080}
+    env_file:
+      - path: .env       # 密钥（LLM_API_KEY 等）只经 env_file 注入，绝不写进镜像
+        required: false
+    volumes:
+      - backend-data:/app/.data      # sqlite db + 执行沙箱 + 仓库克隆，持久化
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # 执行宿主 Docker 以驱动 execution-sandbox（C2）——如启用，再放开下行挂载。
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  frontend:
+    build:
+      context: ./frontend
+    image: rebuild-frontend:local
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+  # ── 可选：PostgreSQL（profile=pg）。默认不启动，保持开箱即用。 ──
+  db:
+    image: postgres:16-alpine
+    profiles: ["pg"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rebuild}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rebuild}
+      POSTGRES_DB: ${POSTGRES_DB:-rebuild}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  # ── Phase C2 scaffold：执行沙箱镜像。默认只构建、不常驻（profile=sandbox）。 ──
+  # 真实执行由 backend 通过短生命周期 exec/容器驱动；此处提供镜像与硬化基线。
+  execution-sandbox:
+    build:
+      context: ./deploy/execution-sandbox
+    image: rebuild-execution-sandbox:local
+    profiles: ["sandbox"]
+    read_only: true
+    network_mode: "none"          # 沙箱无网络：不可外联代码托管/远程
+    user: "10002:10002"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    tmpfs:
+      - /work:size=256m,mode=1777
+    restart: "no"
+
+volumes:
+  backend-data:
+  pg-data:

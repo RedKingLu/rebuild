@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.core.database import get_session
+from app.core.database import get_db
 from app.services.agent_service import AgentService
 from app.services.registry_service import RegistryService
 from app.services.skill_service import SkillService
@@ -45,7 +45,7 @@ def _stream(data: bytes, filename: str) -> StreamingResponse:
 # ── Skill 导出 ─────────────────────────────────────────────────────────
 
 @export_router.get("/skill/{skill_id}")
-def export_skill(skill_id: str, db: Session = Depends(get_session)):
+def export_skill(skill_id: str, db: Session = Depends(get_db)):
     svc = SkillService(db)
     skill = svc.get(skill_id)
     if not skill:
@@ -67,7 +67,7 @@ def export_skill(skill_id: str, db: Session = Depends(get_session)):
 # ── Agent 导出 ────────────────────────────────────────────────────────
 
 @export_router.get("/agent/{agent_id}")
-def export_agent(agent_id: str, db: Session = Depends(get_session)):
+def export_agent(agent_id: str, db: Session = Depends(get_db)):
     svc = AgentService(db)
     agent = svc.get(agent_id)
     if not agent:
@@ -82,7 +82,7 @@ def export_agent(agent_id: str, db: Session = Depends(get_session)):
 # ── Resource 导出 ─────────────────────────────────────────────────────
 
 @export_router.get("/resource/{resource_id}")
-def export_resource(resource_id: str, db: Session = Depends(get_session)):
+def export_resource(resource_id: str, db: Session = Depends(get_db)):
     svc = RegistryService(db)
     entry = svc.get(resource_id)
     if not entry:

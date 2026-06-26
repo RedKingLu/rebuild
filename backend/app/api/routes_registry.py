@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.database import get_session
+from app.core.database import get_db
 from app.schemas.registry import (
     ResourceCreate, ResourceUpdate, ResourceResponse,
     ResourceListData, RegistrySummary,
@@ -14,7 +14,7 @@ from app.schemas.common import SuccessEnvelope
 registry_router = APIRouter(prefix="/resources", tags=["resources"])
 
 
-def get_service(db: Session = Depends(get_session)) -> RegistryService:
+def get_service(db: Session = Depends(get_db)) -> RegistryService:
     return RegistryService(db)
 
 

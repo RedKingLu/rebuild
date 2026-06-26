@@ -8,7 +8,9 @@ No real file system is read.
 from typing import Optional
 
 from app.schemas.workspace import WorkspaceAggregateResponse, GraphStatus, FileIndex
+from app.schemas.project import ProjectResponse
 from app.schemas.common import Meta
+from app.services.project_service import ProjectService
 
 
 class WorkspaceService:
@@ -48,7 +50,7 @@ class WorkspaceService:
         recent_audits = svc.aet_service.list_audits(project_id=project_id, limit=20)
 
         return WorkspaceAggregateResponse(
-            project=project,
+            project=ProjectResponse(**ProjectService.to_response(project)) if project else None,
             active_run=active_run,
             stage_statuses=stage_statuses,
             active_gate=active_gate,
