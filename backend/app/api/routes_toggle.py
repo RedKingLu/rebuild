@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.database import get_session
+from app.core.database import get_db
 from app.schemas.common import SuccessEnvelope
 from app.services.agent_service import AgentService
 from app.services.registry_service import RegistryService
@@ -14,7 +14,7 @@ toggle_router = APIRouter(prefix="/toggle", tags=["toggle"])
 
 
 @toggle_router.patch("/skill/{skill_id}")
-def toggle_skill(skill_id: str, db: Session = Depends(get_session)):
+def toggle_skill(skill_id: str, db: Session = Depends(get_db)):
     svc = SkillService(db)
     skill = svc.get(skill_id)
     if not skill:
@@ -30,7 +30,7 @@ def toggle_skill(skill_id: str, db: Session = Depends(get_session)):
 
 
 @toggle_router.patch("/agent/{agent_id}")
-def toggle_agent(agent_id: str, db: Session = Depends(get_session)):
+def toggle_agent(agent_id: str, db: Session = Depends(get_db)):
     svc = AgentService(db)
     agent = svc.get(agent_id)
     if not agent:
@@ -49,7 +49,7 @@ def toggle_agent(agent_id: str, db: Session = Depends(get_session)):
 
 
 @toggle_router.patch("/resource/{resource_id}")
-def toggle_resource(resource_id: str, db: Session = Depends(get_session)):
+def toggle_resource(resource_id: str, db: Session = Depends(get_db)):
     svc = RegistryService(db)
     entry = svc.get(resource_id)
     if not entry:

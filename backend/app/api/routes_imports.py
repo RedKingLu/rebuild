@@ -15,7 +15,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.database import get_session
+from app.core.database import get_db
 from app.schemas.common import SuccessEnvelope
 from app.services.agent_service import AgentService
 from app.services.mcp_service import MCPService
@@ -58,7 +58,7 @@ def _load_json(data: bytes) -> dict:
 @import_router.post("/agent")
 async def import_agent(
     community_url: str = Body(..., embed=True),
-    db: Session = Depends(get_session),
+    db: Session = Depends(get_db),
 ):
     """从官方社区 URL 导入 Agent（JSON）。"""
     url = _validate_url(community_url)
@@ -88,7 +88,7 @@ async def import_agent(
 @import_router.post("/skill")
 async def import_skill(
     community_url: str = Body(..., embed=True),
-    db: Session = Depends(get_session),
+    db: Session = Depends(get_db),
 ):
     """从官方社区 URL 导入 Skill（zip 自动解压 或 JSON）。"""
     url = _validate_url(community_url)
@@ -131,7 +131,7 @@ async def import_skill(
 @import_router.post("/resource")
 async def import_resource(
     community_url: str = Body(..., embed=True),
-    db: Session = Depends(get_session),
+    db: Session = Depends(get_db),
 ):
     """从官方社区 URL 导入资源（zip 或 JSON）。"""
     url = _validate_url(community_url)
@@ -177,7 +177,7 @@ async def import_resource(
 @import_router.post("/mcp")
 async def import_mcp(
     community_url: str = Body(..., embed=True),
-    db: Session = Depends(get_session),
+    db: Session = Depends(get_db),
 ):
     """从官方社区 URL 导入 MCP 配置（JSON）。"""
     url = _validate_url(community_url)
@@ -207,7 +207,7 @@ async def import_mcp(
 @import_router.post("/case")
 async def import_case(
     community_url: str = Body(..., embed=True),
-    db: Session = Depends(get_session),
+    db: Session = Depends(get_db),
 ):
     """从官方社区 URL 导入案例（zip 或 JSON，resource_type=case）。"""
     url = _validate_url(community_url)

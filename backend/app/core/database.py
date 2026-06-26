@@ -33,10 +33,32 @@ def get_engine():
 
 
 def get_session() -> Session:
+    """Session factory — returns a new Session.
+
+    For DIRECT/internal callers (services, startup seed) that manage their own
+    lifecycle with an explicit `try/finally: db.close()`.
+    FastAPI route dependencies must use `get_db` (generator) below instead, so the
+    connection is reliably returned to the pool after each request.
+    """
     global _SessionLocal
     if _SessionLocal is None:
         _SessionLocal = sessionmaker(bind=get_engine(), autocommit=False, autoflush=False)
     return _SessionLocal()
+
+
+def get_db():
+    """FastAPI dependency — yields a Session and ALWAYS closes it.
+
+    FastAPI only auto-closes *generator* dependencies. A plain function that
+    `return`s a Session leaks the underlying connection (the pool — size 5 +
+    overflow 10 — is exhausted after ~15 requests, then every DB request hangs
+    30s and 500s). Use this for every `Depends(...)` on a DB session.
+    """
+    db = get_session()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def init_db():

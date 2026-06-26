@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 
-from app.core.database import get_session
+from app.core.database import get_db
 from app.schemas.skill import SkillCreate, SkillUpdate, SkillResponse, SkillListData
 from app.services.skill_service import SkillService
 from app.schemas.common import SuccessEnvelope
@@ -11,7 +11,7 @@ from app.schemas.common import SuccessEnvelope
 skill_router = APIRouter(prefix="/skills", tags=["skills"])
 
 
-def get_service(db: Session = Depends(get_session)) -> SkillService:
+def get_service(db: Session = Depends(get_db)) -> SkillService:
     return SkillService(db)
 
 

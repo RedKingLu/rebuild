@@ -1,65 +1,126 @@
-"""Project service — CRUD operations on mock projects."""
+"""Project service — DB-backed CRUD operations on projects."""
 
+from datetime import datetime, timezone
 from typing import Optional
+from sqlalchemy.orm import Session
 
-from app.repositories.fixtures import seed_projects
-from app.schemas.project import ProjectResponse, ProjectCreate
-from app.schemas.common import Meta
+from app.models.project import Project, ProjectStatus, SourceType
+from app.schemas.project import ProjectCreate
 
 
 class ProjectService:
-    def __init__(self, services):
-        self._svc = services
-        self._projects: dict[str, ProjectResponse] = {}
-        self._seed()
+    def __init__(self, db: Session):
+        self.db = db
 
-    def _seed(self):
-        for p in seed_projects():
-            self._projects[p.project_id] = p
-
-    def list(self, status: Optional[str] = None) -> list[ProjectResponse]:
-        projects = list(self._projects.values())
+    def list(self, status: Optional[str] = None, sort: str = "updated_at",
+             order: str = "desc", limit: Optional[int] = None,
+             offset: int = 0, include_archived: bool = False) -> list[Project]:
+        q = self.db.query(Project)
         if status:
-            projects = [p for p in projects if p.project_status == status]
-        return projects
+            # Explicit status filter takes precedence (e.g. status=archived must be
+            # listable); do NOT also apply the default "exclude archived" filter,
+            # which would make status=archived logically impossible (always empty).
+            q = q.filter(Project.project_status == status)
+        elif not include_archived:
+            q = q.filter(Project.project_status != ProjectStatus.archived)
+        # sort
+        col = getattr(Project, sort, Project.updated_at)
+        if order == "asc":
+            q = q.order_by(col.asc())
+        else:
+            q = q.order_by(col.desc())
+        if limit is not None:
+            q = q.limit(limit)
+        q = q.offset(offset)
+        return q.all()
 
-    def get(self, project_id: str) -> Optional[ProjectResponse]:
-        return self._projects.get(project_id)
+    def get(self, project_id: str) -> Optional[Project]:
+        return self.db.get(Project, project_id)
 
-    def create(self, req: ProjectCreate) -> ProjectResponse:
-        import uuid
-        pid = f"proj-{uuid.uuid4().hex[:6]}"
-        p = ProjectResponse(
-            project_id=pid,
+    def create(self, req: ProjectCreate) -> Project:
+        source_config = None
+        if req.source_type in ("git", "github") and req.source_config:
+            source_config = req.source_config
+        elif req.source_type in ("local_dir", "zip") and req.source_config:
+            source_config = req.source_config
+        elif req.source_type == "manual" and req.source_config:
+            source_config = req.source_config
+
+        # Map "zip" to enum member zip_source (value is "zip")
+        st = req.source_type
+        if st == "zip":
+            st = "zip"  # SourceType("zip") looks up by value "zip" -> zip_source
+
+        p = Project(
             name=req.name,
-            description=req.description,
-            project_status="created",
-            source_type=req.source_type,
-            workspace_status="ready",
-            onboarding_done=False,
-            created_at=_now(),
-            updated_at=_now(),
+            description=req.description or "",
+            source_type=SourceType(st),
+            source_config=source_config,
+            project_status=ProjectStatus.created,
         )
-        self._projects[pid] = p
+        self.db.add(p)
+        self.db.commit()
+        self.db.refresh(p)
         return p
 
-    def update(self, project_id: str, **fields) -> Optional[ProjectResponse]:
-        p = self._projects.get(project_id)
+    def update(self, project_id: str, **fields) -> Optional[Project]:
+        p = self.get(project_id)
         if p is None:
             return None
         for k, v in fields.items():
             if v is not None and hasattr(p, k):
                 setattr(p, k, v)
+        p.updated_at = datetime.now(timezone.utc)
+        self.db.commit()
+        self.db.refresh(p)
         return p
 
-    def archive(self, project_id: str) -> bool:
-        p = self._projects.get(project_id)
+    def update_source(self, project_id: str, source_type: str,
+                      source_config: Optional[dict] = None) -> Optional[Project]:
+        """Update project source configuration (used by Git/ZIP/GitHub integration endpoints)."""
+        p = self.get(project_id)
+        if p is None:
+            return None
+        # Map "zip" to value "zip" for enum lookup
+        st = source_type
+        if st == "zip":
+            st = "zip"
+        p.source_type = SourceType(st)
+        if source_config is not None:
+            p.source_config = source_config
+        p.updated_at = datetime.now(timezone.utc)
+        self.db.commit()
+        self.db.refresh(p)
+        return p
+
+    def delete(self, project_id: str) -> bool:
+        """Soft-delete: set status to archived."""
+        p = self.get(project_id)
         if p is None:
             return False
-        p.project_status = "archived"
+        p.project_status = ProjectStatus.archived
+        p.archived_at = datetime.now(timezone.utc)
+        p.updated_at = datetime.now(timezone.utc)
+        self.db.commit()
         return True
 
-
-def _now() -> str:
-    import time
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    @staticmethod
+    def to_response(p: Project) -> dict:
+        return {
+            "project_id": p.project_id,
+            "name": p.name,
+            "description": p.description or "",
+            "project_status": p.project_status.value if hasattr(p.project_status, 'value') else str(p.project_status),
+            "source_type": p.source_type.value if hasattr(p.source_type, 'value') else str(p.source_type),
+            "source_config": p.source_config,
+            "current_stage": p.current_stage,
+            "current_run_id": p.current_run_id,
+            "active_gate": p.active_gate,
+            "evidence_gap_count": p.evidence_gap_count,
+            "workspace_status": p.workspace_status or "ready",
+            "onboarding_done": p.onboarding_done,
+            "created_at": p.created_at.isoformat() if p.created_at else "",
+            "updated_at": p.updated_at.isoformat() if p.updated_at else "",
+            "source_status": "real",
+            "capability_status": "available",
+        }

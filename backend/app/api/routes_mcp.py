@@ -3,14 +3,14 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.database import get_session
+from app.core.database import get_db
 from app.services.mcp_service import MCPService
 from app.schemas.common import SuccessEnvelope, Meta
 
 mcp_router = APIRouter(prefix="/mcp", tags=["mcp"])
 
 
-def get_service(db: Session = Depends(get_session)) -> MCPService:
+def get_service(db: Session = Depends(get_db)) -> MCPService:
     return MCPService(db)
 
 

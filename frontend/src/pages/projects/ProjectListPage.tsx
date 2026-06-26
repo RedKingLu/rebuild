@@ -3,7 +3,7 @@ import { useProjectStore } from '../../stores';
 import { useNavigate } from 'react-router-dom';
 import { STAGE_LABELS } from '../../types';
 import type { Project } from '../../types';
-import { fetchProjectsWithSource } from '../../services/projectService';
+import { fetchProjectsWithSource, updateProject, deleteProject } from '../../services/projectService';
 
 // R4 最小前后端联调（C-B）：本页在挂载时真实调用后端 GET /api/projects，
 // 成功则展示后端数据并标注 source_status；后端不可用时优雅回退到本地 mock，
@@ -18,6 +18,15 @@ export function ProjectListPage() {
   const [sourceStatus, setSourceStatus] = useState<string>('');
   const nav = useNavigate();
   const openWs = (pid: string) => window.open(`/projects/${pid}/workspace`, '_blank');
+
+  // ── Edit modal state ────────────────────────────────────────────────
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editDesc, setEditDesc] = useState('');
+
+  // ── Delete confirm state ────────────────────────────────────────────
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deletingName, setDeletingName] = useState('');
 
   useEffect(() => {
     let active = true;
@@ -38,11 +47,84 @@ export function ProjectListPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const refreshProjects = () => {
+    fetchProjectsWithSource()
+      .then(({ projects: list, sourceStatus: src }) => {
+        setProjects(list);
+        setSourceStatus(src);
+        setConn('connected');
+      })
+      .catch(() => {
+        setProjects(mockProjects);
+        setConn('fallback');
+      });
+  };
+
+  const openEdit = (p: Project) => {
+    setEditingId(p.project_id);
+    setEditName(p.name);
+    setEditDesc(p.description || '');
+  };
+
+  const closeEdit = () => {
+    setEditingId(null);
+  };
+
+  const handleSave = async () => {
+    if (!editingId) return;
+    try {
+      await updateProject(editingId, { name: editName, description: editDesc });
+      closeEdit();
+      refreshProjects();
+    } catch (e) {
+      alert('保存失败：' + (e as Error).message);
+    }
+  };
+
+  const openDelete = (p: Project) => {
+    setDeletingId(p.project_id);
+    setDeletingName(p.name);
+  };
+
+  const closeDelete = () => {
+    setDeletingId(null);
+  };
+
+  const handleDelete = async () => {
+    if (!deletingId) return;
+    try {
+      await deleteProject(deletingId);
+      closeDelete();
+      refreshProjects();
+    } catch (e) {
+      alert('删除失败：' + (e as Error).message);
+    }
+  };
+
   const sourceTag =
     conn === 'loading' ? <span className="tag">加载中…</span>
     : conn === 'connected'
       ? <span className="tag violet">后端接口数据 · /api/projects（source_status: {sourceStatus}）</span>
       : <span className="tag amber">后端未连接 · 显示本地 mock 回退</span>;
+
+  // ── Inline modal overlay styles (CSS variables, no separate component) ──
+  const overlay: React.CSSProperties = {
+    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+    background: 'rgba(0,0,0,0.5)', display: 'flex',
+    alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+  };
+
+  const modalCard: React.CSSProperties = {
+    background: 'var(--surface, #fff)', borderRadius: 12,
+    padding: 24, minWidth: 360, maxWidth: 480, boxShadow: '0 8px 32px rgba(0,0,0,0.2)',
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%', padding: '8px 12px', borderRadius: 6,
+    border: '1px solid var(--border, #d1d5db)', fontSize: 14,
+    outline: 'none', marginBottom: 12, boxSizing: 'border-box',
+    background: 'var(--input-bg, #fff)', color: 'var(--ink, #111)',
+  };
 
   return (
     <div>
@@ -71,15 +153,50 @@ export function ProjectListPage() {
                 {p.active_gate && <span className="tag amber">⚠ Gate: {p.active_gate}</span>}
               </div>
             </div>
-            {/* Right: actions — Runs/设置 等深度交互在工作区内（D-046），列表只保留展示与入口 */}
+            {/* Right: actions */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
               {!p.onboarding_done && <span className="tag amber">待引导</span>}
               <button className="btn sm ghost" onClick={() => nav(`/projects/${p.project_id}`)}>详情</button>
+              <button className="btn sm ghost" onClick={() => openEdit(p)}>编辑</button>
+              <button className="btn sm ghost" onClick={() => openDelete(p)} style={{ color: 'var(--red, #dc2626)' }}>删除</button>
               <button className="btn sm" onClick={() => openWs(p.project_id)}>进入工作区</button>
             </div>
           </div>
         ))}
       </div>
+
+      {/* ── Edit Modal ────────────────────────────────────────────────── */}
+      {editingId && (
+        <div style={overlay} onClick={closeEdit}>
+          <div style={modalCard} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 16px 0', fontSize: 16 }}>编辑项目</h3>
+            <label style={{ fontSize: 13, color: 'var(--ink-2)', display: 'block', marginBottom: 4 }}>名称</label>
+            <input style={inputStyle} value={editName} onChange={e => setEditName(e.target.value)} placeholder="项目名称" />
+            <label style={{ fontSize: 13, color: 'var(--ink-2)', display: 'block', marginBottom: 4 }}>描述</label>
+            <input style={inputStyle} value={editDesc} onChange={e => setEditDesc(e.target.value)} placeholder="项目描述" />
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 8 }}>
+              <button className="btn sm ghost" onClick={closeEdit}>取消</button>
+              <button className="btn sm" onClick={handleSave}>保存</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Delete Confirm Modal ──────────────────────────────────────── */}
+      {deletingId && (
+        <div style={overlay} onClick={closeDelete}>
+          <div style={modalCard} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 12px 0', fontSize: 16 }}>确认删除</h3>
+            <p style={{ margin: '0 0 20px 0', color: 'var(--ink-2)', lineHeight: 1.5 }}>
+              确定删除项目 {deletingName}？此操作不可撤销。
+            </p>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn sm ghost" onClick={closeDelete}>取消</button>
+              <button className="btn sm" onClick={handleDelete} style={{ background: 'var(--red, #dc2626)', color: '#fff', borderColor: 'var(--red, #dc2626)' }}>确认删除</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

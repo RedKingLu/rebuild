@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.database import get_session
+from app.core.database import get_db
 from app.schemas.common import SuccessEnvelope
 from app.services.registry_service import RegistryService
 from app.services.skill_service import SkillService
@@ -33,7 +33,7 @@ async def upload_skill(
     series: str = Form(default="P"),
     description: str = Form(default=""),
     file: UploadFile = File(...),
-    db: Session = Depends(get_session),
+    db: Session = Depends(get_db),
 ):
     """创建 Skill：提供名称、分类（9项），上传 zip 文件。后台自动解压到 source/skills/<category>/<name>/。"""
     if category not in VALID_SKILL_CATS:
@@ -70,7 +70,7 @@ async def upload_resource(
     description: str = Form(default=""),
     risk_level: str = Form(default="L1"),
     file: UploadFile = File(...),
-    db: Session = Depends(get_session),
+    db: Session = Depends(get_db),
 ):
     """创建其他资源：提供名称、类型，上传 zip 文件。后台自动解压到 source/resources/<name>/。"""
     if not file.filename or not file.filename.endswith(".zip"):
@@ -100,7 +100,7 @@ async def upload_resource(
 # ── source/skills 目录扫描入库 ────────────────────────────────────────
 
 @upload_router.post("/skill/scan")
-async def scan_skills(db: Session = Depends(get_session)):
+async def scan_skills(db: Session = Depends(get_db)):
     """扫描 source/skills/<category>/<skill_name>/ 目录，将未入库的 Skill 批量注册。
     SKILL.md 第一行作为 name，目录名作为 fallback。
     """

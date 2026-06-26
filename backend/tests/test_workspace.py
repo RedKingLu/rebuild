@@ -1,14 +1,26 @@
-"""Test Workspace aggregate API."""
+"""Test Workspace aggregate API — uses DB-backed project."""
+
+import pytest
 
 
-def test_workspace_aggregate(client):
-    resp = client.get("/api/projects/proj-001/workspace")
+@pytest.fixture
+def project_id(client):
+    """Create a DB-backed project so workspace routes resolve."""
+    resp = client.post("/api/projects", json={
+        "name": "Workspace Test Project",
+        "description": "Project for workspace tests",
+        "source_type": "local_dir",
+    })
+    assert resp.status_code == 200
+    return resp.json()["data"]["project_id"]
+
+
+def test_workspace_aggregate(client, project_id):
+    resp = client.get(f"/api/projects/{project_id}/workspace")
     assert resp.status_code == 200
     data = resp.json()["data"]
     assert data["project"] is not None
-    assert data["project"]["name"] == "MicroOA 信创迁移"
-    assert data["active_run"] is not None
-    assert data["active_run"]["run_status"] == "running"
+    assert data["project"]["name"] == "Workspace Test Project"
     assert "stage_statuses" in data
     # Graph status must be not_connected
     assert data["graph_status"]["graph_capability_status"] == "not_connected"
@@ -22,8 +34,9 @@ def test_workspace_nonexistent_project(client):
     assert resp.status_code == 404
 
 
-def test_workspace_has_all_sections(client):
-    resp = client.get("/api/projects/proj-001/workspace")
+def test_workspace_has_all_sections(client, project_id):
+    resp = client.get(f"/api/projects/{project_id}/workspace")
+    assert resp.status_code == 200
     data = resp.json()["data"]
     required_sections = [
         "project", "active_run", "stage_statuses", "active_gate",

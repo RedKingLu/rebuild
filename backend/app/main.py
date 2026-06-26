@@ -77,10 +77,17 @@ from app.api.routes_workspace import router as workspace_router
 app.include_router(workspace_router, prefix="/api")
 
 # W11: Model / Resource / Integration (R5: ModelGateway full implementation)
-from app.api.routes_models import model_router, integration_router, assistant_router
+from app.api.routes_models import model_router, assistant_router
 app.include_router(model_router, prefix="/api")
-app.include_router(integration_router, prefix="/api")
 app.include_router(assistant_router, prefix="/api")
+
+# R7: Real Integration endpoints (replaces placeholder in routes_models)
+from app.api.routes_integrations import integration_router
+app.include_router(integration_router, prefix="/api")
+
+# R7: Dashboard stats (for overview page real data)
+from app.api.routes_dashboard import router as dashboard_router
+app.include_router(dashboard_router, prefix="/api")
 
 # W12: SSE / Events
 from app.api.routes_events import router as events_router

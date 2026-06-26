@@ -109,6 +109,7 @@ class UsageResponse(BaseModel):
     by_provider: list[UsageByProvider] = Field(default_factory=list)
     by_model: list[UsageByModel] = Field(default_factory=list)
     persisted: bool = True
+    volatile: bool = False  # FB-006: call log is DB-persisted, not volatile in-memory
 
 
 class ProviderListData(BaseModel):
@@ -263,6 +264,7 @@ class CallLogListData(BaseModel):
     limit: int = 10
     offset: int = 0
     persisted: bool = True
+    volatile: bool = False  # FB-006: call log is DB-persisted, not volatile in-memory
     note: str = "DB persisted. Data survives server restart."
 
 

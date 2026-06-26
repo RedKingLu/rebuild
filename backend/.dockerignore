@@ -1,0 +1,15 @@
+# Build context hygiene — keep host-only/dev/secret files out of the image.
+.venv/
+.data/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.sqlite
+.env
+.env.*
+!.env.example
+.git/
+.gitignore
+Dockerfile
+.dockerignore

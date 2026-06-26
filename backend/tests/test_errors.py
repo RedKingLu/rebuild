@@ -52,8 +52,19 @@ def test_resources_connected(client):
     assert data["total"] > 0  # Seed data loaded
 
 
-def test_integrations_not_connected(client):
-    resp = client.get("/api/projects/proj-001/integrations")
+def test_integrations_real_after_r7(client):
+    """R7: Integration endpoints are now real (replaced placeholder).
+
+    The old /api/projects/{id}/integrations placeholder is replaced by
+    /api/integrations/* real endpoints. R7 delivers Git/Remote/OpenCode/Feishu
+    integration management with DB-backed CRUD and aggregate summary.
+    """
+    resp = client.get("/api/integrations/summary")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["meta"]["source_status"] == "not_connected"
+    # R7: Integration summary returns real status (not not_connected)
+    assert data["meta"]["source_status"] == "real"
+    assert "git" in data["data"]
+    assert "remote" in data["data"]
+    assert "execution" in data["data"]
+    assert "other" in data["data"]

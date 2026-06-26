@@ -47,3 +47,8 @@ logs/
 # 用户导入供应商（仅非敏感配置，Key 不落盘）
 backend/app/config/user_providers.yaml
 backend/app/config/user_strategies.yaml
+
+# Runtime data (mounted as a volume in containers — not source)
+backend/.data/project-sources/
+backend/.data/execution-sandbox/
+backend/.data/integration-repos/
