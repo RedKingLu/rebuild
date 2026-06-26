@@ -7,13 +7,15 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
   listProviders, listProfiles, listStrategies,
-  selfTest, listCalls, deleteProvider, setCredential, getUsage,
+  selfTest, listCalls, deleteProvider, deleteStrategy, getUsage,
   CAPABILITY_MARKERS,
   type ProviderInfo, type ModelProfileInfo, type StrategyInfo,
   type SelfTestResult, type CallLogEntry, type UsageInfo,
 } from '../../services/modelService';
 import { AddProviderModal } from '../../components/models/AddProviderModal';
+import { EditProviderModal } from '../../components/models/EditProviderModal';
 import { StrategyEditModal } from '../../components/models/StrategyEditModal';
+import { CreateStrategyModal } from '../../components/models/CreateStrategyModal';
 import { Icon } from '../../components/ui/Icon';
 
 const COST_TIER_LABEL: Record<string, string> = { low: '低成本', medium: '中等', high: '高成本' };
@@ -46,20 +48,27 @@ export function ModelsPage() {
   const [testing, setTesting] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('providers');
   const [showAdd, setShowAdd] = useState(false);
+  const [editProvider, setEditProvider] = useState<ProviderInfo | null>(null);
   const [editStrategy, setEditStrategy] = useState<StrategyInfo | null>(null);
+  const [showCreateStrategy, setShowCreateStrategy] = useState(false);
   const [catalogFilter, setCatalogFilter] = useState<string>('');
+  const [callPage, setCallPage] = useState(0);
+  const [callTotal, setCallTotal] = useState(0);
+  const PAGE_SIZE = 10;
 
   const fetchData = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const [provResp, profResp, stratResp, callsResp, usageResp] = await Promise.all([
-        listProviders(), listProfiles(), listStrategies(), listCalls(50), getUsage(),
+        listProviders(), listProfiles(), listStrategies(), listCalls(PAGE_SIZE, 0), getUsage(),
       ]);
       setProviders(provResp.data?.providers || []);
       setProfiles(profResp.data?.profiles || []);
       setStrategies(stratResp.data?.strategies || []);
       setCalls(callsResp.data?.calls || []);
+      setCallTotal(callsResp.data?.total || 0);
+      setCallPage(0);
       setUsage(usageResp.data || null);
     } catch (e) {
       setError(e instanceof Error ? e.message : '加载模型数据失败');
@@ -84,16 +93,37 @@ export function ModelsPage() {
   };
 
   const handleDelete = async (p: ProviderInfo) => {
-    if (!confirm(`确认删除供应商「${p.provider_name}」？（仅删除用户导入的供应商）`)) return;
+    const warn = p.origin === 'seed'
+      ? `⚠ 内置供应商「${p.provider_name}」将从当前进程移除（重启后从 YAML 恢复）。确认删除？`
+      : `确认删除供应商「${p.provider_name}」？此操作不可恢复。`;
+    if (!confirm(warn)) return;
     await deleteProvider(p.provider_id);
     await fetchData();
   };
 
-  const handleSetKey = async (p: ProviderInfo) => {
-    const key = prompt(`为「${p.provider_name}」设置 API Key（仅注入进程内存，永不落盘）：`);
-    if (!key) return;
-    await setCredential(p.provider_id, key);
-    await fetchData();
+  const handleDeleteStrategy = async (s: StrategyInfo) => {
+    if (s.strategy_id === 'system-default') {
+      alert('系统默认策略不可删除');
+      return;
+    }
+    if (!confirm(`确认删除策略「${s.strategy_id}」？`)) return;
+    const resp = await deleteStrategy(s.strategy_id);
+    if (resp.data?.removed) {
+      await fetchData();
+    } else {
+      alert('删除失败：策略不存在或不可删除');
+    }
+  };
+
+  const handleEdit = (p: ProviderInfo) => {
+    setEditProvider(p);
+  };
+
+  const fetchCallsPage = async (page: number) => {
+    const resp = await listCalls(PAGE_SIZE, page * PAGE_SIZE);
+    setCalls(resp.data?.calls || []);
+    setCallTotal(resp.data?.total || 0);
+    setCallPage(page);
   };
 
   const configuredCount = providers.filter(p => p.credential_status === 'configured').length;
@@ -124,8 +154,8 @@ export function ModelsPage() {
           title="默认模型" value={defaultStrategy?.default_profile_ref || '—'} valueSize={14}
           label="系统默认策略（点击查看）" />
         <StatCard active={tab === 'usage'} onClick={() => setTab('usage')}
-          title="调用记录" value={`${usage?.total_calls ?? calls.length}`} suffix=" / 内存"
-          label="进程内 · 重启丢失（点击查看用量）" />
+          title="调用记录" value={`${usage?.total_calls ?? calls.length}`}
+          label={`总调用 · 完成 ${usage?.completed_calls ?? 0} · 失败 ${usage?.failed_calls ?? 0}`} />
       </div>
 
       {/* 操作条：仅保留当前面板标题 + 动作（tab 切换已由上方四个统计框承担） */}
@@ -135,6 +165,7 @@ export function ModelsPage() {
         </b>
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
           {tab === 'providers' && <button className="btn sm" onClick={() => setShowAdd(true)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="add" size={14} />添加供应商</button>}
+          {tab === 'strategies' && <button className="btn sm" onClick={() => setShowCreateStrategy(true)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="add" size={14} />创建策略</button>}
           <button className="btn sm ghost" onClick={fetchData} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="refresh" size={14} />刷新</button>
         </span>
       </div>
@@ -182,8 +213,8 @@ export function ModelsPage() {
                   <button className="btn sm" onClick={() => handleSelfTest(p.provider_id)} disabled={testing === p.provider_id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                     <Icon name="plug" size={14} />{testing === p.provider_id ? '测试中…' : '连通自测'}
                   </button>
-                  <button className="btn sm ghost" onClick={() => handleSetKey(p)} title="设置 Key（仅进程内存）" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="key" size={14} />设置 Key</button>
-                  {p.origin === 'user' && <button className="btn sm ghost" onClick={() => handleDelete(p)} title="删除（仅用户导入）" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="delete" size={14} />删除</button>}
+                  <button className="btn sm ghost" onClick={() => handleEdit(p)} title="编辑供应商信息、模型和 Key" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="edit" size={14} />编辑</button>
+                  <button className="btn sm ghost" onClick={() => handleDelete(p)} title="删除供应商" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="delete" size={14} />删除</button>
                 </div>
               </div>
             );
@@ -212,7 +243,11 @@ export function ModelsPage() {
               <div key={p.profile_id} className="card" style={{ padding: 12 }}>
                 <div className="spread">
                   <b>{p.display_name}</b>
-                  <CapabilityBadge marker={p.status === 'configured' ? 'configured_not_verified' : 'not_connected'} />
+                  <CapabilityBadge marker={
+                    p.status === 'configured'
+                      ? (providers.find(pr => pr.provider_id === p.provider_id)?.capability_marker === 'real_available' ? 'real_available' : 'configured_not_verified')
+                      : 'not_connected'
+                  } />
                 </div>
                 <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>{p.model_name} · {COST_TIER_LABEL[p.cost_tier] || p.cost_tier}</div>
                 <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
@@ -245,6 +280,7 @@ export function ModelsPage() {
                 <div className="row" style={{ gap: 6 }}>
                   <span className="tag" style={{ fontSize: 11 }}>{s.scope === 'system' ? '系统级' : s.scope}</span>
                   <button className="btn sm ghost" onClick={() => setEditStrategy(s)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="edit" size={13} />编辑</button>
+                  {s.strategy_id !== 'system-default' && <button className="btn sm ghost" onClick={() => handleDeleteStrategy(s)} title="删除策略" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="delete" size={13} />删除</button>}
                 </div>
               </div>
               <div className="sub" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.7 }}>
@@ -269,7 +305,7 @@ export function ModelsPage() {
             <div className="card statcard"><b>总请求</b><div className="snum">{usage?.total_calls ?? 0}</div><div className="slabel">完成 {usage?.completed_calls ?? 0} · 失败 {usage?.failed_calls ?? 0}</div></div>
             <div className="card statcard"><b>消耗 Token</b><div className="snum">{(usage?.total_tokens ?? 0).toLocaleString()}</div><div className="slabel">输入 {(usage?.prompt_tokens ?? 0).toLocaleString()} · 输出 {(usage?.completion_tokens ?? 0).toLocaleString()}</div></div>
             <div className="card statcard"><b>总成本</b><div className="snum" style={{ fontSize: 15 }}>暂不可用</div><div className="slabel">{usage?.cost_unavailable_reason || '无计价数据'}</div></div>
-            <div className="card statcard"><b>数据持久化</b><div className="snum" style={{ fontSize: 15 }}>内存</div><div className="slabel">volatile · 重启丢失（持久化属 R8+）</div></div>
+            <div className="card statcard"><b>缓存命中率</b><div className="snum">{usage?.cache_hit_rate != null ? `${usage.cache_hit_rate}%` : '—'}</div><div className="slabel">缓存命中 {usage?.cache_hit_tokens?.toLocaleString() ?? 0} / 输入 {usage?.prompt_tokens?.toLocaleString() ?? 0} tokens</div></div>
           </div>
 
           {/* 按供应商/模型 */}
@@ -284,30 +320,45 @@ export function ModelsPage() {
           )}
 
           {/* 请求日志 */}
-          <div className="sub" style={{ fontSize: 11, marginBottom: 8 }}>⚠ 调用记录为进程内存（volatile），重启后端后丢失。</div>
+          <div className="sub" style={{ fontSize: 11, marginBottom: 8 }}>调用记录持久化至数据库。每页 {PAGE_SIZE} 条，共 {callTotal} 条。</div>
           {calls.length === 0 ? (
             <div className="empty"><p className="sub">暂无调用记录。尝试连通自测或使用平台助手。</p></div>
           ) : (
+            <>
             <div className="grid" style={{ gap: 8 }}>
               {calls.map(c => (
                 <div key={c.model_call_id} className="card" style={{ padding: 10, fontSize: 12 }}>
                   <div className="spread">
-                    <code>{c.model_call_id}</code>
+                    <code style={{ fontSize: 11 }}>{c.model_call_id?.slice(0, 8)}…</code>
                     <span className="tag" style={{ background: c.status === 'completed' ? 'var(--green)' : 'var(--red)', color: '#fff' }}>{c.status === 'completed' ? '成功' : c.status}</span>
                   </div>
-                  <div className="sub">
+                  <div className="sub" style={{ fontSize: 11 }}>
                     {c.selected_model} · {c.provider_id} · 来源 {c.source} · {c.latency_ms}ms
-                    {c.usage_summary?.total_tokens > 0 && ` · ${c.usage_summary.total_tokens} tokens`}
+                  </div>
+                  <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>
+                    输入 {c.usage_summary?.prompt_tokens?.toLocaleString() ?? 0}
+                    · 输出 {c.usage_summary?.completion_tokens?.toLocaleString() ?? 0}
+                    · 缓存命中 {c.usage_summary?.cache_hit_tokens?.toLocaleString() ?? 0}
+                    · 总计 {c.usage_summary?.total_tokens?.toLocaleString() ?? 0} tokens
                   </div>
                 </div>
               ))}
             </div>
+            {/* Pagination */}
+            <div className="row" style={{ justifyContent: 'center', gap: 8, marginTop: 12, alignItems: 'center' }}>
+              <button className="btn sm ghost" disabled={callPage === 0} onClick={() => fetchCallsPage(callPage - 1)}>◀ 上一页</button>
+              <span className="sub" style={{ fontSize: 12 }}>第 {callPage + 1} 页 / 共 {Math.ceil(callTotal / PAGE_SIZE) || 1} 页</span>
+              <button className="btn sm ghost" disabled={(callPage + 1) * PAGE_SIZE >= callTotal} onClick={() => fetchCallsPage(callPage + 1)}>下一页 ▶</button>
+            </div>
+            </>
           )}
         </div>
       )}
 
       {showAdd && <AddProviderModal onClose={() => setShowAdd(false)} onCreated={fetchData} />}
+      {editProvider && <EditProviderModal provider={editProvider} profiles={profiles} onClose={() => setEditProvider(null)} onSaved={fetchData} />}
       {editStrategy && <StrategyEditModal strategy={editStrategy} profiles={profiles} onClose={() => setEditStrategy(null)} onSaved={fetchData} />}
+      {showCreateStrategy && <CreateStrategyModal profiles={profiles} onClose={() => setShowCreateStrategy(false)} onCreated={fetchData} />}
     </div>
   );
 }

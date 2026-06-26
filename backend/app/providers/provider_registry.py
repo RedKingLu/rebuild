@@ -59,6 +59,7 @@ class ProviderInfo:
     homepage: str = ""    # 官网链接（可选，非敏感）
     last_checked_at: str = ""  # 最近一次 self-test 时间
     capability_marker: str = "not_checked"  # 见 文档/06-UX与前端/06 §2 的 14 种真实能力标记
+    credential_ref: str = ""  # R6 BYOK: Credential.credential_id 引用（非明文 Key）
 
 
 @dataclass
@@ -179,6 +180,7 @@ class ProviderRegistry:
             origin=origin,
             note=p.get("note", ""),
             homepage=p.get("homepage", ""),
+            credential_ref=p.get("credential_ref", ""),
         )
         provider.capability_marker = _compute_capability_marker(cred_status, "not_connected", "")
 
@@ -266,6 +268,8 @@ class ProviderRegistry:
                 logger.warning("failed to load user_strategies.yaml: %s", e)
 
         self._loaded = True
+        # Restore persisted self-test results
+        self._load_self_test_state()
         logger.info(
             "ProviderRegistry loaded: %d providers, %d profiles, %d strategies",
             len(self._providers), len(self._profiles), len(self._strategies),
@@ -304,17 +308,29 @@ class ProviderRegistry:
         user_override: Optional[str] = None,
         strategy_id: str = "system-default",
     ) -> tuple[Optional[ModelProfileInfo], str, Optional[ProviderInfo]]:
-        """Resolve which model to use. Returns (profile, selection_reason, provider)."""
+        """Resolve which model to use. Returns (profile, selection_reason, provider).
+
+        When user_override is set (explicit provider), NO cross-provider fallback
+        is performed — if the override doesn't match, return (None, reason, None).
+        """
         strategy = self.get_strategy(strategy_id)
         if not strategy:
             return None, "no_strategy", None
 
-        # 1. User temporary override (highest priority)
+        # 1. User temporary override (highest priority — NO fallback on mismatch)
         if user_override:
             profile = self._profiles.get(user_override)
+            if not profile:
+                # Try matching by profile_id suffix (e.g. "deepseek-chat" → "deepseek/deepseek-chat")
+                for pid, p in self._profiles.items():
+                    if pid.endswith(f"/{user_override}") or pid == user_override:
+                        profile = p
+                        break
             if profile and profile.status == "configured":
                 provider = self._providers.get(profile.provider_id)
                 return profile, "user_override", provider
+            # Explicit override → NO fallback to other providers
+            return None, f"explicit_override_not_found:{user_override}", None
 
         # 2. Strategy default
         if strategy.default_profile_ref:
@@ -323,7 +339,7 @@ class ProviderRegistry:
                 provider = self._providers.get(profile.provider_id)
                 return profile, "strategy_default", provider
 
-        # 3. Fallback chain
+        # 3. Fallback chain (only for non-explicit / default-strategy paths)
         for fb_ref in strategy.fallback_profile_refs:
             profile = self._profiles.get(fb_ref)
             if profile and profile.status == "configured":
@@ -396,9 +412,56 @@ class ProviderRegistry:
             pf.status = "configured"
         return provider
 
+    def update_provider(self, provider_id: str, **kwargs) -> Optional[ProviderInfo]:
+        """更新供应商非敏感配置（FB-005）。仅 user 来源可编辑名称/端点/模型等。"""
+        provider = self._providers.get(provider_id)
+        if not provider:
+            return None
+
+        # 更新简单字段
+        for field in ("provider_name", "api_format", "endpoint_openai",
+                      "endpoint_anthropic", "env_key_var", "note", "homepage"):
+            if field in kwargs and kwargs[field] is not None:
+                setattr(provider, field, kwargs[field])
+
+        # 全量替换模型列表
+        if "models" in kwargs and kwargs["models"] is not None:
+            # 清理旧 profiles
+            for old in list(provider.models):
+                self._profiles.pop(old.profile_id, None)
+            provider.models.clear()
+            # 重建新模型
+            for m in kwargs["models"]:
+                profile_id = f"{provider_id}/{m['model_name']}"
+                cred_status = provider.credential_status
+                profile = ModelProfileInfo(
+                    profile_id=profile_id,
+                    provider_id=provider_id,
+                    model_name=m["model_name"],
+                    display_name=m.get("display_name", m["model_name"]),
+                    capability_tags=m.get("capability_tags", []),
+                    cost_tier=m.get("cost_tier", "medium"),
+                    supports_streaming=m.get("supports_streaming", True),
+                    supports_tool_calling=m.get("supports_tool_calling", False),
+                    is_fusion_capable=m.get("is_fusion_capable", False),
+                    context_window_note=m.get("context_window_note", ""),
+                    recommended_use=m.get("recommended_use", ""),
+                    not_recommended_use=m.get("not_recommended_use", ""),
+                    status="configured" if cred_status == "configured" else "not_connected",
+                )
+                provider.models.append(profile)
+                self._profiles[profile_id] = profile
+
+        # 仅 user 来源持久化到 user_providers.yaml
+        if provider.origin == "user":
+            self._persist_user_providers()
+
+        logger.info("provider updated: %s", provider_id)
+        return provider
+
     def mark_self_test_result(self, provider_id: str, reachable: bool,
                               error_category: str, checked_at: str) -> None:
-        """记录 self-test 结果，更新 provider 状态与能力标记。"""
+        """记录 self-test 结果，更新 provider 状态与能力标记，并同步旗下所有 model profile 状态。"""
         provider = self._providers.get(provider_id)
         if not provider:
             return
@@ -407,6 +470,15 @@ class ProviderRegistry:
         provider.capability_marker = _compute_capability_marker(
             provider.credential_status, provider.status, error_category,
         )
+        # 同步旗下所有 model profile 的状态（FB-003 修复）
+        # 当 provider 连通测试通过（available）时，旗下配置了凭据的 model 也应标记为 configured
+        for pf in provider.models:
+            if reachable and provider.credential_status == "configured":
+                pf.status = "configured"
+            elif not reachable:
+                pf.status = "not_connected"
+        # Persist self-test result for restart survival
+        self._persist_self_test_state()
 
     def _persist_user_providers(self) -> None:
         """仅写入用户供应商的非敏感配置。Key 绝不写入（AGENTS.md §12.1）。"""
@@ -456,6 +528,74 @@ class ProviderRegistry:
             st.fallback_profile_refs = list(fallback_profile_refs)
         self._persist_user_strategies()
         return st
+
+    def create_strategy(self, strategy_id: str, default_profile_ref: Optional[str] = None,
+                        fallback_profile_refs: Optional[list] = None) -> StrategyInfo:
+        """创建新策略（FB-004 新增），覆盖落盘 user_strategies.yaml。"""
+        st = StrategyInfo(
+            strategy_id=strategy_id,
+            scope="system",
+            default_profile_ref=default_profile_ref or "",
+            fallback_profile_refs=list(fallback_profile_refs) if fallback_profile_refs else [],
+            fallback_policy="sequential",
+            retry_policy={"max_retries": 3, "retry_delay_sec": 2.0, "backoff": "exponential"},
+            cost_budget_policy={"enabled": False},
+            fusion_allowed=False,
+            streaming_allowed=True,
+            tool_calling_allowed=True,
+            trace_policy="always",
+            audit_policy="on_error_or_high_risk",
+        )
+        self._strategies[strategy_id] = st
+        self._persist_user_strategies()
+        logger.info("strategy created: %s", strategy_id)
+        return st
+
+    def delete_strategy(self, strategy_id: str) -> bool:
+        """删除策略（FB-007 新增）。仅 user 来源可删，system-default 不可删。"""
+        if strategy_id == "system-default":
+            return False
+        if strategy_id not in self._strategies:
+            return False
+        del self._strategies[strategy_id]
+        self._persist_user_strategies()
+        logger.info("strategy deleted: %s", strategy_id)
+        return True
+
+    def _persist_self_test_state(self) -> None:
+        """Persist self-test results to JSON, survive restart."""
+        import json
+        sp = self._config_path.parent / "self_test_state.json"
+        state = {}
+        for pid, p in self._providers.items():
+            if p.last_checked_at:
+                state[pid] = {"status": p.status, "capability_marker": p.capability_marker,
+                              "last_checked_at": p.last_checked_at, "credential_status": p.credential_status}
+        try:
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            with open(sp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("Failed to persist self-test state: %s", e)
+
+    def _load_self_test_state(self) -> None:
+        """Restore self-test results from persisted file."""
+        import json
+        sp = self._config_path.parent / "self_test_state.json"
+        if not sp.exists(): return
+        try:
+            with open(sp, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            for pid, s in state.items():
+                p = self._providers.get(pid)
+                if p:
+                    p.status = s.get("status", "not_connected")
+                    p.capability_marker = s.get("capability_marker", "not_checked")
+                    p.last_checked_at = s.get("last_checked_at", "")
+                    if s.get("credential_status") == "configured" and p.status == "available":
+                        for pf in p.models: pf.status = "configured"
+        except Exception as e:
+            logger.warning("Failed to load self-test state: %s", e)
 
     def _persist_user_strategies(self) -> None:
         """落盘用户对策略的覆盖（仅 default/fallback；非敏感）。"""

@@ -14,8 +14,20 @@ from app.dependencies import get_services, clear_services_cache
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: warm services. Shutdown: clear cache."""
+    """Startup: init DB, seed data, warm services. Shutdown: clear cache."""
     settings = Settings()
+    # Initialize database and seed
+    from app.core.database import get_session, init_db
+    init_db()
+    db = get_session()
+    try:
+        from app.seed import seed_all
+        counts = seed_all(db)
+        if any(v > 0 for v in counts.values()):
+            import logging
+            logging.getLogger("uvicorn").info(f"R6 seed data: {counts}")
+    finally:
+        db.close()
     get_services(settings)
     yield
     clear_services_cache()
@@ -65,12 +77,44 @@ from app.api.routes_workspace import router as workspace_router
 app.include_router(workspace_router, prefix="/api")
 
 # W11: Model / Resource / Integration (R5: ModelGateway full implementation)
-from app.api.routes_models import model_router, resource_router, integration_router, assistant_router
+from app.api.routes_models import model_router, integration_router, assistant_router
 app.include_router(model_router, prefix="/api")
-app.include_router(resource_router, prefix="/api")
 app.include_router(integration_router, prefix="/api")
 app.include_router(assistant_router, prefix="/api")
 
 # W12: SSE / Events
 from app.api.routes_events import router as events_router
 app.include_router(events_router, prefix="/api")
+
+# R6: Agent / Skill / Resource Registry / Credential (BYOK)
+from app.api.routes_agents import agent_router
+app.include_router(agent_router, prefix="/api")
+
+from app.api.routes_skills import skill_router
+app.include_router(skill_router, prefix="/api")
+
+from app.api.routes_registry import registry_router
+app.include_router(registry_router, prefix="/api")
+
+from app.api.routes_credentials import credential_router
+app.include_router(credential_router, prefix="/api")
+
+# R12: Import endpoints (Agent/Skill/Resource local + community)
+from app.api.routes_imports import import_router
+app.include_router(import_router, prefix="/api")
+
+# R12: MCP server management (real MCP protocol)
+from app.api.routes_mcp import mcp_router
+app.include_router(mcp_router, prefix="/api")
+
+# R7 new: Upload (zip 上传创建 + source 扫描入库)
+from app.api.routes_upload import upload_router
+app.include_router(upload_router, prefix="/api")
+
+# R7 new: Export (zip 下载)
+from app.api.routes_export import export_router
+app.include_router(export_router, prefix="/api")
+
+# R7 new: Toggle (启用/禁用)
+from app.api.routes_toggle import toggle_router
+app.include_router(toggle_router, prefix="/api")

@@ -26,6 +26,7 @@ from app.schemas.model import (
     AssistantChatRequest, AssistantChatResponse,
     ModelBindingResponse,
     CreateProviderRequest, SetCredentialRequest,
+    UpdateProviderRequest,
     UsageResponse, UsageByProvider, UsageByModel,
     UpdateStrategyRequest,
 )
@@ -171,6 +172,45 @@ async def set_provider_credential(provider_id: str, req: SetCredentialRequest):
     )
 
 
+    return SuccessEnvelope(
+        data=_provider_resp(p).model_dump(),
+        meta=Meta(source_status=p["credential_status"], capability_status="available"),
+    )
+
+
+@model_router.put("/providers/{provider_id}")
+async def update_provider(provider_id: str, req: "UpdateProviderRequest"):
+    """更新供应商非敏感配置（FB-005）：名称、端点、格式、模型列表等。"""
+    from app.schemas.model import UpdateProviderRequest as _Unused  # noqa: F811
+    gw = _gateway()
+    kwargs = {}
+    if req.provider_name is not None:
+        kwargs["provider_name"] = req.provider_name
+    if req.api_format is not None:
+        kwargs["api_format"] = req.api_format
+    if req.endpoint_openai is not None:
+        kwargs["endpoint_openai"] = req.endpoint_openai
+    if req.endpoint_anthropic is not None:
+        kwargs["endpoint_anthropic"] = req.endpoint_anthropic
+    if req.env_key_var is not None:
+        kwargs["env_key_var"] = req.env_key_var
+    if req.note is not None:
+        kwargs["note"] = req.note
+    if req.homepage is not None:
+        kwargs["homepage"] = req.homepage
+    if req.models is not None:
+        kwargs["models"] = [m.model_dump() for m in req.models]
+    p = gw.update_provider(provider_id, **kwargs)
+    if not p:
+        return SuccessEnvelope(data=None, meta=Meta(source_status="not_found", capability_status="available"))
+    get_services().trace_writer.write("state_change", action="update_provider",
+                                      summary=f"provider={provider_id} updated")
+    return SuccessEnvelope(
+        data=_provider_resp(p).model_dump(),
+        meta=Meta(source_status=p["credential_status"], capability_status="available"),
+    )
+
+
 @model_router.get("/providers/{provider_id}")
 async def get_provider(provider_id: str):
     gw = _gateway()
@@ -249,6 +289,65 @@ async def list_strategies():
     return SuccessEnvelope(
         data=StrategyListData(strategies=resp).model_dump(),
         meta=Meta(source_status="available", capability_status="available"),
+    )
+
+
+@model_router.post("/strategies")
+async def create_strategy(req: UpdateStrategyRequest):
+    """创建新策略（FB-004 新增）。strategy_id 必填且不可与已有策略重复。"""
+    gw = _gateway()
+    if not req.strategy_id:
+        return SuccessEnvelope(
+            data=None,
+            meta=Meta(source_status="invalid", capability_status="available",
+                       not_connected_reason="strategy_id 不能为空"),
+        )
+    # 检查是否已存在
+    existing = gw.list_strategies()
+    if any(s["strategy_id"] == req.strategy_id for s in existing):
+        return SuccessEnvelope(
+            data=None,
+            meta=Meta(source_status="conflict", capability_status="available",
+                       not_connected_reason=f"策略 '{req.strategy_id}' 已存在"),
+        )
+    s = gw.create_strategy(
+        strategy_id=req.strategy_id,
+        default_profile_ref=req.default_profile_ref,
+        fallback_profile_refs=req.fallback_profile_refs,
+    )
+    get_services().trace_writer.write("state_change", action="create_strategy",
+                                      summary=f"strategy={req.strategy_id}")
+    return SuccessEnvelope(
+        data=StrategyResponse(
+            strategy_id=s["strategy_id"], scope=s["scope"],
+            default_profile_ref=s["default_profile_ref"], fallback_profile_refs=s["fallback_profile_refs"],
+            fallback_policy=s["fallback_policy"], retry_policy=s["retry_policy"],
+            cost_budget_policy=s["cost_budget_policy"], fusion_allowed=s["fusion_allowed"],
+            streaming_allowed=s["streaming_allowed"], tool_calling_allowed=s["tool_calling_allowed"],
+            trace_policy=s["trace_policy"], audit_policy=s["audit_policy"],
+        ).model_dump(),
+        meta=Meta(source_status="available", capability_status="available"),
+    )
+
+
+@model_router.delete("/strategies/{strategy_id}")
+async def delete_strategy(strategy_id: str):
+    """删除策略（FB-007）。内置 system-default 不可删。"""
+    if strategy_id == "system-default":
+        return SuccessEnvelope(
+            data={"removed": False},
+            meta=Meta(source_status="forbidden", capability_status="available",
+                       not_connected_reason="系统默认策略不可删除"),
+        )
+    gw = _gateway()
+    ok = gw.delete_strategy(strategy_id)
+    get_services().trace_writer.write("state_change", action="delete_strategy",
+                                      summary=f"strategy={strategy_id} removed={ok}")
+    return SuccessEnvelope(
+        data={"removed": ok},
+        meta=Meta(source_status="removed" if ok else "not_found",
+                   capability_status="available",
+                   not_connected_reason="" if ok else "策略不存在"),
     )
 
 
@@ -384,9 +483,9 @@ async def model_call(req: ModelCallRequest):
 # ═══════════════════════════════════════════════════════════════════════
 
 @model_router.get("/calls")
-async def list_calls(limit: int = Query(default=50, le=200)):
+async def list_calls(limit: int = Query(default=10, le=100), offset: int = Query(default=0, ge=0)):
     gw = _gateway()
-    calls = gw.list_calls(limit=limit)
+    calls, total = gw.list_calls(limit=limit, offset=offset)
     resp = [
         CallLogEntry(
             model_call_id=c["model_call_id"],
@@ -408,9 +507,9 @@ async def list_calls(limit: int = Query(default=50, le=200)):
         for c in calls
     ]
     return SuccessEnvelope(
-        data=CallLogListData(calls=resp).model_dump(),
+        data=CallLogListData(calls=resp, total=total, limit=limit, offset=offset).model_dump(),
         meta=Meta(source_status="available", capability_status="available",
-                   persistence="volatile"),
+                   persistence="persisted"),
     )
 
 
@@ -431,14 +530,17 @@ async def get_usage():
             prompt_tokens=u["prompt_tokens"],
             completion_tokens=u["completion_tokens"],
             total_tokens=u["total_tokens"],
+            cache_hit_tokens=u.get("cache_hit_tokens", 0),
+            cache_read_tokens=u.get("cache_read_tokens", 0),
+            cache_hit_rate=u.get("cache_hit_rate", 0.0),
             cost_available=u["cost_available"],
             cost_unavailable_reason=u["cost_unavailable_reason"],
             by_provider=[UsageByProvider(**x) for x in u["by_provider"]],
             by_model=[UsageByModel(**x) for x in u["by_model"]],
-            volatile=u["volatile"],
+            persisted=u.get("persisted", True),
         ).model_dump(),
         meta=Meta(source_status="available", capability_status="available",
-                   persistence="volatile"),
+                   persistence="persisted"),
     )
 
 

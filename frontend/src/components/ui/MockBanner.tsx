@@ -2,7 +2,7 @@ import { useLocation } from 'react-router-dom';
 import { useWorkspaceStore } from '../../stores';
 
 // 已真实接入后端的路由前缀——这些页面不显示「体验壳/mock」横幅（C-5：诚实边界 D-049）。
-const REAL_ROUTES = ['/models'];
+const REAL_ROUTES = ['/models', '/resources'];
 
 export function GlobalMockBanner() {
   const dismissed = useWorkspaceStore(s => s.mockBannerDismissed);

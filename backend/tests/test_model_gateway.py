@@ -382,20 +382,34 @@ class TestCallLog:
         from app.services.model_gateway import ModelGateway
         gw = ModelGateway()
         calls = gw.list_calls()
-        assert calls == []
+        # FB-006: DB-persisted call log — may contain records from prior tests
+        # New gateway has empty in-memory list
+        assert gw._calls == []
 
     def test_call_log_after_call(self):
         from app.services.model_gateway import ModelGateway
         gw = ModelGateway()
-        # Directly add a call record
-        gw._calls.append({
+        # Add record both in-memory (for backward compat) and persist to DB
+        record = {
             "model_call_id": "test-001",
             "provider_id": "deepseek-official",
+            "profile_id": "deepseek-official/deepseek-v4-flash",
+            "strategy_id": "system-default",
+            "selected_model": "openai/deepseek-v4-flash",
+            "selection_reason": "test",
             "status": "completed",
-        })
+            "latency_ms": 100,
+            "error_category": "",
+            "retry_count": 0,
+            "fallback_used": False,
+            "usage_summary": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "source": "api",
+        }
+        gw._calls.append(record)
+        gw._persist_call(record)
         calls = gw.list_calls()
-        assert len(calls) == 1
-        assert calls[0]["model_call_id"] == "test-001"
+        assert len(calls) >= 1
+        assert any(c["model_call_id"] == "test-001" for c in calls)
 
 
 # ═══════════════════════════════════════════════════════════════════════
