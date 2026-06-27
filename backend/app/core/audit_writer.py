@@ -1,22 +1,23 @@
-"""Audit writer — records Gate decisions and high-risk actions as in-memory Audit entries.
+"""Audit writer — records Gate decisions and high-risk actions to in-memory store + file.
 
-R4: Audits are stored in-memory (volatile). They are lost on restart.
-This is the minimal engineering landing of D-034 (Gate decisions MUST be audited).
-
-The audit_writer is NOT a persistence layer. It is explicitly volatile.
+R4: In-memory (volatile) store for instant API queries.
+R8: Adds file persistence — writes to project workspace .rebuild/audits.jsonl.
+    File persistence ensures audits survive restart.
 """
 
 import hashlib
+import json
 import time
 import uuid
 from collections import deque
+from pathlib import Path
 from typing import Optional
 
 MAX_AUDITS = 10000  # in-memory cap
 
 
 class AuditWriter:
-    """In-memory audit log. Volatile — not persisted to disk."""
+    """Audit log — in-memory for API queries + file persistence (R8)."""
 
     def __init__(self):
         self._audits: deque[dict] = deque(maxlen=MAX_AUDITS)
@@ -36,7 +37,10 @@ class AuditWriter:
         transition_mode: str = "mock",
         **extra,
     ) -> dict:
-        """Record an audit entry. Returns the audit dict."""
+        """Record an audit entry. Returns the audit dict.
+
+        R8: Also appends to .rebuild/audits.jsonl if project_id is set and workspace exists.
+        """
         audit_id_seed = f"{audit_type}:{gate_id or ''}:{decision}:{_now()}"
         audit = {
             "audit_id": f"AU-{hashlib.sha256(audit_id_seed.encode()).hexdigest()[:10]}",
@@ -50,11 +54,23 @@ class AuditWriter:
             "run_id": run_id,
             "stage": stage,
             "transition_mode": transition_mode,
-            "persistence": "volatile",
+            "persistence": "file+memory",
             "created_at": _now(),
             **extra,
         }
         self._audits.append(audit)
+
+        # R8: File persistence to project workspace .rebuild/audits.jsonl
+        if project_id:
+            try:
+                from app.core.config import settings
+                audits_file = Path(settings.workspace_dir) / "projects" / project_id / ".rebuild" / "audits.jsonl"
+                audits_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(audits_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(audit, ensure_ascii=False) + "\n")
+            except Exception:
+                pass  # file persistence failure is non-fatal to in-memory
+
         return audit
 
     def query(

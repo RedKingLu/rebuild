@@ -106,6 +106,10 @@ app.include_router(registry_router, prefix="/api")
 from app.api.routes_credentials import credential_router
 app.include_router(credential_router, prefix="/api")
 
+# R8-5: Coding Agent configuration (D-077 / D-078)
+from app.api.routes_coding_agents import router as coding_agents_router
+app.include_router(coding_agents_router, prefix="/api")
+
 # R12: Import endpoints (Agent/Skill/Resource local + community)
 from app.api.routes_imports import import_router
 app.include_router(import_router, prefix="/api")

@@ -5,22 +5,22 @@ import {
   getGithubAuthorizeUrl, listGitAccounts, listAccountRepos, disconnectGitAccount,
   listGitHosts, createGitHost, deleteGitHost,
   listRemoteHosts, createRemoteHost, deleteRemoteHost, testRemoteHost,
-  executeOpenCode, getOpenCodeStatus,
+  listCodingAgents, createCodingAgent, deleteCodingAgent, testCodingAgent,
   getFeishuConfig, updateFeishuConfig, testFeishu,
   getIntegrationSummary,
   INTEGRATION_STATUS_LABELS,
   type GitAccountInfo, type GitRepoInfo, type GitHostInfo,
-  type RemoteHostInfo, type IntegrationSummary,
+  type RemoteHostInfo, type CodingAgentInfo, type IntegrationSummary,
 } from '../../services/integrationService';
 
-type Tab = 'git' | 'remote' | 'opencode' | 'feishu';
+type Tab = 'git' | 'remote' | 'codingAgents' | 'feishu';
 
 export function IntegrationsPage() {
   const nav = useNavigate();
   const [searchParams] = useSearchParams();
   const [tab, setTab] = useState<Tab>(() => {
     const t = searchParams.get('tab');
-    return (t === 'git' || t === 'remote' || t === 'opencode' || t === 'feishu') ? t : 'git';
+    return (t === 'git' || t === 'remote' || t === 'codingAgents' || t === 'feishu') ? t : 'git';
   });
   const [loading, setLoading] = useState(true);
   const [summary, setSummary] = useState<IntegrationSummary | null>(null);
@@ -35,33 +35,11 @@ export function IntegrationsPage() {
   const [remoteHosts, setRemoteHosts] = useState<RemoteHostInfo[]>([]);
   const [testResults, setTestResults] = useState<Record<string, any>>({});
 
-  // OpenCode state
-  const [ocAvailable, setOcAvailable] = useState(false);
-  const [ocCode, setOcCode] = useState('print("hello")');
-  const [ocLang, setOcLang] = useState('python');
-  const [ocTimeout, setOcTimeout] = useState(30);
-  const [ocModel, setOcModel] = useState('');
-  const [ocModels, setOcModels] = useState<{id: string; name: string}[]>([]);
-  const [ocResult, setOcResult] = useState<any>(null);
-  const [ocExecuting, setOcExecuting] = useState(false);
-
-  // Load models for OpenCode
-  useEffect(() => {
-    import('../../services/modelService').then(({ listProviders }) => {
-      listProviders().then(resp => {
-        const providers: any[] = resp.data?.providers || [];
-        const models: {id: string; name: string}[] = [];
-        for (const p of providers) {
-          const profiles = p.profiles || [];
-          for (const m of profiles) {
-            const mName = m.profile_id || m.model_name || '';
-            if (mName) models.push({ id: mName, name: `${p.provider_id}/${mName}` });
-          }
-        }
-        if (models.length > 0) { setOcModels(models); setOcModel(models[0].id); }
-      }).catch(() => {});
-    }).catch(() => {});
-  }, []);
+  // Coding Agents state (D-077 / D-078, R8-5)
+  const [codingAgents, setCodingAgents] = useState<CodingAgentInfo[]>([]);
+  const [caTestResults, setCaTestResults] = useState<Record<string, any>>({});
+  const [caAdding, setCaAdding] = useState(false);
+  const [caForm, setCaForm] = useState({ name: '', agent_type: 'opencode_cli', invoke_mode: 'cli', model: '' });
 
   // Feishu state
   const [fsConfig, setFsConfig] = useState<any>(null);
@@ -87,17 +65,17 @@ export function IntegrationsPage() {
   const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [s, accts, _hosts, remotes] = await Promise.all([
+      const [s, accts, _hosts, remotes, agents] = await Promise.all([
         getIntegrationSummary().catch(() => null),
         listGitAccounts().catch(() => []),
         listGitHosts().catch(() => []),
         listRemoteHosts().catch(() => []),
+        listCodingAgents().catch(() => []),
       ]);
       setSummary(s);
       setAccounts(accts);
       setRemoteHosts(remotes);
-      // OpenCode status
-      try { const st = await getOpenCodeStatus(); setOcAvailable(st.opencode_available); } catch {}
+      setCodingAgents(agents);
       // Feishu config
       try { const fc = await getFeishuConfig(); setFsConfig(fc); } catch {}
     } catch {} finally { setLoading(false); }
@@ -134,12 +112,25 @@ export function IntegrationsPage() {
     try { const r = await testRemoteHost(id); setTestResults(p => ({ ...p, [id]: r })); } catch {}
   };
 
-  // ── OpenCode ──
-  const handleExecute = async () => {
-    setOcExecuting(true); setOcResult(null);
-    try { setOcResult(await executeOpenCode(ocCode, ocLang, ocTimeout, ocModel || undefined)); } catch (e: any) {
-      setOcResult({ error: e.message, provider: 'error', exit_code: -1 });
-    } finally { setOcExecuting(false); }
+  // ── Coding Agents (R8-5) ──
+  const handleAddCodingAgent = async () => {
+    if (!caForm.name) return;
+    try {
+      const config: any = {};
+      if (caForm.model) config.model = caForm.model;
+      await createCodingAgent({ agent_type: caForm.agent_type, name: caForm.name, invoke_mode: caForm.invoke_mode, config });
+      setCaAdding(false);
+      setCaForm({ name: '', agent_type: 'opencode_cli', invoke_mode: 'cli', model: '' });
+      setCodingAgents(await listCodingAgents());
+    } catch (e: any) { alert('添加失败: ' + e.message); }
+  };
+
+  const handleTestCodingAgent = async (id: string) => {
+    try { const r = await testCodingAgent(id); setCaTestResults(p => ({ ...p, [id]: r })); } catch {}
+  };
+
+  const handleDeleteCodingAgent = async (id: string) => {
+    try { await deleteCodingAgent(id); setCodingAgents(await listCodingAgents()); } catch {}
   };
 
   // ── Feishu ──
@@ -161,7 +152,7 @@ export function IntegrationsPage() {
   const TABS: [Tab, string][] = [
     ['git', '代码托管'],
     ['remote', '远程资源'],
-    ['opencode', '执行集成'],
+    ['codingAgents', '编程 Agent'],
     ['feishu', '其他集成'],
   ];
 
@@ -181,15 +172,15 @@ export function IntegrationsPage() {
           }}>
             <b>{label}</b>
             <div className="snum">{
-              k === 'git' ? `${summary?.git?.connected ?? 0} / ${(summary?.git?.connected ?? 0) + (summary?.git?.total ?? 0) || 0}` :
+              k === 'git' ? `${summary?.git?.connected ?? 0} / ${summary?.git?.total ?? 0}` :
               k === 'remote' ? `${summary?.remote?.connected ?? 0} / ${summary?.remote?.total ?? 0}` :
-              k === 'opencode' ? (ocAvailable ? 'OpenCode' : 'Shell') :
+              k === 'codingAgents' ? `${summary?.coding_agents?.total ?? codingAgents.length}` :
               fsConfig?.configured ? '已配置' : '0'
             }</div>
             <div className="slabel">{
               k === 'git' ? '账号（已绑定 / 总数）' :
               k === 'remote' ? '主机（在线 / 总数）' :
-              k === 'opencode' ? '执行集成状态' :
+              k === 'codingAgents' ? '已配置 Agent 数' :
               '飞书 Webhook'
             }</div>
           </button>
@@ -319,90 +310,101 @@ export function IntegrationsPage() {
         </div>
       )}
 
-      {/* ═══ Tab: OpenCode ═══ */}
-      {tab === 'opencode' && (
+      {/* ═══ Tab: Coding Agents (D-077 / D-078, R8-5) ═══ */}
+      {tab === 'codingAgents' && (
         <div>
-          <div className="card" style={{ marginBottom: 14 }}>
+          {/* Header */}
+          <div className="card" style={{ marginBottom: 12 }}>
             <div className="spread">
-              <b>执行集成 · OpenCode</b>
-              <span className="tag" style={{ background: ocAvailable ? 'var(--green)' : 'var(--amber)', color: '#fff' }}>
-                {ocAvailable ? 'OpenCode CLI' : 'Fallback Shell'}
-              </span>
-            </div>
-            <div className="hash" style={{ marginTop: 4, fontSize: 12 }}>
-              {ocAvailable
-                ? 'OpenCode CLI 已安装，Agent 可通过 ExecutionProvider 直接调用。'
-                : 'OpenCode CLI 未安装，使用 Python3/Bash 安全沙箱作为降级执行器。'}
-            </div>
-          </div>
-
-          {/* Quick test examples */}
-          <div className="card" style={{ marginBottom: 14 }}>
-            <b style={{ fontSize: 13 }}>快速测试</b>
-            <div className="row" style={{ gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
-              {[
-                ['print("hello rebuild")', 'python', 'Hello'],
-                ['echo "test ok"', 'bash', 'Echo'],
-              ].map(([code, lang, label]) => (
-                <button key={label} className="btn sm ghost" onClick={() => { setOcCode(code); setOcLang(lang); }}>
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Execute */}
-          <div className="card">
-            <div className="grid" style={{ gap: 10 }}>
-              <label className="sub" style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12 }}>
-                代码
-                <textarea className="inp" rows={6} value={ocCode} onChange={e => setOcCode(e.target.value)}
-                  style={{ fontFamily: 'monospace', fontSize: 13 }} />
-              </label>
-              <div className="row" style={{ gap: 10, flexWrap: 'wrap' }}>
-                <label className="sub" style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, minWidth: 80 }}>
-                  语言
-                  <select className="inp" value={ocLang} onChange={e => setOcLang(e.target.value)}>
-                    <option value="python">Python</option><option value="bash">Bash</option>
-                  </select>
-                </label>
-                <label className="sub" style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, minWidth: 180 }}>
-                  模型
-                  <select className="inp" value={ocModel} onChange={e => setOcModel(e.target.value)}>
-                    <option value="">默认（OpenCode 内置）</option>
-                    {ocModels.map(m => (
-                      <option key={m.id} value={m.id}>{m.name}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="sub" style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, minWidth: 70 }}>
-                  超时(秒)
-                  <input className="inp" type="number" value={ocTimeout} onChange={e => setOcTimeout(+e.target.value)} style={{ width: 70 }} />
-                </label>
-              </div>
-              <button className="btn" onClick={handleExecute} disabled={ocExecuting} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                <Icon name="send" size={14} />{ocExecuting ? '执行中…' : '执行代码'}
-              </button>
-            </div>
-            {ocResult && (
-              <div style={{ marginTop: 12, padding: 12, background: 'var(--surface-2)', borderRadius: 8, fontFamily: 'monospace', fontSize: 12 }}>
-                <div className="row" style={{ gap: 12, marginBottom: 6, flexWrap: 'wrap' }}>
-                  <span>provider: <b>{ocResult.provider}</b></span>
-                  <span>exit: <b style={{ color: ocResult.exit_code === 0 ? 'var(--green)' : 'var(--red)' }}>{ocResult.exit_code}</b></span>
-                  <span>{ocResult.elapsed_ms}ms</span>
-                  {ocResult.blocked && <span className="tag red">已被安全策略阻止</span>}
+              <div>
+                <b>AI 编程 Agent 配置</b>
+                <div className="hash" style={{ marginTop: 4, fontSize: 12 }}>
+                  接入 OpenCode、qcode 等外部 AI 编程 Agent。配置后可在工作区选择使用，平台为其提供材料、上下文和任务，并由平台审核 Agent 监管其请求（R11 实现）。
                 </div>
-                {ocResult.error && <div className="err" style={{ marginBottom: 6 }}>{ocResult.error}</div>}
-                {ocResult.stdout && <pre style={{ margin: '4px 0', whiteSpace: 'pre-wrap', maxHeight: 300, overflow: 'auto' }}>{ocResult.stdout}</pre>}
-                {ocResult.stderr && <pre style={{ margin: '4px 0', color: 'var(--red)', whiteSpace: 'pre-wrap', maxHeight: 200, overflow: 'auto' }}>{ocResult.stderr}</pre>}
               </div>
-            )}
+              <button className="btn sm" onClick={() => setCaAdding(true)}>＋ 添加 Agent</button>
+            </div>
           </div>
 
-          {/* Security boundary info */}
-          <div className="banner info" style={{ marginTop: 12, fontSize: 12 }}>
-            <b>安全边界</b>：命令 allowlist（python3/echo/cat/ls/pwd）· 禁止 rm -rf / sudo / curl|sh · cwd 沙箱隔离 · 超时 30-120s · 环境变量脱敏 · stdout/stderr 截断 64KB
+          {/* R11 stub notice */}
+          <div className="banner info" style={{ marginBottom: 12, fontSize: 12 }}>
+            <b>R8 预留接口</b>：当前版本已建立 Agent 配置管理和工作区选择器。真实调用（LangGraph 任务委托 + 平台审核 Agent）将在 R11 P4 执行链路中实现（D-078）。
           </div>
+
+          {/* Add form */}
+          {caAdding && (
+            <div className="card" style={{ marginBottom: 12, padding: 14 }}>
+              <b style={{ fontSize: 13 }}>添加 AI 编程 Agent</b>
+              <div className="grid" style={{ gap: 8, marginTop: 10 }}>
+                <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                  <label className="sub" style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, flex: 1 }}>
+                    名称
+                    <input className="inp" value={caForm.name} onChange={e => setCaForm(f => ({ ...f, name: e.target.value }))} placeholder="如：本地 OpenCode" />
+                  </label>
+                  <label className="sub" style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, minWidth: 140 }}>
+                    类型
+                    <select className="inp" value={caForm.agent_type} onChange={e => setCaForm(f => ({ ...f, agent_type: e.target.value }))}>
+                      <option value="opencode_cli">OpenCode (CLI)</option>
+                      <option value="qcode_cli">qcode (CLI)</option>
+                      <option value="openai_compat">自定义（OpenAI 兼容）</option>
+                    </select>
+                  </label>
+                  <label className="sub" style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, minWidth: 100 }}>
+                    接入方式
+                    <select className="inp" value={caForm.invoke_mode} onChange={e => setCaForm(f => ({ ...f, invoke_mode: e.target.value }))}>
+                      <option value="cli">CLI</option>
+                      <option value="api">API</option>
+                      <option value="mcp">MCP</option>
+                    </select>
+                  </label>
+                  <label className="sub" style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, minWidth: 150 }}>
+                    使用模型（可选）
+                    <input className="inp" value={caForm.model} onChange={e => setCaForm(f => ({ ...f, model: e.target.value }))} placeholder="如：deepseek-chat" />
+                  </label>
+                </div>
+                <div className="row" style={{ gap: 6 }}>
+                  <button className="btn sm" onClick={handleAddCodingAgent}>保存</button>
+                  <button className="btn sm ghost" onClick={() => setCaAdding(false)}>取消</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Agent list */}
+          {codingAgents.length === 0 ? (
+            <div className="empty"><p className="sub">暂无已配置的 AI 编程 Agent。</p></div>
+          ) : (
+            codingAgents.map(a => {
+              const tr = caTestResults[a.agent_id];
+              const typeLabel: Record<string, string> = {
+                opencode_cli: 'OpenCode', qcode_cli: 'qcode', openai_compat: '自定义', platform_agent: '平台自有',
+              };
+              return (
+                <div key={a.agent_id} className="card" style={{ padding: 14, marginBottom: 8 }}>
+                  <div className="spread">
+                    <div>
+                      <b>{a.name}</b>
+                      <span className="tag" style={{ marginLeft: 6, fontSize: 11 }}>{typeLabel[a.agent_type] ?? a.agent_type}</span>
+                      <span className="tag grey" style={{ marginLeft: 4, fontSize: 11 }}>{a.invoke_mode}</span>
+                    </div>
+                    <div className="row" style={{ gap: 6 }}>
+                      <span className="tag" style={{ fontSize: 11, background: a.status === 'connected' ? 'var(--green)' : 'var(--ink-2)', color: '#fff' }}>
+                        {a.status === 'connected' ? '已连接' : a.status === 'error' ? '异常' : '未验证'}
+                      </span>
+                      <button className="btn sm ghost" onClick={() => handleTestCodingAgent(a.agent_id)}>测试可用性</button>
+                      <button className="btn sm ghost" style={{ color: 'var(--red)' }} onClick={() => handleDeleteCodingAgent(a.agent_id)}>删除</button>
+                    </div>
+                  </div>
+                  {a.config?.model && <div className="meta" style={{ marginTop: 4, fontSize: 12 }}>模型: {a.config.model}</div>}
+                  {tr && (
+                    <div className="hash" style={{ marginTop: 6, fontSize: 12, color: tr.available ? 'var(--green)' : 'var(--red)' }}>
+                      {tr.available ? `✅ 可用 (${tr.agent_type})` : `❌ 不可用 — CLI 未安装或不在 PATH 中`}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
         </div>
       )}
 

@@ -114,12 +114,12 @@ export function OverviewPage() {
         const connected =
           (s.git?.connected ?? 0) +
           (s.remote?.connected ?? 0) +
-          (s.execution?.connected ?? 0) +
+          (s.coding_agents?.connected ?? 0) +
           (s.other?.connected ?? 0);
         const total =
           (s.git?.total ?? 0) +
           (s.remote?.total ?? 0) +
-          (s.execution?.total ?? 0) +
+          (s.coding_agents?.total ?? 0) +
           (s.other?.total ?? 0);
         setIntConnected(connected);
         setIntTotal(total);

@@ -14,7 +14,7 @@ def test_audit_after_gate_decision(client):
     data = resp.json()["data"]
     audits = data["audits"]
     assert len(audits) >= 1
-    assert data["persistence"] == "volatile"
+    assert data["persistence"] == "file+memory"
 
 
 def test_audit_fields(client):
@@ -33,7 +33,7 @@ def test_audit_fields(client):
         assert "decision" in a
         assert "transition_mode" in a
         assert a["transition_mode"] == "mock"
-        assert a["persistence"] == "volatile"
+        assert a["persistence"] == "file+memory"
 
 
 def test_audit_filter_by_gate(client):

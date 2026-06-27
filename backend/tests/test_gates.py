@@ -33,7 +33,7 @@ def test_gate_decision_writes_audit(client):
     assert data["audit"]["audit_id"].startswith("AU-")
     assert data["audit"]["decision"] == "approve"
     assert data["audit"]["audit_type"] == "gate_decision"
-    assert data["audit"]["persistence"] == "volatile"
+    assert data["audit"]["persistence"] == "file+memory"
 
 
 def test_policy_check_mock(client):

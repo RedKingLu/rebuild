@@ -56,8 +56,10 @@ def test_integrations_real_after_r7(client):
     """R7: Integration endpoints are now real (replaced placeholder).
 
     The old /api/projects/{id}/integrations placeholder is replaced by
-    /api/integrations/* real endpoints. R7 delivers Git/Remote/OpenCode/Feishu
+    /api/integrations/* real endpoints. R7 delivers Git/Remote/Feishu
     integration management with DB-backed CRUD and aggregate summary.
+    R8-5 (D-076): 'execution' key renamed to 'coding_agents' to reflect
+    the correct separation of code execution from AI coding agent config.
     """
     resp = client.get("/api/integrations/summary")
     assert resp.status_code == 200
@@ -66,5 +68,5 @@ def test_integrations_real_after_r7(client):
     assert data["meta"]["source_status"] == "real"
     assert "git" in data["data"]
     assert "remote" in data["data"]
-    assert "execution" in data["data"]
+    assert "coding_agents" in data["data"]  # R8-5: renamed from 'execution'
     assert "other" in data["data"]

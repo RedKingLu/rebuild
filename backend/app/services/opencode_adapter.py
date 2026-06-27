@@ -1,250 +1,290 @@
-"""OpenCode adapter — CLI subprocess execution with fallback shell executor.
+"""AI Coding Agent adapter — interface for external AI coding agents.
 
-Security boundaries per CL-R7-3-3:
-- cwd locked to sandbox directory
-- timeout enforced
-- DENY_SUBSTRINGS for dangerous commands
-- env vars cleared of secrets
-- stdout/stderr truncated
+D-076 (2026-06-26): OpenCode/qcode are AI coding agents that accept natural-language
+tasks, NOT shell wrappers for running subprocess commands.
+
+OpenCodeCLIAdapter now implements real invocation via `opencode run <task>`.
+Credentials are passed only as env vars to the subprocess (never logged/stored in plain text).
+LangGraph-mediated review agent interception is deferred to R11 (D-078).
 """
+
+from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
-import time
+from pathlib import Path
+from typing import Protocol
+
+# ── Protocol ─────────────────────────────────────────────────────────────
+
+class CodingAgentAdapter(Protocol):
+    """Interface every AI coding agent adapter implements."""
+
+    agent_type: str
+
+    def is_available(self) -> bool: ...
+
+    async def invoke_coding_task(
+        self,
+        task: str,
+        context_path: str,
+        config: dict | None = None,
+    ) -> dict:
+        """Returns dict with: status, summary, changed_files, diff_ref, issues, raw_output."""
+        ...
 
 
-SANDBOX_BASE = os.path.join(os.getcwd(), ".data", "execution-sandbox")
+# ── Helpers ───────────────────────────────────────────────────────────────
 
-DENY_SUBSTRINGS = [
-    "rm -rf", "rm -r", "sudo", "curl | sh", "wget | sh",
-    "/dev/", "/proc/", "/sys/", "~/.ssh", "~/.gnupg",
-    ".env", "id_rsa", "id_ed25519", "id_ecdsa",
-    "/etc/passwd", "/etc/shadow", "/root/",
-]
-
-ALLOWED_COMMANDS = ["python3", "python", "echo", "cat", "ls", "pwd", "which"]
+# Providers that use the MaaS/DeepSeek-compatible base URL
+_DEFAULT_BASE_URL = "http://maas.icompify.com:32788/v1"
+_DEFAULT_MODEL = "openai/deepseek-v4-flash"
+_FREE_MODEL = "opencode/deepseek-v4-flash-free"  # no API key required
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHFJ]")
+_OUTPUT_CAP = 32_768   # 32 KB cap on raw_output stored in response
 
 
-_OPENCODE_BIN = None
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
-def _find_opencode() -> str | None:
-    """Locate the opencode binary (npm global or PATH)."""
-    global _OPENCODE_BIN
-    if _OPENCODE_BIN:
-        return _OPENCODE_BIN
-    # Try PATH first
-    found = shutil.which("opencode")
-    if found:
-        _OPENCODE_BIN = found
-        return found
-    # Try npm global install path
-    import subprocess
+def _build_opencode_env(config: dict) -> dict:
+    """Build subprocess env: inject OPENAI_API_KEY + OPENAI_BASE_URL, strip LLM_API_KEY.
+
+    Key is never returned or logged — it only lives in the subprocess env dict
+    for the duration of the opencode run.
+    """
+    env = os.environ.copy()
+    # Prefer key from platform env (set by operator, not from config JSON)
+    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    base_url = (
+        config.get("base_url")
+        or os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("LLM_BASE_URL")
+        or _DEFAULT_BASE_URL
+    )
+    if api_key:
+        env["OPENAI_API_KEY"] = api_key
+        env["OPENAI_BASE_URL"] = base_url
+    # Remove the raw platform key so opencode doesn't forward it in logs
+    env.pop("LLM_API_KEY", None)
+    return env
+
+
+def _pick_model(config: dict, has_key: bool) -> str:
+    """Return the model string to pass to opencode -m."""
+    if config.get("model"):
+        return config["model"]
+    return _DEFAULT_MODEL if has_key else _FREE_MODEL
+
+
+def _extract_summary(text: str) -> str:
+    """Extract last non-empty line as summary (opencode prints result at end)."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # Skip lines that look like progress spinners or tool status
+    skip_prefixes = ("●", "○", "✓", "✗", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "│", "┌", "└", "─")
+    result_lines = [l for l in lines if not any(l.startswith(p) for p in skip_prefixes)]
+    if result_lines:
+        return result_lines[-1][:256]
+    return lines[-1][:256] if lines else ""
+
+
+async def _git_changed_files(path: str) -> list[str]:
+    """Return list of files modified/added/deleted since last commit (or all staged)."""
     try:
-        result = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True, timeout=10)
-        npm_root = result.stdout.strip()
-        candidate = os.path.join(npm_root, "opencode-ai", "bin", "opencode.exe")
-        if os.path.isfile(candidate):
-            _OPENCODE_BIN = candidate
-            return candidate
-    except Exception:
-        pass
-    return None
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "--name-only", "HEAD",
+            cwd=path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        tracked = [l.strip() for l in stdout.decode().splitlines() if l.strip()]
 
+        # Also include untracked new files
+        proc2 = await asyncio.create_subprocess_exec(
+            "git", "ls-files", "--others", "--exclude-standard",
+            cwd=path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=10)
+        untracked = [l.strip() for l in stdout2.decode().splitlines() if l.strip()]
+
+        return list(dict.fromkeys(tracked + untracked))  # preserve order, dedup
+    except Exception:
+        return []
+
+
+# ── OpenCode CLI adapter ──────────────────────────────────────────────────
 
 def is_opencode_available() -> bool:
-    """Check if opencode CLI is installed."""
-    return _find_opencode() is not None
+    return shutil.which("opencode") is not None
 
 
-def _check_dangerous(code: str) -> str | None:
-    """Return denial reason if code contains dangerous patterns, else None."""
-    code_lower = code.lower()
-    for pattern in DENY_SUBSTRINGS:
-        if pattern.lower() in code_lower:
-            return f"Blocked dangerous pattern: {pattern}"
-    return None
+class OpenCodeCLIAdapter:
+    """Adapter for the OpenCode AI coding agent (opencode CLI).
 
-
-def _check_command_allowlist(cmd: list[str]) -> str | None:
-    """Check if the first command is in the allowlist."""
-    if not cmd:
-        return "Empty command"
-    base = os.path.basename(cmd[0])
-    if base not in ALLOWED_COMMANDS:
-        return f"Command not in allowlist: {base}"
-    return None
-
-
-async def execute(code: str, language: str = "python",
-                  timeout: int = 30, cwd: str = None,
-                  model: str = None) -> dict:
-    """Execute code via opencode CLI or fallback shell executor.
-
-    Args:
-        code: The code to execute
-        language: 'python' or 'bash'
-        timeout: Timeout in seconds
-        cwd: Working directory (sandboxed)
-        model: Model name to pass to opencode (e.g. 'deepseek-chat')
-
-    Returns dict with: exit_code, stdout, stderr, elapsed_ms, provider, fallback
+    Invokes `opencode run <task> --dir <context_path> -m <model> --dangerously-skip-permissions`.
+    Credentials are passed via OPENAI_API_KEY + OPENAI_BASE_URL env vars only.
+    Platform review agent interception (D-078) deferred to R11.
     """
-    # Security check
-    denial = _check_dangerous(code)
-    if denial:
+
+    agent_type = "opencode_cli"
+
+    def is_available(self) -> bool:
+        return is_opencode_available()
+
+    async def invoke_coding_task(
+        self,
+        task: str,
+        context_path: str,
+        config: dict | None = None,
+    ) -> dict:
+        config = config or {}
+
+        if not is_opencode_available():
+            return _err("opencode CLI not found in PATH")
+
+        ctx = Path(context_path)
+        if not ctx.is_dir():
+            return _err(f"context_path does not exist: {context_path}")
+
+        env = _build_opencode_env(config)
+        has_key = bool(env.get("OPENAI_API_KEY"))
+        model = _pick_model(config, has_key)
+        timeout = int(config.get("timeout_seconds", 180))
+
+        cmd = [
+            "opencode", "run", task,
+            "--dir", str(ctx),
+            "-m", model,
+            "--dangerously-skip-permissions",
+        ]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(ctx),
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return _err(f"Timed out after {timeout}s", issues=[f"timeout={timeout}s"])
+
+            exit_code = proc.returncode
+            raw = _strip_ansi(stdout_b.decode("utf-8", errors="replace"))[:_OUTPUT_CAP]
+            stderr_text = _strip_ansi(stderr_b.decode("utf-8", errors="replace"))[:4096]
+
+        except Exception as exc:
+            return _err(f"Failed to launch opencode: {exc}")
+
+        changed = await _git_changed_files(str(ctx))
+        summary = _extract_summary(raw) or ("Task completed" if exit_code == 0 else "Task failed")
+        issues = [stderr_text] if exit_code != 0 and stderr_text else []
+
         return {
-            "exit_code": 1, "stdout": "", "stderr": denial,
-            "elapsed_ms": 0, "provider": "security_block",
-            "fallback": True, "blocked": True,
-        }
-
-    # Ensure sandbox directory
-    execution_id = _exec_id()
-    sandbox_dir = cwd or os.path.join(SANDBOX_BASE, execution_id)
-    os.makedirs(sandbox_dir, exist_ok=True)
-
-    # Clean environment
-    clean_env = _clean_env()
-
-    start = time.monotonic()
-
-    if is_opencode_available():
-        result = await _run_opencode(code, language, timeout, sandbox_dir, clean_env, model)
-    else:
-        result = await _run_fallback(code, language, timeout, sandbox_dir, clean_env)
-
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-    result["elapsed_ms"] = elapsed_ms
-    return result
-
-
-async def _run_opencode(code: str, language: str, timeout: int,
-                        cwd: str, env: dict, model: str = None) -> dict:
-    """Execute via opencode CLI.
-
-    Uses `opencode run --command` for direct command execution,
-    or `opencode run <message>` with piped code for AI-assisted execution.
-    """
-    bin_path = _find_opencode()
-    if not bin_path:
-        return await _run_fallback(code, language, timeout, cwd, env)
-
-    # Build command: use --command for direct shell execution
-    if language == "bash" or language == "sh":
-        cmd_str = code
-    else:
-        cmd_str = f"python3 -c {_shell_quote(code)}"
-
-    args = [bin_path, "run", "--command", cmd_str, "--format", "json"]
-    if model:
-        args.extend(["-m", model])
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=timeout,
-        )
-        rc = proc.returncode or 0
-        if rc != 0:
-            # OpenCode CLI present but the invocation failed (e.g. not logged in,
-            # unsupported flag, model not configured). Fall back to the sandboxed
-            # shell executor so the code still runs, and report it honestly.
-            fb = await _run_fallback(code, language, timeout, cwd, env)
-            fb["opencode_error"] = stderr.decode("utf-8", errors="replace")[:512]
-            return fb
-        return {
-            "exit_code": rc,
-            "stdout": stdout.decode("utf-8", errors="replace")[:65536],
-            "stderr": stderr.decode("utf-8", errors="replace")[:65536],
-            "provider": "opencode",
-            "fallback": False,
-            "blocked": False,
-        }
-    except asyncio.TimeoutError:
-        return {
-            "exit_code": -1, "stdout": "", "stderr": f"Timeout after {timeout}s",
-            "provider": "opencode", "fallback": False, "blocked": False,
-        }
-    except Exception as e:
-        return await _run_fallback(code, language, timeout, cwd, env)
-
-
-def _shell_quote(s: str) -> str:
-    """Safely quote a string for shell -c usage."""
-    import shlex
-    return shlex.quote(s)
-
-
-async def _run_fallback(code: str, language: str, timeout: int,
-                        cwd: str, env: dict) -> dict:
-    """Execute via fallback shell executor (python3 -c or bash -c)."""
-    if language == "python" or language == "python3":
-        cmd = ["python3", "-c", code]
-    elif language == "bash" or language == "sh":
-        cmd = ["bash", "-c", code]
-    else:
-        cmd = ["python3", "-c", code]
-
-    # Allowlist check for fallback
-    denial = _check_command_allowlist(cmd)
-    if denial:
-        return {
-            "exit_code": 1, "stdout": "", "stderr": denial,
-            "provider": "fallback_shell", "fallback": True, "blocked": True,
-        }
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout,
-        )
-        return {
-            "exit_code": proc.returncode or 0,
-            "stdout": stdout.decode("utf-8", errors="replace")[:65536],
-            "stderr": stderr.decode("utf-8", errors="replace")[:65536],
-            "provider": "fallback_shell",
-            "fallback": True,
-            "blocked": False,
-        }
-    except asyncio.TimeoutError:
-        return {
-            "exit_code": -1, "stdout": "", "stderr": f"Timeout after {timeout}s",
-            "provider": "fallback_shell", "fallback": True, "blocked": False,
-        }
-    except Exception as e:
-        return {
-            "exit_code": -1, "stdout": "", "stderr": str(e),
-            "provider": "fallback_shell", "fallback": True, "blocked": False,
+            "status": "ok" if exit_code == 0 else "error",
+            "reason": stderr_text if exit_code != 0 else "",
+            "summary": summary,
+            "changed_files": changed,
+            "diff_ref": None,  # R11: write diff to artifact storage
+            "issues": issues,
+            "raw_output": raw,
+            "exit_code": exit_code,
+            "model": model,
+            "agent_type": self.agent_type,
         }
 
 
-def _exec_id() -> str:
-    import uuid
-    return uuid.uuid4().hex[:12]
+def _err(reason: str, issues: list[str] | None = None) -> dict:
+    return {
+        "status": "error",
+        "reason": reason,
+        "summary": "",
+        "changed_files": [],
+        "diff_ref": None,
+        "issues": issues or [reason],
+        "raw_output": "",
+        "exit_code": -1,
+        "agent_type": "opencode_cli",
+    }
 
 
-def _clean_env() -> dict:
-    """Return a clean environment with secret env vars removed."""
-    env = os.environ.copy()
-    # Remove sensitive vars
-    for key in list(env.keys()):
-        if any(s in key.upper() for s in ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]):
-            del env[key]
-    # Ensure basic PATH
-    env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
-    return env
+# ── qcode CLI adapter ─────────────────────────────────────────────────────
+
+class QCodeCLIAdapter:
+    """Adapter for qcode (or other CLI-based AI coding agents). R11: real invocation."""
+
+    agent_type = "qcode_cli"
+
+    def is_available(self) -> bool:
+        return shutil.which("qcode") is not None
+
+    async def invoke_coding_task(
+        self,
+        task: str,
+        context_path: str,
+        config: dict | None = None,
+    ) -> dict:
+        return {
+            "status": "not_implemented",
+            "reason": "Real qcode invocation deferred to R11 (P4 execution chain, D-078)",
+            "summary": "Stub — no task was executed",
+            "changed_files": [],
+            "diff_ref": None,
+            "issues": [],
+            "raw_output": "",
+        }
+
+
+# ── Platform agent adapter (default) ─────────────────────────────────────
+
+class PlatformAgentAdapter:
+    """Routes to LangGraph P4 execution nodes (R11). R8: stub."""
+
+    agent_type = "platform_agent"
+
+    def is_available(self) -> bool:
+        return True
+
+    async def invoke_coding_task(
+        self,
+        task: str,
+        context_path: str,
+        config: dict | None = None,
+    ) -> dict:
+        return {
+            "status": "not_implemented",
+            "reason": "Platform LangGraph agent P4 execution deferred to R11",
+            "summary": "Stub — no task was executed",
+            "changed_files": [],
+            "diff_ref": None,
+            "issues": [],
+            "raw_output": "",
+        }
+
+
+# ── Factory ───────────────────────────────────────────────────────────────
+
+_ADAPTER_MAP = {
+    "opencode_cli": OpenCodeCLIAdapter,
+    "qcode_cli": QCodeCLIAdapter,
+    "platform_agent": PlatformAgentAdapter,
+}
+
+
+def get_coding_agent_adapter(agent_type: str) -> CodingAgentAdapter:
+    cls = _ADAPTER_MAP.get(agent_type)
+    if cls is None:
+        raise ValueError(f"Unknown coding agent type: {agent_type!r}")
+    return cls()

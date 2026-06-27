@@ -24,10 +24,18 @@ def isolated_data():
 
     tmp = tempfile.mkdtemp(prefix="rebuild-test-")
     db_url = f"sqlite:///{tmp}/rebuild.db"
-    settings = Settings(data_dir=tmp, debug=True, database_url=db_url)
+    ws_tmp = os.path.join(tmp, "workspace")
+    settings = Settings(data_dir=tmp, debug=True, database_url=db_url, workspace_dir=ws_tmp)
     clear_services_cache()
     svc = get_services(settings)
+    # workspace_service / trace_writer / audit_writer read the GLOBAL settings
+    # singleton directly (not the injected one), so isolate it too — otherwise
+    # tests pollute the real 工作区/ tree. object.__setattr__ bypasses frozen.
+    import app.core.config as cfg
+    _orig_ws = cfg.settings.workspace_dir
+    object.__setattr__(cfg.settings, "workspace_dir", ws_tmp)
     yield svc
+    object.__setattr__(cfg.settings, "workspace_dir", _orig_ws)
     clear_services_cache()
     # Reset globals again so next test uses a fresh DB
     db_mod._engine = None

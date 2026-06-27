@@ -1,4 +1,9 @@
-"""Integration API routes — Git, Remote, OpenCode, Feishu, and aggregate summary."""
+"""Integration API routes — Git, Remote, Feishu, and aggregate summary.
+
+D-076 (2026-06-26): OpenCode and AI coding agent configuration has been moved to
+routes_coding_agents.py. The former /execution/opencode endpoints (which incorrectly
+treated OpenCode as a shell executor) have been removed.
+"""
 
 import os
 import uuid
@@ -16,7 +21,6 @@ from app.schemas.common import SuccessEnvelope, Meta
 from app.services.git_service import GitService, run_git_command
 from app.services.remote_service import RemoteService
 from app.services.integration_service import IntegrationSummaryService
-from app.services.opencode_adapter import is_opencode_available
 from app.services.git_oauth_service import (
     GitAccountService, get_github_authorize_url,
     exchange_github_code, fetch_github_user, fetch_github_repos,
@@ -437,42 +441,6 @@ async def test_remote(remote_host_id: str, db: Session = Depends(_db)):
         svc.update(remote_host_id, status=RemoteHostStatus.error)
         return SuccessEnvelope(data={"status": "error", "error": str(e)},
                                meta=Meta(source_status="real", capability_status="available"))
-
-
-# ── OpenCode Execution Integration ──────────────────────
-
-class OpenCodeExecuteRequest(BaseModel):
-    code: str = Field(..., min_length=1)
-    language: str = "python"
-    timeout: int = 30
-    model: str | None = None  # Model name for opencode (e.g. 'deepseek-chat')
-
-
-@integration_router.post("/execution/opencode")
-async def execute_opencode(req: OpenCodeExecuteRequest):
-    """Execute code via the configured ExecutionProvider (local subprocess by
-    default; container sandbox when EXECUTION_MODE=container — Phase C2)."""
-    from app.services.execution_provider import get_execution_provider
-    provider = get_execution_provider()
-    result = await provider.execute(code=req.code, language=req.language,
-                                    timeout=req.timeout, model=req.model)
-    get_services().trace_writer.write("state_change", action="opencode_execute",
-                                       summary=f"Provider={result['provider']}, exit={result['exit_code']}")
-    return SuccessEnvelope(data=result, meta=Meta(
-        source_status="fallback" if result.get("fallback") else "real",
-        capability_status="available",
-    ))
-
-
-@integration_router.get("/execution/opencode/status")
-async def opencode_status():
-    """Check OpenCode availability."""
-    available = is_opencode_available()
-    return SuccessEnvelope(data={
-        "opencode_available": available,
-        "fallback_available": True,
-        "provider": "opencode" if available else "fallback_shell",
-    }, meta=Meta(source_status="real", capability_status="available"))
 
 
 # ── Feishu Integration ───────────────────────────────────

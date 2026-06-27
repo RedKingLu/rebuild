@@ -103,7 +103,7 @@ interface AuditState { audits: Audit[]; }
 export const useAuditStore = create<AuditState>(() => ({ audits: mockAudits }));
 
 // === Workspace UI Store ===
-export type ActivityType = 'stage' | 'files' | 'git' | 'remote' | 'search' | 'agent';
+export type ActivityType = 'stage' | 'files' | 'materials' | 'git' | 'remote' | 'search' | 'agent';
 export type RightTab = 'gate' | 'evidence' | 'trace' | 'audit' | 'context' | 'resource' | 'model';
 export type CenterTabKind = 'agent' | 'stage' | 'file' | 'artifact';
 /** D-025 阶段内部执行模式（不改变 P 阶段晋级 Gate 必须人工授权） */

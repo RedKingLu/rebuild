@@ -16,10 +16,15 @@ services:
     image: rebuild-backend:local
     environment:
       # 容器内路径；env_prefix=REBUILD_（见 backend/app/core/config.py）。
+      # 端口标准：后端统一 8000；前端容器 8080。详见 06-容器化部署与执行隔离规范 §1.1。
       REBUILD_DATA_DIR: /app/.data
       REBUILD_DATABASE_URL: ${REBUILD_DATABASE_URL:-sqlite:////app/.data/rebuild.db}
       REBUILD_CORS_ORIGINS: ${REBUILD_CORS_ORIGINS:-http://localhost:8080}
       REBUILD_FRONTEND_URL: ${REBUILD_FRONTEND_URL:-http://localhost:8080}
+      # OAuth 回调后端两套拓扑都在 8000，注册一次通用：
+      REBUILD_GITHUB_REDIRECT_URI: ${REBUILD_GITHUB_REDIRECT_URI:-http://localhost:8000/api/integrations/git/oauth/github/callback}
+      # 容器内执行模式（默认 local 宿主子进程；container 见下方 docker.sock opt-in）：
+      EXECUTION_MODE: ${EXECUTION_MODE:-local}
     env_file:
       - path: .env       # 密钥（LLM_API_KEY 等）只经 env_file 注入，绝不写进镜像
         required: false
@@ -28,9 +33,14 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
-    # 执行宿主 Docker 以驱动 execution-sandbox（C2）——如启用，再放开下行挂载。
+    # ── 容器内执行（Phase C2，Q-R8-01 已裁决方案 A：docker-py）——默认关闭。 ──
+    # 在 compose 启用受控容器执行需三步同时满足：
+    #   1) 上方 environment 改为：  EXECUTION_MODE: container
+    #   2) 取消注释下面的 docker.sock 挂载（L4：等同把宿主 Docker 控制权交给 backend，
+    #      仅在可信单机环境启用；纵深防御与硬化基线见 06-容器化部署与执行隔离规范 §3）
+    #   3) 先构建沙箱镜像：  docker compose --profile sandbox build execution-sandbox
     # volumes:
-    #   - /var/run/docker.sock:/var/run/docker.sock:ro
+    #   - /var/run/docker.sock:/var/run/docker.sock
 
   frontend:
     build:

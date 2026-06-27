@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.models.agent_definition import AgentDefinition, AgentType, DefinitionStatus
 from app.models.skill_definition import SkillDefinition, SkillSeries, SkillCategory, SkillStatus
 from app.models.resource_entry import ResourceEntry, ResourceType, SourceType, TrustLevel, RiskLevel, ResourceStatus
+from app.models.coding_agent_config import CodingAgentConfig, CodingAgentType, CodingAgentInvokeMode, CodingAgentStatus
 
 
 AGENT_SEEDS = [
@@ -207,7 +208,7 @@ RESOURCE_SEEDS = [
 
 def seed_all(db: Session) -> dict:
     """Seed initial data. Returns counts seeded."""
-    counts = {"agents": 0, "skills": 0, "resources": 0}
+    counts = {"agents": 0, "skills": 0, "resources": 0, "coding_agents": 0}
 
     # Agents
     existing = db.query(AgentDefinition).count()
@@ -229,6 +230,26 @@ def seed_all(db: Session) -> dict:
         for s in RESOURCE_SEEDS:
             db.add(ResourceEntry(**s))
         counts["resources"] = len(RESOURCE_SEEDS)
+
+    # Coding Agent: pre-seed one OpenCode config if none exist
+    existing_ca = db.query(CodingAgentConfig).count()
+    if existing_ca == 0:
+        import shutil
+        oc_available = shutil.which("opencode") is not None
+        db.add(CodingAgentConfig(
+            agent_type=CodingAgentType.opencode_cli,
+            name="OpenCode (本地 CLI)",
+            invoke_mode=CodingAgentInvokeMode.cli,
+            config={
+                "model": "openai/deepseek-v4-flash",
+                "base_url": "http://maas.icompify.com:32788/v1",
+                "timeout_seconds": 180,
+                "note": "API Key 由平台 LLM_API_KEY 环境变量注入，不存储于此处",
+            },
+            status=CodingAgentStatus.connected if oc_available else CodingAgentStatus.not_configured,
+            enabled=True,
+        ))
+        counts["coding_agents"] = 1
 
     db.commit()
     return counts
