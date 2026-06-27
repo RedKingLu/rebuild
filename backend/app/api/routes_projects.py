@@ -57,6 +57,15 @@ async def create_project(
     svc = ProjectService(db)
     project = svc.create(req)
     svc_deps = get_services()
+
+    # R8: Auto-initialize per-project workspace directory (D-050)
+    try:
+        from app.services.workspace_service import init_workspace
+        init_workspace(project.project_id)
+        svc.update(project.project_id, workspace_status="initialized")
+    except Exception:
+        pass  # Workspace init failure is non-fatal
+
     svc_deps.trace_writer.write(
         "state_change", action="create_project",
         summary=f"Created project {project.project_id}",

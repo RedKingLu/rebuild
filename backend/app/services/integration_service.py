@@ -70,12 +70,13 @@ class IntegrationSummaryService:
         remote_connected = sum(1 for r in remote_hosts if r.status == RemoteHostStatus.connected)
         remote_total = len(remote_hosts)
 
-        # Count execution integrations (opencode)
-        opencode_configs = self.db.query(IntegrationConfig).filter(
-            IntegrationConfig.integration_type == IntegrationType.opencode
+        # Count AI coding agents (D-076: replaces old "execution/opencode" count)
+        from app.models.coding_agent_config import CodingAgentConfig, CodingAgentStatus
+        coding_agents = self.db.query(CodingAgentConfig).filter(
+            CodingAgentConfig.enabled == True
         ).all()
-        opencode_connected = sum(1 for o in opencode_configs if o.status == IntegrationStatus.connected)
-        opencode_total = len(opencode_configs)
+        coding_agents_connected = sum(1 for a in coding_agents if a.status == CodingAgentStatus.connected)
+        coding_agents_total = len(coding_agents)
 
         # Count other integrations (feishu)
         feishu_configs = self.db.query(IntegrationConfig).filter(
@@ -87,7 +88,7 @@ class IntegrationSummaryService:
         return {
             "git": {"connected": git_connected, "total": git_total},
             "remote": {"connected": remote_connected, "total": remote_total},
-            "execution": {"connected": opencode_connected, "total": opencode_total},
+            "coding_agents": {"connected": coding_agents_connected, "total": coding_agents_total},
             "other": {"connected": feishu_connected, "total": feishu_total},
             "source_status": "real",
         }

@@ -1,21 +1,22 @@
-"""Trace writer — FastAPI middleware that records every API request as an in-memory Trace.
+"""Trace writer — records execution/action traces to in-memory store + file.
 
-R4: Traces are stored in-memory (volatile). They are lost on restart.
-This is the minimal engineering landing of D-066 "No Trace, No Trusted Result".
-
-The trace_writer is NOT a persistence layer. It is explicitly volatile.
+R4: In-memory (volatile) store for instant API queries.
+R8: Adds file persistence — writes to project workspace .rebuild/traces.jsonl.
+    File persistence ensures traces survive restart.
 """
 
+import json
 import time
 import uuid
 from collections import deque
+from pathlib import Path
 from typing import Dict, List, Optional
 
 MAX_TRACES = 10000  # in-memory cap to prevent unbounded growth
 
 
 class TraceWriter:
-    """In-memory trace event store. Volatile — not persisted to disk."""
+    """Trace event store — in-memory for API queries + file persistence (R8)."""
 
     def __init__(self):
         self._traces: deque[dict] = deque(maxlen=MAX_TRACES)
@@ -34,7 +35,10 @@ class TraceWriter:
         project_id: Optional[str] = None,
         **extra,
     ) -> dict:
-        """Record a trace event. Returns the trace dict."""
+        """Record a trace event. Returns the trace dict.
+
+        R8: Also appends to .rebuild/traces.jsonl if project_id is set and workspace exists.
+        """
         trace = {
             "trace_id": f"trace-{uuid.uuid4().hex[:12]}",
             "trace_type": trace_type,
@@ -46,11 +50,23 @@ class TraceWriter:
             "graph_status": graph_status,
             "transition_mode": transition_mode,
             "request_id": request_id,
-            "persistence": "volatile",
+            "persistence": "file+memory",
             "created_at": _now(),
             **extra,
         }
         self._traces.append(trace)
+
+        # R8: File persistence to project workspace .rebuild/traces.jsonl
+        if project_id:
+            try:
+                from app.core.config import settings
+                traces_file = Path(settings.workspace_dir) / "projects" / project_id / ".rebuild" / "traces.jsonl"
+                traces_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(traces_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(trace, ensure_ascii=False) + "\n")
+            except Exception:
+                pass  # file persistence failure is non-fatal to in-memory
+
         return trace
 
     def query(

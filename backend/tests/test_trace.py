@@ -27,7 +27,7 @@ def test_trace_writer_records_requests(client, project_id):
     data = resp.json()["data"]
     traces = data["traces"]
     assert len(traces) >= 1
-    assert data["persistence"] == "volatile"
+    assert data["persistence"] == "file+memory"
 
 
 def test_trace_has_required_fields(client, project_id):
@@ -44,7 +44,7 @@ def test_trace_has_required_fields(client, project_id):
         assert "transition_mode" in t
         assert t["graph_status"] == "not_connected"
         assert t["transition_mode"] == "mock"
-        assert t["persistence"] == "volatile"
+        assert t["persistence"] == "file+memory"
 
 
 def test_trace_filter_by_type(client, project_id):

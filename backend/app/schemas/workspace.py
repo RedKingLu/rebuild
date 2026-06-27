@@ -33,5 +33,6 @@ class WorkspaceAggregateResponse(BaseModel):
     recent_traces: list[TraceResponse] = Field(default_factory=list)
     recent_audits: list[AuditResponse] = Field(default_factory=list)
     file_index: list[FileIndex] = Field(default_factory=list)
+    material_index: list[FileIndex] = Field(default_factory=list)
     graph_status: GraphStatus = Field(default_factory=GraphStatus)
     meta: Meta = Field(default_factory=Meta)

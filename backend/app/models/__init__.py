@@ -10,6 +10,9 @@ from app.models.git_host import GitHost, GitHostStatus, GitPlatform
 from app.models.remote_host import RemoteHost, HostType, RemoteHostStatus
 from app.models.integration_config import IntegrationConfig, IntegrationType, IntegrationStatus
 from app.models.git_account import GitAccount, GitAccountPlatform, AccountStatus
+from app.models.coding_agent_config import (
+    CodingAgentConfig, CodingAgentType, CodingAgentInvokeMode, CodingAgentStatus
+)
 
 __all__ = [
     "Base",
@@ -24,4 +27,5 @@ __all__ = [
     "RemoteHost", "HostType", "RemoteHostStatus",
     "IntegrationConfig", "IntegrationType", "IntegrationStatus",
     "GitAccount", "GitAccountPlatform", "AccountStatus",
+    "CodingAgentConfig", "CodingAgentType", "CodingAgentInvokeMode", "CodingAgentStatus",
 ]

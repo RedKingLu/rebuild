@@ -1,4 +1,7 @@
-/** Integration Service — Git OAuth / Remote / OpenCode / Feishu APIs. */
+/** Integration Service — Git OAuth / Remote / Coding Agents / Feishu APIs.
+ * D-076 (R8-5): OpenCode is now an AI coding agent config, not a shell executor.
+ * Old executeOpenCode / getOpenCodeStatus removed. Use CodingAgent APIs instead.
+ */
 
 import { get, post, del } from './client';
 
@@ -34,7 +37,7 @@ export interface RemoteHostInfo {
 export interface IntegrationSummary {
   git: { connected: number; total: number };
   remote: { connected: number; total: number };
-  execution: { connected: number; total: number };
+  coding_agents: { connected: number; total: number };
   other: { connected: number; total: number };
 }
 
@@ -101,15 +104,49 @@ export async function testRemoteHost(id: string): Promise<any> {
   return resp.data;
 }
 
-// ── OpenCode APIs ──
+// ── Coding Agent APIs (D-077 / D-078, R8-5) ──
 
-export async function executeOpenCode(code: string, language?: string, timeout?: number, model?: string): Promise<any> {
-  const resp = await post<any>('/integrations/execution/opencode', { code, language, timeout, model });
+export interface CodingAgentInfo {
+  agent_id: string;
+  agent_type: string;  // opencode_cli | qcode_cli | openai_compat | platform_agent
+  name: string;
+  invoke_mode: string; // cli | api | mcp
+  config: Record<string, any>;
+  credential_ref?: string;
+  credential_status: string;
+  status: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function listCodingAgents(): Promise<CodingAgentInfo[]> {
+  const resp = await get<any>('/coding-agents');
+  return resp.data?.agents || [];
+}
+
+export async function createCodingAgent(data: {
+  agent_type: string; name: string; invoke_mode?: string;
+  config?: Record<string, any>; credential_ref?: string;
+}): Promise<CodingAgentInfo> {
+  const resp = await post<any>('/coding-agents', data);
   return resp.data;
 }
 
-export async function getOpenCodeStatus(): Promise<any> {
-  const resp = await get<any>('/integrations/execution/opencode/status');
+export async function updateCodingAgent(agentId: string, data: Partial<{
+  name: string; invoke_mode: string; config: Record<string, any>;
+  credential_ref: string; enabled: boolean;
+}>): Promise<CodingAgentInfo> {
+  const resp = await post<any>(`/coding-agents/${agentId}`, data);
+  return resp.data;
+}
+
+export async function deleteCodingAgent(agentId: string): Promise<void> {
+  await del(`/coding-agents/${agentId}`);
+}
+
+export async function testCodingAgent(agentId: string): Promise<any> {
+  const resp = await post<any>(`/coding-agents/${agentId}/test`, {});
   return resp.data;
 }
 

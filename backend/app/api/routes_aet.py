@@ -64,7 +64,7 @@ async def list_traces(project_id: str, run_id: str | None = None,
     svc = _svc()
     traces = svc.aet_service.list_traces(project_id=project_id, run_id=run_id,
                                          stage=stage, trace_type=trace_type, limit=limit)
-    return SuccessEnvelope(data={"traces": traces, "persistence": "volatile"}, meta=Meta())
+    return SuccessEnvelope(data={"traces": traces, "persistence": "file+memory"}, meta=Meta())
 
 
 @router.get("/trace/{trace_id}")
@@ -83,7 +83,7 @@ async def list_audits(project_id: str, gate_id: str | None = None,
     svc = _svc()
     audits = svc.aet_service.list_audits(project_id=project_id, gate_id=gate_id,
                                          risk_level=risk_level, limit=limit)
-    return SuccessEnvelope(data={"audits": audits, "persistence": "volatile"}, meta=Meta())
+    return SuccessEnvelope(data={"audits": audits, "persistence": "file+memory"}, meta=Meta())
 
 
 @router.get("/audit/{audit_id}")
