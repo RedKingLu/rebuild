@@ -548,12 +548,42 @@ class TestModelAPI:
         data = resp.json()
         assert data["meta"]["capability_status"] == "future"
 
-    def test_assistant_chat_endpoint_exists(self, client):
-        """Assistant chat endpoint should exist (may return blocked if no keys)."""
+    def test_assistant_chat_endpoint_exists(self, client, monkeypatch):
+        """Assistant chat endpoint contract — gateway→adapter→response wiring.
+
+        Mocks the litellm boundary so the test is deterministic and does NOT depend on a
+        live external LLM (live connectivity is verified by /model/self-test and in real use).
+        R9-5-1: real LLM calls now carry a hard timeout (LLM_REQUEST_TIMEOUT) so a
+        non-responding provider fails fast instead of hanging — this test no longer hangs.
+        """
+        class _Msg:
+            content = "你好，我是平台助手。"
+
+        class _Choice:
+            message = _Msg()
+
+        class _Usage:
+            prompt_tokens = 1
+            completion_tokens = 2
+            total_tokens = 3
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = _Usage()
+
+        async def _fake_acompletion(**kwargs):
+            return _Resp()
+
+        import litellm
+        monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
+
         resp = client.post("/api/assistant/chat", json={"message": "Hi"})
         assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "success"
+        data = resp.json()["data"]
+        # adapter success status is "completed"
+        assert data["status"] == "completed"
+        assert data["reply"] == "你好，我是平台助手。"
+        assert data["source"] == "ModelGateway"
 
 
 # ═══════════════════════════════════════════════════════════════════════

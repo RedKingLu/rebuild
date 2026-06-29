@@ -97,5 +97,5 @@ AUDIT_TYPES = [
 # === Transition mode (R4: always "mock") ===
 TRANSITION_MODES = ["mock", "langgraph", "manual"]
 
-# === Graph capability status (R4: always "not_connected") ===
-GRAPH_CAPABILITY_STATUSES = ["not_connected", "mock_graph", "placeholder", "live"]
+# === Graph capability status (R9-5-1: real probe — "live" when StateGraph builds) ===
+GRAPH_CAPABILITY_STATUSES = ["live", "degraded", "not_connected", "mock_graph", "placeholder"]

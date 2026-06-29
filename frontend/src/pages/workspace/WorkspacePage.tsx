@@ -6,15 +6,21 @@ import { STAGE_LABELS, type StageId } from '../../types';
 import { listCodingAgents, type CodingAgentInfo } from '../../services/integrationService';
 import { GlobalMockBanner } from '../../components/ui/MockBanner';
 import { Icon, type IconKey } from '../../components/ui/Icon';
+import { OnboardingWizard } from '../../components/onboarding/OnboardingWizard';
 import { FileTree } from './FileTree';
 import { FileView } from './FileView';
 import { MaterialTree } from './MaterialTree';
 import { BottomDock } from './BottomDock';
 import { InspectPanel, type InspectTab } from './InspectPanel';
+import { GatePanel } from '../../components/gate/GatePanel';
+import { StagePageP0 } from './StagePageP0';
+import { StagePageP1 } from './StagePageP1';
+import { AgentChat, type SystemMessage } from '../../components/agent/AgentChat';
 import {
-  fetchWorkspace, fetchFileTree, fetchMaterialTree, fetchSessions,
+  fetchWorkspace, fetchFileTree, fetchMaterialTree, fetchSessions, fetchMode,
   type WorkspaceAggregate, type FileTreeResponse,
 } from '../../services/workspaceService';
+import { connectEventStream } from '../../services/eventService';
 
 const STAGES: StageId[] = ['p0', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6'];
 const EXEC_MODES: [ExecMode, string, IconKey, string][] = [
@@ -38,6 +44,8 @@ export function WorkspacePage() {
   const [error, setError] = useState<string | null>(null);
   const [usingMock, setUsingMock] = useState(false);
   const [onbDismissed, setOnbDismissed] = useState(false);
+  const [p0SystemMessages, setP0SystemMessages] = useState<SystemMessage[]>([]);
+  const [p0Executing, setP0Executing] = useState(false);
 
   // ── UI state ──
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -47,8 +55,8 @@ export function WorkspacePage() {
   const [rightTab, setRightTab] = useState<InspectTab>('trace');
   const dragging = useRef<'left' | 'right' | 'bottom' | null>(null);
 
-  // Output history (for terminal → output panel)
-  const [outputHistory] = useState<Array<{
+  // Output history (for terminal → output panel). R9-3A: now writable.
+  const [outputHistory, setOutputHistory] = useState<Array<{
     cmd: string; exit_code: number; provider: string; elapsed_ms: number; stdout: string; stderr: string;
   }>>([]);
 
@@ -72,6 +80,8 @@ export function WorkspacePage() {
       setMaterialTree(mt);
       setSessions(sess.sessions || []);
       setUsingMock(false);
+      // R9-3F: hydrate execution mode from backend so it survives refresh.
+      fetchMode(id).then(m => { if (m) ws.setExecMode(m as ExecMode); }).catch(() => {});
     } catch (e: any) {
       setError(e.message || '加载失败');
       setUsingMock(true);
@@ -80,6 +90,62 @@ export function WorkspacePage() {
     }
   }, [id]);
 
+  // ── Agent-driven P0 execution (R9-3G P0-2: consume SSE, show in AgentChat) ──
+  const executeP0Agent = useCallback(async () => {
+    if (!id || p0Executing) return;
+    setP0Executing(true);
+    setP0SystemMessages([]);
+    try {
+      const resp = await fetch(`/api/projects/${id}/onboarding/execute`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const reader = resp.body?.getReader();
+      if (!reader) throw new Error('No response body');
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let currentEvent = '';
+      const msgs: SystemMessage[] = [];
+      const addSysMsg = (data: any, phase: string) => {
+        const sm: SystemMessage = {
+          id: `${phase}-${Date.now()}-${msgs.length}`,
+          phase, message: data.message || '',
+          ok: data.ok, file_count: data.file_count, gate_id: data.gate_id,
+          timestamp: new Date().toISOString(),
+        };
+        msgs.push(sm);
+        setP0SystemMessages([...msgs]);
+      };
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) { currentEvent = line.slice(7).trim(); continue; }
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (currentEvent === 'status') addSysMsg(data, data.phase || 'executing');
+              else if (currentEvent === 'complete') addSysMsg(data, 'complete');
+              else if (currentEvent === 'error') addSysMsg({ ...data, ok: false }, 'error');
+            } catch { /* skip malformed */ }
+          }
+        }
+      }
+      await loadData();
+    } catch (e: any) {
+      setP0SystemMessages(prev => [...prev, {
+        id: `err-${Date.now()}`, phase: 'error', ok: false,
+        message: `Agent 执行失败: ${e.message}`,
+        timestamp: new Date().toISOString(),
+      }]);
+    } finally {
+      setP0Executing(false);
+    }
+  }, [id, p0Executing, loadData]);
+
   useEffect(() => {
     if (id) ws.setProjectId(id);
     if (!ws.tabs.find(t => t.id === 'agent')) {
@@ -87,6 +153,21 @@ export function WorkspacePage() {
     }
     loadData();
   }, [id]);
+
+  // R9-5-8 T6: real SSE subscription — refetch the workspace aggregate when the
+  // backend emits a domain event (run/gate/stage/trace/audit). Replaces the
+  // previously-dead connectEventStream; heartbeats are ignored. Closes on unmount.
+  useEffect(() => {
+    if (!id) return;
+    const DOMAIN_PREFIXES = ['run.', 'stage.', 'gate.', 'trace.', 'audit.', 'checkpoint.', 'interrupt.', 'resume.'];
+    const es = connectEventStream(id, (evt: any) => {
+      const t = evt?.event_type || evt?.type || '';
+      if (DOMAIN_PREFIXES.some(p => t.startsWith(p))) {
+        loadData();
+      }
+    });
+    return () => { try { es?.close(); } catch { /* noop */ } };
+  }, [id, loadData]);
 
   // ── Resize handlers ──
   const onMouseMove = useCallback((e: MouseEvent) => {
@@ -148,10 +229,23 @@ export function WorkspacePage() {
         {/* Status cluster */}
         <span className="row" style={{ marginLeft: 'auto', gap: 8, flexShrink: 0 }}>
           <StatusChip dot="var(--blue)" label={run?.current_stage ? `阶段 ${STAGE_LABELS[run.current_stage].split(' ')[0]}` : '阶段 未启动'} tone="blue" />
-          <StatusChip dot={data?.active_gate ? 'var(--amber)' : 'var(--green)'} label={data?.active_gate ? '等待 Gate' : '无待决 Gate'} tone={data?.active_gate ? 'amber' : 'grey'} />
+          <StatusChip dot={
+            data?.active_gate?.gate_status === 'rejected' ? 'var(--red)' :
+            data?.active_gate ? 'var(--amber)' : 'var(--green)'
+          } label={
+            data?.active_gate?.gate_status === 'rejected' ? 'Gate 已拒绝' :
+            data?.active_gate?.gate_status === 'changes_requested' ? '需返工' :
+            data?.active_gate ? '等待 Gate' : '无待决 Gate'
+          } tone={data?.active_gate?.gate_status === 'rejected' || data?.active_gate?.gate_status === 'changes_requested' ? 'red' : data?.active_gate ? 'amber' : 'grey'} />
           <ModelGwChip />
-          <ExecModeSwitch />
-          <CodingAgentSelector />
+          <ExecModeSwitch projectId={id!} />
+          <CodingAgentSelector projectId={id!} currentRef={project?.coding_agent_ref} />
+          {project?.onboarding_done && onbDismissed && (
+            <button className="btn sm ghost" title="重新打开引导向导" style={{ flexShrink: 0, fontSize: 11 }}
+              onClick={() => setOnbDismissed(false)}>
+              重新引导
+            </button>
+          )}
           <button className="btn sm ghost" title="切换主题" style={{ flexShrink: 0 }} onClick={() => useSettingsStore.getState().setTheme(useSettingsStore.getState().theme === 'light' ? 'dark' : 'light')}>
             {theme === 'light' ? '☾' : '☀'}
           </button>
@@ -219,23 +313,32 @@ export function WorkspacePage() {
             ))}
           </div>
 
-          {/* Gate banner */}
+          {/* R9-3G-B: GatePanel with material review */}
           {data?.active_gate && (
-            <div style={{ padding: '8px 12px', background: 'var(--amber-soft, #fff8e1)', borderBottom: '1px solid var(--amber)', flexShrink: 0 }}>
-              <div style={{ fontSize: 13, fontWeight: 600 }}>⚠ {data.active_gate.gate_type}</div>
-              <div style={{ fontSize: 12, marginTop: 2 }}>{data.active_gate.summary} · 风险级别: {data.active_gate.risk_level || 'L0'}</div>
-            </div>
+            <GatePanel gate={data.active_gate} projectId={id!}
+              onDecided={() => loadData()}
+              onProfilingStart={() => { ws.setActiveTab('agent'); }} />
           )}
 
-          {/* R8: 首次进入诚实占位（非阻塞）。完整引导向导归 P0 接入阶段（R9，§25）；
-              此处不做收集环境/模型/模式的模态，避免空壳。读取真实 onboarding_done。 */}
+          {/* R9-3B: Real onboarding wizard replaces the R8 honest placeholder. */}
           {project && !project.onboarding_done && !onbDismissed && (
+            <OnboardingWizard
+              projectId={id!}
+              projectName={project.name}
+              sourceType={project.source_type}
+              initialMode={ws.execMode}
+              codingAgentRef={project.coding_agent_ref}
+              onDone={() => { setOnbDismissed(true); executeP0Agent(); }}
+            />
+          )}
+
+          {/* R9-3B: Hide placeholder banner when wizard is shown */}
+          {project && !project.onboarding_done && onbDismissed && (
             <div style={{ padding: '6px 12px', background: 'var(--color-surface-subtle)', borderBottom: '1px solid var(--color-border)', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
               <Icon name="run" size={14} />
               <span style={{ color: 'var(--color-text-muted)' }}>
-                项目已接入，工作区可直接使用；完整<b>引导向导</b>将在 P0 接入阶段（R9）开放。
+                项目已接入，工作区可直接使用；<b>引导向导</b>已跳过。可在设置中重新打开。
               </span>
-              <button className="btn sm ghost" style={{ marginLeft: 'auto', fontSize: 11 }} onClick={() => setOnbDismissed(true)}>不再提示</button>
             </div>
           )}
 
@@ -243,26 +346,44 @@ export function WorkspacePage() {
           <div style={{ flex: 1, overflow: 'auto', padding: 12 }}>
             {loading && <div style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>加载 Workspace…</div>}
             {!loading && tab?.kind === 'agent' && (
-              <div style={{ fontSize: 13 }}>
-                <h3>Agent 对话</h3>
-                <p style={{ color: 'var(--color-text-muted)' }}>
-                  项目：{project?.name || id} · 来源：{project?.source_type} · 状态：{project?.workspace_status || 'ready'}
-                </p>
-                <p style={{ color: 'var(--color-text-muted)', fontSize: 12 }}>
-                  Agent 对话将在 P0-P6 编排阶段（R9）接入真实能力。当前展示项目上下文摘要。
-                </p>
-                {run && (
-                  <div style={{ marginTop: 12, fontSize: 12, padding: 8, background: 'var(--color-surface-subtle)', borderRadius: 4 }}>
-                    <div>Run: {run.run_id} · 状态: {run.run_status} · 当前阶段: {run.current_stage}</div>
-                  </div>
-                )}
+              <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                {/* Compact project summary bar */}
+                <div style={{ padding: '6px 12px', fontSize: 11, color: 'var(--color-text-muted)',
+                  background: 'var(--color-surface-subtle)', borderBottom: '1px solid var(--color-border)',
+                  display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                  <span>项目: <b style={{ color: 'var(--color-text)' }}>{project?.name || id}</b></span>
+                  <span>Run: {run?.run_status || '—'}</span>
+                  <span>文件数: {data?.file_index?.reduce?.((acc: number, r: any) => acc + (r.children?.length || 0), 0) || '—'}</span>
+                </div>
+                <div style={{ flex: 1, overflow: 'hidden' }}>
+                  <AgentChat projectId={id!} stage={run?.current_stage || 'p0'} systemMessages={p0SystemMessages} />
+                </div>
               </div>
             )}
             {!loading && tab?.kind === 'stage' && (
-              <div style={{ fontSize: 13 }}>
-                <h3>{STAGE_LABELS[tab.data as StageId]}</h3>
-                <p style={{ color: 'var(--color-text-muted)' }}>阶段页面将在 P0-P6 编排阶段（R9）接入真实业务数据。</p>
-              </div>
+              (() => {
+                const sid = tab.data as StageId;
+                if (sid === 'p0') {
+                  return <StagePageP0
+                    projectId={id!}
+                    project={project}
+                    run={run}
+                    traces={data?.recent_traces || []}
+                    audits={data?.recent_audits || []}
+                    fileIndex={data?.file_index || []}
+                    onReExecute={() => setOnbDismissed(false)}
+                  />;
+                }
+                if (sid === 'p1') {
+                  return <StagePageP1 projectId={id!} stageStatus={run?.stage_status?.p1} onReExecute={loadData} />;
+                }
+                return (
+                  <div style={{ fontSize: 13 }}>
+                    <h3>{STAGE_LABELS[sid]}</h3>
+                    <p style={{ color: 'var(--color-text-muted)' }}>将在后续阶段接入</p>
+                  </div>
+                );
+              })()
             )}
             {!loading && tab?.kind === 'file' && (tab.data as any) && (
               <FileView
@@ -276,7 +397,7 @@ export function WorkspacePage() {
           {/* Bottom Dock */}
           {ws.bottomOpen && (
             <div style={{ height: bottomH, minHeight: 100, maxHeight: window.innerHeight * 0.55, borderTop: '1px solid var(--color-border)', background: 'var(--color-surface)', flexShrink: 0 }}>
-              <BottomDock projectId={id!} outputHistory={outputHistory} sessions={sessions} />
+              <BottomDock projectId={id!} outputHistory={outputHistory} setOutputHistory={setOutputHistory} sessions={sessions} />
             </div>
           )}
         </div>
@@ -313,6 +434,7 @@ export function WorkspacePage() {
                   traces={data?.recent_traces || []}
                   audits={data?.recent_audits || []}
                   loading={loading}
+                  projectId={id}
                 />
               </div>
             </>
@@ -331,7 +453,7 @@ function NodeRail({ run, onOpen }: { run: any; onOpen: (s: StageId) => void }) {
     <div style={{ display: 'flex', gap: 0, alignItems: 'center', flexShrink: 0 }}>
       {STAGES.map((s, i) => {
         const status = ss[s] || 'pending';
-        const color = status === 'completed' ? 'var(--green)' : status === 'in_progress' ? 'var(--blue)' : status === 'waiting_gate' ? 'var(--amber)' : status === 'blocked' ? 'var(--red)' : 'var(--color-text-muted)';
+        const color = status === 'completed' ? 'var(--green)' : status === 'in_progress' ? 'var(--blue)' : status === 'waiting_gate' ? 'var(--amber)' : status === 'blocked' ? 'var(--red)' : status === 'changes_requested' ? 'var(--orange, #e67e22)' : 'var(--color-text-muted)';
         return (
           <div key={s} style={{ display: 'flex', alignItems: 'center' }}>
             {i > 0 && <div style={{ width: 12, height: 1, background: 'var(--color-border)' }} />}
@@ -387,16 +509,27 @@ function ModelGwChip() {
   );
 }
 
-function ExecModeSwitch() {
+function ExecModeSwitch({ projectId }: { projectId: string }) {
   const execMode = useWorkspaceStore(s => s.execMode);
   const setExecMode = useWorkspaceStore(s => s.setExecMode);
+  const handleSwitch = async (mode: ExecMode) => {
+    setExecMode(mode);
+    // R9-3A: Persist to backend
+    try {
+      await fetch(`/api/projects/${projectId}/mode`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+    } catch { /* non-fatal */ }
+  };
   return (
     <span className="row" style={{ gap: 1, flexShrink: 0 }}>
       {EXEC_MODES.map(([mode, label, icon, title]) => (
         <button key={mode} title={title}
           className="btn sm ghost"
           style={{ fontSize: 11, padding: '2px 6px', background: execMode === mode ? 'var(--color-primary-soft)' : 'transparent', color: execMode === mode ? 'var(--color-primary)' : 'var(--color-text-muted)' }}
-          onClick={() => setExecMode(mode)}>
+          onClick={() => handleSwitch(mode)}>
           <Icon name={icon} size={12} /> {label}
         </button>
       ))}
@@ -404,27 +537,42 @@ function ExecModeSwitch() {
   );
 }
 
-/** Coding agent selector (D-078 / R8-5 stub).
- * R11 will wire selection to LangGraph P4 invocation via CodingAgentAdapter.
+/** Coding agent selector (D-078 / R9-3A persistence).
+ * Selection persists to Project.coding_agent_ref.
+ * Real AI invocation still deferred to R11.
  */
-function CodingAgentSelector() {
+function CodingAgentSelector({ projectId, currentRef }: { projectId: string; currentRef?: string | null }) {
   const [agents, setAgents] = useState<CodingAgentInfo[]>([]);
-  const [selected, setSelected] = useState<string>('platform');
+  const [selected, setSelected] = useState<string>(currentRef || 'platform');
 
   useEffect(() => {
     listCodingAgents().then(setAgents).catch(() => {});
   }, []);
 
+  // Sync from parent when project data loads
+  useEffect(() => {
+    if (currentRef) setSelected(currentRef);
+  }, [currentRef]);
+
   const typeLabel: Record<string, string> = {
     opencode_cli: 'OpenCode', qcode_cli: 'qcode', openai_compat: '自定义', platform_agent: '平台',
   };
 
+  const handleChange = async (agentId: string) => {
+    setSelected(agentId);
+    // R9-3A: Persist to backend
+    try {
+      const { updateProject } = await import('../../services/projectService');
+      await updateProject(projectId, { coding_agent_ref: agentId === 'platform' ? null : agentId });
+    } catch { /* non-fatal */ }
+  };
+
   return (
-    <span title="编程 Agent 选择（D-078）：R11 实现真实调用" style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 4 }}>
+    <span title="编程 Agent 选择（D-078）：R11 实现真实调用，R9 已持久化" style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 4 }}>
       <Icon name="agent" size={13} style={{ color: 'var(--color-text-muted)' }} />
       <select
         value={selected}
-        onChange={e => setSelected(e.target.value)}
+        onChange={e => handleChange(e.target.value)}
         style={{ fontSize: 11, padding: '2px 4px', background: 'transparent', border: '1px solid var(--color-border)', borderRadius: 4, color: 'var(--color-text-muted)', cursor: 'pointer' }}
       >
         <option value="platform">平台自有 Agent</option>

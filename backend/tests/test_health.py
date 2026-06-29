@@ -26,7 +26,9 @@ def test_meta(client):
     assert "enums" in data
     assert "r_stages" in data["enums"]
     assert "p_stages" in data["enums"]
-    assert data["source_status"] == "mock"
+    # R9-5-1 阶段D: graph is real (LangGraph compiled) → source_status honest "real"
+    assert data["source_status"] == "real"
+    assert data["graph_status"]["graph_capability_status"] in ("live", "degraded")
 
 
 def test_docs_available(client):

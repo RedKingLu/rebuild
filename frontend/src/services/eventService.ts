@@ -28,9 +28,10 @@ export function connectEventStream(
     es.addEventListener(eventType, (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
-        onEvent(data);
+        // Inject the SSE event name so consumers can filter by type (R9-5-8 T6).
+        onEvent({ event_type: eventType, ...data });
       } catch {
-        // ignore parse errors for mock events
+        // ignore parse errors
       }
     });
   }

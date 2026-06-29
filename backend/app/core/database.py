@@ -29,6 +29,7 @@ def get_engine():
         # (e.g. TestClient without a context manager). Production still uses Alembic.
         from app.models import Base  # noqa: F401 — imports all model classes
         Base.metadata.create_all(bind=_engine)
+        _migrate_add_columns_on_engine(_engine)
     return _engine
 
 
@@ -63,5 +64,31 @@ def get_db():
 
 def init_db():
     """Create all tables (dev convenience — production uses Alembic migrations)."""
+    import app.models  # noqa: F401 — ensure all model tables are registered with Base.metadata
     from app.models.base import Base
     Base.metadata.create_all(bind=get_engine())
+    _migrate_add_columns_on_engine(get_engine())
+
+
+def _migrate_add_columns_on_engine(engine) -> None:
+    """Additive SQLite column migrations for columns added after initial table creation.
+
+    SQLite does not support IF NOT EXISTS on ALTER TABLE (< 3.37), so we check
+    the pragma first. Idempotent — safe to run on every startup.
+    """
+    import sqlalchemy as _sa
+    db_url = str(engine.url)
+    if not db_url.startswith("sqlite"):
+        return  # PostgreSQL uses proper Alembic migrations
+    with engine.connect() as conn:
+        def _add_if_missing(table: str, col: str, col_def: str):
+            res = conn.execute(_sa.text(f"PRAGMA table_info({table})"))
+            existing = [row[1] for row in res.fetchall()]
+            if col not in existing:
+                conn.execute(_sa.text(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}"))
+                conn.commit()
+
+        # WP-6: checkpoint_ref / interrupt_ref added to p_gate (D-037 checkpoint link)
+        _add_if_missing("p_gate", "checkpoint_ref", "VARCHAR(64)")
+        _add_if_missing("p_gate", "interrupt_ref", "VARCHAR(64)")
+

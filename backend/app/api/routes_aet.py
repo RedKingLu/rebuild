@@ -16,10 +16,10 @@ def _svc():
 @router.get("/artifacts")
 async def list_artifacts(project_id: str, stage: str | None = None):
     svc = _svc()
-    artifacts = svc.aet_service.list_artifacts(stage=stage)
+    artifacts = svc.aet_service.list_artifacts(project_id=project_id, stage=stage)
     svc.trace_writer.write("artifact_event", action="list_artifacts",
                            summary=f"Listed {len(artifacts)} artifacts", project_id=project_id)
-    return SuccessEnvelope(data={"artifacts": [a.model_dump() for a in artifacts]}, meta=Meta())
+    return SuccessEnvelope(data={"artifacts": artifacts}, meta=Meta())
 
 
 @router.get("/artifacts/{artifact_id}")
@@ -35,16 +35,18 @@ async def get_artifact(project_id: str, artifact_id: str):
 @router.get("/evidence")
 async def list_evidence(project_id: str, stage: str | None = None):
     svc = _svc()
-    evidences = svc.aet_service.list_evidence(stage=stage)
+    # WP-2: evidence items are now dicts (real filesystem storage), not Pydantic models
+    evidences = svc.aet_service.list_evidence(project_id=project_id, stage=stage)
     svc.trace_writer.write("evidence_event", action="list_evidence",
                            summary=f"Listed {len(evidences)} evidence items", project_id=project_id)
-    return SuccessEnvelope(data={"evidence": [e.model_dump() for e in evidences]}, meta=Meta())
+    return SuccessEnvelope(data={"evidence": evidences}, meta=Meta())
 
 
 @router.get("/evidence/{evidence_id}")
 async def get_evidence(project_id: str, evidence_id: str):
     svc = _svc()
-    e = svc.aet_service.get_evidence(evidence_id)
+    # WP-2: pass project_id for scoped lookup
+    e = svc.aet_service.get_evidence(evidence_id, project_id=project_id)
     if e is None:
         raise HTTPException(404, f"Evidence {evidence_id} not found")
     return SuccessEnvelope(data=e, meta=Meta())
@@ -53,8 +55,9 @@ async def get_evidence(project_id: str, evidence_id: str):
 @router.get("/evidence-gaps")
 async def list_evidence_gaps(project_id: str):
     svc = _svc()
-    gaps = svc.aet_service.list_evidence_gaps()
-    return SuccessEnvelope(data={"gaps": [g.model_dump() for g in gaps]}, meta=Meta())
+    gaps = svc.aet_service.list_evidence_gaps(project_id=project_id)
+    # R9-3G P0-3: gaps are now dicts from uncertainty_manifest.json, not Pydantic models
+    return SuccessEnvelope(data={"gaps": gaps}, meta=Meta())
 
 
 # --- Trace ---

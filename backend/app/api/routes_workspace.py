@@ -6,6 +6,7 @@ material tree, and terminal execution endpoint.
 
 import asyncio
 import os
+import uuid
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -34,6 +35,7 @@ class TerminalExecuteRequest(BaseModel):
     language: str = "shell"
     timeout: int = 30
     session_id: str | None = None
+    confirm: bool = False  # R9-3F: user confirmation for manual/plan-gated actions
 
 
 class EnvironmentUpdateRequest(BaseModel):
@@ -227,13 +229,38 @@ async def execute_command(project_id: str, req: TerminalExecuteRequest):
             "execution_mode": "blocked",
         }, meta=Meta())
 
+    # R9-3F: mode-aware authorization — real behavioral difference + Auto proxy.
+    from app.services.mode_policy import authorize_action
+    from app.services.workspace_service import get_execution_mode
+    current_mode = get_execution_mode(project_id)  # single source (R9-5-7)
+    # Ordinary terminal command = L2 (dangerous commands are deny-listed as L4 above).
+    action_risk = "L2"
+    authz = authorize_action(current_mode, action_risk, req.command[:80], confirmed=req.confirm)
+    svc.trace_writer.write("authorization", action="authorize_execute",
+        summary=f"Auth[{current_mode}]={authz['decision']} for: {req.command[:60]}",
+        project_id=project_id,
+        extras={"decision": authz["decision"], "mode": current_mode, "risk_level": action_risk})
+    if authz["decision"] == "require_confirmation":
+        a = svc.audit_writer.write(audit_type="authorization", action="authorize_execute",
+            decision="require_confirmation", risk_level=action_risk, project_id=project_id,
+            reason=authz["reason"], extras={"mode": current_mode, "command": req.command[:80]})
+        authz["audit_ref"] = a.get("audit_id") if isinstance(a, dict) else getattr(a, "audit_id", None)
+        return SuccessEnvelope(data={
+            "requires_confirmation": True, "executed": False, "blocked": False,
+            "authorization": authz, "exit_code": None, "stdout": "", "stderr": "",
+            "execution_mode": current_mode,
+        }, meta=Meta())
+    if authz["decision"] == "auto_approved":
+        a = svc.audit_writer.write(audit_type="authorization", action="auto_authorize",
+            decision="auto_approved", risk_level=action_risk, project_id=project_id,
+            reason=authz["reason"], extras={"mode": current_mode, "command": req.command[:80]})
+        authz["audit_ref"] = a.get("audit_id") if isinstance(a, dict) else getattr(a, "audit_id", None)
+
     # Create or reuse execution session
     session_id = req.session_id
     if not session_id:
-        import uuid
         session_id = f"es-{uuid.uuid4().hex[:8]}"
         # Write initial session record
-        from app.services.workspace_service import workspace_path
         session_dir = workspace_path(project_id) / ".rebuild" / "sessions"
         session_dir.mkdir(parents=True, exist_ok=True)
         import json
@@ -254,6 +281,7 @@ async def execute_command(project_id: str, req: TerminalExecuteRequest):
             code=req.command,
             language=req.language if req.language == "python" else "shell",
             timeout=req.timeout,
+            cwd=str(workspace_path(project_id)),
         )
     except Exception as e:
         result = {
@@ -283,7 +311,6 @@ async def execute_command(project_id: str, req: TerminalExecuteRequest):
 
     # Update session record
     try:
-        from app.services.workspace_service import workspace_path
         session_file = workspace_path(project_id) / ".rebuild" / "sessions" / f"{session_id}.json"
         if session_file.exists():
             import json as _json
@@ -301,6 +328,7 @@ async def execute_command(project_id: str, req: TerminalExecuteRequest):
 
     return SuccessEnvelope(data={
         "session_id": session_id,
+        "authorization": authz,
         **result,
     }, meta=Meta())
 
@@ -323,3 +351,231 @@ async def list_sessions(project_id: str):
             except Exception:
                 pass
     return SuccessEnvelope(data={"sessions": sessions[:50]}, meta=Meta())
+
+
+# ── Execution mode switching (R9-3A, D-081) ──────────────────────────────
+
+class ModeSwitchRequest(BaseModel):
+    mode: str = Field(..., pattern="^(manual|plan|auto)$")
+
+
+@router.get("/mode")
+async def get_mode(project_id: str):
+    """Read current execution mode for the workspace (single source: workspace.json)."""
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    from app.services.workspace_service import get_execution_mode
+    current_mode = get_execution_mode(project_id)
+    return SuccessEnvelope(data={"project_id": project_id, "execution_mode": current_mode}, meta=Meta())
+
+
+@router.put("/mode")
+async def switch_mode(project_id: str, req: ModeSwitchRequest):
+    """Switch execution mode. Writes Trace (always) and Audit (if density changes)."""
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    # Read previous mode (single source: workspace.json execution_mode)
+    from app.services.workspace_service import get_execution_mode, set_execution_mode
+    previous_mode = get_execution_mode(project_id)
+
+    # Write through the shared single-source helper (R9-5-7 T6/T7, 公理6)
+    new_mode = set_execution_mode(project_id, req.mode)
+
+    # Trace: mode_change event
+    svc.trace_writer.write(
+        "mode_change", action="switch_mode",
+        summary=f"Execution mode changed: {previous_mode} → {new_mode}",
+        project_id=project_id,
+        extras={"from_mode": previous_mode, "to_mode": new_mode},
+    )
+
+    # Audit if authorization density changes significantly
+    if previous_mode != new_mode:
+        svc.audit_writer.write(
+            audit_type="mode_change", action="switch_mode",
+            decision="executed", risk_level="L2",
+            project_id=project_id,
+            reason=f"User switched execution mode: {previous_mode} → {new_mode}",
+            extras={"from_mode": previous_mode, "to_mode": new_mode},
+        )
+
+    return SuccessEnvelope(data={
+        "project_id": project_id,
+        "execution_mode": new_mode,
+        "previous_mode": previous_mode,
+    }, meta=Meta())
+
+
+# ── Source materialization trigger (R9-3A, WP-A3) ────────────────────────
+
+class MaterializeRequest(BaseModel):
+    source_type: str | None = None
+
+
+@router.post("/materialize")
+async def trigger_materialization(project_id: str, req: MaterializeRequest | None = None):
+    """Trigger source materialization for a project. Uses Project.source_config."""
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    from app.services.source_materializer import SourceMaterializer
+    materializer = SourceMaterializer(
+        trace_writer=svc.trace_writer,
+        audit_writer=svc.audit_writer,
+    )
+
+    source_type = req.source_type if req and req.source_type else (
+        project.source_type.value if hasattr(project.source_type, 'value')
+        else str(project.source_type)
+    )
+    source_config = project.source_config or {}
+
+    result = materializer.materialize(project_id, source_type, source_config)
+
+    svc.trace_writer.write(
+        "workspace_action", action="trigger_materialization",
+        summary=f"Materialization {result['materialization_status']}: "
+                f"{result['file_count']} files, {len(result['errors'])} errors",
+        project_id=project_id,
+        extras={"source_type": source_type, "status": result["materialization_status"]},
+    )
+
+    return SuccessEnvelope(data=result, meta=Meta())
+
+
+# ── source_index endpoint (R9-3A, WP-A4) ─────────────────────────────────
+
+@router.get("/source-index")
+async def get_source_index(project_id: str):
+    """Get or generate the source_index for a project."""
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    from app.services.source_materializer import generate_source_index
+    index = generate_source_index(project_id)
+    return SuccessEnvelope(data=index, meta=Meta())
+
+
+def _now_str() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ── Context Assembly (R9-3D) ─────────────────────────────────────────────
+
+@router.get("/context")
+async def get_context(project_id: str, stage: str | None = None):
+    """Assemble Context Package for a given stage (defaults to project.current_stage).
+
+    R9-3D: Filters skills by category=common + category=<stage>.
+    Other stage skills are excluded from the context.
+    """
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    current_stage = stage or project.current_stage or "p0"
+    from app.services.context_assembler import assemble_context
+    ctx = assemble_context(
+        project_id=project_id,
+        current_stage=current_stage,
+        project={
+            "name": project.name,
+            "source_type": project.source_type.value if hasattr(project.source_type, 'value') else str(project.source_type),
+            "workspace_status": project.workspace_status,
+            "onboarding_done": project.onboarding_done,
+            "coding_agent_ref": project.coding_agent_ref,
+        },
+        run={"run_id": project.current_run_id} if project.current_run_id else None,
+        include_skills=True,
+    )
+    svc.trace_writer.write("context_assembly", action="get_context",
+        summary=f"Context assembled for stage={current_stage}, {len(ctx.get('skills', []))} skills",
+        project_id=project_id, extras={"stage": current_stage})
+    return SuccessEnvelope(data=ctx, meta=Meta())
+
+
+# ── P1 Profiling Summary (R9-3D) ─────────────────────────────────────────
+_P0_CORE_ARTIFACTS = [
+    ("intake_report.json", "接入报告"),
+    ("p0_execution_record.json", "执行记录"),
+    ("p0_construction_report.md", "施工报告"),
+    ("p0_review_pass.json", "自检报告"),
+]
+
+
+@router.get("/stage-artifacts/{stage}")
+async def get_stage_artifacts(project_id: str, stage: str):
+    """Return a stage's expected core artifacts with REAL existence (R9-5-8 T4).
+
+    Replaces the frontend's hardcoded filename list that never checked existence.
+    P0 returns its 4 core artifacts; other stages return what is actually present
+    in artifacts/ (honest — a not-yet-produced artifact reads exists=false)."""
+    svc = get_services()
+    if svc.project_service.get(project_id) is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    art_dir = workspace_path(project_id) / "artifacts"
+    stage_l = (stage or "").lower()
+    if stage_l == "p0":
+        items = [{"name": name, "label": label, "exists": (art_dir / name).exists()}
+                 for name, label in _P0_CORE_ARTIFACTS]
+    else:
+        present = sorted(f.name for f in art_dir.glob("*")) if art_dir.exists() else []
+        items = [{"name": n, "label": n, "exists": True} for n in present]
+    return SuccessEnvelope(data={"stage": stage_l, "artifacts": items}, meta=Meta())
+
+
+@router.get("/profiling-summary")
+async def get_profiling_summary(project_id: str):
+    """Get the P1 profiling summary (Markdown) + the authoritative identification
+    item list (R9-5-8 T2/T3). `items` is the single-source list (PROFILING_ITEMS)
+    with per-item existence computed from real artifacts/{key}.json; `uncertainty`
+    is the parsed uncertainty_manifest.json content (backs the Evidence Gaps card).
+    The frontend renders from these — no hardcoded item list."""
+    import json as _json
+    from app.services.full_stack_profiler import PROFILING_ITEMS
+
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    art_dir = workspace_path(project_id) / "artifacts"
+    summary_path = art_dir / "profiling_summary.md"
+
+    # Authoritative items + real existence (single source, T2)
+    items = [
+        {"key": key, "label": label,
+         "exists": (art_dir / f"{key}.json").exists()}
+        for key, label in PROFILING_ITEMS
+    ]
+    # Evidence Gaps source = uncertainty_manifest.json content (T3, not inferred)
+    uncertainty = None
+    um_path = art_dir / "uncertainty_manifest.json"
+    if um_path.exists():
+        try:
+            uncertainty = _json.loads(um_path.read_text(encoding="utf-8"))
+        except Exception:
+            uncertainty = None
+
+    if not summary_path.exists():
+        return SuccessEnvelope(data={
+            "available": False, "summary": "P1 全量识别尚未执行",
+            "items": items, "uncertainty": uncertainty,
+        }, meta=Meta())
+    return SuccessEnvelope(data={
+        "available": True,
+        "summary": summary_path.read_text(encoding="utf-8"),
+        "artifacts": [f.name for f in art_dir.glob("*.json")],
+        "items": items,
+        "uncertainty": uncertainty,
+    }, meta=Meta())

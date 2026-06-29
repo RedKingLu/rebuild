@@ -1,104 +1,249 @@
-"""Gate service — CRUD and mock decision with mandatory Audit writing.
+"""Gate service — DB-persisted CRUD with mandatory Audit writing (R9 P1-2).
 
-R4: Gate decisions MUST write an Audit entry (D-034 hard rule).
-Policy Check and Risk Assessment are mock placeholders.
+Replaces the in-memory _gates dict with SQLAlchemy Gate model.
 """
 
+import logging as _logging
 import uuid
+_logger = _logging.getLogger("rebuild.gate_service")
+
+from datetime import datetime, timezone
 from typing import Optional
 
-from app.repositories.fixtures import seed_gates
+from sqlalchemy.orm import Session
+
+from app.models.gate import Gate
 from app.schemas.gate import (
     GateResponse, GateDecisionRequest,
     PolicyCheckRequest, PolicyCheckResponse,
     RiskAssessmentRequest, RiskAssessmentResponse,
 )
-from app.schemas.aet import AuditResponse
+
+VALID_DECISIONS = {"approve", "reject", "request_changes"}
+STAGE_ORDER = ["p0", "p1", "p2", "p3", "p4", "p5", "p6"]
+_DECISION_TO_STATUS = {
+    "approve": "approved",
+    "reject": "rejected",
+    "request_changes": "changes_requested",
+}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _gate_to_response(g: Gate) -> GateResponse:
+    return GateResponse(
+        gate_id=g.gate_id,
+        gate_type=g.gate_type,
+        gate_status=g.gate_status,
+        project_id=g.project_id,
+        run_id=g.run_id or "",
+        stage=g.stage or "",
+        reason=g.reason or "",
+        risk_level=g.risk_level or "L0",
+        summary=g.summary or "",
+        options=g.options or ["approve", "reject"],
+        recommended_option=None,
+        decision=g.decision,
+        decided_by=None,
+        decided_at=g.decided_at.isoformat() if g.decided_at else None,
+        artifact_refs=g.artifact_refs or [],
+        evidence_refs=g.evidence_refs or [],
+        trace_refs=g.trace_refs or [],
+        audit_ref=g.audit_ref,
+        source_status="real",
+        transition_mode=g.transition_mode or "real",
+        checkpoint_ref=g.checkpoint_ref,
+        interrupt_ref=g.interrupt_ref,
+    )
 
 
 class GateService:
     def __init__(self, services):
         self._svc = services
-        self._gates: dict[str, GateResponse] = {}
-        self._seed()
 
-    def _seed(self):
-        for g in seed_gates():
-            self._gates[g.gate_id] = g
+    def _db(self) -> Session:
+        from app.core.database import get_session
+        return get_session()
 
     def list_by_project(self, project_id: str) -> list[GateResponse]:
-        return [g for g in self._gates.values() if g.project_id == project_id]
+        db = self._db()
+        try:
+            gates = db.query(Gate).filter(Gate.project_id == project_id).order_by(Gate.gate_id).all()
+            return [_gate_to_response(g) for g in gates]
+        finally:
+            db.close()
 
     def get(self, gate_id: str) -> Optional[GateResponse]:
-        return self._gates.get(gate_id)
+        db = self._db()
+        try:
+            g = db.get(Gate, gate_id)
+            return _gate_to_response(g) if g else None
+        finally:
+            db.close()
 
     def get_active(self, project_id: str) -> Optional[GateResponse]:
-        for g in self._gates.values():
-            if g.project_id == project_id and g.gate_status == "waiting_decision":
-                return g
-        return None
+        db = self._db()
+        try:
+            g = db.query(Gate).filter(
+                Gate.project_id == project_id,
+                Gate.gate_status == "waiting_decision",
+            ).first()
+            return _gate_to_response(g) if g else None
+        finally:
+            db.close()
 
-    def create(self, project_id: str, run_id: str, stage: str,
+    def create(self, project_id: str, run_id: str | None, stage: str,
                gate_type: str, reason: str = "", risk_level: str = "L0",
-               summary: str = "", options: list[str] | None = None) -> GateResponse:
-        gid = f"gate-{uuid.uuid4().hex[:6]}"
-        g = GateResponse(
-            gate_id=gid,
-            gate_type=gate_type,
-            gate_status="created",
-            project_id=project_id,
-            run_id=run_id,
-            stage=stage,
-            reason=reason,
-            risk_level=risk_level,
-            summary=summary,
-            options=options or ["approve", "reject"],
-        )
-        self._gates[gid] = g
-        return g
+               summary: str = "", options: list[str] | None = None,
+               artifact_refs: list[str] | None = None,
+               evidence_refs: list[str] | None = None,
+               checkpoint_ref: str | None = None,
+               interrupt_ref: str | None = None) -> GateResponse:
+        db = self._db()
+        try:
+            g = Gate(
+                project_id=project_id,
+                run_id=run_id or "",
+                stage=stage,
+                gate_type=gate_type,
+                gate_status="waiting_decision",
+                reason=reason,
+                risk_level=risk_level,
+                summary=summary,
+                options=options or ["approve", "reject", "request_changes"],
+                artifact_refs=artifact_refs or [],
+                evidence_refs=evidence_refs or [],
+                checkpoint_ref=checkpoint_ref,
+                interrupt_ref=interrupt_ref,
+            )
+            db.add(g)
+            db.commit()
+            db.refresh(g)
+            return _gate_to_response(g)
+        finally:
+            db.close()
 
-    def decide(self, gate_id: str, req: GateDecisionRequest) -> tuple[Optional[GateResponse], Optional[dict]]:
-        """Submit a Gate decision. Returns (updated_gate, audit).
+    def decide(self, gate_id: str, req: GateDecisionRequest,
+               drive_promotion: bool = True) -> tuple[Optional[GateResponse], Optional[dict]]:
+        """Submit a Gate decision with full state advancement (R9 P1-2).
 
-        MUST write an Audit entry (D-034). This is enforced here, not optional.
+        drive_promotion: when False (LangGraph orchestration, R9-5-1), record the
+        decision + Audit but DO NOT advance project/run stage here — the graph drives
+        stage transitions via conditional edges (avoids double-advancement).
         """
-        g = self._gates.get(gate_id)
-        if g is None:
-            return None, None
+        db = self._db()
+        try:
+            g = db.get(Gate, gate_id)
+            if g is None:
+                return None, None
 
-        g.gate_status = "approved" if req.decision == "approve" else (
-            "rejected" if req.decision == "reject" else "resolved"
-        )
-        g.decision = req.decision
-        g.transition_mode = "mock"
+            decision = (req.decision or "").strip().lower()
+            if decision not in VALID_DECISIONS:
+                raise ValueError(
+                    f"非法 Gate 决策：{req.decision!r}（允许 {sorted(VALID_DECISIONS)}）"
+                )
 
-        # MANDATORY: Write Audit entry (D-034, D-066)
-        audit = self._svc.audit_writer.write(
-            audit_type="gate_decision",
-            gate_id=gate_id,
-            risk_level=g.risk_level,
-            action="gate_decision",
-            decision=req.decision,
-            reason=req.reason,
-            project_id=g.project_id,
-            run_id=g.run_id,
-            stage=g.stage,
-        )
+            g.gate_status = _DECISION_TO_STATUS[decision]
+            g.decision = decision
+            g.decided_at = datetime.now(timezone.utc)
+            g.transition_mode = "real"
+            db.commit()
+            db.refresh(g)
 
-        return g, audit
+            # Drive stage transition
+            if g.gate_type == "stage_promotion" and drive_promotion:
+                self._apply_promotion(g, decision)
+
+            # Audit
+            audit = self._svc.audit_writer.write(
+                audit_type="gate_decision", gate_id=gate_id, risk_level=g.risk_level,
+                action="gate_decision", decision=decision, reason=req.reason,
+                project_id=g.project_id, run_id=g.run_id, stage=g.stage,
+            )
+            if audit and isinstance(audit, dict):
+                g.audit_ref = audit.get("audit_id")
+                db.commit()
+
+            return _gate_to_response(g), audit
+        finally:
+            db.close()
+
+    def _apply_promotion(self, g: Gate, decision: str) -> None:
+        """Advance project/run state per a stage-promotion decision."""
+        ps = self._svc.project_service
+        try:
+            project = ps.get(g.project_id)
+        except Exception:
+            _logger.warning(f"_apply_promotion: failed to get project {g.project_id}", exc_info=True)
+            project = None
+        cur = (g.stage or (getattr(project, "current_stage", None) if project else None) or "p0").lower()
+
+        if decision == "approve":
+            try:
+                nxt = STAGE_ORDER[STAGE_ORDER.index(cur) + 1]
+            except (ValueError, IndexError):
+                nxt = cur
+            if g.run_id:
+                self._svc.run_service.set_stage_status(g.run_id, cur, "completed")
+                if nxt != cur:
+                    self._svc.run_service.set_stage_status(g.run_id, nxt, "in_progress")
+            if project is not None:
+                try:
+                    ps.update(g.project_id, current_stage=nxt, active_gate="")
+                except Exception:
+                    _logger.warning(f"_apply_promotion: approve update failed for project {g.project_id}", exc_info=True)
+        elif decision == "reject":
+            if g.run_id:
+                self._svc.run_service.set_stage_status(g.run_id, cur, "blocked")
+            if project is not None:
+                try:
+                    ps.update(g.project_id, active_gate="")
+                except Exception:
+                    _logger.warning(f"_apply_promotion: reject update failed for project {g.project_id}", exc_info=True)
+        elif decision == "request_changes":
+            if g.run_id:
+                self._svc.run_service.set_stage_status(g.run_id, cur, "changes_requested")
+            if project is not None:
+                try:
+                    ps.update(g.project_id, active_gate="")
+                except Exception:
+                    _logger.warning(f"_apply_promotion: request_changes update failed for project {g.project_id}", exc_info=True)
 
     def policy_check(self, req: PolicyCheckRequest) -> PolicyCheckResponse:
-        """Mock policy check — always returns allowed=True in R4."""
+        from app.services.mode_policy import authorize_action, risk_for_action
+        ctx = req.context or {}
+        # Risk: explicit request value wins; else derive from action type (Q-5 single source).
+        risk = req.risk_level if (req.risk_level and req.risk_level != "L0") else risk_for_action(req.action_type)
+        result = authorize_action(
+            mode=ctx.get("mode", "plan"),
+            risk_level=risk,
+            action=req.action_type or "policy_check",
+            in_plan=bool(ctx.get("in_plan", False)),
+        )
         return PolicyCheckResponse(
             check_id=f"pc-{uuid.uuid4().hex[:6]}",
-            allowed=True,
-            reason="R4 mock: no real policy evaluation",
+            allowed=result["decision"] != "require_confirmation",
+            reason=result["reason"],
+            required_gate=result["decision"] == "require_confirmation",
+            source_status="real",
         )
 
     def risk_assess(self, req: RiskAssessmentRequest) -> RiskAssessmentResponse:
-        """Mock risk assessment — always returns L0 in R4."""
+        from app.services.mode_policy import authorize_action, risk_for_action
+        ctx = req.context or {}
+        # R9-5-7 T14: derive mode + risk from request context, not hardcoded plan/L1.
+        mode = ctx.get("mode", "plan")
+        risk = ctx.get("risk_level") or risk_for_action(req.action_type)
+        result = authorize_action(
+            mode=mode, risk_level=risk,
+            action=req.action_type or "risk_assessment",
+            in_plan=bool(ctx.get("in_plan", False)),
+        )
         return RiskAssessmentResponse(
             assessment_id=f"ra-{uuid.uuid4().hex[:6]}",
-            risk_level="L0",
-            summary="R4 mock: no real risk assessment",
+            risk_level=result["risk_level"],
+            summary=result["reason"],
+            source_status="real",
         )

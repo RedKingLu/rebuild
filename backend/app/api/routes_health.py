@@ -50,8 +50,16 @@ async def meta():
             "capability_statuses": CAPABILITY_STATUSES,
         },
         "graph_status": {
-            "graph_capability_status": "not_connected",
-            "transition_mode": "mock",
+            "graph_capability_status": _graph_capability(),
+            "transition_mode": "langgraph",
         },
-        "source_status": "mock",
+        "source_status": "real",
     }
+
+
+def _graph_capability() -> str:
+    try:
+        from app.graph.runtime import graph_capability_probe
+        return graph_capability_probe()
+    except Exception:
+        return "degraded"

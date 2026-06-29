@@ -1,19 +1,16 @@
 import { useEffect, useState } from 'react';
-import { useProjectStore } from '../../stores';
 import { useNavigate } from 'react-router-dom';
 import { STAGE_LABELS } from '../../types';
 import type { Project } from '../../types';
 import { fetchProjectsWithSource, updateProject, deleteProject } from '../../services/projectService';
 
-// R4 最小前后端联调（C-B）：本页在挂载时真实调用后端 GET /api/projects，
-// 成功则展示后端数据并标注 source_status；后端不可用时优雅回退到本地 mock，
-// 页面不崩溃。刻意使用 page-local state（非 store selector），规避 R3-4 的
-// React19 选择器新引用无限渲染问题。
-type ConnState = 'loading' | 'connected' | 'fallback';
+// R4 最小前后端联调（C-B）：本页挂载时真实调用后端 GET /api/projects。
+// R9-5-8 T13/公理1：后端不可用时显示「后端未连接」错误态 + 重试，
+// 绝不回退到本地 mock 冒充真实列表（消除“看起来有数据”的假象）。
+type ConnState = 'loading' | 'connected' | 'error';
 
 export function ProjectListPage() {
-  const mockProjects = useProjectStore(s => s.projects);
-  const [projects, setProjects] = useState<Project[]>(mockProjects);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [conn, setConn] = useState<ConnState>('loading');
   const [sourceStatus, setSourceStatus] = useState<string>('');
   const nav = useNavigate();
@@ -39,11 +36,11 @@ export function ProjectListPage() {
       })
       .catch(() => {
         if (!active) return;
-        setProjects(mockProjects);
-        setConn('fallback');
+        setProjects([]);
+        setConn('error');
       });
     return () => { active = false; };
-    // 仅挂载时拉取一次；mockProjects 为 store 稳定引用，作为回退基线。
+    // 仅挂载时拉取一次。后端不可用→错误态，不回退 mock（公理1）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -55,8 +52,8 @@ export function ProjectListPage() {
         setConn('connected');
       })
       .catch(() => {
-        setProjects(mockProjects);
-        setConn('fallback');
+        setProjects([]);
+        setConn('error');
       });
   };
 
@@ -105,7 +102,10 @@ export function ProjectListPage() {
     conn === 'loading' ? <span className="tag">加载中…</span>
     : conn === 'connected'
       ? <span className="tag violet">后端接口数据 · /api/projects（source_status: {sourceStatus}）</span>
-      : <span className="tag amber">后端未连接 · 显示本地 mock 回退</span>;
+      : <>
+          <span className="tag red">后端未连接 · 无法加载项目</span>
+          <button className="btn sm ghost" style={{ marginLeft: 8 }} onClick={refreshProjects}>重试</button>
+        </>;
 
   // ── Inline modal overlay styles (CSS variables, no separate component) ──
   const overlay: React.CSSProperties = {
@@ -148,6 +148,7 @@ export function ProjectListPage() {
               <div className="row" style={{ fontSize: 12, color: 'var(--ink-2)', gap: 12 }}>
                 <span>来源: {p.source_type}</span>
                 <span>阶段: {p.current_stage ? STAGE_LABELS[p.current_stage as keyof typeof STAGE_LABELS] || p.current_stage : '未开始'}</span>
+                <span>状态: {p.workspace_status === 'importing' ? '⏳ 导入中…' : p.workspace_status === 'ready' ? '✅ 已就绪' : p.workspace_status || '—'}</span>
                 <span>缺口: {p.evidence_gap_count}</span>
                 <span>更新: {p.updated_at?.slice(0, 10)}</span>
                 {p.active_gate && <span className="tag amber">⚠ Gate: {p.active_gate}</span>}
@@ -155,11 +156,16 @@ export function ProjectListPage() {
             </div>
             {/* Right: actions */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-              {!p.onboarding_done && <span className="tag amber">待引导</span>}
+              {p.workspace_status === 'importing' && <span className="tag amber">⏳ 导入中</span>}
+              {!p.onboarding_done && p.workspace_status === 'ready' && <span className="tag amber">待引导</span>}
               <button className="btn sm ghost" onClick={() => nav(`/projects/${p.project_id}`)}>详情</button>
               <button className="btn sm ghost" onClick={() => openEdit(p)}>编辑</button>
               <button className="btn sm ghost" onClick={() => openDelete(p)} style={{ color: 'var(--red, #dc2626)' }}>删除</button>
-              <button className="btn sm" onClick={() => openWs(p.project_id)}>进入工作区</button>
+              <button className="btn sm" onClick={() => openWs(p.project_id)}
+                disabled={p.workspace_status === 'importing'}
+                title={p.workspace_status === 'importing' ? '源码导入中，请稍候…' : '进入工作区'}>
+                {p.workspace_status === 'importing' ? '导入中…' : '进入工作区'}
+              </button>
             </div>
           </div>
         ))}

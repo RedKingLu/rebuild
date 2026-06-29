@@ -2,19 +2,19 @@
   "deepseek-official": {
     "status": "available",
     "capability_marker": "real_available",
-    "last_checked_at": "2026-06-26T01:45:01.853695+00:00",
+    "last_checked_at": "2026-06-28T07:43:05.315202+00:00",
     "credential_status": "configured"
   },
   "maas-icompify": {
     "status": "available",
     "capability_marker": "real_available",
-    "last_checked_at": "2026-06-26T03:13:28.721727+00:00",
+    "last_checked_at": "2026-06-28T07:43:08.020755+00:00",
     "credential_status": "configured"
   },
   "agnes-ai": {
     "status": "available",
     "capability_marker": "real_available",
-    "last_checked_at": "2026-06-26T03:13:15.836304+00:00",
+    "last_checked_at": "2026-06-28T07:43:16.947134+00:00",
     "credential_status": "configured"
   }
 }

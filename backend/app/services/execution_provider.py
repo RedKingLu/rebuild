@@ -6,11 +6,13 @@ D-076 (2026-06-26): Code execution and AI coding agents are strictly separate pa
   - ExecutionProvider must NEVER depend on OpenCode CLI availability.
 
 R8: ContainerExecutionProvider wired via docker-py (Plan A, Q-R8-01 confirmed).
+R9-5-6: RemoteSSHExecutionProvider added (D-093). Three-mode factory.
 
 Modes (env `EXECUTION_MODE`, default "local"):
   - "local"     → LocalSubprocessExecutionProvider: host subprocess behind deny-list.
   - "container" → ContainerExecutionProvider: disposable, network-isolated container.
                   NEVER silently downgrades to host execution.
+  - "remote"    → RemoteSSHExecutionProvider: paramiko SSH + SFTP (D-093).
 """
 
 from __future__ import annotations
@@ -33,6 +35,14 @@ DENY_SUBSTRINGS = [
 
 ALLOWED_COMMANDS = ["python3", "python", "echo", "cat", "ls", "pwd", "which"]
 
+# Commands that are high-risk but not in DENY_SUBSTRINGS (L4 soft-block)
+_L4_PATTERNS = [
+    "chmod", "chown", "chgrp", "crontab", "iptables", "ip6tables",
+    "nftables", "nc -l", "ncat -l", "netcat -l", "mkfs", "fdisk",
+    "dd if=", "kill -9", "killall", "systemctl", "service ",
+    "useradd", "userdel", "passwd", "adduser",
+]
+
 
 def _check_dangerous(code: str) -> str | None:
     code_lower = code.lower()
@@ -40,6 +50,37 @@ def _check_dangerous(code: str) -> str | None:
         if pattern.lower() in code_lower:
             return f"Blocked dangerous pattern: {pattern}"
     return None
+
+
+def _classify_risk(code: str, language: str = "exec") -> str:
+    """Classify execution risk level L0-L5 (R9-5-6 T8 / D-093).
+
+    Returns the risk level string. Does NOT block — caller decides based on mode.
+    """
+    code_lower = code.lower()
+
+    # L5: hard deny patterns (DENY_SUBSTRINGS)
+    for p in DENY_SUBSTRINGS:
+        if p.lower() in code_lower:
+            return "L5"
+
+    # L4: system-modification patterns
+    for p in _L4_PATTERNS:
+        if p.lower() in code_lower:
+            return "L4"
+
+    if language in ("python", "python3"):
+        # Python: flag subprocess/os.system calls as L3
+        if any(x in code_lower for x in ("subprocess", "os.system", "os.popen", "exec(")):
+            return "L3"
+        return "L1"
+
+    # Shell/bash
+    first_word = (code.strip().split() or [""])[0].split("/")[-1].lower()
+    if first_word in {c.lower() for c in ALLOWED_COMMANDS}:
+        return "L1"
+    # Unknown command
+    return "L3"
 
 
 def _clean_env() -> dict:
@@ -52,16 +93,18 @@ def _clean_env() -> dict:
 
 
 class ExecutionProvider(Protocol):
-    """Contract every execution backend implements."""
+    """Contract every execution backend implements (R9-5-6 T3: aligned signature)."""
 
     name: str
 
     async def execute(self, code: str, language: str = "python",
-                      timeout: int = 30, model: str | None = None) -> dict:
-        """Run code and return the standard ExecutionResult dict.
+                      timeout: int = 30, model: str | None = None,
+                      cwd: str | None = None) -> dict:
+        """Run code/command and return the standard ExecutionResult dict.
 
-        Result keys: exit_code, stdout, stderr, elapsed_ms, provider, fallback,
-        blocked. Never raises for ordinary execution failures.
+        Result keys: exit_code, stdout, stderr, elapsed_ms, provider,
+        execution_mode, fallback, blocked, risk_level, audited.
+        Never raises for ordinary execution failures.
         """
         ...
 
@@ -76,7 +119,8 @@ class LocalSubprocessExecutionProvider:
     name = "local_subprocess"
 
     async def execute(self, code: str, language: str = "python",
-                      timeout: int = 30, model: str | None = None) -> dict:
+                      timeout: int = 30, model: str | None = None,
+                      cwd: str | None = None) -> dict:
         import time
         start = time.monotonic()
 
@@ -86,16 +130,24 @@ class LocalSubprocessExecutionProvider:
                 "exit_code": 1, "stdout": "", "stderr": denial,
                 "elapsed_ms": 0, "provider": "security_block",
                 "execution_mode": "local", "fallback": True, "blocked": True,
+                "risk_level": "L5", "audited": False,
             }
 
-        result = await _run_subprocess(code, language, timeout)
+        risk = _classify_risk(code, language)
+        result = await _run_subprocess(code, language, timeout, cwd=cwd)
         result["elapsed_ms"] = int((time.monotonic() - start) * 1000)
         result["execution_mode"] = "local"
+        result["risk_level"] = risk
+        result["audited"] = False
         return result
 
 
-async def _run_subprocess(code: str, language: str, timeout: int) -> dict:
-    """Execute via python3 -c or bash -c in a clean environment."""
+async def _run_subprocess(code: str, language: str, timeout: int,
+                         cwd: str | None = None) -> dict:
+    """Execute via python3 -c or bash -c in a clean environment.
+
+    R9-3A: Accepts optional cwd to bind execution to project workspace (WP-A1.1).
+    """
     clean_env = _clean_env()
 
     if language in ("python", "python3"):
@@ -118,6 +170,7 @@ async def _run_subprocess(code: str, language: str, timeout: int) -> dict:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=clean_env,
+            cwd=cwd,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return {
@@ -161,6 +214,7 @@ class ContainerExecutionProvider:
                 "exit_code": 1, "stdout": "", "stderr": denial,
                 "elapsed_ms": 0, "provider": "security_block",
                 "execution_mode": "container", "fallback": False, "blocked": True,
+                "risk_level": "L5", "audited": False,
             }
 
         # Write code to a temp file that will be mounted into the container.
@@ -220,6 +274,7 @@ class ContainerExecutionProvider:
                 pass
 
         elapsed = int((time.time() - start) * 1000)
+        risk = _classify_risk(code, language)
         return {
             "exit_code": exit_code,
             "stdout": stdout,
@@ -229,12 +284,33 @@ class ContainerExecutionProvider:
             "execution_mode": "container",
             "fallback": False,
             "blocked": False,
+            "risk_level": risk,
+            "audited": False,
         }
 
 
-def get_execution_provider() -> ExecutionProvider:
-    """Return the execution provider selected by EXECUTION_MODE (default local)."""
-    mode = (os.environ.get("EXECUTION_MODE") or "local").strip().lower()
-    if mode == "container":
+def get_execution_provider(
+    mode: str | None = None,
+    remote_host_id: str | None = None,
+    db=None,
+) -> "ExecutionProvider":
+    """Return the execution provider for the given mode.
+
+    Priority: explicit mode arg > EXECUTION_MODE env var > "local".
+    When mode="remote", remote_host_id and db are required.
+    """
+    resolved_mode = (mode or os.environ.get("EXECUTION_MODE") or "local").strip().lower()
+    if resolved_mode == "container":
         return ContainerExecutionProvider()
+    if resolved_mode == "remote":
+        if remote_host_id is None or db is None:
+            raise ValueError(
+                "get_execution_provider(mode='remote') requires remote_host_id and db"
+            )
+        from app.services.remote_executor import RemoteSSHExecutionProvider
+        from app.services.remote_service import RemoteService
+        host = RemoteService(db).get(remote_host_id)
+        if host is None:
+            raise ValueError(f"RemoteHost not found: {remote_host_id}")
+        return RemoteSSHExecutionProvider(host, db)
     return LocalSubprocessExecutionProvider()

@@ -32,6 +32,7 @@ WORKSPACE_SUBDIRS = [
     "logs",
     "reports",
     "indexes",
+    "output_code",   # R9-5-5 D-088②: external platform write target (WorkspaceMediator)
     ".rebuild/sessions",
     ".rebuild/user-notes",
 ]
@@ -43,6 +44,7 @@ USER_WRITABLE_DIRS = {"materials", "reports", ".rebuild/user-notes"}
 PLATFORM_WRITABLE_DIRS = {
     "artifacts", "evidence", "patches", "logs", "runs",
     ".rebuild", ".rebuild/sessions",
+    "output_code",   # R9-5-5: external platform output goes here
 }
 
 # Read-only for users (source code, patches viewing)
@@ -55,6 +57,15 @@ def _now() -> str:
 
 def _workspace_root() -> Path:
     return Path(settings.workspace_dir).resolve()
+
+
+def _graph_cap() -> str:
+    """Real orchestration capability probe (R9-5-1 阶段D); 'degraded' if graph unavailable."""
+    try:
+        from app.graph.runtime import graph_capability_probe
+        return graph_capability_probe()
+    except Exception:
+        return "degraded"
 
 
 def workspace_path(project_id: str) -> Path:
@@ -80,6 +91,49 @@ def init_workspace(project_id: str) -> Path:
     # R8: Environment Profile (D-051 三对象之一) — declarative env metadata.
     init_environment(project_id)
     return ws
+
+
+# ── Execution mode single source (R9-5-7 T6/T7, D-086④ / 公理6) ───────────
+# workspace.json execution_mode is the ONE control source. The top-bar
+# ExecModeSwitch (PUT /mode) and the onboarding wizard finalize both write
+# through here so "选了即生效" with no second source (no Project.execution_mode).
+
+VALID_EXECUTION_MODES = {"manual", "plan", "auto"}
+
+
+def set_execution_mode(project_id: str, mode: str) -> str:
+    """Persist execution_mode into workspace.json. Returns the stored mode.
+
+    Idempotent; creates .rebuild/workspace.json if missing. Invalid modes fall
+    back to the existing/default value rather than corrupting the source.
+    """
+    ws = workspace_path(project_id)
+    meta_dir = ws / ".rebuild"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    meta_file = meta_dir / "workspace.json"
+    meta: dict = {}
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    new_mode = mode if mode in VALID_EXECUTION_MODES else meta.get("execution_mode", "plan")
+    meta["execution_mode"] = new_mode
+    meta["execution_mode_updated_at"] = _now()
+    meta.setdefault("project_id", project_id)
+    meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return new_mode
+
+
+def get_execution_mode(project_id: str) -> str:
+    """Read execution_mode from workspace.json (the single control source)."""
+    meta_file = workspace_path(project_id) / ".rebuild" / "workspace.json"
+    if meta_file.exists():
+        try:
+            return json.loads(meta_file.read_text(encoding="utf-8")).get("execution_mode", "plan")
+        except Exception:
+            pass
+    return "plan"
 
 
 # ── Environment Profile (D-051) ─────────────────────────────────────────
@@ -146,11 +200,17 @@ def _guard(project_id: str, target: Path) -> Path:
     """Resolve target path and enforce it stays within project workspace.
 
     Returns resolved Path on success, raises PermissionError on boundary violation.
-    Absorbed from V26.0 workspace/service.py _guard() pattern.
+    R9-3A: Uses os.path.commonpath for robust prefix matching (fixes D-P2-3:
+    projects/p1 was a prefix match for projects/p10).
     """
+    import os
     ws = workspace_path(project_id).resolve()
     resolved = (ws / target).resolve()
-    if not str(resolved).startswith(str(ws)):
+    try:
+        common = os.path.commonpath([str(ws), str(resolved)])
+    except ValueError:
+        raise PermissionError(f"路径越界：无法解析路径关系")
+    if common != str(ws):
         raise PermissionError(f"路径越界：不允许访问 workspace 之外的文件")
     return resolved
 
@@ -232,6 +292,10 @@ def scan_file_tree(project_id: str) -> list[FileIndex]:
                    children=walk(ws / "artifacts", False)),
         FileIndex(key="patches", label="变更补丁（只读）", editable=False,
                    children=walk(ws / "patches", False)),
+        # R9-5-8 T9: 产出代码 root (D-088② external-platform/P4 write target).
+        # Platform-writable; user-editable view deferred to R11 (avoid P4 write race).
+        FileIndex(key="output_code", label="产出代码", editable=False,
+                   children=walk(ws / "output_code", False)),
     ]
     return roots
 
@@ -359,7 +423,7 @@ class WorkspaceService:
         pending_gates = svc.gate_service.list_by_project(project_id)
 
         recent_artifacts = svc.aet_service.list_artifacts(project_id=project_id)[:10]
-        pending_evidence_gaps = svc.aet_service.list_evidence_gaps()
+        pending_evidence_gaps = svc.aet_service.list_evidence_gaps(project_id=project_id)
         recent_traces = svc.aet_service.list_traces(project_id=project_id, limit=20)
         recent_audits = svc.aet_service.list_audits(project_id=project_id, limit=20)
 
@@ -374,24 +438,31 @@ class WorkspaceService:
         except Exception:
             material_index = []
 
+        # R9-5-8 T1/T11/T12: real state probes — no hardcoded "real"/"available".
+        from app.services import capability_probe
+        _src_type = project.source_type.value if hasattr(project.source_type, 'value') else str(project.source_type)
+        _ws_status = project.workspace_status or "ready"
+        _source_status = capability_probe.probe_source_status(project.project_id, _src_type, _ws_status)
+        _capability_status = capability_probe.probe_capability_status()
+
         # Convert project to dict for response (avoid circular import from ProjectService)
         project_dict = {
             "project_id": project.project_id,
             "name": project.name,
             "description": project.description or "",
             "project_status": project.project_status.value if hasattr(project.project_status, 'value') else str(project.project_status),
-            "source_type": project.source_type.value if hasattr(project.source_type, 'value') else str(project.source_type),
+            "source_type": _src_type,
             "source_config": project.source_config,
             "current_stage": project.current_stage,
             "current_run_id": project.current_run_id,
             "active_gate": project.active_gate,
             "evidence_gap_count": project.evidence_gap_count,
-            "workspace_status": project.workspace_status or "ready",
+            "workspace_status": _ws_status,
             "onboarding_done": project.onboarding_done,
             "created_at": project.created_at.isoformat() if project.created_at else "",
             "updated_at": project.updated_at.isoformat() if project.updated_at else "",
-            "source_status": "real",
-            "capability_status": "available",
+            "source_status": _source_status,
+            "capability_status": _capability_status,
         }
 
         return WorkspaceAggregateResponse(
@@ -407,8 +478,8 @@ class WorkspaceService:
             file_index=file_index,
             material_index=material_index,
             graph_status=GraphStatus(
-                graph_capability_status="not_connected",
-                transition_mode="mock",
+                graph_capability_status=_graph_cap(),
+                transition_mode="langgraph",
             ),
             meta=Meta(),
         )

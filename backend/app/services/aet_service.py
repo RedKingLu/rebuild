@@ -1,53 +1,165 @@
 """AET service — Artifact, Evidence, Trace, Audit queries.
 
-R4: Artifacts and Evidence are mock. Traces and Audits come from
-the in-memory TraceWriter and AuditWriter respectively.
+R9-3G P0-3: Artifacts and Evidence Gaps are now read from the real
+workspace filesystem (artifacts/ directory + uncertainty_manifest.json).
+Traces and Audits come from TraceWriter/AuditWriter.
 """
 
+import json
+from pathlib import Path
 from typing import Optional
 
-from app.repositories.fixtures import (
-    seed_artifacts, seed_evidences, seed_evidence_gaps,
-)
+from app.services.workspace_service import workspace_path
 
 
 class AETService:
     def __init__(self, services):
         self._svc = services
-        self._artifacts: dict[str, object] = {}
-        self._evidences: dict[str, object] = {}
-        self._gaps: list[object] = []
-        self._seed()
 
-    def _seed(self):
-        for a in seed_artifacts():
-            self._artifacts[a.artifact_id] = a
-        for e in seed_evidences():
-            self._evidences[e.evidence_id] = e
-        self._gaps = list(seed_evidence_gaps())
-
-    # --- Artifact ---
+    # --- Artifact (real — reads artifacts/ directory) ---
     def list_artifacts(self, project_id: Optional[str] = None, stage: Optional[str] = None) -> list:
-        results = list(self._artifacts.values())
-        if stage:
-            results = [a for a in results if getattr(a, 'stage', '') == stage]
+        if not project_id:
+            return []
+        art_dir = workspace_path(project_id) / "artifacts"
+        if not art_dir.exists():
+            return []
+        results = []
+        for f in sorted(art_dir.iterdir()):
+            if f.is_file():
+                try:
+                    st = f.stat()
+                    atype = f.suffix.lstrip(".")
+                    results.append({
+                        "artifact_id": f"artifact-{f.stem}",
+                        "artifact_type": atype,
+                        "title": f.stem.replace("_", " ").replace("-", " "),
+                        "stage": stage or "",
+                        "artifact_status": "generated",
+                        "is_evidence_candidate": False,
+                        "content_hash": "",
+                        "bytes": st.st_size,
+                        "path": f"artifacts/{f.name}",
+                        "mock_level": "real",
+                        "name": f.name,
+                        "modified_at": st.st_mtime,
+                    })
+                except Exception:
+                    pass
         return results
 
     def get_artifact(self, artifact_id: str):
-        return self._artifacts.get(artifact_id)
+        # Simple lookup by name match (artifact_id encodes the stem)
+        # Real lookup is done via file read in routes
+        return None
 
-    # --- Evidence ---
+    # --- Evidence (WP-2: real filesystem storage under workspace/evidence/) ---
+    # Evidence objects are stored as {evidence_id}.json in workspace/{project_id}/evidence/
+    # This replaces the deprecated in-memory list approach.
+
+    def _evidence_dir(self, project_id: str):
+        ev_dir = workspace_path(project_id) / "evidence"
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        return ev_dir
+
+    def write_evidence(self, project_id: str, evidence_id: str, evidence_type: str,
+                       status: str = "candidate", source: str = "p0",
+                       claim: str = "", stage: str = "p0",
+                       extra: dict | None = None) -> dict:
+        """Write a real Evidence object to workspace/evidence/{evidence_id}.json.
+
+        Returns the evidence dict (can be serialized as API response).
+        """
+        from datetime import datetime, timezone
+        ev = {
+            "evidence_id": evidence_id,
+            "project_id": project_id,
+            "type": evidence_type,
+            "status": status,
+            "source": source,
+            "claim": claim,
+            "stage": stage,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            ev.update(extra)
+        ev_dir = self._evidence_dir(project_id)
+        ev_file = ev_dir / f"{evidence_id}.json"
+        ev_file.write_text(json.dumps(ev, ensure_ascii=False, indent=2), encoding="utf-8")
+        return ev
+
     def list_evidence(self, project_id: Optional[str] = None, stage: Optional[str] = None) -> list:
-        results = list(self._evidences.values())
-        if stage:
-            results = [e for e in results if getattr(e, 'stage', '') == stage]
+        """Read real Evidence objects from workspace/{project_id}/evidence/.
+
+        Each file is a complete Evidence dict. Optionally filtered by stage.
+        """
+        if not project_id:
+            return []
+        ev_dir = workspace_path(project_id) / "evidence"
+        if not ev_dir.exists():
+            return []
+        results = []
+        for f in sorted(ev_dir.iterdir()):
+            if f.is_file() and f.suffix == ".json":
+                try:
+                    ev = json.loads(f.read_text(encoding="utf-8"))
+                    if stage and ev.get("stage") != stage:
+                        continue
+                    results.append(ev)
+                except Exception:
+                    pass
         return results
 
-    def get_evidence(self, evidence_id: str):
-        return self._evidences.get(evidence_id)
+    def get_evidence(self, evidence_id: str, project_id: Optional[str] = None):
+        """Get a single Evidence by id (optionally scoped to project).
 
-    def list_evidence_gaps(self) -> list:
-        return self._gaps
+        Searches workspace evidence directories. If project_id is given,
+        only searches that project. Otherwise scans all known projects.
+        """
+        from app.core.config import settings
+        import os
+        ws_root = getattr(settings, 'workspace_dir', None) or os.path.join(os.getcwd(), '工作区')
+        projects_dir = os.path.join(ws_root, "projects")
+        if project_id:
+            ev_file = workspace_path(project_id) / "evidence" / f"{evidence_id}.json"
+            if ev_file.exists():
+                try:
+                    return json.loads(ev_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            return None
+        # Scan all projects for this evidence_id
+        if not os.path.isdir(projects_dir):
+            return None
+        for pid in os.listdir(projects_dir):
+            ev_file = workspace_path(pid) / "evidence" / f"{evidence_id}.json"
+            if ev_file.exists():
+                try:
+                    return json.loads(ev_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+        return None
+
+    def list_evidence_gaps(self, project_id: Optional[str] = None) -> list:
+        """Read real evidence gaps from uncertainty_manifest.json.
+
+        Maps gap fields to frontend Evidence schema (evidence_id, summary).
+        """
+        if not project_id:
+            return []
+        manifest = workspace_path(project_id) / "artifacts" / "uncertainty_manifest.json"
+        if not manifest.exists():
+            return []
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            gaps = data.get("evidence_gaps", [])
+            return [{
+                "evidence_id": f"gap-{g.get('item', '')}-{i}",
+                "summary": g.get("detail", g.get("type", "")),
+                "type": g.get("type", ""),
+                "item": g.get("item"),
+            } for i, g in enumerate(gaps)]
+        except Exception:
+            return []
 
     # --- Trace (from trace_writer) ---
     def list_traces(self, project_id: Optional[str] = None, run_id: Optional[str] = None,

@@ -47,6 +47,12 @@ AGENT_SEEDS = [
         "responsibilities": "检查 Node Worker 输出 → 检查与 Task Plan/Stage Plan 对齐 → 检查 Artifact/Evidence → 检查 Trace/Audit → 给出结论（accepted / rework_required / retry_required / gate_required / failed）",
         "forbidden": "替代 P5 验证 / 替代用户 Gate / 批准 Policy 禁止项 / 把缺 Evidence 的结果标记为可信完成",
         "model_policy_ref": "system-default",
+        "context_recipe": {
+            "required_context_layers": ["C0", "C2", "C4"],
+            "optional_layers": ["C3", "C5"],
+            "source_priority": ["C0", "C2", "C4", "C3", "C5"],
+            "max_context_budget": "100k tokens",
+        },
     },
     {
         "agent_type": AgentType.auto_review,
@@ -56,6 +62,12 @@ AGENT_SEEDS = [
         "responsibilities": "在 Auto Mode 内辅助审核 Stage Plan/Task Plan → 辅助判断风险级别 → 辅助判断是否越界 → 辅助判断是否需要 Gate → 辅助处理安全与授权建议",
         "forbidden": "批准 Policy 禁止项 / 批准 L5 高风险动作 / 绕过用户阶段晋级 Gate / 绕过 Audit",
         "model_policy_ref": "system-default",
+        "context_recipe": {
+            "required_context_layers": ["C0", "C2", "C4"],
+            "optional_layers": ["C3"],
+            "source_priority": ["C0", "C2", "C4", "C3"],
+            "max_context_budget": "100k tokens",
+        },
     },
     {
         "agent_type": AgentType.expert,
@@ -65,6 +77,12 @@ AGENT_SEEDS = [
         "responsibilities": "提供特定技术栈或领域专家能力 → 辅助复杂迁移判断 → 辅助安全/性能/兼容性/验证分析 → 辅助确定性转换资源选择 → 辅助解释复杂风险",
         "forbidden": "直接成为最终验收主体 / 直接批准高风险执行 / 直接跳过 P5 Evidence / 直接关闭用户 Gate",
         "model_policy_ref": "system-default",
+        "context_recipe": {
+            "required_context_layers": ["C0", "C1", "C2", "C3", "C4"],
+            "optional_layers": ["C5", "C6"],
+            "source_priority": ["C0", "C1", "C2", "C3", "C4", "C5", "C6"],
+            "max_context_budget": "100k tokens",
+        },
     },
     {
         "agent_type": AgentType.conversation_gate,
@@ -74,6 +92,12 @@ AGENT_SEEDS = [
         "responsibilities": "与用户交互 → 解释 Gate（原因/风险/选项/影响）→ 收集用户决策 → 将用户决策写回 Gate 流程",
         "forbidden": "伪造用户授权 / 默认批准高风险动作 / 隐藏 Evidence 不足 / 隐藏风险或冲突",
         "model_policy_ref": "system-default",
+        "context_recipe": {
+            "required_context_layers": ["C0", "C4"],
+            "optional_layers": ["C1", "C2"],
+            "source_priority": ["C0", "C4", "C1", "C2"],
+            "max_context_budget": "100k tokens",
+        },
     },
 ]
 
@@ -173,10 +197,10 @@ RESOURCE_SEEDS = [
     {"resource_type": ResourceType.case, "name": "信创迁移候选案例", "description": "参考案例——来源旧版 WebForms→Vue3 迁移", "status": ResourceStatus.read_only, "risk_level": RiskLevel.L0, "source_type": SourceType.internal_archive, "source_trust_level": TrustLevel.read_only_reference, "permission_scope": "read_only", "type_metadata": {"executable": False, "never_execute": True}},
     {"resource_type": ResourceType.case, "name": "WebForms 重写规则（已审核）", "description": "确定性转换规则案例——已审核，不可直接执行", "status": ResourceStatus.read_only, "risk_level": RiskLevel.L0, "source_type": SourceType.internal_archive, "source_trust_level": TrustLevel.read_only_reference, "permission_scope": "read_only", "type_metadata": {"executable": False, "never_execute": True}},
 
-    # Knowledge entries
-    {"resource_type": ResourceType.knowledge, "name": "ECC Security Guide 11 基线", "description": "ECC the-security-guide.md——11 条 Agent 安全最低基线（隔离/最小权限/审批边界/可观测/Kill Switch）", "status": ResourceStatus.read_only, "risk_level": RiskLevel.L0, "source_type": SourceType.community, "source_trust_level": TrustLevel.read_only_reference, "source_path_or_ref": "https://github.com/affaan-m/ECC/blob/main/the-security-guide.md"},
-    {"resource_type": ResourceType.knowledge, "name": "ECC Agent 结构模板参考", "description": "ECC agents/——Prompt Defense Baseline + Pre-Report Gate + Approval Criteria", "status": ResourceStatus.read_only, "risk_level": RiskLevel.L0, "source_type": SourceType.community, "source_trust_level": TrustLevel.read_only_reference, "source_path_or_ref": "https://github.com/affaan-m/ECC/tree/main/agents"},
-    {"resource_type": ResourceType.knowledge, "name": "ECC AGENTS.md 结构约定参考", "description": "ECC AGENTS.md——agent-first/TDD/security-first/immutability/plan-before-execute + Workflow Surface Policy(skills 优先于 commands)", "status": ResourceStatus.read_only, "risk_level": RiskLevel.L0, "source_type": SourceType.community, "source_trust_level": TrustLevel.read_only_reference, "source_path_or_ref": "https://github.com/affaan-m/ECC/blob/main/AGENTS.md"},
+    # Knowledge entries (T5.5/R9-5-4: source_type=internal_current so platform docs tab shows correctly)
+    {"resource_type": ResourceType.knowledge, "name": "ECC Security Guide 11 基线", "description": "ECC the-security-guide.md——11 条 Agent 安全最低基线（隔离/最小权限/审批边界/可观测/Kill Switch）", "status": ResourceStatus.read_only, "risk_level": RiskLevel.L0, "source_type": SourceType.internal_current, "source_trust_level": TrustLevel.read_only_reference, "source_path_or_ref": "https://github.com/affaan-m/ECC/blob/main/the-security-guide.md"},
+    {"resource_type": ResourceType.knowledge, "name": "ECC Agent 结构模板参考", "description": "ECC agents/——Prompt Defense Baseline + Pre-Report Gate + Approval Criteria", "status": ResourceStatus.read_only, "risk_level": RiskLevel.L0, "source_type": SourceType.internal_current, "source_trust_level": TrustLevel.read_only_reference, "source_path_or_ref": "https://github.com/affaan-m/ECC/tree/main/agents"},
+    {"resource_type": ResourceType.knowledge, "name": "ECC AGENTS.md 结构约定参考", "description": "ECC AGENTS.md——agent-first/TDD/security-first/immutability/plan-before-execute + Workflow Surface Policy(skills 优先于 commands)", "status": ResourceStatus.read_only, "risk_level": RiskLevel.L0, "source_type": SourceType.internal_current, "source_trust_level": TrustLevel.read_only_reference, "source_path_or_ref": "https://github.com/affaan-m/ECC/blob/main/AGENTS.md"},
 
     # Template entries (always "not fact source")
     {"resource_type": ResourceType.template, "name": "Agent Definition Contract 模板", "description": "13 要素契约模板——不是事实源", "status": ResourceStatus.read_only, "risk_level": RiskLevel.L0, "type_metadata": {"not_fact_source": True}},

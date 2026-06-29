@@ -4,6 +4,26 @@ R4: Basic engineering skeleton with mock/in-memory API.
 No real LangGraph graph, model calls, agent execution, or Git operations.
 """
 
+# ── Load .env into os.environ BEFORE any module reads from os.environ ──
+#    pydantic-settings reads .env into its Settings object but does NOT
+#    inject values into os.environ.  Modules like byok_crypto and the
+#    startup REBUILD_MASTER_KEY check read os.environ directly, so we
+#    pre-load the .env file here (skip keys already set in the shell).
+import os as _load_os
+_ENV_PATH = _load_os.path.join(_load_os.path.dirname(__file__), "..", ".env")
+if _load_os.path.exists(_ENV_PATH):
+    with open(_ENV_PATH, encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _, _val = _line.partition("=")
+            _key = _key.strip()
+            _val = _val.strip().strip('"').strip("'")
+            if _key not in _load_os.environ:
+                _load_os.environ[_key] = _val
+del _load_os, _ENV_PATH, _f, _line, _key, _val
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,8 +49,30 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     get_services(settings)
+    # T7/公理7: warn if REBUILD_MASTER_KEY is missing — BYOK encrypt/decrypt will fail
+    import os as _os
+    if not _os.environ.get("REBUILD_MASTER_KEY"):
+        import logging
+        logging.getLogger("uvicorn").critical(
+            "REBUILD_MASTER_KEY is not set — BYOK credential encryption is disabled. "
+            "Add REBUILD_MASTER_KEY=<random-32-byte-hex> to backend/.env. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+    # R9-5-1: register real P0/P1 stage handlers + Gate backend onto the LangGraph graph
+    try:
+        from app.graph.stage_handlers import bootstrap_graph_handlers
+        bootstrap_graph_handlers()
+    except Exception:
+        import logging
+        logging.getLogger("uvicorn").warning("graph handler bootstrap failed", exc_info=True)
     yield
     clear_services_cache()
+    try:
+        from app.graph.checkpoint import close_checkpointer
+        await close_checkpointer()
+    except Exception:
+        import logging
+        logging.getLogger("uvicorn").debug("close_checkpointer failed (non-fatal, may be uninitialized)", exc_info=True)
 
 
 app = FastAPI(
@@ -97,6 +139,10 @@ app.include_router(events_router, prefix="/api")
 from app.api.routes_agents import agent_router
 app.include_router(agent_router, prefix="/api")
 
+# R9-3G-C: Agent chat with SSE streaming
+from app.api.routes_agent_chat import agent_chat_router
+app.include_router(agent_chat_router, prefix="/api")
+
 from app.api.routes_skills import skill_router
 app.include_router(skill_router, prefix="/api")
 
@@ -129,3 +175,7 @@ app.include_router(export_router, prefix="/api")
 # R7 new: Toggle (启用/禁用)
 from app.api.routes_toggle import toggle_router
 app.include_router(toggle_router, prefix="/api")
+
+# R9-5-1: graph driver endpoints (drive the real P0-P6 LangGraph over HTTP)
+from app.api.routes_graph import router as graph_router
+app.include_router(graph_router, prefix="/api")

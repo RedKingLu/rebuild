@@ -7,10 +7,11 @@ type DockTab = 'terminal' | 'output' | 'problems' | 'progress';
 interface Props {
   projectId: string;
   outputHistory: Array<{ cmd: string; exit_code: number; provider: string; elapsed_ms: number; stdout: string; stderr: string }>;
+  setOutputHistory: (updater: (prev: Array<{ cmd: string; exit_code: number; provider: string; elapsed_ms: number; stdout: string; stderr: string }>) => Array<{ cmd: string; exit_code: number; provider: string; elapsed_ms: number; stdout: string; stderr: string }>) => void;
   sessions: Array<Record<string, unknown>>;
 }
 
-export function BottomDock({ projectId, outputHistory, sessions }: Props) {
+export function BottomDock({ projectId, outputHistory, setOutputHistory, sessions }: Props) {
   const [tab, setTab] = useState<DockTab>('terminal');
 
   const tabs: [DockTab, string][] = [
@@ -38,7 +39,7 @@ export function BottomDock({ projectId, outputHistory, sessions }: Props) {
 
       {/* Content */}
       <div style={{ flex: 1, overflow: 'auto', padding: 8 }}>
-        {tab === 'terminal' && <TerminalPanel projectId={projectId} />}
+        {tab === 'terminal' && <TerminalPanel projectId={projectId} onOutput={(entry) => setOutputHistory(prev => [...prev, entry])} />}
         {tab === 'output' && (
           <div style={{ fontSize: 12 }}>
             <b style={{ fontSize: 13 }}>执行输出</b>

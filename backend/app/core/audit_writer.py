@@ -80,15 +80,42 @@ class AuditWriter:
         risk_level: Optional[str] = None,
         limit: int = 50,
     ) -> list[dict]:
-        """Query audits with optional filters (most recent first)."""
+        """Query audits with optional filters (most recent first).
+
+        R9 P1-3: Also reads from .rebuild/audits.jsonl so audits survive restart.
+        """
         results = list(self._audits)
+
+        # Read persisted audits from jsonl file (survives restart)
+        if project_id:
+            try:
+                from app.core.config import settings
+                audits_file = Path(settings.workspace_dir) / "projects" / project_id / ".rebuild" / "audits.jsonl"
+                if audits_file.exists():
+                    seen_ids = {a.get("audit_id") for a in results}
+                    with open(audits_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                a = json.loads(line)
+                                aid = a.get("audit_id", "")
+                                if aid and aid not in seen_ids:
+                                    seen_ids.add(aid)
+                                    results.append(a)
+                            except json.JSONDecodeError:
+                                pass
+            except Exception:
+                pass
+
         if project_id:
             results = [a for a in results if a.get("project_id") == project_id]
         if gate_id:
             results = [a for a in results if a.get("gate_id") == gate_id]
         if risk_level:
             results = [a for a in results if a.get("risk_level") == risk_level]
-        results.reverse()
+        results.sort(key=lambda a: a.get("created_at", ""), reverse=True)
         return results[:limit]
 
     def list_all(self) -> list[dict]:

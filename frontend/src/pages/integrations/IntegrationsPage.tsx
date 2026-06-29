@@ -52,7 +52,13 @@ export function IntegrationsPage() {
     const oauth = searchParams.get('oauth');
     const status = searchParams.get('status');
     if (oauth === 'github' && status === 'connected') {
-      // Clear URL params and refresh accounts
+      // If we're in a popup, notify the opener and close
+      if (window.opener && window.opener !== window) {
+        try { window.opener.postMessage({ type: 'github-oauth-connected' }, window.location.origin); } catch {}
+        window.close();
+        return;
+      }
+      // Main window: clear URL params and refresh accounts
       window.history.replaceState({}, '', '/integrations');
       fetchAccounts();
     }
@@ -87,8 +93,31 @@ export function IntegrationsPage() {
   const handleConnectGithub = async () => {
     try {
       const url = await getGithubAuthorizeUrl();
-      if (url) window.open(url, '_blank', 'width=800,height=700');
-      else alert('GitHub OAuth 未配置。请在 backend .env 中设置 REBUILD_GITHUB_CLIENT_ID 和 REBUILD_GITHUB_CLIENT_SECRET。');
+      if (!url) {
+        alert('GitHub OAuth 未配置。请在 backend .env 中设置 REBUILD_GITHUB_CLIENT_ID 和 REBUILD_GITHUB_CLIENT_SECRET。');
+        return;
+      }
+      // Open popup for OAuth flow. The popup will postMessage when done.
+      const popup = window.open(url, 'github-oauth', 'width=800,height=700');
+      if (!popup) {
+        window.location.href = url;
+        return;
+      }
+      // Listen for the popup's postMessage (sent by the OAuth callback page)
+      const onMsg = (e: MessageEvent) => {
+        if (e.data?.type === 'github-oauth-connected' && e.origin === window.location.origin) {
+          window.removeEventListener('message', onMsg);
+          clearInterval(timer);
+          clearTimeout(safety);
+          fetchAccounts();
+        }
+      };
+      window.addEventListener('message', onMsg);
+      // Also poll for popup closure as fallback
+      const timer = setInterval(() => {
+        if (popup.closed) { clearInterval(timer); clearTimeout(safety); fetchAccounts(); }
+      }, 500);
+      const safety = setTimeout(() => { clearInterval(timer); clearTimeout(safety); }, 120000);
     } catch (e) { alert('获取授权链接失败'); }
   };
 

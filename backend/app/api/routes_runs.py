@@ -55,7 +55,7 @@ async def start_run(project_id: str, run_id: str):
     if run is None:
         raise HTTPException(404, f"Run {run_id} not found")
     svc.trace_writer.write("state_change", action="start_run",
-                           summary=f"Started run {run_id} (mock transition)", project_id=project_id, run_id=run_id)
+                           summary=f"Started run {run_id}", project_id=project_id, run_id=run_id)
     return SuccessEnvelope(data=run, meta=Meta())
 
 
@@ -66,7 +66,7 @@ async def pause_run(project_id: str, run_id: str):
     if run is None:
         raise HTTPException(404, f"Run {run_id} not found")
     svc.trace_writer.write("state_change", action="pause_run",
-                           summary=f"Paused run {run_id} (mock)", project_id=project_id, run_id=run_id)
+                           summary=f"Paused run {run_id}", project_id=project_id, run_id=run_id)
     return SuccessEnvelope(data=run, meta=Meta())
 
 
@@ -77,16 +77,37 @@ async def cancel_run(project_id: str, run_id: str):
     if run is None:
         raise HTTPException(404, f"Run {run_id} not found")
     svc.trace_writer.write("state_change", action="cancel_run",
-                           summary=f"Canceled run {run_id} (mock)", project_id=project_id, run_id=run_id)
+                           summary=f"Canceled run {run_id}", project_id=project_id, run_id=run_id)
     return SuccessEnvelope(data=run, meta=Meta())
 
 
 @router.post("/{run_id}/resume")
 async def resume_run(project_id: str, run_id: str, req: RunResumeRequest):
+    """Resume a run. W10: when a paused graph checkpoint thread exists for this run,
+    the resume is driven through FlowRuntime (single thread, thread_id=run_id) so the
+    graph advances; run_service keeps the run status row in sync. For non-graph runs
+    (legacy/manual) it is a plain status transition. No mock Trace text (公理4/G7)."""
+    from app.graph.runtime import get_flow_runtime, graph_thread_active
+
     svc = _svc()
-    run = svc.run_service.resume(run_id)
+    run = svc.run_service.get(run_id)
     if run is None:
         raise HTTPException(404, f"Run {run_id} not found")
-    svc.trace_writer.write("state_change", action="resume_run",
-                           summary=f"Resumed run {run_id} with decision={req.decision} (mock)", project_id=project_id, run_id=run_id)
+
+    driven_by_graph = False
+    if await graph_thread_active(run_id):
+        try:
+            await get_flow_runtime().resume(run_id, req.decision)
+            driven_by_graph = True
+        except Exception:
+            driven_by_graph = False
+
+    run = svc.run_service.resume(run_id)
+    svc.trace_writer.write(
+        "state_change", action="resume_run",
+        summary=f"Resumed run {run_id} (decision={req.decision}, "
+                f"{'graph-driven' if driven_by_graph else 'state-only'})",
+        project_id=project_id, run_id=run_id,
+        extras={"decision": req.decision, "graph_driven": driven_by_graph},
+    )
     return SuccessEnvelope(data=run, meta=Meta())

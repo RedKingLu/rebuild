@@ -1,7 +1,8 @@
 """CodingAgentService — CRUD for external AI coding agent configurations.
 
 D-077 / D-078: Manages CodingAgentConfig records.
-Real invoke is deferred to R11 (P4 execution chain).
+R9-5-5: invoke now routes through ExternalPlatformDelegator (T3) for OpenCode agents;
+        stub types (qcode_cli, platform_agent) remain honestly not_implemented.
 """
 
 from __future__ import annotations
@@ -102,14 +103,23 @@ class CodingAgentService:
             "status": status.value,
         }
 
-    # ── Invoke (Stub — R11 will implement real invocation) ───────────────
+    # ── Invoke ───────────────────────────────────────────────────────────
 
-    async def invoke(self, agent_id: str, task: str, context_path: str) -> dict:
+    async def invoke(
+        self,
+        agent_id: str,
+        task: str,
+        context_path: str,
+        *,
+        stage: str = "P4",
+        mode: str = "plan",
+        project_id: str | None = None,
+    ) -> dict:
         """Dispatch a coding task to the external AI agent.
 
-        R8: Returns a stub response. Real invocation via LangGraph deferred to R11.
-        R11-TODO: route through LangGraph P4 execution node → CodingAgentAdapter →
-                  platform review agent (checks file writes / command execution) → result.
+        R9-5-5: OpenCode invocations go through ExternalPlatformDelegator (T3)
+        which enforces context injection / file mediation / command review / Trace.
+        Stub agent types (qcode_cli, platform_agent) return honest not_implemented.
         """
         agent = self.get(agent_id)
         if not agent:
@@ -123,8 +133,50 @@ class CodingAgentService:
                 "raw_output": "",
             }
 
+        agent_type = agent.agent_type.value
+
+        # ── OpenCode: real delegation via ExternalPlatformDelegator ─────
+        if agent_type == CodingAgentType.opencode_cli.value:
+            try:
+                from app.services.external_platform_delegator import (
+                    ExternalPlatformDelegator, DelegationError,
+                )
+                delegator = ExternalPlatformDelegator(
+                    project_id or "",
+                    context_path,
+                    mode=mode,
+                )
+                return await delegator.delegate(
+                    task,
+                    stage=stage,
+                    context_policy=(agent.config or {}).get("context_policy", "full"),
+                    timeout=int((agent.config or {}).get("timeout_seconds", 300)),
+                    agent_config=agent.config or {},
+                )
+            except DelegationError as exc:
+                return {
+                    "status": "error",
+                    "reason": str(exc),
+                    "summary": "",
+                    "changed_files": [],
+                    "diff_ref": None,
+                    "issues": [str(exc)],
+                    "raw_output": "",
+                }
+            except Exception as exc:
+                return {
+                    "status": "error",
+                    "reason": f"Delegation failed: {exc}",
+                    "summary": "",
+                    "changed_files": [],
+                    "diff_ref": None,
+                    "issues": [str(exc)],
+                    "raw_output": "",
+                }
+
+        # ── Stub types: honest not_implemented ───────────────────────────
         try:
-            adapter = get_coding_agent_adapter(agent.agent_type.value)
+            adapter = get_coding_agent_adapter(agent_type)
         except ValueError as e:
             return {
                 "status": "error",
@@ -136,7 +188,6 @@ class CodingAgentService:
                 "raw_output": "",
             }
 
-        # R11-TODO: replace stub call with LangGraph-mediated invocation
         return await adapter.invoke_coding_task(
             task=task,
             context_path=context_path,

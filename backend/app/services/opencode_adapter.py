@@ -3,9 +3,10 @@
 D-076 (2026-06-26): OpenCode/qcode are AI coding agents that accept natural-language
 tasks, NOT shell wrappers for running subprocess commands.
 
-OpenCodeCLIAdapter now implements real invocation via `opencode run <task>`.
+D-079 (2026-06-27): OpenCodeCLIAdapter now uses `opencode serve` + ACP protocol
+instead of `opencode run --dangerously-skip-permissions`.  Permission requests
+are intercepted via SSE and evaluated by PermissionPolicy.
 Credentials are passed only as env vars to the subprocess (never logged/stored in plain text).
-LangGraph-mediated review agent interception is deferred to R11 (D-078).
 """
 
 from __future__ import annotations
@@ -16,6 +17,10 @@ import re
 import shutil
 from pathlib import Path
 from typing import Protocol
+
+from app.services.opencode_acp_client import OpenCodeACPClient
+from app.services.opencode_permission_handler import PermissionPolicy
+from app.services.opencode_server import OpenCodeServer
 
 # ── Protocol ─────────────────────────────────────────────────────────────
 
@@ -38,10 +43,10 @@ class CodingAgentAdapter(Protocol):
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
-# Providers that use the MaaS/DeepSeek-compatible base URL
-_DEFAULT_BASE_URL = "http://maas.icompify.com:32788/v1"
-_DEFAULT_MODEL = "openai/deepseek-v4-flash"
-_FREE_MODEL = "opencode/deepseek-v4-flash-free"  # no API key required
+# D-098 / B-ORCH-02: no hardcoded model or endpoint — ALL model resolution
+# goes through OpenCodeModelResolver → ModelGateway.  There is no fallback
+# free model: if the platform has no configured provider, the call fails
+# explicitly so the user knows to configure a credential (G2 / G8).
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHFJ]")
 _OUTPUT_CAP = 32_768   # 32 KB cap on raw_output stored in response
 
@@ -53,31 +58,57 @@ def _strip_ansi(text: str) -> str:
 def _build_opencode_env(config: dict) -> dict:
     """Build subprocess env: inject OPENAI_API_KEY + OPENAI_BASE_URL, strip LLM_API_KEY.
 
-    Key is never returned or logged — it only lives in the subprocess env dict
-    for the duration of the opencode run.
+    Model/base/key resolve from the platform strategy (D-098), no hardcoded endpoint.
+    Key is never returned or logged — it only lives in the subprocess env dict.
     """
+    from app.services.opencode_server import resolve_model_defaults
     env = os.environ.copy()
-    # Prefer key from platform env (set by operator, not from config JSON)
-    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    base_url = (
-        config.get("base_url")
-        or os.environ.get("OPENAI_BASE_URL")
-        or os.environ.get("LLM_BASE_URL")
-        or _DEFAULT_BASE_URL
-    )
-    if api_key:
+    target = resolve_model_defaults(config)
+    api_key = target.get("api_key") or os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    base_url = target.get("base_url") or os.environ.get("OPENAI_BASE_URL") or os.environ.get("LLM_BASE_URL")
+    if api_key and base_url:
         env["OPENAI_API_KEY"] = api_key
         env["OPENAI_BASE_URL"] = base_url
-    # Remove the raw platform key so opencode doesn't forward it in logs
     env.pop("LLM_API_KEY", None)
     return env
 
 
-def _pick_model(config: dict, has_key: bool) -> str:
-    """Return the model string to pass to opencode -m."""
-    if config.get("model"):
-        return config["model"]
-    return _DEFAULT_MODEL if has_key else _FREE_MODEL
+def _pick_model(
+    config: dict,
+    *,
+    project_id: str | None = None,
+    strategy_id: str = "system-default",
+    user_override: str | None = None,
+) -> str:
+    """Return the model string to pass to opencode — from the platform strategy (D-098).
+
+    Raises RuntimeError if no model can be resolved (G2: no hardcoded fallback).
+    """
+    from app.services.opencode_server import resolve_model_defaults
+    target = resolve_model_defaults(
+        config, project_id=project_id, strategy_id=strategy_id, user_override=user_override
+    )
+    if target.get("model"):
+        return target["model"]
+    raise RuntimeError(
+        "No model could be resolved for OpenCode — "
+        "configure a provider and credential in the platform settings (D-088⑤)."
+    )
+
+
+def _extract_summary_from_messages(messages: list[dict]) -> str:
+    """Extract a short summary from the last assistant message."""
+    for msg in reversed(messages):
+        role = msg.get("role", "")
+        if role != "assistant":
+            continue
+        for part in msg.get("parts", []):
+            if part.get("type") == "text":
+                text = _strip_ansi(part.get("text", ""))
+                lines = [l.strip() for l in text.splitlines() if l.strip()]
+                if lines:
+                    return lines[-1][:256]
+    return ""
 
 
 def _extract_summary(text: str) -> str:
@@ -127,9 +158,10 @@ def is_opencode_available() -> bool:
 class OpenCodeCLIAdapter:
     """Adapter for the OpenCode AI coding agent (opencode CLI).
 
-    Invokes `opencode run <task> --dir <context_path> -m <model> --dangerously-skip-permissions`.
-    Credentials are passed via OPENAI_API_KEY + OPENAI_BASE_URL env vars only.
-    Platform review agent interception (D-078) deferred to R11.
+    Uses `opencode serve` + ACP protocol (D-079).  Permission requests raised
+    by opencode are intercepted via SSE and evaluated by PermissionPolicy —
+    no `--dangerously-skip-permissions` needed.
+    Credentials are injected via OPENAI_API_KEY / OPENAI_BASE_URL env vars only.
     """
 
     agent_type = "opencode_cli"
@@ -152,55 +184,49 @@ class OpenCodeCLIAdapter:
         if not ctx.is_dir():
             return _err(f"context_path does not exist: {context_path}")
 
-        env = _build_opencode_env(config)
-        has_key = bool(env.get("OPENAI_API_KEY"))
-        model = _pick_model(config, has_key)
+        try:
+            model = _pick_model(
+                config,
+                project_id=config.get("project_id"),
+                strategy_id=config.get("strategy_id", "system-default"),
+                user_override=config.get("model_override"),
+            )
+        except RuntimeError as exc:
+            return _err(str(exc))
         timeout = int(config.get("timeout_seconds", 180))
-
-        cmd = [
-            "opencode", "run", task,
-            "--dir", str(ctx),
-            "-m", model,
-            "--dangerously-skip-permissions",
-        ]
+        policy = PermissionPolicy()
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(ctx),
-            )
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                return _err(f"Timed out after {timeout}s", issues=[f"timeout={timeout}s"])
-
-            exit_code = proc.returncode
-            raw = _strip_ansi(stdout_b.decode("utf-8", errors="replace"))[:_OUTPUT_CAP]
-            stderr_text = _strip_ansi(stderr_b.decode("utf-8", errors="replace"))[:4096]
-
+            async with OpenCodeServer(str(ctx), config) as server:
+                client = OpenCodeACPClient(server.base_url, server.password)
+                session_id = await client.create_session(model)
+                await client.send_message(session_id, task)
+                idle = await client.run_until_idle(
+                    session_id, policy, str(ctx), timeout
+                )
+                messages = await client.get_messages(session_id)
+        except RuntimeError as exc:
+            return _err(str(exc))
         except Exception as exc:
-            return _err(f"Failed to launch opencode: {exc}")
+            return _err(f"ACP invocation failed: {exc}")
 
         changed = await _git_changed_files(str(ctx))
-        summary = _extract_summary(raw) or ("Task completed" if exit_code == 0 else "Task failed")
-        issues = [stderr_text] if exit_code != 0 and stderr_text else []
+        summary = _extract_summary_from_messages(messages) or (
+            "Task completed" if idle["status"] == "ok" else "Task failed"
+        )
+        issues: list[str] = []
+        if idle["status"] != "ok":
+            issues.append(f"session ended with: {idle.get('idle_reason', 'unknown')}")
 
         return {
-            "status": "ok" if exit_code == 0 else "error",
-            "reason": stderr_text if exit_code != 0 else "",
+            "status": idle["status"],
+            "reason": idle.get("idle_reason", ""),
             "summary": summary,
             "changed_files": changed,
-            "diff_ref": None,  # R11: write diff to artifact storage
+            "diff_ref": None,
             "issues": issues,
-            "raw_output": raw,
-            "exit_code": exit_code,
+            "raw_output": "",
+            "exit_code": 0 if idle["status"] == "ok" else 1,
             "model": model,
             "agent_type": self.agent_type,
         }

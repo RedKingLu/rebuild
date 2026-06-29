@@ -307,11 +307,16 @@ class ProviderRegistry:
         self,
         user_override: Optional[str] = None,
         strategy_id: str = "system-default",
+        preferred_ref: Optional[str] = None,
     ) -> tuple[Optional[ModelProfileInfo], str, Optional[ProviderInfo]]:
         """Resolve which model to use. Returns (profile, selection_reason, provider).
 
         When user_override is set (explicit provider), NO cross-provider fallback
         is performed — if the override doesn't match, return (None, reason, None).
+
+        preferred_ref (D-098: project global_model_ref / agent custom model) is a SOFT
+        preference — used if configured, otherwise falls through to the strategy default +
+        fallback chain (availability-driven, unlike the hard user_override).
         """
         strategy = self.get_strategy(strategy_id)
         if not strategy:
@@ -331,6 +336,14 @@ class ProviderRegistry:
                 return profile, "user_override", provider
             # Explicit override → NO fallback to other providers
             return None, f"explicit_override_not_found:{user_override}", None
+
+        # 1.5 Preferred ref (project global / agent custom) — SOFT: falls back if unavailable
+        if preferred_ref:
+            profile = self._profiles.get(preferred_ref)
+            if profile and profile.status == "configured":
+                provider = self._providers.get(profile.provider_id)
+                return profile, "preferred_ref", provider
+            # not configured → continue to strategy default + availability fallback
 
         # 2. Strategy default
         if strategy.default_profile_ref:
