@@ -29,6 +29,7 @@ import {
   type MCPServer, type MCPServerTool,
 } from '../../services/mcpService';
 import { Icon } from '../../components/ui/Icon';
+import { listProfiles, type ModelProfileInfo } from '../../services/modelService';
 
 type Tab = 'agents' | 'skills' | 'mcp' | 'other';
 
@@ -132,11 +133,13 @@ function AgentModal({ agent, onClose, onSaved }: { agent?: AgentDef; onClose: ()
 
   const [availSkills, setAvailSkills] = useState<SkillDef[]>([]);
   const [availTools, setAvailTools] = useState<ResourceEntry[]>([]);
+  const [availProfiles, setAvailProfiles] = useState<ModelProfileInfo[]>([]);
   const [ddOpen, setDdOpen] = useState('');
 
   useEffect(() => {
     listSkills().then(r => setAvailSkills(r.skills || [])).catch(() => {});
     listResources({ type: 'tool' }).then(r => setAvailTools(r.resources || [])).catch(() => {});
+    listProfiles().then(r => setAvailProfiles(r.data.profiles || [])).catch(() => {});
   }, []);
 
   const ComboInput = ({ label, value, onChange, options, ddKey }: {
@@ -205,7 +208,19 @@ function AgentModal({ agent, onClose, onSaved }: { agent?: AgentDef; onClose: ()
           <ComboInput label="绑定工具" value={boundTools} onChange={setBT} options={availTools.map(r => ({ id: r.resource_id, name: r.name }))} ddKey="tools" />
           <F label="绑定 MCP（逗号分隔 ID）"><input className="inp" value={boundMcps} onChange={e => setBM(e.target.value)} /></F>
         </>}
-        <F label="默认模型 ID"><input className="inp" value={modelRef} onChange={e => setModelRef(e.target.value)} placeholder="model_policy_ref" /></F>
+        <F label="默认模型（自定义模式 · 留空=系统默认）">
+          <select className="inp" value={modelRef} onChange={e => setModelRef(e.target.value)}>
+            <option value="">（系统默认策略）</option>
+            {availProfiles.map(p => (
+              <option key={p.profile_id} value={p.profile_id}>
+                {p.display_name || p.model_name}（{p.provider_id}）{p.status === 'configured' ? '' : ' · 未配置'}
+              </option>
+            ))}
+          </select>
+        </F>
+        <div className="muted" style={{ fontSize: 12, marginTop: -4 }}>
+          自定义模式下该 Agent 使用此模型；模型不可用时按策略自动回退到下一个可用模型。
+        </div>
         {error && <div className="err">⚠ {error}</div>}
         <div className="row" style={{ justifyContent: 'flex-end', gap: 8 }}>
           <button className="btn ghost" onClick={onClose} disabled={saving}>取消</button>

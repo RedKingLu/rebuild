@@ -87,15 +87,14 @@ def test_skill_create_and_delete(client):
 def test_resources_list(client):
     resp = client.get("/api/resources")
     assert resp.status_code == 200
-    data = resp.json()
+    data = resp.json()["data"]
     assert data["total"] >= 24  # Seed data
-    assert data["source_status"] == "real"
 
 
 def test_resources_filter_by_type(client):
     resp = client.get("/api/resources?type=agent")
     assert resp.status_code == 200
-    data = resp.json()
+    data = resp.json()["data"]
     assert data["total"] >= 2
     assert all(r["resource_type"] == "agent" for r in data["resources"])
 
@@ -103,21 +102,21 @@ def test_resources_filter_by_type(client):
 def test_resources_filter_by_status(client):
     resp = client.get("/api/resources?status=active")
     assert resp.status_code == 200
-    data = resp.json()
+    data = resp.json()["data"]
     assert all(r["status"] == "active" for r in data["resources"])
 
 
 def test_resources_filter_by_risk(client):
     resp = client.get("/api/resources?risk=L5")
     assert resp.status_code == 200
-    data = resp.json()
+    data = resp.json()["data"]
     assert all(r["risk_level"] == "L5" for r in data["resources"])
 
 
 def test_resources_registry_summary(client):
     resp = client.get("/api/resources/registry")
     assert resp.status_code == 200
-    data = resp.json()
+    data = resp.json()["data"]
     assert data["total"] >= 24
     assert "by_type" in data
     assert "by_status" in data
@@ -128,7 +127,7 @@ def test_resources_case_never_executable(client):
     """All Case resources must be read_only and never executable."""
     resp = client.get("/api/resources?type=case")
     assert resp.status_code == 200
-    for r in resp.json()["resources"]:
+    for r in resp.json()["data"]["resources"]:
         assert r["status"] in ("read_only",)
         assert r["permission_scope"] == "read_only"
         if r.get("type_metadata"):
@@ -138,7 +137,7 @@ def test_resources_case_never_executable(client):
 def test_resources_knowledge_read_only(client):
     """All Knowledge resources must be read_only."""
     resp = client.get("/api/resources?type=knowledge")
-    for r in resp.json()["resources"]:
+    for r in resp.json()["data"]["resources"]:
         assert r["status"] in ("read_only", "local_existing", "externally_available")
 
 

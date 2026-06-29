@@ -20,6 +20,9 @@ logger = logging.getLogger("rebuild.litellm_adapter")
 # ── Retry config (tunable via env) ───────────────────────────────────
 _MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 _RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_BASE_DELAY", "2.0"))
+# R9-5-1: hard request timeout so a non-responding provider FAILS FAST instead of
+# hanging forever (公理3 失败必发声). Configurable via LLM_REQUEST_TIMEOUT (seconds).
+_REQUEST_TIMEOUT = float(os.environ.get("LLM_REQUEST_TIMEOUT", "60"))
 
 
 @dataclass
@@ -109,6 +112,7 @@ class LiteLLMAdapter:
             "api_key": api_key,
             "api_base": api_base,
             "stream": stream,
+            "timeout": _REQUEST_TIMEOUT,  # R9-5-1: never hang on a dead provider
         }
         if extra_params:
             kwargs.update(extra_params)
@@ -157,6 +161,92 @@ class LiteLLMAdapter:
         result.error_message = "Max retries exceeded"
         result.retry_count = _MAX_RETRIES
         return result
+
+    # ── Streaming call ────────────────────────────────────────────────
+
+    async def stream_complete(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        api_base: str,
+        api_key: str,
+        api_format: str = "openai",
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        tools: Optional[list[dict]] = None,
+        extra_params: Optional[dict] = None,
+    ):
+        """Stream a completion as an async generator yielding dicts.
+
+        Yields:
+          {"type": "token", "content": "<str>"}          — text delta
+          {"type": "tool_calls", "tool_calls": [...]}     — tool call chunks (accumulated per chunk)
+          {"type": "usage", "usage": {...}}               — final usage (last chunk)
+          {"type": "done", "usage": {...}}                — stream complete sentinel
+          {"type": "error", "error_category": "...", "error_message": "..."} — failure
+
+        Chunk parsing logic adapted from AgentLoop real streaming (三步法吸收, T1).
+        Once any token has been yielded, errors emit an error frame — no silent swallow (公理3).
+        """
+        call_id = f"scall_{uuid.uuid4().hex[:12]}"
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "api_key": api_key,
+            "api_base": api_base,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "timeout": _REQUEST_TIMEOUT,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        if extra_params:
+            kwargs.update(extra_params)
+
+        tokens_yielded = False
+        usage: dict = {}
+        try:
+            response = await litellm.acompletion(**kwargs)
+            async for chunk in response:
+                if not chunk.choices:
+                    # Usage-only final chunk
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage = {
+                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
+                            "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
+                            "total_tokens": getattr(chunk.usage, "total_tokens", 0),
+                        }
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+                # Text token
+                if delta.content:
+                    tokens_yielded = True
+                    yield {"type": "token", "content": delta.content, "call_id": call_id}
+                # Tool call delta
+                if delta.tool_calls:
+                    yield {"type": "tool_calls", "tool_calls": delta.tool_calls, "call_id": call_id}
+                # Usage in delta (some providers)
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = {
+                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
+                        "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
+                        "total_tokens": getattr(chunk.usage, "total_tokens", 0),
+                    }
+        except Exception as e:
+            error_cat, error_msg = _classify_litellm_error(e)
+            logger.warning("stream_complete error after tokens_yielded=%s: %s %s",
+                           tokens_yielded, error_cat, error_msg)
+            yield {"type": "error", "error_category": error_cat,
+                   "error_message": error_msg, "call_id": call_id}
+            return
+
+        yield {"type": "done", "usage": usage, "call_id": call_id}
 
     # ── Self-test / connectivity check ────────────────────────────────
 

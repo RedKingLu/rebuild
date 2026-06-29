@@ -1,0 +1,78 @@
+"""R9-5-1 阶段C-routes tests — drive the real P0-P6 graph over HTTP (additive endpoints).
+
+Uses `with TestClient(app)` to trigger lifespan (graph handler bootstrap + checkpointer close),
+proving: real HTTP → compiled LangGraph → real P0/P1 business + DB Gates + checkpoint state,
+through /graph/start, /graph/resume, /graph/state.
+"""
+
+import json
+
+import pytest
+
+
+def test_graph_http_drive_p0_p1(tmp_path, monkeypatch, isolated_data):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.services import workspace_service
+    import app.graph.stage_handlers as sh
+
+    # checkpoint to tmp (global settings.data_dir isn't isolated by conftest)
+    monkeypatch.setattr("app.graph.checkpoint.checkpoint_path",
+                        lambda: tmp_path / "graph_checkpoints.sqlite")
+    # ensure lifespan re-registers real handlers onto this app instance
+    sh._bootstrapped = False
+
+    with TestClient(app) as c:
+        # create a manual project
+        pid = c.post("/api/projects", json={
+            "name": "Graph API", "source_type": "manual", "source_config": {},
+        }).json()["data"]["project_id"]
+
+        # place a real source tree so P1 profiler has input
+        src = workspace_service.workspace_path(pid) / "source"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "package.json").write_text(
+            json.dumps({"name": "d", "dependencies": {"react": "^18"}}), encoding="utf-8")
+        (src / "app.py").write_text("print(1)\n", encoding="utf-8")
+
+        # start graph → P0 real work, pause at P0 promotion Gate
+        r = c.post(f"/api/projects/{pid}/graph/start",
+                   json={"execution_mode": "plan", "source_type": "manual"})
+        assert r.status_code == 200, r.text
+        d = r.json()["data"]
+        run_id = d["run_id"]
+        assert d["paused"] is True
+        assert d["pending_gate"]["stage"] == "p0"
+        assert d["graph_capability_status"] == "live"
+        art = workspace_service.workspace_path(pid) / "artifacts"
+        assert (art / "intake_report.json").exists(), "P0 real intake artifact via HTTP"
+        assert (art / "p0_acceptance.json").exists(), "P0 three-report via HTTP"
+
+        # illegal decision → 400
+        assert c.post(f"/api/projects/{pid}/graph/resume",
+                      json={"run_id": run_id, "decision": "bogus"}).status_code == 400
+
+        # resume approve → P1 real profiling, pause at P1 Gate
+        r = c.post(f"/api/projects/{pid}/graph/resume",
+                   json={"run_id": run_id, "decision": "approve"})
+        d = r.json()["data"]
+        assert d["paused"] is True
+        assert d["pending_gate"]["stage"] == "p1"
+        assert (art / "profiling_summary.md").exists(), "P1 real profiling via HTTP"
+        assert (art / "p2_input_manifest.json").exists()
+
+        # state endpoint reflects checkpoint
+        s = c.get(f"/api/projects/{pid}/graph/state", params={"run_id": run_id}).json()["data"]
+        assert s["current_stage"] == "p1"
+        assert s["stage_status"].get("p0") == "completed"
+
+        # RealGateBackend persisted gates to DB
+        gates = c.get(f"/api/projects/{pid}/gates").json()["data"]["gates"]
+        stages = {g["stage"] for g in gates}
+        assert "p0" in stages and "p1" in stages
+
+        # approve P1 → advance to p2 (stub)
+        r = c.post(f"/api/projects/{pid}/graph/resume",
+                   json={"run_id": run_id, "decision": "approve"})
+        d = r.json()["data"]
+        assert d["stage_status"].get("p1") == "completed"

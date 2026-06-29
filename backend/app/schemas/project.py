@@ -15,6 +15,13 @@ class ProjectCreate(BaseModel):
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    coding_agent_ref: Optional[str] = None
+    # D-088 / R9-5-5: external platform delegation scope
+    # none | coding_only | all_stages
+    external_platform_scope: Optional[str] = None
+    # D-098: per-project model strategy (global_unified / custom) + global model ref
+    model_strategy_mode: Optional[str] = None
+    global_model_ref: Optional[str] = None
 
 
 class ProjectSourceUpdate(BaseModel):
@@ -36,12 +43,16 @@ class ProjectResponse(BaseModel):
     source_config: Optional[dict] = None
     workspace_status: str = "ready"
     onboarding_done: bool = False
+    coding_agent_ref: Optional[str] = None
+    external_platform_scope: str = "none"
+    model_strategy_mode: str = "global_unified"
+    global_model_ref: Optional[str] = None
     updated_at: str = ""
     created_at: str = ""
 
-    # Capability marking
-    source_status: str = "mock"
-    capability_status: str = "not_connected"
+    # Capability marking — WP-4 F-4: real backend, not mock
+    source_status: str = "real"
+    capability_status: str = "available"
 
 
 class ProjectListResponse(BaseModel):

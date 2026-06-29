@@ -17,6 +17,7 @@ class RunResponse(GraphPlaceholderFields):
     run_goal: str
     run_status: str
     current_stage: Optional[str] = None
+    execution_mode: str = "plan"  # R9-3B
     started_at: str = ""
     updated_at: str = ""
     active_gate: Optional[str] = None

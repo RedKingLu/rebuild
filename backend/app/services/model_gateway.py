@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -187,6 +188,41 @@ class ModelGateway:
             stream=stream,
         )
 
+        # 5b. Runtime fallback: if call failed and no explicit override, try strategy fallback profiles
+        if result.status == "failed" and user_override is None:
+            strategy = self._registry.get_strategy(strategy_id)
+            for fb_ref in (strategy.fallback_profile_refs if strategy else []):
+                if fb_ref == profile.profile_id:
+                    continue
+                fb_profile = self._registry.get_profile(fb_ref)
+                if not fb_profile or fb_profile.status != "configured":
+                    continue
+                fb_provider = self._registry.get_provider(fb_profile.provider_id)
+                if not fb_provider:
+                    continue
+                fb_key, _ = self._resolve_key(fb_provider, False)
+                if not fb_key:
+                    continue
+                fb_format = fb_provider.api_format
+                fb_base = (fb_provider.endpoint_anthropic
+                           if fb_format == "anthropic" and fb_provider.endpoint_anthropic
+                           else fb_provider.endpoint_openai or fb_provider.endpoint_anthropic)
+                fb_model = normalize_model_name(fb_profile.model_name, fb_format)
+                fb_result = await self._adapter.complete(
+                    model=fb_model, messages=messages, api_base=fb_base, api_key=fb_key,
+                    api_format=fb_format, max_tokens=max_tokens, temperature=temperature,
+                    stream=stream,
+                )
+                if fb_result.status == "completed":
+                    fb_result.fallback_used = True
+                    fb_result.fallback_from = profile.profile_id
+                    result = fb_result
+                    profile = fb_profile
+                    provider = fb_provider
+                    reason = f"fallback:{fb_ref}"
+                    litellm_model = fb_model
+                    break
+
         # 6. Record call log — persist to DB (FB-006) + in-memory
         latency = (time.monotonic() - t0) * 1000
         call_record = {
@@ -226,6 +262,243 @@ class ModelGateway:
             "call_record": call_record,
         }
 
+    async def call_stream(
+        self,
+        *,
+        messages: list[dict],
+        user_override: Optional[str] = None,
+        strategy_id: str = "system-default",
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        tools: Optional[list[dict]] = None,
+        source: str = "api",
+        project_id: Optional[str] = None,
+        agent_ref: Optional[str] = None,
+    ):
+        """Stream a model call through the gateway as an async generator.
+
+        Yields {"type": "token"/"tool_calls"/"done"/"error"} frames.
+        Fallback policy (T3): if an error frame arrives BEFORE any token is yielded to the
+        caller, and user_override is None, try next profile in strategy.fallback_profile_refs.
+        Once a token/tool_calls frame has been yielded (committed), errors pass through directly.
+        Call log is always written at stream end (公理3: failures must declare).
+        """
+        t0 = time.monotonic()
+
+        # 1. Resolve primary model
+        preferred_ref = self._project_preferred_ref(project_id, agent_ref)
+        profile, reason, provider = self._registry.resolve_model(
+            user_override=user_override, strategy_id=strategy_id, preferred_ref=preferred_ref,
+        )
+
+        if not profile or not provider:
+            yield {
+                "type": "error", "error_category": "not_configured",
+                "error_message": "No configured model available",
+            }
+            return
+
+        # 2. Build ordered profiles_to_try: primary + strategy fallbacks
+        strategy = self._registry.get_strategy(strategy_id)
+        fallback_refs: list[str] = list(strategy.fallback_profile_refs) if strategy else []
+        profiles_to_try: list[tuple] = [(profile, provider, reason, False)]
+        if user_override is None:
+            for fb_ref in fallback_refs:
+                if fb_ref == profile.profile_id:
+                    continue
+                fb_p = self._registry.get_profile(fb_ref)
+                if not fb_p or fb_p.status != "configured":
+                    continue
+                fb_prov = self._registry.get_provider(fb_p.provider_id)
+                if fb_prov:
+                    profiles_to_try.append((fb_p, fb_prov, f"fallback:{fb_ref}", True))
+
+        # State for call log
+        status = "failed"
+        last_error_cat = "not_configured"
+        last_error_msg = "No model available"
+        usage: dict = {}
+        call_id = f"scall_{uuid.uuid4().hex[:12]}"
+        fallback_used = False
+        fallback_from = ""
+        selected_profile = profile
+        selected_provider = provider
+        selected_reason = reason
+        tokens_committed = False
+        stream_done = False
+
+        for try_profile, try_provider, try_reason, is_fb in profiles_to_try:
+            key_val, _ = self._resolve_key(try_provider, user_override is not None)
+            if not key_val:
+                last_error_cat = "credential_missing"
+                last_error_msg = f"No API key for {try_provider.provider_id}"
+                continue
+
+            api_format = try_provider.api_format
+            api_base = (try_provider.endpoint_anthropic
+                        if api_format == "anthropic" and try_provider.endpoint_anthropic
+                        else try_provider.endpoint_openai or try_provider.endpoint_anthropic)
+            litellm_model = normalize_model_name(try_profile.model_name, api_format)
+
+            profile_failed_pre_token = False
+
+            async for frame in self._adapter.stream_complete(
+                model=litellm_model, messages=messages, api_base=api_base, api_key=key_val,
+                max_tokens=max_tokens, temperature=temperature, tools=tools,
+            ):
+                ftype = frame.get("type")
+
+                if ftype == "error":
+                    if tokens_committed:
+                        # Committed to this profile — yield error, stop
+                        call_id = frame.get("call_id", call_id)
+                        last_error_cat = frame.get("error_category", "stream_error")
+                        last_error_msg = frame.get("error_message", "")
+                        status = "failed"
+                        yield frame
+                        stream_done = True
+                        break
+                    else:
+                        # Pre-token — record, allow fallback
+                        last_error_cat = frame.get("error_category", "stream_error")
+                        last_error_msg = frame.get("error_message", "")
+                        call_id = frame.get("call_id", call_id)
+                        profile_failed_pre_token = True
+                        break
+
+                elif ftype == "done":
+                    usage = frame.get("usage", {})
+                    call_id = frame.get("call_id", call_id)
+                    selected_profile = try_profile
+                    selected_provider = try_provider
+                    selected_reason = try_reason
+                    if is_fb:
+                        fallback_used = True
+                        fallback_from = profiles_to_try[0][0].profile_id
+                    status = "completed"
+                    last_error_cat = ""
+                    last_error_msg = ""
+                    yield frame
+                    stream_done = True
+                    break
+
+                else:
+                    # token / tool_calls — commit to this profile on first yield
+                    if not tokens_committed:
+                        tokens_committed = True
+                        selected_profile = try_profile
+                        selected_provider = try_provider
+                        selected_reason = try_reason
+                        if is_fb:
+                            fallback_used = True
+                            fallback_from = profiles_to_try[0][0].profile_id
+                    yield frame
+
+            if stream_done:
+                break
+            if not profile_failed_pre_token:
+                stream_done = True
+                break
+            logger.info(
+                "call_stream: profile %s failed pre-token (%s), trying fallback",
+                try_profile.profile_id, last_error_cat,
+            )
+
+        # If all profiles exhausted without any commit or done
+        if not stream_done and not tokens_committed:
+            yield {
+                "type": "error", "error_category": last_error_cat,
+                "error_message": last_error_msg, "call_id": call_id,
+            }
+
+        # Write call log (always — 公理3)
+        latency = (time.monotonic() - t0) * 1000
+        final_model = normalize_model_name(selected_profile.model_name, selected_provider.api_format)
+        call_record = {
+            "model_call_id": call_id,
+            "provider_id": selected_provider.provider_id,
+            "profile_id": selected_profile.profile_id,
+            "strategy_id": strategy_id,
+            "selected_model": final_model,
+            "selection_reason": selected_reason,
+            "status": status,
+            "latency_ms": round(latency, 1),
+            "error_category": last_error_cat,
+            "retry_count": 0,
+            "fallback_used": fallback_used,
+            "usage_summary": usage,
+            "source": source,
+            "created_at": _now_iso(),
+            "completed_at": _now_iso(),
+        }
+        self._calls.append(call_record)
+        self._persist_call(call_record)
+
+    def resolve_call_target(self, *, user_override: Optional[str] = None,
+                            strategy_id: str = "system-default",
+                            project_id: Optional[str] = None,
+                            agent_ref: Optional[str] = None) -> Optional[dict]:
+        """Single source of truth for 'which model/endpoint/key to use' (D-098).
+
+        Resolves the user's strategy (priority + availability fallback) and returns the
+        litellm-ready target. Call sites (agent_loop streaming, etc.) MUST use this
+        instead of hardcoding a model/endpoint (B-ORCH-02). Returns None if nothing
+        configured (caller surfaces an honest error, never fabricates).
+
+        Priority (D-098/D-036): user_override → project preferred (global_model_ref in
+        global mode / agent model in custom mode) → system strategy default → availability
+        fallback. The project preference is read dynamically from DB.
+        """
+        preferred_ref = self._project_preferred_ref(project_id, agent_ref)
+        profile, reason, provider = self._registry.resolve_model(
+            user_override=user_override, strategy_id=strategy_id, preferred_ref=preferred_ref,
+        )
+        if not profile or not provider:
+            return None
+        key_val, key_source = self._resolve_key(provider, user_override is not None)
+        if not key_val:
+            return None
+        api_format = provider.api_format
+        if api_format == "anthropic" and provider.endpoint_anthropic:
+            api_base = provider.endpoint_anthropic
+        else:
+            api_base = provider.endpoint_openai or provider.endpoint_anthropic
+        return {
+            "model": normalize_model_name(profile.model_name, api_format),
+            "api_base": api_base,
+            "api_key": key_val,
+            "api_format": api_format,
+            "profile_id": profile.profile_id,
+            "provider_id": provider.provider_id,
+            "selection_reason": reason,
+        }
+
+    def _project_preferred_ref(self, project_id: Optional[str],
+                               agent_ref: Optional[str]) -> Optional[str]:
+        """Dynamically read the project's model strategy preference (D-098)."""
+        if not project_id:
+            return None
+        try:
+            from app.core.database import get_session
+            from app.models.project import Project
+            db = get_session()
+            try:
+                p = db.get(Project, project_id)
+                if p is None:
+                    return None
+                mode = getattr(p, "model_strategy_mode", "global_unified")
+                if mode == "global_unified":
+                    return getattr(p, "global_model_ref", None) or None
+                if mode == "custom" and agent_ref:
+                    from app.models.agent_definition import AgentDefinition
+                    a = db.get(AgentDefinition, agent_ref)
+                    return getattr(a, "model_policy_ref", None) if a else None
+            finally:
+                db.close()
+        except Exception:
+            return None
+        return None
+
     # ── Self-test ─────────────────────────────────────────────────────
 
     async def self_test(self, provider_id: str, profile_id: Optional[str] = None) -> dict:
@@ -244,8 +517,8 @@ class ModelGateway:
         else:
             return {"status": "not_configured", "error": "No models configured for provider"}
 
-        # Check credential
-        key_val, key_source = _resolve_api_key(provider.env_key_var, provider_id)
+        # Check credential — same path as call() so self-test result = actual call result (T6, P-1.4)
+        key_val, key_source = self._resolve_key(provider, explicit_provider=True)
         if not key_val:
             return {
                 "status": "not_configured",

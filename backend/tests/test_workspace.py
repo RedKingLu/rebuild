@@ -22,11 +22,11 @@ def test_workspace_aggregate(client, project_id):
     assert data["project"] is not None
     assert data["project"]["name"] == "Workspace Test Project"
     assert "stage_statuses" in data
-    # Graph status must be not_connected
-    assert data["graph_status"]["graph_capability_status"] == "not_connected"
-    assert data["graph_status"]["transition_mode"] == "mock"
-    # Meta
-    assert data["meta"]["source_status"] == "mock"
+    # R9-5-1 阶段D: real LangGraph orchestration → capability probe is live, not_connected retired
+    assert data["graph_status"]["graph_capability_status"] in ("live", "degraded")
+    assert data["graph_status"]["transition_mode"] == "langgraph"
+    # Meta — WP-4 F-4: real backend, source_status must be "real" (not "mock")
+    assert data["meta"]["source_status"] == "real"
 
 
 def test_workspace_nonexistent_project(client):

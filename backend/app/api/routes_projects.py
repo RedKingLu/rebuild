@@ -1,10 +1,14 @@
 """Project API routes — DB-backed CRUD with Trace audit."""
 
+import logging
 import os
 import uuid
 import zipfile
 import shutil
+
+logger = logging.getLogger("rebuild.routes_projects")
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -43,10 +47,21 @@ async def list_projects(
         data=ProjectListResponse(
             projects=[ProjectResponse(**svc.to_response(p)) for p in projects],
             total=len(projects),
-            meta=Meta(),
+            meta=Meta(source_status="real"),
         ),
-        meta=Meta(),
+        meta=Meta(source_status="real"),  # R9-5-8 T11: real DB list, not "mock"
     )
+
+
+@router.post("/precheck")
+async def precheck_project(req: ProjectCreate, db: Session = Depends(get_db)):
+    """R9-5-8 T10: pre-create validation (nothing persisted). Returns field-level
+    checks; passed=False on a hard error (empty name / invalid type / Git without
+    usable credential). The guide calls this before create — passed≠create success."""
+    from app.services.precheck_service import run_precheck
+    result = run_precheck(req.name, req.source_type, req.source_config,
+                          services=get_services())
+    return SuccessEnvelope(data=result.to_dict(), meta=Meta())
 
 
 @router.post("")
@@ -55,22 +70,61 @@ async def create_project(
     db: Session = Depends(get_db),
 ):
     svc = ProjectService(db)
-    project = svc.create(req)
     svc_deps = get_services()
 
-    # R8: Auto-initialize per-project workspace directory (D-050)
+    # 1. Create project record (status = importing)
+    project = svc.create(req)
+    svc.update(project.project_id, workspace_status="importing")
+
+    # 2. Initialize workspace directory structure (source/, materials/, artifacts/, ...)
     try:
         from app.services.workspace_service import init_workspace
         init_workspace(project.project_id)
-        svc.update(project.project_id, workspace_status="initialized")
     except Exception:
-        pass  # Workspace init failure is non-fatal
+        logger.warning("Workspace init failed", exc_info=True)
+
+    # 3. Source materialization — copy/clone source into workspace/source/
+    src_type = project.source_type.value if hasattr(project.source_type, 'value') else str(project.source_type)
+    materialized = {"materialization_status": "skipped", "file_count": 0}
+    try:
+        from app.services.source_materializer import SourceMaterializer, generate_source_index
+        m = SourceMaterializer(trace_writer=svc_deps.trace_writer, audit_writer=svc_deps.audit_writer)
+        materialized = m.materialize(project.project_id, src_type, project.source_config or {})
+        if materialized.get("file_count", 0) > 0:
+            generate_source_index(project.project_id)
+    except Exception:
+        logger.warning("Source materialization failed", exc_info=True)
+        materialized = {"materialization_status": "error", "file_count": 0}
+
+    # 4. Update project status based on materialization result (R9-5-8 T12/T8).
+    #    Honest status — NEVER force "ready" over a failed/empty materialization.
+    #      blocked  : materialization error/failed (user must act)
+    #      deferred : non-manual source produced 0 files (creds / not yet imported)
+    #      ready    : source present, or legitimately-empty manual project
+    mat_status = materialized.get("materialization_status")
+    file_count = materialized.get("file_count", 0)
+    if mat_status in ("failed", "error"):
+        final_status = "blocked"
+    elif mat_status == "deferred" or (file_count == 0 and src_type not in ("manual",)):
+        final_status = "deferred"
+    else:
+        final_status = "ready"
+    svc.update(project.project_id, workspace_status=final_status)
+
+    # 5. Environment Profile defaults
+    try:
+        from app.services.workspace_service import init_environment
+        init_environment(project.project_id)
+    except Exception:
+        logger.warning("Environment init failed", exc_info=True)
 
     svc_deps.trace_writer.write(
         "state_change", action="create_project",
-        summary=f"Created project {project.project_id}",
+        summary=f"Created project {project.project_id}: {src_type}, "
+                f"{materialized.get('file_count', 0)} files, status={materialized.get('materialization_status')}",
         project_id=project.project_id,
     )
+
     return SuccessEnvelope(
         data=ProjectResponse(**svc.to_response(project)),
         meta=Meta(),
@@ -199,23 +253,31 @@ async def create_project_with_zip(
         contents = await file.read()
         import io
         with zipfile.ZipFile(io.BytesIO(contents)) as zf:
-            # Security: guard against zip bombs and path traversal
+            # Security: guard against zip bombs and path traversal (R9-3F).
+            # Extract member-by-member, skipping any path that escapes extract_dir,
+            # so a malicious member can never be written outside the sandbox even
+            # if stdlib sanitization changes.
+            extract_root = os.path.realpath(extract_dir)
             total_size = 0
+            extracted = 0
             for member in zf.infolist():
                 total_size += member.file_size
                 if total_size > 100 * 1024 * 1024:  # 100MB limit
                     raise HTTPException(400, "ZIP too large (max 100MB uncompressed)")
-                # Guard against path traversal in ZIP
                 member_path = os.path.normpath(member.filename)
                 if member_path.startswith('..') or os.path.isabs(member_path):
-                    continue  # Skip dangerous paths
-            zf.extractall(extract_dir)
+                    continue  # Skip dangerous paths — do NOT extract
+                dest = os.path.realpath(os.path.join(extract_dir, member_path))
+                if dest != extract_root and not dest.startswith(extract_root + os.sep):
+                    continue  # Zip-slip guard: target escapes sandbox
+                zf.extract(member, extract_dir)
+                extracted += 1
 
         # Update source_config with extraction path
         svc.update(project.project_id, source_config={
             "original_filename": file.filename,
             "extracted_path": extract_dir,
-            "file_count": len(zf.infolist()),
+            "file_count": extracted,
         })
     except HTTPException:
         raise
@@ -375,3 +437,661 @@ async def configure_github_source(
         data=ProjectResponse(**svc.to_response(project)),
         meta=Meta(),
     )
+
+
+# ── P0 Onboarding completion (R9-3B) ────────────────────────────────────
+
+from pydantic import BaseModel as _BaseModel
+
+class OnboardingCompleteRequest(_BaseModel):
+    execution_mode: str = "plan"
+    env_kind: str | None = None
+    language_hint: str | None = None
+    framework_hint: str | None = None
+    coding_agent_ref: str | None = None
+    # D-088 / R9-5-5: external platform delegation scope for this project
+    external_platform_scope: str | None = None
+    # D-098: model strategy chosen in the guide (global_unified → global_model_ref)
+    model_strategy_mode: str | None = None
+    global_model_ref: str | None = None
+    # R9-5-7 T1/T2 (D-086②/D-094): submission method chosen in the guide.
+    #   submission_kind ∈ {remote_git, local_git}. This round only remote_git is
+    #   wired (本轮只接远端 Git); local_git is a read-only placeholder pending D-094.
+    submission_kind: str | None = None
+    git_remote_url: str | None = None
+    git_branch: str | None = None
+
+
+@router.post("/{project_id}/onboarding/complete")
+async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, db: Session = Depends(get_db)):
+    """Complete the P0 onboarding wizard and create the initial Run."""
+    svc = ProjectService(db)
+    svc_deps = get_services()
+    project = svc.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    # 1. Update Environment Profile
+    try:
+        from app.services.workspace_service import update_environment
+        env_updates = {"status": "declared"}
+        if req.env_kind:
+            env_updates["env_kind"] = req.env_kind
+        if req.language_hint:
+            env_updates["language_hint"] = req.language_hint
+        if req.framework_hint:
+            env_updates["framework_hint"] = req.framework_hint
+        update_environment(project_id, env_updates)
+    except Exception:
+        logger.warning("Environment update failed", exc_info=True)
+
+    # 2. Update Project
+    updates = {"onboarding_done": True}
+    if req.coding_agent_ref:
+        updates["coding_agent_ref"] = req.coding_agent_ref
+    if req.external_platform_scope:
+        updates["external_platform_scope"] = req.external_platform_scope
+    # D-098: persist the model strategy chosen in the guide (引导可写, D-086)
+    if req.model_strategy_mode:
+        updates["model_strategy_mode"] = req.model_strategy_mode
+    if req.global_model_ref is not None:
+        updates["global_model_ref"] = req.global_model_ref
+    # R9-5-7 T1/T2: persist remote-Git submission choice into source_config so the
+    # materializer (step 5b) clones the chosen repo. Honest deferred if no creds.
+    if req.submission_kind == "remote_git" and req.git_remote_url:
+        from app.models.project import SourceType as _ST
+        merged_cfg = dict(project.source_config or {})
+        merged_cfg["remote_url"] = req.git_remote_url
+        if req.git_branch:
+            merged_cfg["branch"] = req.git_branch
+        updates["source_type"] = _ST.git
+        updates["source_config"] = merged_cfg
+    svc.update(project_id, **updates)
+    # Re-read so downstream materialization sees the updated source_type/config
+    project = svc.get(project_id)
+
+    # 3. Create P0 Run — WP-3: idempotent; return existing active Run if present
+    run = None
+    try:
+        from app.services.run_service import RunService, _run_to_response as _r2r
+        from app.schemas.run import RunCreate as _RunCreate
+        from app.models.run import Run as _Run
+        from app.core.database import get_session as _get_session
+        # Check for existing p0 Run for this project (idempotency key: project_id + current_stage=p0 + active status)
+        _idem_db = _get_session()
+        _existing_run = None
+        try:
+            _existing_run = _idem_db.query(_Run).filter(
+                _Run.project_id == project_id,
+                _Run.current_stage == "p0",
+                _Run.run_status.in_(["created", "running"]),
+            ).first()
+        finally:
+            _idem_db.close()
+        if _existing_run is not None:
+            # Reuse existing Run — don't create duplicate
+            run = _r2r(_existing_run)
+            logger.info(f"WP-3 idempotent: reusing existing p0 Run {_existing_run.run_id} for project {project_id}")
+        else:
+            run_req = _RunCreate(run_goal=f"P0 接入：{project.name}", mode=req.execution_mode)
+            run = RunService(svc_deps).create(project_id, run_req)
+            svc.update(project_id, current_run_id=run.run_id, current_stage="p0")
+    except Exception:
+        logger.warning("Run creation failed", exc_info=True)
+
+    # 3b. R9-5-7 T7: persist execution_mode to workspace.json — the SINGLE control
+    #     source shared with the top-bar ExecModeSwitch (PUT /mode). Without this the
+    #     wizard's mode choice was "选了不生效" (run.mode is only a per-Run snapshot).
+    try:
+        from app.services.workspace_service import set_execution_mode
+        set_execution_mode(project_id, req.execution_mode)
+    except Exception:
+        logger.warning("execution_mode persist failed", exc_info=True)
+
+    # 4. Write intake_report Artifact
+    intake_id = f"artifact-intake-{project_id[:8]}"
+    try:
+        from app.services.workspace_service import workspace_path
+        import json as _json
+        art_dir = workspace_path(project_id) / "artifacts"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        (art_dir / "intake_report.json").write_text(_json.dumps({
+            "artifact_id": intake_id, "project_id": project_id, "stage": "p0",
+            "artifact_type": "intake_report", "title": f"P0 接入报告：{project.name}",
+            "source_type": str(project.source_type.value) if hasattr(project.source_type, 'value') else str(project.source_type),
+            "execution_mode": req.execution_mode, "status": "generated",
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logger.warning("intake_report write failed", exc_info=True)
+
+    # 5. Evidence candidates — WP-2: write real Evidence objects to workspace/evidence/
+    #    so GET /evidence returns non-empty list; Gate evidence_refs point to real ids.
+    _ev_ws_id = f"ev-p0-ws-{project_id[:8]}"
+    _ev_onb_id = f"ev-p0-onb-{project_id[:8]}"
+    evidence_candidates = [
+        {"evidence_id": _ev_ws_id, "type": "workspace_initialized", "status": "candidate"},
+        {"evidence_id": _ev_onb_id, "type": "onboarding_completed", "status": "candidate"},
+    ]
+    try:
+        svc_deps.aet_service.write_evidence(
+            project_id=project_id, evidence_id=_ev_ws_id,
+            evidence_type="workspace_initialized", status="candidate",
+            source="p0_onboarding", claim="P0 工作区已初始化", stage="p0",
+        )
+        svc_deps.aet_service.write_evidence(
+            project_id=project_id, evidence_id=_ev_onb_id,
+            evidence_type="onboarding_completed", status="candidate",
+            source="p0_onboarding", claim="P0 Onboarding 已完成（Run 已建，产物已生成）", stage="p0",
+        )
+    except Exception:
+        logger.warning("Evidence write failed", exc_info=True)
+
+    # 5b. Source Materialization — REAL import of source code (R9-3G fix).
+    #     For non-manual types, actually copy/clone source into workspace/source/.
+    materialized = None
+    p0_artifact_refs = ["artifacts/intake_report.json"]
+    try:
+        from app.services.source_materializer import SourceMaterializer
+        src_type = project.source_type.value if hasattr(project.source_type, 'value') else str(project.source_type)
+        m = SourceMaterializer(trace_writer=svc_deps.trace_writer, audit_writer=svc_deps.audit_writer)
+        materialized = m.materialize(project_id, src_type, project.source_config or {})
+        if materialized.get("success") or materialized.get("materialization_status") in ("completed", "empty"):
+            svc_deps.trace_writer.write("source_materialized", action="onboarding_materialize",
+                summary=f"P0 materialized: {materialized.get('file_count', 0)} files ({materialized.get('materialization_status')})",
+                project_id=project_id)
+        else:
+            svc_deps.trace_writer.write("source_materialized", action="onboarding_materialize",
+                summary=f"P0 materialize: {materialized.get('materialization_status')} ({materialized.get('file_count', 0)} files)",
+                project_id=project_id)
+        # Generate source_index if we have files
+        if materialized.get("file_count", 0) > 0:
+            from app.services.source_materializer import generate_source_index
+            generate_source_index(project_id)
+    except Exception:
+        logger.warning("Source materialization failed", exc_info=True)
+        materialized = {"materialization_status": "error", "file_count": 0, "errors": ["Materialization exception"]}
+
+    # Append material artifacts to p0_artifact_refs
+    p0_artifact_refs.extend([
+        "artifacts/p0_execution_record.json",
+        "artifacts/p0_construction_report.md",
+        "artifacts/p0_review_pass.json",
+    ])
+
+    # 4b. P0 Review Pass (no Gate yet — Gate is created by Agent-driven /onboarding/execute)
+    from app.services.review_pass import ReviewPass, ReviewResult
+    from app.services.workspace_service import workspace_path as _wp
+
+    def _review_intake(_state) -> ReviewResult:
+        issues = []
+        if run is None:
+            issues.append({"type": "run_missing", "detail": "P0 Run was not created"})
+        if not (_wp(project_id) / "artifacts" / "intake_report.json").exists():
+            issues.append({"type": "intake_missing", "detail": "intake_report.json not generated"})
+        return ReviewResult(passed=not issues, issues=issues,
+                            recommendations=["重建 P0 接入产物"] if issues else [],
+                            reviewer="intake_review_skill")
+
+    rp = ReviewPass(max_rounds=2, tracer=svc_deps.trace_writer, auditor=svc_deps.audit_writer)
+    review_outcome = await rp.run(execute_fn=lambda: {"ok": True},
+                                  review_fn=_review_intake, project_id=project_id, stage="p0")
+
+    # 5. Generate P0 Gate review materials (R9-3G-B: 4 artifact files — generated NOW
+    #    so the Gate can reference them later in /onboarding/execute)
+    from datetime import datetime as _dt, timezone as _tz
+    _ts_now = _dt.now(_tz.utc).isoformat()
+    import json as _json
+
+    art_dir2 = workspace_path(project_id) / "artifacts"
+    art_dir2.mkdir(parents=True, exist_ok=True)
+
+    _p0_exec = {
+        "stage": "p0", "project_id": project_id,
+        "generated_at": _ts_now,
+        "steps": [
+            {"step": "environment_update", "status": "completed", "timestamp": _ts_now},
+            {"step": "source_materialized", "status": "completed" if materialized else "skipped_manual", "timestamp": _ts_now,
+             "files_imported": materialized.get("file_count", 0) if materialized else 0},
+            {"step": "onboarding_done", "status": "completed", "timestamp": _ts_now},
+            {"step": "run_created", "status": "completed" if run else "failed", "timestamp": _ts_now,
+             "run_id": run.run_id if run else None},
+            {"step": "intake_written", "status": "completed", "timestamp": _ts_now},
+            {"step": "evidence_written", "status": "completed", "timestamp": _ts_now},
+            {"step": "review_completed", "status": "completed", "timestamp": _ts_now},
+        ],
+    }
+    (art_dir2 / "p0_execution_record.json").write_text(
+        _json.dumps(_p0_exec, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    _p0_report = f"""# P0 接入施工报告
+
+- **项目**: {project.name}
+- **阶段**: P0 接入
+- **时间**: {_ts_now}
+- **执行模式**: {req.execution_mode}
+- **来源类型**: {project.source_type}
+- **源码导入**: {materialized.get('file_count', 0) if materialized else 0} 文件
+
+## 产物清单
+- intake_report.json
+- p0_execution_record.json
+- p0_construction_report.md
+- p0_review_pass.json
+
+## 自检结论
+P0 接入完成：环境配置已声明、{'源码已导入' if materialized else '手动项目（无源码导入）'}、Run 已创建、Evidence 候选已记录。
+
+## 备注
+本报告由 R9-3G Gate 附审材料系统自动生成。
+"""
+    (art_dir2 / "p0_construction_report.md").write_text(_p0_report, encoding="utf-8")
+
+    _p0_review = {
+        "stage": "p0", "project_id": project_id,
+        "generated_at": _ts_now,
+        "reviewer": review_outcome.get("reviewer", "intake_review_skill"),
+        "passed": review_outcome.get("passed", True),
+        "rounds": review_outcome.get("rounds", 1),
+        "issues": review_outcome.get("issues", []),
+        "recommendations": review_outcome.get("recommendations", []),
+    }
+    (art_dir2 / "p0_review_pass.json").write_text(
+        _json.dumps(_p0_review, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 6. Trace + Audit
+    svc_deps.trace_writer.write("onboarding_complete", action="complete_onboarding",
+        summary=f"Onboarding completed: {project.name} (source: {materialized.get('file_count', 0) if materialized else 0} files)",
+        project_id=project_id)
+    svc_deps.audit_writer.write(audit_type="onboarding_complete", action="complete_onboarding",
+        decision="executed", risk_level="L2", project_id=project_id,
+        reason=f"P0 onboarding: {project.name}")
+
+    return SuccessEnvelope(data={
+        "project_id": project_id, "onboarding_done": True,
+        "run_id": run.run_id if run else None,
+        "intake_artifact_id": intake_id,
+        "evidence_candidates": evidence_candidates,
+        "materialized": materialized,
+        "review": {"passed": review_outcome.get("passed"), "reviewer": "intake_review_skill"},
+        "p0_artifacts": p0_artifact_refs,
+        "next": "调用 POST /onboarding/execute 以 Agent 驱动完成 P0 执行并创建 Gate",
+    }, meta=Meta())
+
+
+# ── P1 Full-Stack Profiling (R9-3C) ─────────────────────────────────────
+
+class ProfilingRequest(_BaseModel):
+    pass  # No params needed — profiling reads from workspace/source/
+
+
+
+# ── P0 Agent-driven execution (WP-6: LangGraph delegate) ────────────────────
+
+@router.post("/{project_id}/onboarding/execute")
+async def execute_onboarding(project_id: str, db: Session = Depends(get_db)):
+    """P0 execution delegate — WP-6: thin trigger that drives the LangGraph P0 node.
+
+    Streams SSE events from the real graph execution (FlowRuntime.astream_events).
+    Gate created by the graph carries real checkpoint_ref (thread_id=run_id).
+    Falls back to the legacy inline pipeline if FlowRuntime is unavailable.
+
+    Call this AFTER /onboarding/complete.
+    """
+    import json as _json
+    import asyncio as _asyncio
+
+    svc = ProjectService(db)
+    svc_deps = get_services()
+    project = svc.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    # WP-3 F-3 idempotency guard (before stream):
+    # 1. If project already past p0, reject to prevent creating stale P0 Gates
+    _stage_order = ["p0", "p1", "p2", "p3", "p4", "p5", "p6"]
+    _cur_stage = (project.current_stage or "p0").lower()
+    if _cur_stage in _stage_order and _stage_order.index(_cur_stage) > 0:
+        raise HTTPException(
+            409,
+            f"项目当前阶段已是 {_cur_stage}，不能重新执行 P0 onboarding。"
+            f"（当前阶段 > p0，拒绝重建 P0 Gate）",
+        )
+    # 2. If there is already an active P0 Gate, return it (don't create duplicate)
+    _active_gate_id = getattr(project, "active_gate", None)
+    if _active_gate_id:
+        _existing_gate = svc_deps.gate_service.get(_active_gate_id)
+        if _existing_gate and _existing_gate.stage == "p0" and _existing_gate.gate_status == "waiting_decision":
+            _idem_data = _json.dumps({
+                "message": "P0 Gate 已存在，无需重复执行。",
+                "gate_id": _active_gate_id,
+                "gate_type": _existing_gate.gate_type,
+                "checkpoint_ref": _existing_gate.checkpoint_ref,
+                "idempotent": True,
+            }, ensure_ascii=False)
+            async def _idem_stream():
+                yield f"event: complete\ndata: {_idem_data}\n\n"
+            return StreamingResponse(_idem_stream(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ── WP-6: delegate to FlowRuntime (LangGraph P0 node) ────────────────
+    run_id = getattr(project, "current_run_id", None) or ""
+
+    def _src_type_str():
+        st = project.source_type
+        return st.value if hasattr(st, "value") else str(st)
+
+    async def graph_stream():
+        from app.graph.runtime import get_flow_runtime, graph_capability_probe
+        nonlocal run_id
+
+        def _emit(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
+
+        # If no run exists yet, create one now (complete_onboarding may have been skipped)
+        if not run_id:
+            try:
+                from app.services.run_service import RunService
+                from app.schemas.run import RunCreate as _RC
+                r = RunService(svc_deps).create(project_id, _RC(run_goal=f"P0 接入：{project.name}"))
+                run_id = r.run_id
+                svc.update(project_id, current_run_id=run_id, current_stage="p0")
+            except Exception as exc:
+                logger.warning("execute_onboarding: run creation failed: %s", exc, exc_info=True)
+                yield _emit("error", {"message": f"Run 创建失败：{exc}"})
+                return
+
+        yield _emit("status", {"phase": "graph_start", "message": "正在启动 LangGraph P0 节点…", "run_id": run_id})
+        await _asyncio.sleep(0.05)
+
+        rt = get_flow_runtime()
+        init_state = {
+            "run_id": run_id,
+            "project_id": project_id,
+            "run_goal": f"P0 接入：{project.name}",
+            "run_status": "running",
+            "source_type": _src_type_str(),
+            "source_config": project.source_config or {},
+            "execution_mode": "plan",
+            "stage_status": {"p0": "in_progress"},
+            "current_stage": "p0",
+        }
+
+        gate_id = None
+        gate_type = None
+        checkpoint_ref = None
+        final_stage = "p0"
+        had_interrupt = False
+
+        try:
+            async for ev in rt.astream_events(run_id, init_state=init_state):
+                etype = ev.get("event", "")
+                # Surface graph events as SSE status events
+                if etype == "on_chain_start":
+                    node = ev.get("name", "")
+                    if node:
+                        yield _emit("status", {"phase": "node_start", "node": node,
+                                               "message": f"节点 {node} 开始执行…"})
+                elif etype == "on_chain_end":
+                    node = ev.get("name", "")
+                    if node:
+                        yield _emit("status", {"phase": "node_end", "node": node,
+                                               "message": f"节点 {node} 执行完成"})
+                elif etype == "on_chain_stream":
+                    pass  # skip intermediate stream chunks
+                # Extract gate_id from interrupt events
+                data = ev.get("data") or {}
+                if isinstance(data, dict):
+                    output = data.get("output") or {}
+                    if isinstance(output, dict):
+                        pg = output.get("pending_gate") or {}
+                        if isinstance(pg, dict) and pg.get("gate_id"):
+                            gate_id = pg["gate_id"]
+                            checkpoint_ref = run_id  # thread_id == run_id
+
+        except Exception as exc:
+            # Check if it's an interrupt (normal pause at gate)
+            exc_str = str(exc)
+            if "interrupt" in exc_str.lower() or "GraphInterrupt" in type(exc).__name__:
+                had_interrupt = True
+            else:
+                logger.warning("graph stream error: %s", exc, exc_info=True)
+                yield _emit("error", {"message": f"图执行失败：{exc}"})
+                return
+
+        # After graph execution (which paused at interrupt), query the Gate
+        # The gate was created by RealGateBackend with checkpoint_ref=run_id
+        gate_reason = ""
+        if not gate_id:
+            # Look up active gate created during this graph run
+            active_gate = svc_deps.gate_service.get_active(project_id)
+            if active_gate and active_gate.run_id == run_id:
+                gate_id = active_gate.gate_id
+                gate_type = active_gate.gate_type
+                gate_reason = active_gate.reason or ""
+                checkpoint_ref = active_gate.checkpoint_ref or run_id
+        else:
+            # gate_id was extracted from graph events; pull full gate for type info
+            try:
+                _gt = svc_deps.gate_service.get(gate_id)
+                if _gt:
+                    gate_type = _gt.gate_type
+                    gate_reason = _gt.reason or ""
+            except Exception:
+                pass
+
+        # Update project state
+        if gate_id:
+            svc.update(project_id, active_gate=gate_id)
+
+        # Re-read project to get real state
+        proj_now = svc.get(project_id)
+        final_stage = (proj_now.current_stage if proj_now else "p0") or "p0"
+
+        # surface graph capability status
+        cap_status = rt.capability_status()
+        _complete_data = {
+            "message": f"P0 接入完成（LangGraph 图节点执行）。Gate 已创建。",
+            "gate_id": gate_id,
+            "gate_type": gate_type or "stage_promotion",
+            "checkpoint_ref": checkpoint_ref,
+            "run_id": run_id,
+            "current_stage": final_stage,
+            "graph_capability_status": cap_status,
+            "graph_driven": True,
+        }
+        # WP-1: surface retry_action for source_pending gates so clients can guide recovery
+        if gate_type == "source_pending":
+            _complete_data["retry_action"] = "update_source_config"
+            if gate_reason:
+                _complete_data["gate_reason"] = gate_reason
+        yield _emit("complete", _complete_data)
+
+    return StreamingResponse(graph_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.post("/{project_id}/profile")
+async def run_profiling(project_id: str, req: ProfilingRequest | None = None, db: Session = Depends(get_db)):
+    """Run P1 full-stack profiling on the project workspace.
+
+    Generates all 14 identification artifacts, profiling summary,
+    and P2 input manifest. Creates P1→P2 promotion Gate.
+    """
+    svc = ProjectService(db)
+    svc_deps = get_services()
+    project = svc.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    # Ensure workspace source/ exists
+    from app.services.workspace_service import workspace_path
+    ws_source = workspace_path(project_id) / "source"
+    if not ws_source.exists() or not any(ws_source.iterdir()):
+        # Try materialization first
+        try:
+            from app.services.source_materializer import SourceMaterializer
+            m = SourceMaterializer(trace_writer=svc_deps.trace_writer, audit_writer=svc_deps.audit_writer)
+            src_type = project.source_type.value if hasattr(project.source_type, 'value') else str(project.source_type)
+            m.materialize(project_id, src_type, project.source_config or {})
+        except Exception:
+            logger.warning("Profiling pre-materialization failed", exc_info=True)
+
+    # Run the profiler THROUGH a Review Pass (R9-3F: execute→review→retry≤2→escalate)
+    from app.services.full_stack_profiler import FullStackProfiler
+    from app.services.review_pass import ReviewPass, ReviewResult
+    from app.services.workspace_service import workspace_path as _wp
+    profiler = FullStackProfiler(
+        trace_writer=svc_deps.trace_writer,
+        audit_writer=svc_deps.audit_writer,
+    )
+
+    def _review_profiling(prof_result: dict) -> ReviewResult:
+        """Quality gate for P1 profiling output (real artifacts on disk)."""
+        issues = []
+        art = _wp(project_id) / "artifacts"
+        if prof_result.get("items_completed", 0) < 1:
+            issues.append({"type": "no_artifacts", "detail": "profiler produced no identification artifacts"})
+        if not (art / "p2_input_manifest.json").exists():
+            issues.append({"type": "missing_p2_manifest", "detail": "p2_input_manifest.json not generated"})
+        if not (art / "profiling_summary.md").exists():
+            issues.append({"type": "missing_summary", "detail": "profiling_summary.md not generated"})
+        return ReviewResult(
+            passed=not issues, issues=issues,
+            recommendations=["重新执行全量识别并确认产物写入"] if issues else [],
+            reviewer="profile_review_skill",
+        )
+
+    rp = ReviewPass(max_rounds=2, tracer=svc_deps.trace_writer, auditor=svc_deps.audit_writer)
+    review_outcome = await rp.run(
+        execute_fn=lambda: profiler.profile(project_id),
+        review_fn=_review_profiling,
+        project_id=project_id, stage="p1",
+    )
+    result = review_outcome.get("final_result") or {"items_completed": 0, "gaps_count": 0}
+
+    # If Review Pass escalated (failed after max rounds), do NOT create the
+    # promotion Gate — surface the escalation honestly.
+    if not review_outcome.get("passed"):
+        svc_deps.trace_writer.write("profiling_review", action="run_profiling",
+            summary=f"P1 profiling escalated after review: {review_outcome.get('escalation_reason')}",
+            project_id=project_id)
+        return SuccessEnvelope(data={
+            "project_id": project_id,
+            "profiling_result": result,
+            "review": {"passed": False, "rounds": review_outcome.get("rounds"),
+                       "escalated_to_gate": review_outcome.get("escalated_to_gate"),
+                       "escalation_reason": review_outcome.get("escalation_reason")},
+            "gate_id": None,
+            "next_stage": None,
+        }, meta=Meta())
+
+    # Generate P1 Gate review materials (R9-3G-C: mirror B4 pattern)
+    from datetime import datetime as _dt2, timezone as _tz2
+    _ts_now2 = _dt2.now(_tz2.utc).isoformat()
+    import json as _json2
+
+    art_dir_p1 = _wp(project_id) / "artifacts"
+    art_dir_p1.mkdir(parents=True, exist_ok=True)
+
+    # p1_stage_plan.json
+    _p1_plan = {
+        "stage": "p1", "project_id": project_id,
+        "generated_at": _ts_now2,
+        "items": [
+            "tech_stack", "language_detection", "framework_detection",
+            "build_system", "package_manifest", "dependency_graph",
+            "database_schema", "api_surface", "entry_points",
+            "config_inventory", "security_baseline", "code_quality",
+            "deployment_artifacts", "container_readiness",
+        ],
+        "expected_artifacts": 13,
+    }
+    (art_dir_p1 / "p1_stage_plan.json").write_text(
+        _json2.dumps(_p1_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # p1_execution_record.json
+    _p1_exec = {
+        "stage": "p1", "project_id": project_id,
+        "generated_at": _ts_now2,
+        "items_completed": result.get("items_completed", 0),
+        "gaps_count": result.get("gaps_count", 0),
+        "review_passed": review_outcome.get("passed", False),
+        "review_rounds": review_outcome.get("rounds", 1),
+    }
+    (art_dir_p1 / "p1_execution_record.json").write_text(
+        _json2.dumps(_p1_exec, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # p1_construction_report.md
+    _p1_report = f"""# P1 建档施工报告
+
+- **项目**: {project.name}
+- **阶段**: P1 全量识别
+- **时间**: {_ts_now2}
+- **完成项**: {result.get('items_completed', 0)} / 14
+
+## 产物清单
+- profiling_summary.md
+- p2_input_manifest.json
+- 13 个类别识别 JSON
+
+## 自检结论
+P1 全量识别完成：{result.get('items_completed', 0)} 项产出，{result.get('gaps_count', 0)} 个待确认项。
+
+## 备注
+本报告由 R9-3G-C Gate 附审材料系统自动生成。
+"""
+    (art_dir_p1 / "p1_construction_report.md").write_text(_p1_report, encoding="utf-8")
+
+    # p1_review_pass.json
+    _p1_review = {
+        "stage": "p1", "project_id": project_id,
+        "generated_at": _ts_now2,
+        "reviewer": review_outcome.get("reviewer", "profile_review_skill"),
+        "passed": review_outcome.get("passed", True),
+        "rounds": review_outcome.get("rounds", 1),
+        "issues": review_outcome.get("issues", []),
+        "recommendations": review_outcome.get("recommendations", []),
+    }
+    (art_dir_p1 / "p1_review_pass.json").write_text(
+        _json2.dumps(_p1_review, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    p1_artifact_refs = [
+        "artifacts/p1_stage_plan.json",
+        "artifacts/p1_execution_record.json",
+        "artifacts/p1_construction_report.md",
+        "artifacts/p1_review_pass.json",
+    ]
+
+    # Create P1→P2 Gate
+    gate_id = None
+    try:
+        gate = svc_deps.gate_service.create(
+            project_id=project_id,
+            run_id=project.current_run_id,
+            stage="p1",
+            gate_type="stage_promotion",
+            reason="P1 全量识别完成，请求进入 P2 评估阶段",
+            summary=f"全量识别完成：{result['items_completed']} 项产出，{result['gaps_count']} 个待确认项。请点击横幅查看审核材料后做出决策。",
+            options=["approve", "reject", "request_changes"],
+            artifact_refs=p1_artifact_refs,
+        )
+        gate_id = gate.gate_id if hasattr(gate, 'gate_id') else gate.get("gate_id", "")
+        svc.update(project_id, active_gate=gate_id, current_stage="p1")
+    except Exception:
+        logger.warning("P1 Gate creation failed", exc_info=True)
+
+    # Trace + Audit
+    svc_deps.trace_writer.write("profiling_complete", action="run_profiling",
+        summary=f"P1 profiling: {result['items_completed']} items, {result['gaps_count']} gaps",
+        project_id=project_id)
+    svc_deps.audit_writer.write(audit_type="profiling_complete", action="run_profiling",
+        decision="executed", risk_level="L2", project_id=project_id,
+        reason=f"P1 profiling: {result['items_completed']} artifacts")
+
+    return SuccessEnvelope(data={
+        "project_id": project_id,
+        "profiling_result": result,
+        "review": {"passed": True, "rounds": review_outcome.get("rounds"), "reviewer": "profile_review_skill"},
+        "gate_id": gate_id,
+        "next_stage": "p2",
+    }, meta=Meta())

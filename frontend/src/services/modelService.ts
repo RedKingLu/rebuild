@@ -71,6 +71,22 @@ export interface ModelStatus {
   overall_status: string;
 }
 
+/** R9-3B: simplified gateway status for onboarding wizard */
+export interface ModelGatewayStatus {
+  global_status: string;
+  configured_providers: number;
+  reachable_providers: number;
+}
+
+export async function fetchModelGatewayStatus(): Promise<ModelGatewayStatus> {
+  const status = await getModelStatus();
+  return {
+    global_status: status.data?.overall_status || 'unknown',
+    configured_providers: status.data?.configured_providers || 0,
+    reachable_providers: status.data?.reachable_providers || 0,
+  };
+}
+
 export interface SelfTestResult {
   provider_id: string;
   profile_id: string;

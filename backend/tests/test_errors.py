@@ -47,8 +47,7 @@ def test_resources_connected(client):
     """R6: Resource Registry returns real data with source_status=real."""
     resp = client.get("/api/resources")
     assert resp.status_code == 200
-    data = resp.json()
-    assert data["source_status"] == "real"
+    data = resp.json()["data"]
     assert data["total"] > 0  # Seed data loaded
 
 

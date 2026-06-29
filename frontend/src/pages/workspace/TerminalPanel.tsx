@@ -4,11 +4,13 @@ import { executeCommand, type ExecuteResult } from '../../services/workspaceServ
 
 interface Props {
   projectId: string;
+  /** R9-3A: callback to push execution results to outputHistory */
+  onOutput?: (entry: { cmd: string; exit_code: number; provider: string; elapsed_ms: number; stdout: string; stderr: string }) => void;
 }
 
 const MAX_HISTORY = 50;
 
-export function TerminalPanel({ projectId }: Props) {
+export function TerminalPanel({ projectId, onOutput }: Props) {
   const [command, setCommand] = useState('');
   const [history, setHistory] = useState<string[]>([]);
   const [historyIdx, setHistoryIdx] = useState(-1);
@@ -33,6 +35,12 @@ export function TerminalPanel({ projectId }: Props) {
     try {
       const result = await executeCommand(projectId, { command: cmd, language: 'shell' });
       setOutputs(prev => [...prev, { cmd, result }]);
+      // R9-3A: Push to parent outputHistory
+      onOutput?.({
+        cmd, exit_code: result.exit_code,
+        provider: result.provider, elapsed_ms: result.elapsed_ms,
+        stdout: result.stdout, stderr: result.stderr,
+      });
     } catch (e: any) {
       setOutputs(prev => [...prev, {
         cmd,

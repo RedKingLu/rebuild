@@ -1,68 +1,82 @@
-"""Test Gate API and mandatory Audit writing."""
+"""Test Gate API and mandatory Audit writing (R9 P1-2: DB-backed)."""
+
+import pytest
 
 
-def test_list_gates(client):
-    resp = client.get("/api/projects/proj-001/gates")
+@pytest.fixture
+def proj_with_gate(client):
+    """Create a project with a real gate."""
+    pid = client.post("/api/projects", json={
+        "name": "Gate Test Project", "source_type": "manual",
+    }).json()["data"]["project_id"]
+    # Complete onboarding + agent execute to create a gate
+    client.post(f"/api/projects/{pid}/onboarding/complete",
+                json={"execution_mode": "plan"})
+    client.post(f"/api/projects/{pid}/onboarding/execute")
+    g = client.get(f"/api/projects/{pid}/gates/active").json()["data"]
+    return pid, g["gate_id"], g.get("run_id", "")
+
+
+def test_list_gates(client, proj_with_gate):
+    pid, gid, _ = proj_with_gate
+    resp = client.get(f"/api/projects/{pid}/gates")
     assert resp.status_code == 200
     gates = resp.json()["data"]["gates"]
     assert len(gates) >= 1
 
 
-def test_active_gate(client):
-    resp = client.get("/api/projects/proj-001/gates/active")
+def test_active_gate(client, proj_with_gate):
+    pid, gid, _ = proj_with_gate
+    resp = client.get(f"/api/projects/{pid}/gates/active")
     assert resp.status_code == 200
     gate = resp.json()["data"]
     assert gate is not None
-    assert gate["gate_id"] == "gate-001"
+    assert gate["gate_id"] == gid
     assert gate["gate_status"] == "waiting_decision"
 
 
-def test_gate_decision_writes_audit(client):
-    """D-034: Gate decision MUST write an Audit entry."""
-    resp = client.post("/api/projects/proj-001/gates/gate-001/decision", json={
-        "decision": "approve",
-        "reason": "Test approval",
+def test_gate_decision_writes_audit(client, proj_with_gate):
+    pid, gid, _ = proj_with_gate
+    resp = client.post(f"/api/projects/{pid}/gates/{gid}/decision", json={
+        "decision": "approve", "reason": "Test approval",
     })
     assert resp.status_code == 200
     data = resp.json()["data"]
-    # Gate should be updated
     assert data["gate"]["gate_status"] == "approved"
     assert data["gate"]["decision"] == "approve"
-    # Audit MUST be present
     assert data["audit"] is not None
-    assert data["audit"]["audit_id"].startswith("AU-")
-    assert data["audit"]["decision"] == "approve"
     assert data["audit"]["audit_type"] == "gate_decision"
-    assert data["audit"]["persistence"] == "file+memory"
+    assert data["audit"]["decision"] == "approve"
 
 
-def test_policy_check_mock(client):
-    resp = client.post("/api/projects/proj-001/policy/check", json={
-        "action_type": "test_action",
-        "risk_level": "L2",
-        "context": {},
+def test_policy_check_real(client, proj_with_gate):
+    pid, _, _ = proj_with_gate
+    resp = client.post(f"/api/projects/{pid}/policy/check", json={
+        "action_type": "test_action", "risk_level": "L2", "context": {"mode": "plan"},
     })
     assert resp.status_code == 200
     data = resp.json()["data"]
-    assert data["allowed"] is True  # R4 always allows
-    assert data["source_status"] == "mock"
+    assert data["allowed"] is True
+    assert data["source_status"] == "real"
 
 
-def test_risk_assess_mock(client):
-    resp = client.post("/api/projects/proj-001/risk/assess", json={
-        "action_type": "test_action",
-        "target": "test",
-        "context": {},
+def test_risk_assess_real(client, proj_with_gate):
+    pid, _, _ = proj_with_gate
+    resp = client.post(f"/api/projects/{pid}/risk/assess", json={
+        "action_type": "test_action", "target": "test", "context": {},
     })
     assert resp.status_code == 200
     data = resp.json()["data"]
-    assert data["risk_level"] == "L0"
-    assert data["source_status"] == "mock"
+    # R9-5-7 T14: risk is now derived from the single-source action→risk map
+    # (mode_policy.risk_for_action) instead of hardcoded L1. An unknown action
+    # type falls to the moderate default L2; source_status is "real".
+    assert data["risk_level"] == "L2"
+    assert data["source_status"] == "real"
 
 
-def test_nonexistent_gate(client):
-    resp = client.post("/api/projects/proj-001/gates/nonexistent/decision", json={
-        "decision": "approve",
-        "reason": "test",
+def test_nonexistent_gate(client, proj_with_gate):
+    pid, _, _ = proj_with_gate
+    resp = client.post(f"/api/projects/{pid}/gates/nonexistent/decision", json={
+        "decision": "approve", "reason": "test",
     })
     assert resp.status_code == 404

@@ -13,6 +13,8 @@ from app.models.git_account import GitAccount, GitAccountPlatform, AccountStatus
 from app.models.coding_agent_config import (
     CodingAgentConfig, CodingAgentType, CodingAgentInvokeMode, CodingAgentStatus
 )
+from app.models.run import Run
+from app.models.gate import Gate
 
 __all__ = [
     "Base",
@@ -28,4 +30,6 @@ __all__ = [
     "IntegrationConfig", "IntegrationType", "IntegrationStatus",
     "GitAccount", "GitAccountPlatform", "AccountStatus",
     "CodingAgentConfig", "CodingAgentType", "CodingAgentInvokeMode", "CodingAgentStatus",
+    "Run",
+    "Gate",
 ]

@@ -131,3 +131,15 @@ export async function updateEnvironment(projectId: string, updates: Partial<Envi
   const resp = await put<EnvironmentProfile>(`/projects/${projectId}/environment`, updates);
   return resp.data;
 }
+
+export async function fetchMode(projectId: string): Promise<string> {
+  const resp = await get<{ execution_mode: string }>(`/projects/${projectId}/mode`);
+  return resp.data.execution_mode;
+}
+
+/** R9-5-7 T6: persist execution mode (single source = workspace.json). Shared by
+ *  the workspace top-bar ExecModeSwitch and the onboarding wizard step 4. */
+export async function updateMode(projectId: string, mode: string): Promise<string> {
+  const resp = await put<{ execution_mode: string }>(`/projects/${projectId}/mode`, { mode });
+  return resp.data.execution_mode;
+}

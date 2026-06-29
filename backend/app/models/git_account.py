@@ -42,9 +42,9 @@ class GitAccount(Base):
     token_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     avatar_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     status: Mapped[AccountStatus] = mapped_column(
-        SAEnum(AccountStatus), default=AccountStatus.connected, nullable=False
+        SAEnum(AccountStatus), default=AccountStatus.connected, server_default="connected", nullable=False
     )
-    tenant_id: Mapped[str] = mapped_column(String(255), default="default")
+    tenant_id: Mapped[str] = mapped_column(String(255), default="default", server_default="default")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

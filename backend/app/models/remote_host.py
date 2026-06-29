@@ -52,3 +52,6 @@ class RemoteHost(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
     enabled: Mapped[bool] = mapped_column(default=True)
+    # R9-5-6 T6: SSH host key fingerprint (SHA-256 hex) for strict host verification.
+    # None = not yet registered (trust_on_first_use or reject on connect).
+    host_key_fingerprint: Mapped[str | None] = mapped_column(String(255), nullable=True)

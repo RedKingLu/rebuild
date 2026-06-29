@@ -411,36 +411,122 @@ async def delete_remote(remote_host_id: str, db: Session = Depends(_db)):
 
 @integration_router.post("/remote/{remote_host_id}/test")
 async def test_remote(remote_host_id: str, db: Session = Depends(_db)):
-    """Test SSH connection to remote host."""
+    """Test SSH connection using credential_ref (D-093: no hardcoded root@, no StrictHostKeyChecking=no)."""
     svc = RemoteService(db)
     host = svc.get(remote_host_id)
     if host is None:
         raise HTTPException(404, f"Remote host {remote_host_id} not found")
+    if not host.credential_ref:
+        raise HTTPException(400, "Remote host has no credential_ref configured")
+
     svc.update(remote_host_id, status=RemoteHostStatus.testing)
     try:
-        # Attempt SSH connection with timeout
-        import subprocess
-        result = subprocess.run(
-            ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-             "-p", str(host.port), f"root@{host.address}", "echo connected"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0:
+        from app.services.remote_executor import RemoteSSHExecutionProvider
+        provider = RemoteSSHExecutionProvider(host, db, mode="auto", trust_on_first_use=False)
+        result = await provider.execute("echo connected", language="bash", timeout=15)
+
+        if result.get("exit_code") == 0 and "connected" in result.get("stdout", ""):
             svc.update(remote_host_id, status=RemoteHostStatus.connected,
                        last_connected_at=datetime.now(timezone.utc))
             status = "connected"
         else:
             svc.update(remote_host_id, status=RemoteHostStatus.error)
             status = "error"
+
         get_services().trace_writer.write("state_change", action="remote_test",
-                                           summary=f"SSH test {remote_host_id}: {status}")
+                                          summary=f"SSH test {remote_host_id}: {status}")
         return SuccessEnvelope(data={
-            "status": status, "stdout": result.stdout[:1024], "stderr": result.stderr[:1024],
+            "status": status,
+            "stdout": result.get("stdout", "")[:1024],
+            "stderr": result.get("stderr", "")[:1024],
+            "provider": result.get("provider", "remote_ssh"),
         }, meta=Meta(source_status="real", capability_status="available"))
-    except Exception as e:
+    except Exception as exc:
         svc.update(remote_host_id, status=RemoteHostStatus.error)
-        return SuccessEnvelope(data={"status": "error", "error": str(e)},
+        return SuccessEnvelope(data={"status": "error", "error": str(exc)[:512]},
                                meta=Meta(source_status="real", capability_status="available"))
+
+
+# ── Remote exec/transfer API (D-093 T12) ─────────────────
+
+class RemoteExecRequest(BaseModel):
+    command: str = Field(..., min_length=1, max_length=2048)
+    cwd: str | None = None
+    timeout: int = Field(default=30, ge=1, le=300)
+    mode: str = Field(default="plan", pattern="^(manual|plan|auto)$")
+
+
+class RemoteTransferRequest(BaseModel):
+    action: str = Field(..., pattern="^(put|get)$")
+    local_path: str = Field(..., min_length=1, max_length=1024)
+    remote_path: str = Field(..., min_length=1, max_length=1024)
+
+
+@integration_router.post("/remote/{remote_host_id}/exec")
+async def remote_exec(remote_host_id: str, req: RemoteExecRequest,
+                      db: Session = Depends(_db)):
+    """Run a command on the remote host via SSH (D-093 / R9-5-6 T12)."""
+    svc = RemoteService(db)
+    host = svc.get(remote_host_id)
+    if host is None:
+        raise HTTPException(404, f"Remote host {remote_host_id} not found")
+    if not host.credential_ref:
+        raise HTTPException(400, "Remote host has no credential_ref configured")
+
+    from app.services.remote_executor import RemoteSSHExecutionProvider
+    provider = RemoteSSHExecutionProvider(host, db, mode=req.mode)
+    result = await provider.execute(req.command, language="bash",
+                                    timeout=req.timeout, cwd=req.cwd)
+    return SuccessEnvelope(
+        data={
+            "exit_code": result.get("exit_code"),
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+            "blocked": result.get("blocked", False),
+            "risk_level": result.get("risk_level", "L1"),
+            "provider": result.get("provider", "remote_ssh"),
+            "elapsed_ms": result.get("elapsed_ms", 0),
+        },
+        meta=Meta(source_status="real",
+                  capability_status="available" if result.get("exit_code") == 0 else "error"),
+    )
+
+
+@integration_router.post("/remote/{remote_host_id}/transfer")
+async def remote_transfer(remote_host_id: str, req: RemoteTransferRequest,
+                          db: Session = Depends(_db)):
+    """Transfer a file to/from the remote host via SFTP (D-093 / R9-5-6 T12)."""
+    svc = RemoteService(db)
+    host = svc.get(remote_host_id)
+    if host is None:
+        raise HTTPException(404, f"Remote host {remote_host_id} not found")
+    if not host.credential_ref:
+        raise HTTPException(400, "Remote host has no credential_ref configured")
+
+    from pathlib import Path as _Path
+    local_abs = _Path(req.local_path).resolve()
+    ws_dir = _Path(os.environ.get("WORKSPACE_DIR", "/workspace")).resolve()
+    try:
+        local_abs.relative_to(ws_dir)
+    except ValueError:
+        raise HTTPException(400,
+            f"local_path must be within workspace directory ({ws_dir})")
+
+    from app.services.remote_executor import RemoteSSHExecutionProvider
+    provider = RemoteSSHExecutionProvider(host, db, mode="plan")
+    result = await provider.transfer(req.action, str(local_abs), req.remote_path)
+    return SuccessEnvelope(
+        data={
+            "exit_code": result.get("exit_code"),
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+            "blocked": result.get("blocked", False),
+            "risk_level": result.get("risk_level", "L2"),
+            "provider": result.get("provider", "remote_ssh"),
+        },
+        meta=Meta(source_status="real",
+                  capability_status="available" if result.get("exit_code") == 0 else "error"),
+    )
 
 
 # ── Feishu Integration ───────────────────────────────────

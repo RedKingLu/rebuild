@@ -4,9 +4,10 @@ D-077 / D-078: Manages external AI coding agent configurations.
 Invoke endpoint returns a stub response in R8; R11 will wire to LangGraph.
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import Optional
+from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies import get_services
@@ -60,9 +61,8 @@ def _agent_to_dict(agent) -> dict:
 # ── Routes ────────────────────────────────────────────────────────────────
 
 @router.get("")
-async def list_coding_agents():
+async def list_coding_agents(db: Session = Depends(get_db)):
     """List all configured AI coding agents."""
-    db = get_db()
     svc = CodingAgentService(db)
     agents = svc.list_agents()
     return SuccessEnvelope(
@@ -72,7 +72,7 @@ async def list_coding_agents():
 
 
 @router.post("")
-async def create_coding_agent(req: CreateCodingAgentRequest):
+async def create_coding_agent(req: CreateCodingAgentRequest, db: Session = Depends(get_db)):
     """Create a new AI coding agent configuration."""
     valid_types = {"opencode_cli", "qcode_cli", "openai_compat", "platform_agent"}
     if req.agent_type not in valid_types:
@@ -81,7 +81,6 @@ async def create_coding_agent(req: CreateCodingAgentRequest):
     if req.invoke_mode not in valid_modes:
         raise HTTPException(400, f"Invalid invoke_mode. Must be one of: {sorted(valid_modes)}")
 
-    db = get_db()
     svc = CodingAgentService(db)
     agent = svc.create(
         agent_type=req.agent_type,
@@ -98,9 +97,8 @@ async def create_coding_agent(req: CreateCodingAgentRequest):
 
 
 @router.get("/{agent_id}")
-async def get_coding_agent(agent_id: str):
+async def get_coding_agent(agent_id: str, db: Session = Depends(get_db)):
     """Get a single AI coding agent configuration."""
-    db = get_db()
     svc = CodingAgentService(db)
     agent = svc.get(agent_id)
     if not agent:
@@ -109,9 +107,8 @@ async def get_coding_agent(agent_id: str):
 
 
 @router.put("/{agent_id}")
-async def update_coding_agent(agent_id: str, req: UpdateCodingAgentRequest):
+async def update_coding_agent(agent_id: str, req: UpdateCodingAgentRequest, db: Session = Depends(get_db)):
     """Update an AI coding agent configuration."""
-    db = get_db()
     svc = CodingAgentService(db)
     updates = req.model_dump(exclude_none=True)
     agent = svc.update(agent_id, **updates)
@@ -125,9 +122,8 @@ async def update_coding_agent(agent_id: str, req: UpdateCodingAgentRequest):
 
 
 @router.delete("/{agent_id}")
-async def delete_coding_agent(agent_id: str):
+async def delete_coding_agent(agent_id: str, db: Session = Depends(get_db)):
     """Delete an AI coding agent configuration."""
-    db = get_db()
     svc = CodingAgentService(db)
     ok = svc.delete(agent_id)
     if not ok:
@@ -140,9 +136,8 @@ async def delete_coding_agent(agent_id: str):
 
 
 @router.post("/{agent_id}/test")
-async def test_coding_agent(agent_id: str):
+async def test_coding_agent(agent_id: str, db: Session = Depends(get_db)):
     """Check CLI/API availability of a configured coding agent."""
-    db = get_db()
     svc = CodingAgentService(db)
     result = svc.check_availability(agent_id)
     if "Agent config not found" in result.get("reason", ""):
@@ -154,13 +149,12 @@ async def test_coding_agent(agent_id: str):
 
 
 @router.post("/{agent_id}/invoke")
-async def invoke_coding_agent(agent_id: str, req: InvokeCodingAgentRequest):
+async def invoke_coding_agent(agent_id: str, req: InvokeCodingAgentRequest, db: Session = Depends(get_db)):
     """Invoke an AI coding agent with a natural-language task.
 
     OpenCodeCLIAdapter: real invocation via `opencode run` (LLM_API_KEY from env).
     Platform review agent interception deferred to R11 (D-078).
     """
-    db = get_db()
     svc = CodingAgentService(db)
     if not svc.get(agent_id):
         raise HTTPException(404, f"Coding agent {agent_id} not found")

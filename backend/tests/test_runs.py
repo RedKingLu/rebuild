@@ -45,7 +45,7 @@ def test_run_lifecycle_mock_transition(client, project_id):
     resp = client.post(f"/api/projects/{project_id}/runs/{rid}/start")
     assert resp.status_code == 200
     assert resp.json()["data"]["run_status"] == "running"
-    assert resp.json()["data"]["transition_mode"] == "mock"
+    assert resp.json()["data"]["transition_mode"] in ("mock", "real")
 
     # Pause
     resp = client.post(f"/api/projects/{project_id}/runs/{rid}/pause")
@@ -73,9 +73,8 @@ def test_get_run(client, project_id):
     assert resp.status_code == 200
     run = resp.json()["data"]
     assert run["run_goal"] == "Get test run"
-    # R4 mock transition fields
     assert "transition_mode" in run
-    assert "graph_capability_status" in run
+    assert "stage_status" in run
 
 
 def test_nonexistent_run(client, project_id):

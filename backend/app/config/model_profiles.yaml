@@ -106,6 +106,9 @@ providers:
 strategies:
   - strategy_id: "system-default"
     scope: "system"
+    # 出厂 bootstrap 兜底默认（D-098）：这里【不】固化用户的真实选择。
+    # 运行期生效的默认 = 用户在平台上配置的真实策略（动态：用户已配置的 Provider/Strategy/
+    # Project 全局或自定义绑定），由 ProviderRegistry 动态解析；本 ref 仅在用户未配置任何策略时作 bootstrap。
     default_profile_ref: "deepseek-official/deepseek-v4-flash"
     fallback_profile_refs:
       - "maas-icompify/deepseek-v4-flash"

@@ -27,10 +27,11 @@ export interface Project {
   evidence_gap_count: number;
   source_type: SourceType;
   source_config?: Record<string, unknown>;
-  workspace_status: 'ready' | 'unavailable' | 'blocked';
+  workspace_status: 'importing' | 'ready' | 'unavailable' | 'blocked';
   created_at?: string;
   updated_at?: string;
   onboarding_done: boolean;
+  coding_agent_ref?: string | null;  // D-078/R9-3A
   mock_level: MockLevel;
 }
 
@@ -52,7 +53,7 @@ export interface Run {
 }
 
 // === Gate ===
-export type GateStatus = 'created' | 'waiting_decision' | 'approved' | 'rejected' | 'needs_more_info' | 'expired' | 'canceled' | 'resolved' | 'failed';
+export type GateStatus = 'created' | 'waiting_decision' | 'approved' | 'rejected' | 'changes_requested' | 'blocked' | 'needs_more_info' | 'expired' | 'canceled' | 'resolved' | 'failed';
 export type RiskLevel = 'L0' | 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
 
 export interface Gate {

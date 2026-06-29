@@ -110,18 +110,44 @@ export function ProjectCreatePage() {
     } finally { setLoading(false); }
   };
 
+  const [wsStatus, setWsStatus] = useState<string>('');
+
+  // Poll project status after creation until ready
+  useEffect(() => {
+    if (!createdId) return;
+    const poll = async () => {
+      try {
+        const resp = await fetch(`/api/projects/${createdId}`);
+        if (!resp.ok) return;
+        const p = (await resp.json()).data;
+        setWsStatus(p.workspace_status || '');
+        if (p.workspace_status === 'ready') return;
+      } catch {}
+      setTimeout(poll, 1500);
+    };
+    poll();
+  }, [createdId]);
+
   if (createdId) {
+    const isReady = wsStatus === 'ready';
     return (
       <div>
         <h1>新建项目</h1>
         <div className="card" style={{ textAlign: 'center', padding: 32 }}>
-          <h2>创建完成</h2>
+          <h2>{isReady ? '✅ 已就绪' : '⏳ 源码导入中…'}</h2>
           <div className="banner info" style={{ margin: '12px 0' }}>
             <b>Project ID: {createdId}</b>
+            {!isReady && <div style={{ marginTop: 4, fontSize: 12 }}>状态: {wsStatus || 'importing'}</div>}
           </div>
+          <p className="sub" style={{ marginBottom: 12 }}>
+            {isReady ? '源码已导入到工作区，可以开始使用了。' : '正在将源码导入到工作区，请稍候…'}
+          </p>
           <div className="row" style={{ gap: 10, justifyContent: 'center' }}>
             <button className="btn" onClick={() => nav(`/projects/${createdId}`)}>打开项目详情</button>
-            <button className="btn" onClick={() => window.open(`/projects/${createdId}/workspace`, '_blank')}>进入工作区</button>
+            <button className="btn" disabled={!isReady}
+              onClick={() => window.open(`/projects/${createdId}/workspace`, '_blank')}>
+              {isReady ? '进入工作区' : '导入中…'}
+            </button>
             <button className="btn ghost" onClick={() => nav('/projects')}>返回列表</button>
           </div>
         </div>

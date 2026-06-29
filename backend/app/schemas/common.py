@@ -1,7 +1,7 @@
 """Common schema components — request/response envelope, meta, capability fields.
 
-All R4 API responses use a unified envelope with source_status and capability_status
-metadata so the frontend can accurately display mock vs real capability.
+All rebuild API responses use a unified envelope with source_status and capability_status
+metadata so the frontend can accurately display real vs mock capability.
 """
 
 from datetime import datetime, timezone
@@ -14,15 +14,18 @@ def _now() -> str:
 
 
 class Meta(BaseModel):
-    """Response metadata — capability and source status."""
-    source_status: str = "mock"
-    capability_status: str = "not_connected"
-    not_connected_reason: str = (
-        "R4 provides API skeleton with mock/in-memory data; "
-        "real backend capabilities planned for later R stages."
-    )
+    """Response metadata — capability and source status.
+
+    WP-4 F-4: Removed R4 placeholder defaults (mock/not_connected/volatile).
+    Real backend: source_status=real, capability_status=available, persistence=durable.
+    Endpoints that are NOT yet real should explicitly set the appropriate status,
+    not rely on defaults that claim to be real.
+    """
+    source_status: str = "real"
+    capability_status: str = "available"
+    not_connected_reason: str = ""
     generated_at: str = Field(default_factory=_now)
-    persistence: str = "volatile"
+    persistence: str = "durable"
 
 
 class GraphPlaceholderFields(BaseModel):

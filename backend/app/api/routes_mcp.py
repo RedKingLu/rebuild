@@ -1,6 +1,7 @@
-"""MCP API routes — real MCP server management (Phase 12)."""
+"""MCP API routes — real MCP server management (Phase 12 + T3.3/R9-5-4)."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -74,5 +75,41 @@ async def test_mcp(mcp_id: str, svc: MCPService = Depends(get_service)):
     result = await svc.test_connection(mcp_id)
     return SuccessEnvelope(
         data=result,
+        meta=Meta(source_status="real", capability_status="available"),
+    )
+
+
+# ── T3.3: tools/call endpoint ────────────────────────────────────────────────
+
+class MCPCallRequest(BaseModel):
+    tool_name: str
+    arguments: dict = {}
+
+
+@mcp_router.post("/{mcp_id}/call")
+async def call_mcp_tool(
+    mcp_id: str,
+    body: MCPCallRequest,
+    svc: MCPService = Depends(get_service),
+):
+    """Invoke a tool on an MCP server (T3.3/R9-5-4).
+
+    - Forwards to the stdio/SSE JSON-RPC channel via mcp_service.call_tool()
+    - env_vars values are NEVER returned in the response (脱敏 / 公理7)
+    """
+    srv = svc.get(mcp_id)
+    if not srv:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    if not srv.enabled:
+        raise HTTPException(status_code=400, detail="MCP server is disabled")
+    if not body.tool_name:
+        raise HTTPException(status_code=422, detail="tool_name is required")
+
+    result = await svc.call_tool(mcp_id, body.tool_name, body.arguments)
+
+    # Security: strip env_vars values from response (公理7)
+    safe_result = {k: v for k, v in result.items() if k != "env_vars"}
+    return SuccessEnvelope(
+        data=safe_result,
         meta=Meta(source_status="real", capability_status="available"),
     )

@@ -9,13 +9,20 @@ from cryptography.hazmat.primitives import hashes
 
 
 def get_master_key() -> bytes:
-    """Derive master key from env or use dev fallback."""
+    """Derive master key from REBUILD_MASTER_KEY env var.
+
+    SECURITY: dev fallback has been removed (T7/公理3/公理7).
+    Set REBUILD_MASTER_KEY=<32-byte hex> in backend/.env before using BYOK encryption.
+    """
     import os as _os
     raw = _os.environ.get("REBUILD_MASTER_KEY")
     if raw:
         return hashlib.sha256(raw.encode("utf-8")).digest()
-    # Dev fallback — must NOT be used in production
-    return hashlib.sha256(b"rebuild-dev-master-key-change-in-production").digest()
+    raise RuntimeError(
+        "REBUILD_MASTER_KEY is not set. "
+        "Add REBUILD_MASTER_KEY=<random-32-byte-hex> to backend/.env before using BYOK encryption. "
+        "Example: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
 
 
 def hkdf_derive(tenant_id: str, salt: bytes | None = None) -> bytes:

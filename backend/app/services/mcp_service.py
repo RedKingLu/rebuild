@@ -201,18 +201,182 @@ class MCPService:
             return {"status": "error", "error": str(e)[:300]}
 
     async def _test_sse(self, srv: MCPServer) -> dict:
-        """Test SSE MCP endpoint."""
+        """SSE MCP: send initialize + tools/list (T3.2 — upgraded from GET-only probe)."""
         if not srv.sse_url:
             return {"status": "error", "error": "SSE URL not configured"}
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(srv.sse_url)
-                if resp.status_code == 200:
-                    return {"status": "connected", "tools": [], "error": None}
-                return {"status": "error", "error": f"HTTP {resp.status_code}"}
+            async with httpx.AsyncClient(timeout=15) as client:
+                # Send initialize request
+                init_payload = {
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "rebuild", "version": "V26.1.1"},
+                    },
+                }
+                try:
+                    resp = await client.post(
+                        srv.sse_url.rstrip("/") + "/",
+                        json=init_payload,
+                        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                        timeout=8,
+                    )
+                    if resp.status_code == 200:
+                        # Try tools/list
+                        tools_payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+                        t_resp = await client.post(
+                            srv.sse_url.rstrip("/") + "/",
+                            json=tools_payload,
+                            headers={"Content-Type": "application/json", "Accept": "application/json"},
+                            timeout=8,
+                        )
+                        tools = []
+                        if t_resp.status_code == 200:
+                            t_data = t_resp.json()
+                            for t in t_data.get("result", {}).get("tools", []):
+                                tools.append({
+                                    "name": t.get("name", ""),
+                                    "description": t.get("description", ""),
+                                    "inputSchema": t.get("inputSchema", {}),
+                                })
+                        return {"status": "connected", "tools": tools, "error": None}
+                    # Fallback: simple GET probe
+                    get_resp = await client.get(srv.sse_url, timeout=5)
+                    if get_resp.status_code == 200:
+                        return {"status": "connected", "tools": [], "error": None,
+                                "note": "GET probe only — POST initialize not supported"}
+                    return {"status": "error", "error": f"HTTP {get_resp.status_code}"}
+                except Exception:
+                    # Last resort: GET
+                    get_resp = await client.get(srv.sse_url, timeout=5)
+                    if get_resp.status_code == 200:
+                        return {"status": "connected", "tools": [], "error": None}
+                    return {"status": "error", "error": f"HTTP {get_resp.status_code}"}
         except Exception as e:
             return {"status": "error", "error": str(e)[:300]}
+
+    async def call_tool(self, mcp_id: str, tool_name: str, arguments: dict) -> dict:
+        """Send tools/call to an MCP server (T3.1 / R9-5-4).
+
+        Reuses the stdio channel (initialize → tools/call) for stdio servers.
+        For SSE servers, sends POST tools/call JSON-RPC.
+        Returns {"result": ..., "isError": False} on success or {"error": "..."} on failure.
+        """
+        srv: MCPServer | None = self.db.get(MCPServer, mcp_id)
+        if srv is None:
+            return {"error": f"MCP server {mcp_id} not found"}
+        if not srv.enabled:
+            return {"error": f"MCP server {mcp_id} is disabled"}
+
+        if srv.transport == "stdio":
+            return await self._call_tool_stdio(srv, tool_name, arguments)
+        else:
+            return await self._call_tool_sse(srv, tool_name, arguments)
+
+    async def _call_tool_stdio(self, srv: MCPServer, tool_name: str, arguments: dict) -> dict:
+        """Send tools/call over stdio JSON-RPC channel."""
+        if not srv.command:
+            return {"error": "stdio command not configured"}
+
+        cmd = [srv.command] + (srv.args or [])
+        env = os.environ.copy()
+        if srv.env_vars:
+            env.update(srv.env_vars)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+
+            async def _send(msg: dict) -> None:
+                proc.stdin.write((json.dumps(msg) + "\n").encode())
+                await proc.stdin.drain()
+
+            async def _recv(expected_id: int, timeout: float = 8.0) -> dict:
+                try:
+                    async with asyncio.timeout(timeout):
+                        async for line in proc.stdout:
+                            line = line.decode("utf-8", errors="replace").strip()
+                            if not line:
+                                continue
+                            try:
+                                msg = json.loads(line)
+                                if msg.get("id") == expected_id:
+                                    return msg
+                            except json.JSONDecodeError:
+                                continue
+                except (asyncio.TimeoutError, Exception):
+                    pass
+                return {}
+
+            # Handshake: initialize
+            await _send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                    "clientInfo": {"name": "rebuild", "version": "V26.1.1"}}})
+            init_resp = await _recv(1)
+            if not init_resp.get("result"):
+                err = init_resp.get("error", {})
+                return {"error": f"MCP initialize failed: {err.get('message', str(err))}"}
+
+            await _send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+            # tools/call
+            await _send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": {"name": tool_name, "arguments": arguments}})
+            call_resp = await _recv(2)
+
+            # Cleanup
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+
+            if "error" in call_resp:
+                err = call_resp["error"]
+                return {"error": f"MCP tools/call error: {err.get('message', str(err))}",
+                        "isError": True}
+            result = call_resp.get("result", {})
+            return {"result": result.get("content", result), "isError": result.get("isError", False)}
+
+        except FileNotFoundError:
+            return {"error": f"Command not found: {srv.command}"}
+        except Exception as e:
+            return {"error": str(e)[:300]}
+
+    async def _call_tool_sse(self, srv: MCPServer, tool_name: str, arguments: dict) -> dict:
+        """Send tools/call via HTTP/SSE."""
+        if not srv.sse_url:
+            return {"error": "SSE URL not configured"}
+        try:
+            import httpx
+            payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": tool_name, "arguments": arguments}}
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    srv.sse_url.rstrip("/") + "/",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code != 200:
+                    return {"error": f"HTTP {resp.status_code}"}
+                data = resp.json()
+                if "error" in data:
+                    return {"error": data["error"].get("message", str(data["error"])), "isError": True}
+                result = data.get("result", {})
+                return {"result": result.get("content", result), "isError": result.get("isError", False)}
+        except Exception as e:
+            return {"error": str(e)[:300]}
 
     @staticmethod
     def to_response(srv: MCPServer) -> dict:

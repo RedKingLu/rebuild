@@ -15,6 +15,7 @@ class KeySource(str, enum.Enum):
     user = "user"
     byok = "byok"
     env_fallback = "env_fallback"
+    remote_ssh = "remote_ssh"  # R9-5-6: SSH credentials (JSON: user+password|private_key)
 
 
 class CredentialStatus(str, enum.Enum):

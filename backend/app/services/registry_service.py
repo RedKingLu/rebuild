@@ -106,17 +106,27 @@ class RegistryService:
         by_type: dict[str, int] = {}
         by_status: dict[str, int] = {}
         by_risk: dict[str, int] = {}
+        enabled_count = 0
+        schedulable_count = 0
+        _schedulable_statuses = {"active", "read_only", "local_existing"}
+        _remote_sources = {"external_online", "third_party"}
         for e in entries:
             by_type[e.resource_type.value] = by_type.get(e.resource_type.value, 0) + 1
             by_status[e.status.value] = by_status.get(e.status.value, 0) + 1
             by_risk[e.risk_level.value] = by_risk.get(e.risk_level.value, 0) + 1
+            if e.enabled:
+                enabled_count += 1
+                if (e.status.value in _schedulable_statuses
+                        and e.source_type.value not in _remote_sources):
+                    schedulable_count += 1
         return {
             "by_type": by_type,
             "by_status": by_status,
             "by_risk_level": by_risk,
             "total": len(entries),
+            "enabled_count": enabled_count,
+            "schedulable_count": schedulable_count,
             "source_status": "real",
-            "capability_status": "active",
         }
 
     @staticmethod

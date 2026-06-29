@@ -105,5 +105,6 @@ class RegistrySummary(BaseModel):
     by_status: dict[str, int] = Field(default_factory=dict)
     by_risk_level: dict[str, int] = Field(default_factory=dict)
     total: int = 0
+    enabled_count: int = 0
+    schedulable_count: int = 0
     source_status: str = "real"
-    capability_status: str = "active"
