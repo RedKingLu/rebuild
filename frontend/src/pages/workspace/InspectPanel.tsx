@@ -1,6 +1,6 @@
 /** Right-side inspection panel — Gate / Evidence / Trace / Audit / Context / Resource / Model. */
 import { useState, useEffect } from 'react';
-import type { Gate, Artifact, Evidence, Trace, Audit } from '../../types';
+import type { Gate, Artifact, EvidenceGap, Trace, Audit } from '../../types';
 
 export type InspectTab = 'gate' | 'evidence' | 'trace' | 'audit' | 'context' | 'resource' | 'model';
 
@@ -9,7 +9,7 @@ interface Props {
   gates: Gate[];
   activeGate: Gate | null;
   artifacts: Artifact[];
-  evidences: Evidence[];
+  evidences: EvidenceGap[];
   traces: Trace[];
   audits: Audit[];
   loading: boolean;
@@ -70,7 +70,7 @@ function GatePanel({ gates, activeGate }: { gates: Gate[]; activeGate: Gate | nu
   );
 }
 
-function EvidencePanel({ evidences }: { evidences: Evidence[] }) {
+function EvidencePanel({ evidences }: { evidences: EvidenceGap[] }) {
   return (
     <div style={{ fontSize: 12 }}>
       <b style={{ fontSize: 13 }}>证据链</b>
@@ -79,8 +79,8 @@ function EvidencePanel({ evidences }: { evidences: Evidence[] }) {
       ) : (
         evidences.map((e, i) => (
           <div key={i} style={{ marginTop: 6, padding: 6, background: 'var(--color-surface-subtle)', borderRadius: 4, fontSize: 11 }}>
-            <div style={{ fontWeight: 600 }}>{e.evidence_id}</div>
-            <div style={{ color: 'var(--color-text-muted)' }}>{e.summary}</div>
+            <div style={{ fontWeight: 600 }}>{e.evidence_type || e.gap_id}</div>
+            <div style={{ color: 'var(--color-text-muted)' }}>{e.description}</div>
           </div>
         ))
       )}

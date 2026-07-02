@@ -1,8 +1,12 @@
 """Gate, Policy Check, and Risk Assessment API routes."""
 
+import logging
+
 from fastapi import APIRouter, HTTPException
 
 from app.dependencies import get_services
+
+logger = logging.getLogger("rebuild.routes_gates")
 from app.schemas.gate import (
     GateDecisionRequest,
     PolicyCheckRequest, RiskAssessmentRequest,
@@ -100,13 +104,13 @@ async def decide_gate(project_id: str, gate_id: str, req: GateDecisionRequest):
         if nxt:
             try:
                 svc.project_service.update(project_id, current_stage=nxt, active_gate="")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("DB sync current_stage failed for %s: %s", project_id, e)
         for st, status in ((graph_state if isinstance(graph_state, dict) else {}).get("stage_status") or {}).items():
             try:
                 svc.run_service.set_stage_status(run_id, st, status)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("DB sync stage_status failed run=%s stage=%s: %s", run_id, st, e)
 
     svc.trace_writer.write("gate_event", action="decide_gate",
                            summary=f"Gate {gate_id} decision: {req.decision} "

@@ -23,7 +23,7 @@ async def health():
         "status": "ok",
         "platform": "rebuild",
         "version": "V26.1.1",
-        "r_stage": "R4",
+        "r_stage": "R10",
     }
 
 
@@ -33,8 +33,8 @@ async def version():
     return {
         "platform": "rebuild",
         "version": "V26.1.1",
-        "r_stage": "R4",
-        "stage_name": "基础工程骨架与 API 契约落地",
+        "r_stage": "R10",
+        "stage_name": "P2-P3 评估与规划链路",
     }
 
 

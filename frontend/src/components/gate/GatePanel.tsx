@@ -20,6 +20,24 @@ function getMaterialLabels(stage: string): MaterialItem[] {
       { path: 'artifacts/p0_review_pass.json', label: 'Review 报告 (p0_review)', type: 'json' },
     ];
   }
+  // R10 T20: P2→P3 gate — review the 6 P2 assessment outputs (契约 §4.5)
+  if (stage === 'p2') {
+    return [
+      { path: 'artifacts/p2_assessment_report.json', label: '评估报告 (p2_assessment_report)', type: 'json' },
+      { path: 'artifacts/p2_risk_list.json', label: '风险清单 (p2_risk_list)', type: 'json' },
+      { path: 'artifacts/p2_blocker_list.json', label: '阻塞项清单 (p2_blocker_list)', type: 'json' },
+      { path: 'artifacts/p2_validation_gaps.json', label: '验证缺口 (p2_validation_gaps)', type: 'json' },
+      { path: 'artifacts/p2_resource_needs.json', label: '资源需求 (p2_resource_needs)', type: 'json' },
+    ];
+  }
+  // R10 T20: P3→P4 gate — review the P3 plan artifacts (契约 §5.6)
+  if (stage === 'p3') {
+    return [
+      { path: 'artifacts/p3_stage_plan.json', label: 'Stage Plan (p3_stage_plan)', type: 'json' },
+      { path: 'artifacts/p3_task_plans.json', label: 'Task Plan 批次 (p3_task_plans)', type: 'json' },
+      { path: 'artifacts/p3_task_graph.json', label: 'TaskGraph (p3_task_graph)', type: 'json' },
+    ];
+  }
   // p1 (default for other stages)
   return [
     { path: 'artifacts/p1_stage_plan.json', label: '阶段计划 (p1_stage_plan)', type: 'json' },

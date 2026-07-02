@@ -579,3 +579,174 @@ async def get_profiling_summary(project_id: str):
         "items": items,
         "uncertainty": uncertainty,
     }, meta=Meta())
+
+
+# ── P2 Assessment Summary (R10 T18) ──────────────────────────────────────
+# Read-only view of the 6 P2 assessment outputs written by RealP2Handler to
+# workspace/artifacts/p2_*.json (契约 §4.5). Mirrors profiling-summary: parses the
+# already-produced artifact files (no LLM call here) so StagePageP2 renders real
+# content — risk_list/blocker_list/validation_gap_list/resource_needs items plus
+# the assessment_report + embedded uncertainty_list. Honest empty state when P2 has
+# not been assessed yet (available=false, not 404). model_used is a model identifier
+# (NOT a Key/Token, §12.1) read best-effort from the ev-p2-model-analysis Evidence.
+@router.get("/assessment-summary")
+async def get_assessment_summary(project_id: str):
+    import json as _json
+    svc = get_services()
+    if svc.project_service.get(project_id) is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    art_dir = workspace_path(project_id) / "artifacts"
+
+    def _read(name: str) -> dict | None:
+        fp = art_dir / name
+        if not fp.exists():
+            return None
+        try:
+            return _json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            # honest: an unreadable/corrupt artifact is surfaced as missing content,
+            # not silently treated as empty success (公理3)
+            return {"_unreadable": True}
+
+    report = _read("p2_assessment_report.json")
+    risk = _read("p2_risk_list.json")
+    blocker = _read("p2_blocker_list.json")
+    gaps = _read("p2_validation_gaps.json")
+    resources = _read("p2_resource_needs.json")
+
+    # P2 not assessed yet → honest empty state (§4.10; no fabricated content)
+    if report is None and risk is None and blocker is None:
+        return SuccessEnvelope(data={
+            "available": False,
+            "reason": "P2 评估尚未执行。请先完成 P1 并批准 Gate 以触发 P2 评估。",
+        }, meta=Meta())
+
+    # best-effort model identifier (analysis-only marker) from persisted Evidence
+    model_used = None
+    try:
+        ev = svc.aet_service.get_evidence("ev-p2-model-analysis", project_id=project_id)
+        if isinstance(ev, dict):
+            model_used = ev.get("model")
+    except Exception:
+        model_used = None
+
+    return SuccessEnvelope(data={
+        "available": True,
+        # §4.7-5 / STOP-4: model output is auxiliary analysis, never fact
+        "analysis_only": (report or {}).get("analysis_only", True),
+        "model_used": model_used,
+        "assessment_report": (report or {}).get("report", {}),
+        "uncertainty_list": (report or {}).get("uncertainty_list", []),
+        "risk_list": (risk or {}).get("items", []),
+        "blocker_list": (blocker or {}).get("items", []),
+        "validation_gap_list": (gaps or {}).get("items", []),
+        "resource_needs": (resources or {}).get("items", []),
+        "artifacts": [f"artifacts/{n}" for n in (
+            "p2_assessment_report.json", "p2_risk_list.json", "p2_blocker_list.json",
+            "p2_validation_gaps.json", "p2_resource_needs.json")
+            if (art_dir / n).exists()],
+    }, meta=Meta())
+
+
+# ── P3 Planning Summary (R10 T19) ────────────────────────────────────────
+# Read-only view of the P3 plan (Stage Plan + Task Plan Batch + TaskGraph) for
+# StagePageP3. The structured plan lives in the DB (stage_plan / task_plan /
+# task_graph / task_node tables), not in the artifact files (which hold only refs
+# + counts), so this reads the DB directly — the minimal read endpoint the DAG
+# view needs (R10-2 handoff §3: 缺则最小新增，归 T19). Honest empty state when P3
+# has not produced a plan (available=false, not 404). No LLM call here.
+@router.get("/planning-summary")
+async def get_planning_summary(project_id: str):
+    from app.models.stage_plan import StagePlan, TaskPlan
+    from app.models.task_graph import TaskGraph, TaskNode
+    from app.core.database import get_session
+
+    svc = get_services()
+    if svc.project_service.get(project_id) is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    db = get_session()
+    try:
+        # latest P3 Stage Plan (version then recency — mirrors stage_service)
+        sp = (db.query(StagePlan)
+              .filter(StagePlan.project_id == project_id, StagePlan.stage == "p3")
+              .order_by(StagePlan.version.desc(), StagePlan.created_at.desc())
+              .first())
+        if sp is None:
+            return SuccessEnvelope(data={
+                "available": False,
+                "reason": "P3 规划尚未执行。请先完成 P2 评估并批准 Gate 以触发 P3 规划。",
+            }, meta=Meta())
+
+        detail = sp.plan_detail or {}
+        batch_meta = detail.get("task_plan_batch", {}) or {}
+        tps = (db.query(TaskPlan)
+               .filter(TaskPlan.stage_plan_ref == sp.stage_plan_id)
+               .order_by(TaskPlan.created_at).all())
+        # latest TaskGraph for this Stage Plan (Q-R10-3 必生; version then recency)
+        tg = (db.query(TaskGraph)
+              .filter(TaskGraph.project_id == project_id,
+                      TaskGraph.stage_plan_ref == sp.stage_plan_id)
+              .order_by(TaskGraph.version.desc(), TaskGraph.created_at.desc())
+              .first())
+        nodes: list = []
+        edges: list = []
+        graph_payload = None
+        if tg is not None:
+            tns = (db.query(TaskNode)
+                   .filter(TaskNode.task_graph_id == tg.task_graph_id)
+                   .order_by(TaskNode.created_at).all())
+            # stable node order = the persisted creation order (= generation index)
+            nodes = [{"node_id": n.node_id, "index": i, "title": n.title,
+                      "risk_level": n.risk_level, "node_type": n.node_type}
+                     for i, n in enumerate(tns)]
+            edges = [{"source_node_id": e.get("source_node_id"),
+                      "target_node_id": e.get("target_node_id"),
+                      "edge_type": e.get("edge_type")}
+                     for e in (tg.edges or []) if isinstance(e, dict)]
+            # degraded flag is not on the definition row — read best-effort from the
+            # p3_task_graph.json artifact (honest: null when absent)
+            degraded = None
+            try:
+                import json as _json
+                fp = workspace_path(project_id) / "artifacts" / "p3_task_graph.json"
+                if fp.exists():
+                    degraded = _json.loads(fp.read_text(encoding="utf-8")).get("degraded")
+            except Exception:
+                degraded = None
+            graph_payload = {
+                "task_graph_id": tg.task_graph_id, "graph_status": tg.graph_status,
+                "degraded": degraded, "node_count": len(nodes), "edge_count": len(edges),
+                "nodes": nodes, "edges": edges,
+            }
+
+        return SuccessEnvelope(data={
+            "available": True,
+            "model_used": detail.get("model_used"),
+            "stage_plan": {
+                "stage_plan_id": sp.stage_plan_id, "plan_status": sp.plan_status,
+                "objective": sp.objective or "", "scope": sp.scope or {},
+                "risk_level": sp.risk_level, "permission_boundary": sp.permission_boundary or "",
+                "expected_artifacts": sp.expected_artifacts or [],
+                "expected_evidence": sp.expected_evidence or [],
+                "gate_policy": sp.gate_policy or {},
+                "completion_criteria": detail.get("completion_criteria", []),
+                "validation_strategy": detail.get("validation_strategy", ""),
+            },
+            "task_batch": {
+                "batch_id": batch_meta.get("batch_id"),
+                "batch_objective": batch_meta.get("batch_objective", ""),
+                "batch_risk_level": batch_meta.get("batch_risk_level", "L0"),
+                "gate_required": bool(batch_meta.get("gate_required", False)),
+                "task_count": len(tps),
+            },
+            "task_plans": [{
+                "task_plan_id": t.task_plan_id, "title": t.title or t.objective or "",
+                "objective": t.objective or "", "risk_level": t.risk_level,
+                "validation_method": t.validation_method or "",
+                "scope": t.scope or {},
+            } for t in tps],
+            "task_graph": graph_payload,
+        }, meta=Meta())
+    finally:
+        db.close()

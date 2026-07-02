@@ -40,6 +40,7 @@ def assemble_context(
     agent_type: str = "node_worker",
     task_type: str = "default",
     node_state: Optional[dict] = None,
+    skill_disclosure: str = "full",  # R10-5 P1-C: "full" | "metadata" (progressive disclosure)
 ) -> dict:
     """Assemble a full C0-C6 context package for project_id/stage.
 
@@ -139,7 +140,17 @@ def assemble_context(
         layers["C2"] = assemble_c2()
 
     if "C3" in active_layers:
-        layers["C3"] = assemble_c3(skills_with_body)
+        layers["C3"] = assemble_c3(skills_with_body, disclosure=skill_disclosure)
+
+    # 公理3: skill load failures must surface, not stay silent. If any bound/stage
+    # skill failed to load its SKILL.md (capability_status=not_connected), warn.
+    _nc = [s for s in skills_with_body if s.get("capability_status") == "not_connected"]
+    if _nc:
+        logger.warning(
+            "context_assembler[%s/%s]: %d skill(s) not_connected (SKILL.md 加载失败/缺失): %s",
+            project_id, current_stage, len(_nc),
+            [s.get("name") or s.get("skill_id") for s in _nc],
+        )
 
     if "C4" in active_layers:
         layers["C4"] = assemble_c4(
@@ -206,17 +217,23 @@ def build_system_prompt(
     agent_type: str = "node_worker",
     task_type: str = "default",
     user_message: str = "",
+    skill_disclosure: str = "full",  # R10-5 P1-C: "full" | "metadata"
 ) -> str:
     """Build a complete system_prompt string from assembled C0-C6 layers.
 
     This is the single entry point for any code needing a system_prompt.
     agent_loop._build_prompt should be replaced with this (T-10).
+
+    skill_disclosure="metadata" makes the C3 layer carry only Skill name+description
+    (progressive disclosure) — the full SKILL.md body is loaded on demand in the
+    tool loop, never dumped wholesale into the system prompt (R10-5 P1-C).
     """
     ctx = assemble_context(
         project_id, current_stage,
         project=project, run=run, node_state=node_state,
         agent_type=agent_type, task_type=task_type,
         include_skills=True, include_body=False,
+        skill_disclosure=skill_disclosure,
     )
     agent_name = (ctx.get("selected_agent") or {}).get("name", "AI 助手")
     layers = ctx.get("layers", {})

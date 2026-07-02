@@ -33,6 +33,14 @@ def _now() -> str:
 
 
 def _gate_to_response(g: Gate) -> GateResponse:
+    # P2-C: graph capability must be a REAL probe, never the schema default
+    # "not_connected" (state.py 红线：不得写死 not_connected). "live" when the
+    # StateGraph compiles, else "degraded" (公理4, no hardcode).
+    try:
+        from app.graph.runtime import graph_capability_probe
+        graph_cap = graph_capability_probe()
+    except Exception:
+        graph_cap = "degraded"
     return GateResponse(
         gate_id=g.gate_id,
         gate_type=g.gate_type,
@@ -54,6 +62,7 @@ def _gate_to_response(g: Gate) -> GateResponse:
         audit_ref=g.audit_ref,
         source_status="real",
         transition_mode=g.transition_mode or "real",
+        graph_capability_status=graph_cap,
         checkpoint_ref=g.checkpoint_ref,
         interrupt_ref=g.interrupt_ref,
     )

@@ -44,14 +44,20 @@ def test_onboarding_creates_run_intake_and_gate(client, project_id):
     assert d["run_id"]
     assert d["intake_artifact_id"]
     assert d["review"]["passed"] is True      # Review Pass ran and passed
-    # R9-3G: Gate is NOT created by /onboarding/complete — it's created by Agent-driven /onboarding/execute
-    assert d.get("gate_id") is None or d.get("gate_id") == ""  # No gate yet
-    assert "p0_artifacts" in d  # But materials are prepared
-    # After Agent execute, gate should exist
-    exec_resp = client.post(f"/api/projects/{project_id}/onboarding/execute")
-    assert exec_resp.status_code == 200
+    assert "p0_artifacts" in d  # materials prepared
+    # T6b / W8 full cutover (Approach A): the LangGraph P0 node is the sole P0 path
+    # and Gate authority — /onboarding/complete drives the graph which creates the
+    # P0→P1 Gate at complete time.
+    assert d.get("gate_id"), "complete should now create the P0→P1 Gate (graph-driven)"
+    assert d.get("graph_driven") is True
     active = client.get(f"/api/projects/{project_id}/gates/active").json()["data"]
     assert active is not None and active["gate_status"] == "waiting_decision"
+    # /onboarding/execute remains an idempotent trigger — returns the existing gate
+    exec_resp = client.post(f"/api/projects/{project_id}/onboarding/execute")
+    assert exec_resp.status_code == 200
+    active2 = client.get(f"/api/projects/{project_id}/gates/active").json()["data"]
+    assert active2 is not None and active2["gate_status"] == "waiting_decision"
+    assert active2["gate_id"] == active["gate_id"]  # same gate (no duplicate)
 
 
 # ── Gate decision closure ─────────────────────────────────────────────────
@@ -104,6 +110,32 @@ def test_gate_illegal_decision_rejected(client, project_id):
     # state unchanged (still awaiting)
     g2 = client.get(f"/api/projects/{project_id}/gates/active").json()["data"]
     assert g2 is not None and g2["gate_status"] == "waiting_decision"
+
+
+def test_promotion_decision_illegal_value_rejected(client, project_id):
+    """R10-5 P1-B: /promotion-decision must reject illegal decision with 400,
+    must NOT advance the stage, and must NOT create a duplicate stage_promotion Gate."""
+    g = _make_gate(client, project_id)
+    run_id = g["run_id"]
+    gates_before = client.get(f"/api/projects/{project_id}/gates").json()["data"]["gates"]
+    n_before = len(gates_before)
+
+    r = client.post(f"/api/projects/{project_id}/runs/{run_id}/stages/p0/promotion-decision",
+                    json={"decision": "badvalue"})
+    assert r.status_code == 400                # illegal -> 400 (was 200 before fix)
+
+    # No duplicate Gate created, stage not advanced
+    gates_after = client.get(f"/api/projects/{project_id}/gates").json()["data"]["gates"]
+    assert len(gates_after) == n_before
+    proj = client.get(f"/api/projects/{project_id}").json()["data"]
+    assert proj["current_stage"] == "p0"       # not advanced
+
+    # Legal decision still works
+    r2 = client.post(f"/api/projects/{project_id}/runs/{run_id}/stages/p0/promotion-decision",
+                     json={"decision": "approve"})
+    assert r2.status_code == 200
+    proj2 = client.get(f"/api/projects/{project_id}").json()["data"]
+    assert proj2["current_stage"] == "p1"
 
 
 # ── P1 profiling chain ────────────────────────────────────────────────────

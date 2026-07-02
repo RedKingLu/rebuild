@@ -8,7 +8,7 @@ def test_health(client):
     assert data["status"] == "ok"
     assert data["platform"] == "rebuild"
     assert data["version"] == "V26.1.1"
-    assert data["r_stage"] == "R4"
+    assert data["r_stage"] == "R10"
 
 
 def test_version(client):

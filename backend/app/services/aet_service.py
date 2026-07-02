@@ -142,7 +142,10 @@ class AETService:
     def list_evidence_gaps(self, project_id: Optional[str] = None) -> list:
         """Read real evidence gaps from uncertainty_manifest.json.
 
-        Maps gap fields to frontend Evidence schema (evidence_id, summary).
+        Maps gap fields to EvidenceGapResponse schema
+        (gap_id / evidence_type / description / blocking / stage), which is what
+        WorkspaceAggregateResponse.pending_evidence_gaps validates against. Gaps
+        come from a real manifest, so source_status is "real".
         """
         if not project_id:
             return []
@@ -153,10 +156,12 @@ class AETService:
             data = json.loads(manifest.read_text(encoding="utf-8"))
             gaps = data.get("evidence_gaps", [])
             return [{
-                "evidence_id": f"gap-{g.get('item', '')}-{i}",
-                "summary": g.get("detail", g.get("type", "")),
-                "type": g.get("type", ""),
-                "item": g.get("item"),
+                "gap_id": f"gap-{g.get('item', '')}-{i}",
+                "evidence_type": g.get("type", ""),
+                "description": g.get("detail", g.get("type", "")),
+                "blocking": bool(g.get("blocking", False)),
+                "stage": g.get("stage", ""),
+                "source_status": "real",
             } for i, g in enumerate(gaps)]
         except Exception:
             return []
