@@ -8,10 +8,10 @@ Design — work/gate node separation (RK: interrupt re-runs the whole node on re
                  applies the decision via the gate backend and emits routing state.
                  Kept minimal so resume re-execution is cheap and side-effect-safe.
 
-Stage handlers are pluggable (register_handler): P0/P1 wire to real services
-(SourceMaterializer / FullStackProfiler / ReviewPass) in 阶段 C (T10/T11); P2-P6 are
-`future_r10` stubs that keep the graph structurally walkable without doing business
-(00-总规划 §1.2, G7 诚实标记). Tests inject fakes.
+Stage handlers are pluggable (register_handler): P0/P1/P2 wire to real services
+(SourceMaterializer / FullStackProfiler / AssessmentService via ReviewPass); P3-P6
+are `future_r10`/`future_r11` stubs that keep the graph structurally walkable without
+doing business (00-总规划 §1.2, G7 诚实标记). Tests inject fakes.
 """
 
 from __future__ import annotations

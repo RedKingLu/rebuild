@@ -35,6 +35,15 @@ def test_active_gate(client, proj_with_gate):
     assert gate["gate_status"] == "waiting_decision"
 
 
+def test_gate_graph_capability_is_real_probe(client, proj_with_gate):
+    """R10-5 P2-C: Gate.graph_capability_status must be a real probe (live/degraded),
+    never the schema default 'not_connected' (state.py 红线)."""
+    pid, gid, _ = proj_with_gate
+    gate = client.get(f"/api/projects/{pid}/gates/active").json()["data"]
+    assert gate["graph_capability_status"] in ("live", "degraded")
+    assert gate["graph_capability_status"] != "not_connected"
+
+
 def test_gate_decision_writes_audit(client, proj_with_gate):
     pid, gid, _ = proj_with_gate
     resp = client.post(f"/api/projects/{pid}/gates/{gid}/decision", json={

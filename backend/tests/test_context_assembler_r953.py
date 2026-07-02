@@ -334,6 +334,7 @@ def test_context_assembler_single_source():
     approved = {
         "stage_handlers.py", "agent_loop.py", "routes_workspace.py",
         "external_context_builder.py",  # R9-5-5: external platform context injection
+        "node_loop.py",  # R10 T2: NodeLoop Step 2 loads context via the canonical assembler
     }
     for name in caller_names:
         assert name in approved, (

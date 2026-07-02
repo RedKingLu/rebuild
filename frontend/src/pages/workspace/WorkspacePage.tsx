@@ -15,6 +15,8 @@ import { InspectPanel, type InspectTab } from './InspectPanel';
 import { GatePanel } from '../../components/gate/GatePanel';
 import { StagePageP0 } from './StagePageP0';
 import { StagePageP1 } from './StagePageP1';
+import { StagePageP2 } from './StagePageP2';
+import { StagePageP3 } from './StagePageP3';
 import { AgentChat, type SystemMessage } from '../../components/agent/AgentChat';
 import {
   fetchWorkspace, fetchFileTree, fetchMaterialTree, fetchSessions, fetchMode,
@@ -376,6 +378,12 @@ export function WorkspacePage() {
                 }
                 if (sid === 'p1') {
                   return <StagePageP1 projectId={id!} stageStatus={run?.stage_status?.p1} onReExecute={loadData} />;
+                }
+                if (sid === 'p2') {
+                  return <StagePageP2 projectId={id!} stageStatus={run?.stage_status?.p2} onReExecute={loadData} />;
+                }
+                if (sid === 'p3') {
+                  return <StagePageP3 projectId={id!} stageStatus={run?.stage_status?.p3} onReExecute={loadData} />;
                 }
                 return (
                   <div style={{ fontSize: 13 }}>

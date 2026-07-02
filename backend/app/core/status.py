@@ -43,6 +43,22 @@ STAGE_STATUSES = [
     "validation_required", "failed", "completed", "accepted",
 ]
 
+# === Task Node status (NodeLoop runtime, 02-架构设计/03 §8.3 — 12 states) ===
+# blocked was added to §8.3 per Q-R10-5 (user-decided 2026-07-01): the original
+# 11-state list omitted it, though §Step1/§6/§Step9 and Stage/Run/Project enums
+# all use it. Doc §8.3 now reconciled to 12 states.
+NODE_STATUSES = [
+    "pending", "running", "waiting_gate", "waiting_resource",
+    "self_checking", "acceptance_checking", "completed",
+    "failed", "retrying", "skipped", "rework_required", "blocked",
+]
+
+# === Acceptance result (NodeLoop Step 8/9, 03-流程与运行时/03 §Step9 — 8 values) ===
+ACCEPTANCE_RESULTS = [
+    "accepted", "accepted_with_warning", "rework_required",
+    "retry_required", "gate_required", "failed", "blocked", "skipped",
+]
+
 # === Gate status ===
 GATE_STATUSES = [
     "created", "waiting_decision", "under_review", "approved",

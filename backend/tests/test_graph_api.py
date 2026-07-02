@@ -71,8 +71,17 @@ def test_graph_http_drive_p0_p1(tmp_path, monkeypatch, isolated_data):
         stages = {g["stage"] for g in gates}
         assert "p0" in stages and "p1" in stages
 
-        # approve P1 → advance to p2 (stub)
+        # approve P1 → advance to p2. T11: p2 is now a REAL handler (RealP2Handler),
+        # no longer a future_r10 stub. Force the model gateway unavailable so the P2
+        # assessment blocks deterministically offline (Q-R10-2) instead of making a
+        # live LLM call — then escalates to a p2 Gate (§4.10 honest, no fake completed).
+        from types import SimpleNamespace
+        from app.dependencies import get_services
+        monkeypatch.setattr(get_services().model_gateway, "get_status",
+                            lambda: SimpleNamespace(overall_status="not_configured"))
         r = c.post(f"/api/projects/{pid}/graph/resume",
                    json={"run_id": run_id, "decision": "approve"})
         d = r.json()["data"]
         assert d["stage_status"].get("p1") == "completed"
+        # p2 ran real business (blocked, not a future_r10 stub)
+        assert d["stage_status"].get("p2") != "future_r10"

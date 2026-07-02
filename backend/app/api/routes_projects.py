@@ -706,7 +706,40 @@ P0 接入完成：环境配置已声明、{'源码已导入' if materialized els
         decision="executed", risk_level="L2", project_id=project_id,
         reason=f"P0 onboarding: {project.name}")
 
-    return SuccessEnvelope(data={
+    # 7. T6b / W8 full cutover (Approach A): the LangGraph P0 node is now the sole
+    #    P0 execution path and the Gate authority. /onboarding/complete drives the
+    #    graph, which materializes + creates the P0→P1 Gate. /onboarding/execute
+    #    becomes an idempotent trigger returning the existing gate.
+    #    Graceful degradation: if the graph drive fails, gate stays None and the
+    #    client may still call /onboarding/execute (legacy fallback).
+    gate_id = None
+    gate_type = None
+    checkpoint_ref = None
+    if run is not None:
+        try:
+            from app.graph.runtime import get_flow_runtime
+            _src = project.source_type.value if hasattr(project.source_type, "value") else str(project.source_type)
+            init_state = {
+                "run_id": run.run_id, "project_id": project_id,
+                "run_goal": f"P0 接入：{project.name}", "run_status": "running",
+                "source_type": _src, "source_config": project.source_config or {},
+                "execution_mode": req.execution_mode,
+                "stage_status": {"p0": "in_progress"}, "current_stage": "p0",
+            }
+            await get_flow_runtime().start(run.run_id, init_state)
+        except Exception:
+            logger.warning("T6b: graph P0 drive failed (client may fall back to /execute)", exc_info=True)
+        try:
+            active_gate = svc_deps.gate_service.get_active(project_id)
+            if active_gate and active_gate.run_id == run.run_id:
+                gate_id = active_gate.gate_id
+                gate_type = active_gate.gate_type
+                checkpoint_ref = active_gate.checkpoint_ref or run.run_id
+                svc.update(project_id, active_gate=gate_id)
+        except Exception:
+            logger.warning("T6b: gate lookup after graph drive failed", exc_info=True)
+
+    _resp_data = {
         "project_id": project_id, "onboarding_done": True,
         "run_id": run.run_id if run else None,
         "intake_artifact_id": intake_id,
@@ -714,8 +747,18 @@ P0 接入完成：环境配置已声明、{'源码已导入' if materialized els
         "materialized": materialized,
         "review": {"passed": review_outcome.get("passed"), "reviewer": "intake_review_skill"},
         "p0_artifacts": p0_artifact_refs,
-        "next": "调用 POST /onboarding/execute 以 Agent 驱动完成 P0 执行并创建 Gate",
-    }, meta=Meta())
+        # T6b: Gate now created by the graph at complete time (graph_driven)
+        "gate_id": gate_id,
+        "gate_type": gate_type,
+        "checkpoint_ref": checkpoint_ref,
+        "graph_driven": gate_id is not None,
+        "next": ("Gate 已由 LangGraph 图创建，前往 P0→P1 Gate 审批"
+                 if gate_id else "调用 POST /onboarding/execute 以图驱动创建 Gate"),
+    }
+    # WP-1: surface retry_action for source_pending gates so clients can guide recovery
+    if gate_type == "source_pending":
+        _resp_data["retry_action"] = "update_source_config"
+    return SuccessEnvelope(data=_resp_data, meta=Meta())
 
 
 # ── P1 Full-Stack Profiling (R9-3C) ─────────────────────────────────────
@@ -756,18 +799,30 @@ async def execute_onboarding(project_id: str, db: Session = Depends(get_db)):
             f"项目当前阶段已是 {_cur_stage}，不能重新执行 P0 onboarding。"
             f"（当前阶段 > p0，拒绝重建 P0 Gate）",
         )
-    # 2. If there is already an active P0 Gate, return it (don't create duplicate)
+    # 2. If there is already an active P0 Gate, return it (don't create duplicate).
+    #    T6b: /onboarding/complete now drives the graph and creates this gate, so
+    #    the idempotent path is the common case — surface full gate fields
+    #    (incl. source_pending retry_action) so clients get the same info as a drive.
     _active_gate_id = getattr(project, "active_gate", None)
     if _active_gate_id:
         _existing_gate = svc_deps.gate_service.get(_active_gate_id)
         if _existing_gate and _existing_gate.stage == "p0" and _existing_gate.gate_status == "waiting_decision":
-            _idem_data = _json.dumps({
+            from app.graph.runtime import graph_capability_probe as _gcp
+            _idem_payload = {
                 "message": "P0 Gate 已存在，无需重复执行。",
                 "gate_id": _active_gate_id,
                 "gate_type": _existing_gate.gate_type,
                 "checkpoint_ref": _existing_gate.checkpoint_ref,
+                "run_id": _existing_gate.run_id,
+                "graph_capability_status": _gcp(),
+                "graph_driven": True,
                 "idempotent": True,
-            }, ensure_ascii=False)
+            }
+            if _existing_gate.gate_type == "source_pending":
+                _idem_payload["retry_action"] = "update_source_config"
+                if _existing_gate.reason:
+                    _idem_payload["gate_reason"] = _existing_gate.reason
+            _idem_data = _json.dumps(_idem_payload, ensure_ascii=False)
             async def _idem_stream():
                 yield f"event: complete\ndata: {_idem_data}\n\n"
             return StreamingResponse(_idem_stream(), media_type="text/event-stream",

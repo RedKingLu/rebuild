@@ -44,7 +44,8 @@ class PolicyCheckResponse(BaseModel):
     allowed: bool = True
     reason: str = ""
     required_gate: bool = False
-    source_status: str = "mock"
+    # real: policy_check derives from mode_policy.authorize_action (R10 T12)
+    source_status: str = "real"
 
 
 class RiskAssessmentRequest(BaseModel):
@@ -58,7 +59,8 @@ class RiskAssessmentResponse(BaseModel):
     risk_level: str = "L0"
     summary: str = ""
     mitigations: list[str] = Field(default_factory=list)
-    source_status: str = "mock"
+    # real: risk_assess derives from mode_policy.authorize_action (R10 T12)
+    source_status: str = "real"
 
 
 class GateListResponse(BaseModel):

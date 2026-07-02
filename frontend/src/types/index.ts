@@ -88,6 +88,17 @@ export interface Evidence {
   mock_level: MockLevel;
 }
 
+// Evidence Gap — pending gaps from uncertainty_manifest.json
+// (backend EvidenceGapResponse: gap_id / evidence_type / description / blocking / stage)
+export interface EvidenceGap {
+  gap_id: string;
+  evidence_type: string;
+  description: string;
+  blocking: boolean;
+  stage: string;
+  source_status?: string;
+}
+
 // === Artifact ===
 export type ArtifactStatus = 'draft' | 'generated' | 'under_review' | 'accepted' | 'rejected' | 'evidence_candidate' | 'superseded' | 'archived';
 

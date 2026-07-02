@@ -1,10 +1,14 @@
 """Stage API routes."""
 
+import logging
+
 from fastapi import APIRouter, HTTPException
 
 from app.dependencies import get_services
 from app.schemas.stage import StagePlanRequest, PromotionRequest, PromotionDecision
 from app.schemas.common import SuccessEnvelope, Meta
+
+logger = logging.getLogger("rebuild.routes_stages")
 
 router = APIRouter(prefix="/projects/{project_id}/runs/{run_id}/stages", tags=["stages"])
 
@@ -65,8 +69,18 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
     stage_service.promote(drive_promotion=True) for direct advancement."""
     import uuid as _uuid
     from app.graph.runtime import get_flow_runtime, graph_thread_active
+    from app.services.gate_service import VALID_DECISIONS
 
     svc = _svc()
+
+    # P1-B: validate decision at the entry BEFORE any graph resume — an illegal
+    # value must not drive the graph (which would rebuild a duplicate stage_promotion
+    # Gate) nor return 200. Mirrors GateService.decide / routes_gates 400 semantics.
+    decision_norm = (req.decision or "").strip().lower()
+    if decision_norm not in VALID_DECISIONS:
+        raise HTTPException(
+            400, f"非法晋级决策：{req.decision!r}（允许 {sorted(VALID_DECISIONS)}）")
+
 
     graph_driven = False
     graph_state = None
@@ -74,7 +88,8 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
         try:
             graph_state = await get_flow_runtime().resume(run_id, req.decision)
             graph_driven = True
-        except Exception:
+        except Exception as e:
+            logger.warning("graph resume failed for run=%s: %s", run_id, e)
             graph_driven = False
 
     if graph_driven and graph_state:
@@ -84,13 +99,13 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
         if nxt:
             try:
                 svc.project_service.update(project_id, current_stage=nxt, active_gate="")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("DB sync current_stage failed project=%s: %s", project_id, e)
         for st, status in (graph_state.get("stage_status") or {}).items():
             try:
                 svc.run_service.set_stage_status(run_id, st, status)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("DB sync stage_status failed run=%s stage=%s: %s", run_id, st, e)
         result = {
             "promotion_id": f"promo-{_uuid.uuid4().hex[:8]}",
             "gate_id": "",
@@ -119,8 +134,8 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
                     stage_gate_already_decided = True
                     already_decided_gate = gx
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("gate already-decided check failed project=%s stage=%s: %s", project_id, stage, e)
 
         if stage_gate_already_decided and already_decided_gate:
             # Graph ran the gate decision but failed to save checkpoint; sync DB.
@@ -135,8 +150,8 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
                 elif _dec in ("reject", "request_changes"):
                     svc.project_service.update(project_id, active_gate="")
                     graph_driven = True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("DB sync after already-decided gate failed project=%s: %s", project_id, e)
             result = {
                 "promotion_id": f"promo-{_uuid.uuid4().hex[:8]}",
                 "gate_id": already_decided_gate.gate_id,

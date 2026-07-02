@@ -1,7 +1,7 @@
 /** Workspace API service — file read/write, material tree, terminal execution. */
 
 import { get, put, post } from './client';
-import type { Project, Run, Gate, Artifact, Evidence, Trace, Audit } from '../types';
+import type { Project, Run, Gate, Artifact, EvidenceGap, Trace, Audit } from '../types';
 
 export interface WorkspaceAggregate {
   project: Project | null;
@@ -10,7 +10,7 @@ export interface WorkspaceAggregate {
   active_gate: Gate | null;
   pending_gates: Gate[];
   recent_artifacts: Artifact[];
-  pending_evidence_gaps: Evidence[];
+  pending_evidence_gaps: EvidenceGap[];
   recent_traces: Trace[];
   recent_audits: Audit[];
   file_index: FileTreeNode[];

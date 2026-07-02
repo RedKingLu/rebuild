@@ -597,8 +597,8 @@ class ModelGateway:
                 db.rollback()
             finally:
                 db.close()
-        except Exception:
-            pass  # best-effort — in-memory log is still available
+        except Exception as e:
+            logger.debug("background call-log DB write failed (in-memory log still available): %s", e)
 
     def list_calls(self, limit: int = 10, offset: int = 0) -> tuple[list[dict], int]:
         """List calls from DB with pagination (FB-M). Returns (records, total_count)."""
@@ -718,8 +718,8 @@ class ModelGateway:
                     all_calls[r.model_call_id] = r.to_dict()
             finally:
                 db.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("usage DB read failed, falling back to in-memory: %s", e)
         # In-memory records (may have calls not yet flushed to DB)
         for c in self._calls:
             cid = c.get("model_call_id", "")

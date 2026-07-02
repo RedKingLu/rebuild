@@ -96,18 +96,32 @@ def assemble_c2() -> dict:
     return {"layer": "C2", "content": _C2_ARCHITECTURE_TEXT, "chars": len(_C2_ARCHITECTURE_TEXT)}
 
 
-def assemble_c3(skills: list[dict]) -> dict:
-    """C3 专题层：stage 相关 Skill 正文（由 skill_loader 提供，含 body 字段）。"""
+def assemble_c3(skills: list[dict], disclosure: str = "full") -> dict:
+    """C3 专题层：stage 相关 Skill。
+
+    disclosure 控制 Skill 披露粒度（渐进式披露 progressive disclosure）：
+      - "full"     : 注入 SKILL.md 正文（body[:4000]）——P0/P1 既有行为，保持不变。
+      - "metadata" : 仅注入 name + description 元数据摘要，不整包灌入正文；
+                     正文由 tool_loop 中 Agent 按需经 resource_loader/skill 工具披露。
+    """
     parts = []
     for s in skills:
-        body = s.get("body", "")
         name = s.get("name", s.get("skill_id", ""))
+        if disclosure == "metadata":
+            if s.get("capability_status") == "not_connected":
+                parts.append(f"### Skill: {name}\n[SKILL.md 未找到，能力标记 not_connected]")
+            else:
+                desc = s.get("description", "") or s.get("meta", {}).get("description", "")
+                parts.append(f"### Skill（元数据）: {name}\n{desc}\n[正文按需经工具披露]")
+            continue
+        body = s.get("body", "")
         if body:
             parts.append(f"### Skill: {name}\n{body[:4000]}")
         elif s.get("capability_status") == "not_connected":
             parts.append(f"### Skill: {name}\n[SKILL.md 未找到，能力标记 not_connected]")
     content = "\n\n".join(parts) if parts else "[C3 专题层：当前阶段无可用 Skill 正文]"
     return {"layer": "C3", "content": content, "chars": len(content),
+            "disclosure": disclosure,
             "skill_count": len(skills), "skills_with_body": sum(1 for s in skills if s.get("body"))}
 
 

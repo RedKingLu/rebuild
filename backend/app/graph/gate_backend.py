@@ -6,10 +6,13 @@ drive_promotion=False (record decision + Audit only; graph advances the stage).
 
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 
 from app.dependencies import get_services
 from app.schemas.gate import GateDecisionRequest
+
+logger = logging.getLogger("rebuild.gate_backend")
 
 
 class RealGateBackend:
@@ -57,8 +60,8 @@ class RealGateBackend:
                         db.commit()
                 finally:
                     db.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("gate retry_action DB update failed gate_id=%s: %s", gate.gate_id, e)
         return gate.gate_id
 
     def decide(self, *, gate_id: str, decision: str) -> None:

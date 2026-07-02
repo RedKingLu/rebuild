@@ -15,6 +15,10 @@ from app.models.coding_agent_config import (
 )
 from app.models.run import Run
 from app.models.gate import Gate
+from app.models.task_graph import TaskGraph, TaskNode, TaskGraphRun
+from app.models.task_node_run import TaskNodeRun
+from app.models.stage_plan import StagePlan, TaskPlan
+from app.models.plan_delta import PlanDelta
 
 __all__ = [
     "Base",
@@ -32,4 +36,8 @@ __all__ = [
     "CodingAgentConfig", "CodingAgentType", "CodingAgentInvokeMode", "CodingAgentStatus",
     "Run",
     "Gate",
+    "TaskGraph", "TaskNode", "TaskGraphRun",
+    "TaskNodeRun",
+    "StagePlan", "TaskPlan",
+    "PlanDelta",
 ]
