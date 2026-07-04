@@ -26,21 +26,41 @@ def isolated_data():
     db_url = f"sqlite:///{tmp}/rebuild.db"
     ws_tmp = os.path.join(tmp, "workspace")
     settings = Settings(data_dir=tmp, debug=True, database_url=db_url, workspace_dir=ws_tmp)
-    clear_services_cache()
-    svc = get_services(settings)
-    # workspace_service / trace_writer / audit_writer read the GLOBAL settings
-    # singleton directly (not the injected one), so isolate it too — otherwise
-    # tests pollute the real 工作区/ tree. object.__setattr__ bypasses frozen.
+    # workspace_service / trace_writer / audit_writer AND database.get_engine()
+    # all read the GLOBAL settings singleton directly (not the injected one), so
+    # every isolated field must be redirected on the global too — otherwise tests
+    # pollute (and, for database_url, DROP) the real .data/rebuild.db + 工作区/ tree.
+    # B-DB-ISOLATION-1 (R11-3): database_url was NOT overridden here, so
+    # get_engine() kept pointing at the real DB and drop_all/create_all below
+    # wiped the user's real projects on every pytest run. Redirect it too, and do
+    # it BEFORE get_services() so no service can construct a real-DB engine that
+    # then gets cached in db_mod._engine and drops the real DB at drop_all.
+    # object.__setattr__ bypasses the frozen Settings.
     import app.core.config as cfg
     _orig_ws = cfg.settings.workspace_dir
+    _orig_db = cfg.settings.database_url
+    _orig_data = cfg.settings.data_dir
     object.__setattr__(cfg.settings, "workspace_dir", ws_tmp)
+    object.__setattr__(cfg.settings, "database_url", db_url)
+    object.__setattr__(cfg.settings, "data_dir", tmp)
+    clear_services_cache()
+    svc = get_services(settings)
     # R9-3A: Drop + recreate tables to pick up new columns (SQLite create_all
     # won't alter existing tables, so old project table lacks coding_agent_ref).
     import app.models  # noqa: F401
     from app.models.base import Base
     from app.core.database import get_engine
-    Base.metadata.drop_all(bind=get_engine())
-    Base.metadata.create_all(bind=get_engine())
+    # B-DB-ISOLATION-1 safety guard: refuse to drop_all unless the engine is truly
+    # bound to this test's temp DB. If a future change breaks the redirect above,
+    # this raises loudly instead of silently wiping the real .data/rebuild.db.
+    _eng = get_engine()
+    if str(_eng.url) != db_url:
+        raise RuntimeError(
+            f"Test DB isolation broken: engine bound to {_eng.url!r}, expected {db_url!r}. "
+            f"Refusing to drop_all on a non-temp database (would delete real data)."
+        )
+    Base.metadata.drop_all(bind=_eng)
+    Base.metadata.create_all(bind=_eng)
     # R9-3E: Seed minimal test data so resource/agent/skill list tests pass
     _seed_test_data()
     # WP-6: bootstrap graph handlers so graph-based execute_onboarding works in tests
@@ -68,6 +88,8 @@ def isolated_data():
         pass
     yield svc
     object.__setattr__(cfg.settings, "workspace_dir", _orig_ws)
+    object.__setattr__(cfg.settings, "database_url", _orig_db)
+    object.__setattr__(cfg.settings, "data_dir", _orig_data)
     clear_services_cache()
     # Reset globals again so next test uses a fresh DB
     db_mod._engine = None

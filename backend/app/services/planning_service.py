@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -30,6 +31,21 @@ from app.core.status import RISK_LEVELS
 from app.services.task_graph_service import EDGE_TYPES
 
 logger = logging.getLogger(__name__)
+
+# R11-7 (B-P3-NO-TASKPLANS): P3 planning is a slow domain — a single Stage Plan /
+# Task Plan / edge call runs 60-120s on the planning model, exceeding the adapter's
+# fail-fast default request timeout (60s) and failing every retry → empty task_plans →
+# no TaskGraph. Give planning calls a longer, env-tunable request timeout so a
+# live-but-slow provider is not treated as a dead one. This tunes only the request
+# timeout, not the model/endpoint (D-098 — the strategy still resolves the model).
+_PLANNING_TIMEOUT = float(os.environ.get("P3_PLANNING_TIMEOUT", "240"))
+
+# R11-7 (B-P3-NO-TASKPLANS): a Task Plan Batch is verbose (a batch of tasks, each with
+# scope/inputs/outputs/validation/artifacts) and easily exceeds a 4096-token cap — the
+# JSON then truncates mid-object and fails to parse (empty task_plans → no TaskGraph).
+# Give the JSON-heavy planning calls more output headroom (env-tunable). The model's
+# context window (1M) easily accommodates this; edge proposal stays small.
+_PLANNING_MAX_TOKENS = int(os.environ.get("P3_PLANNING_MAX_TOKENS", "8192"))
 
 # §5.2 Stage Plan content fields the model must produce (id/status/audit cols are set by us)
 STAGE_PLAN_FIELDS = [
@@ -221,7 +237,8 @@ class PlanningService:
             {"role": "user", "content": self._build_user_prompt(inputs)},
         ]
         result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=4096, temperature=0.3, source="api")
+                               max_tokens=_PLANNING_MAX_TOKENS, temperature=0.3, source="api",
+                               timeout=_PLANNING_TIMEOUT)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
             self._trace(f"P3 stage-plan model call not completed: {reason}", project_id, run_id, stage)
@@ -294,7 +311,8 @@ class PlanningService:
             {"role": "user", "content": self._build_task_plan_prompt(sp_objective, sp_scope, user_goal)},
         ]
         result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=4096, temperature=0.3, source="api")
+                               max_tokens=_PLANNING_MAX_TOKENS, temperature=0.3, source="api",
+                               timeout=_PLANNING_TIMEOUT)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
             self._trace(f"P3 task-plan model call not completed: {reason}", project_id, run_id, stage)
@@ -357,6 +375,22 @@ class PlanningService:
                 db.add(tp)
                 db.flush()   # assign task_plan_id
                 task_ids.append(tp.task_plan_id)
+
+            # R11-7 (B-P3-NO-TASKPLANS) honesty: an empty batch must NOT be judged
+            # "completed" — a 0-plan batch was previously reported completed (task_plan_ids=[]),
+            # letting P3 review pass while generate_task_graph then failed no_task_plans (a
+            # self-contradictory "completed but no TaskGraph"). No valid Task Plan → failed
+            # (nothing persisted; no batch meta written), so P3 review does not pass and the
+            # stage escalates its Gate honestly. parse_error is a retryable structured-output
+            # miss; a genuinely empty array means the model produced no plan.
+            if not task_ids:
+                reason = ("task_plan_parse_error: 模型输出未能解析出 task_plans（结构化输出契约不匹配，可重试）"
+                          if parse_error else
+                          "no_task_plans_generated: 模型未产出任何有效 Task Plan（空批次不可承接 TaskGraph）")
+                self._trace(f"P3 task-plan batch empty → failed: {reason}", project_id, run_id, stage)
+                return TaskPlanBatchResult(
+                    status="failed", stage_plan_ref=stage_plan_id, reason=reason,
+                    model_used=model_used, parse_error=parse_error)
 
             # §4.2-3: batch risk = max task risk; §4.2-4: high-risk → Gate
             batch_risk = self._max_risk(risks)
@@ -489,7 +523,8 @@ class PlanningService:
                 f"（edge_type ∈ {EDGE_TYPES}）。仅表达任务依赖顺序，不得越过 Gate。")},
         ]
         result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=2048, temperature=0.2, source="api")
+                               max_tokens=2048, temperature=0.2, source="api",
+                               timeout=_PLANNING_TIMEOUT)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
             return [], result.get("model"), False, "failed", str(reason)

@@ -94,11 +94,16 @@ class LiteLLMAdapter:
         max_tokens: int = 4096,
         temperature: float = 0.7,
         stream: bool = False,
+        timeout: Optional[float] = None,
         extra_params: Optional[dict] = None,
     ) -> ModelCallResult:
         """Execute a completion call via litellm.
 
         IMPORTANT: api_key is used in-memory only for this call; never persisted.
+
+        R11-7: `timeout` overrides the module default per call — slow domains (e.g. P3
+        planning, single call 60-120s) need a longer request timeout than the fail-fast
+        default so they don't time out on a live-but-slow provider (B-P3-NO-TASKPLANS).
         """
         call_id = f"call_{uuid.uuid4().hex[:12]}"
         t0 = time.monotonic()
@@ -112,7 +117,8 @@ class LiteLLMAdapter:
             "api_key": api_key,
             "api_base": api_base,
             "stream": stream,
-            "timeout": _REQUEST_TIMEOUT,  # R9-5-1: never hang on a dead provider
+            # R9-5-1: never hang on a dead provider; R11-7: per-call override for slow domains
+            "timeout": timeout if timeout is not None else _REQUEST_TIMEOUT,
         }
         if extra_params:
             kwargs.update(extra_params)

@@ -121,6 +121,8 @@ interface WorkspaceState {
   execMode: ExecMode;
   tabs: CenterTab[];
   activeTab: string;
+  // UX-3: active agent conversation id (persisted session).
+  activeConversationId: string | null;
   mockBannerDismissed: boolean;
   setProjectId: (id: string) => void;
   setActivity: (a: ActivityType) => void;
@@ -132,6 +134,7 @@ interface WorkspaceState {
   openTab: (t: CenterTab) => void;
   closeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
+  setActiveConversation: (id: string | null) => void;
   dismissMockBanner: () => void;
 }
 export const useWorkspaceStore = create<WorkspaceState>((set) => ({
@@ -144,6 +147,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
   execMode: 'plan',
   tabs: [{ id: 'agent', title: 'Agent 对话', kind: 'agent', closable: false }],
   activeTab: 'agent',
+  activeConversationId: null,
   mockBannerDismissed: false,
   setProjectId: (id) => set({ projectId: id }),
   setActivity: (a) => set(s => ({ activity: a, leftCollapsed: s.activity === a ? !s.leftCollapsed : false })),
@@ -158,6 +162,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
   }),
   closeTab: (id) => set(s => ({ tabs: s.tabs.filter(x => x.id !== id), activeTab: s.activeTab === id ? 'agent' : s.activeTab })),
   setActiveTab: (id) => set({ activeTab: id }),
+  setActiveConversation: (id) => set({ activeConversationId: id }),
   dismissMockBanner: () => set({ mockBannerDismissed: true }),
 }));
 

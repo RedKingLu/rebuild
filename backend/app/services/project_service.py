@@ -120,6 +120,9 @@ class ProjectService:
             "workspace_status": p.workspace_status or "ready",
             "onboarding_done": p.onboarding_done,
             "coding_agent_ref": p.coding_agent_ref,
+            # D-088 / R9-5-5 — must be surfaced so the B-6 PATCH response round-trips the new scope
+            # and the Workspace toolbar switch reflects exactly what should_delegate() will read.
+            "external_platform_scope": getattr(p, "external_platform_scope", None) or "none",
             "model_strategy_mode": getattr(p, "model_strategy_mode", "global_unified") or "global_unified",
             "global_model_ref": getattr(p, "global_model_ref", None),
             "created_at": p.created_at.isoformat() if p.created_at else "",

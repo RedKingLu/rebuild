@@ -230,6 +230,13 @@ class AssessmentService:
             # unparseable → keep raw text in the report; lists stay empty (honest,
             # the NodeLoop ReviewPass retries structured output — T2)
             out = {"assessment_report": {"raw": text[:2000], "parse_error": True}}
+        # assessment_report must be an OBJECT; a non-dict value (model returned a bare
+        # string / prose while the JSON itself parsed) is unstructured output — normalize
+        # to a parse_error report so downstream never receives a bare str (single source
+        # of truth for the "assessment_report 非对象" case, avoids .get on str).
+        rep = out.get("assessment_report")
+        if "assessment_report" in out and not isinstance(rep, dict):
+            out["assessment_report"] = {"raw": str(rep)[:2000], "parse_error": True}
         return out
 
     # ── evidence (§4.7 five items + context provenance) ────────────────────

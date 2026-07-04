@@ -11,40 +11,56 @@ interface MaterialItem {
   type: 'json' | 'markdown';
 }
 
-function getMaterialLabels(stage: string): MaterialItem[] {
+function labelForRef(ref: string): MaterialItem {
+  const path = ref.startsWith('artifacts/') ? ref : `artifacts/${ref}`;
+  const file = path.split('/').pop() || path;
+  const type: 'json' | 'markdown' = file.endsWith('.md') ? 'markdown' : 'json';
+  const stem = file.replace(/\.(json|md)$/i, '');
+  // Known real StageReport / domain artifact stems → 中文标签
+  const known: Record<string, string> = {
+    intake_report: '接入报告 (intake_report)',
+  };
+  let label = known[stem];
+  if (!label) {
+    if (stem.endsWith('_start_plan')) label = `起始计划报告 (${stem})`;
+    else if (stem.endsWith('_construction')) label = `施工报告 (${stem})`;
+    else if (stem.endsWith('_acceptance')) label = `验收报告 (${stem})`;
+    else if (stem.endsWith('_task_plans')) label = `Task Plan 批次 (${stem})`;
+    else if (stem.endsWith('_task_graph')) label = `TaskGraph (${stem})`;
+    else if (stem.endsWith('_stage_plan')) label = `Stage Plan (${stem})`;
+    else if (stem.endsWith('_assessment_report')) label = `评估报告 (${stem})`;
+    else if (stem.endsWith('_risk_list')) label = `风险清单 (${stem})`;
+    else if (stem.endsWith('_blocker_list')) label = `阻塞项清单 (${stem})`;
+    else if (stem.endsWith('_validation_gaps')) label = `验证缺口 (${stem})`;
+    else if (stem.endsWith('_resource_needs')) label = `资源需求 (${stem})`;
+    else label = stem;
+  }
+  return { path, label, type };
+}
+
+// B-P0-FAKE-1 (R11-3): the review materials come from the Gate's REAL artifact_refs
+// (produced by the LangGraph stage node / StageReports), not a hardcoded per-stage
+// filename list. The old P0 list pointed at fabricated files (p0_execution_record /
+// p0_construction_report / p0_review_pass); those are no longer produced (D-101).
+// The per-stage fallbacks below use the REAL StageReport names and are only used when
+// a Gate carries no artifact_refs (degraded / legacy gate).
+function getMaterials(gate: any): MaterialItem[] {
+  const refs: string[] = Array.isArray(gate?.artifact_refs) ? gate.artifact_refs : [];
+  if (refs.length > 0) return refs.map(labelForRef);
+  const stage = gate?.stage || 'p0';
   if (stage === 'p0') {
-    return [
-      { path: 'artifacts/intake_report.json', label: '阶段计划 (intake_report)', type: 'json' },
-      { path: 'artifacts/p0_execution_record.json', label: '执行记录 (p0_execution)', type: 'json' },
-      { path: 'artifacts/p0_construction_report.md', label: '施工报告 (p0_report)', type: 'markdown' },
-      { path: 'artifacts/p0_review_pass.json', label: 'Review 报告 (p0_review)', type: 'json' },
-    ];
+    return ['intake_report.json', 'p0_start_plan.json', 'p0_construction.json', 'p0_acceptance.json']
+      .map(f => labelForRef(f));
   }
-  // R10 T20: P2→P3 gate — review the 6 P2 assessment outputs (契约 §4.5)
   if (stage === 'p2') {
-    return [
-      { path: 'artifacts/p2_assessment_report.json', label: '评估报告 (p2_assessment_report)', type: 'json' },
-      { path: 'artifacts/p2_risk_list.json', label: '风险清单 (p2_risk_list)', type: 'json' },
-      { path: 'artifacts/p2_blocker_list.json', label: '阻塞项清单 (p2_blocker_list)', type: 'json' },
-      { path: 'artifacts/p2_validation_gaps.json', label: '验证缺口 (p2_validation_gaps)', type: 'json' },
-      { path: 'artifacts/p2_resource_needs.json', label: '资源需求 (p2_resource_needs)', type: 'json' },
-    ];
+    return ['p2_assessment_report.json', 'p2_risk_list.json', 'p2_blocker_list.json',
+      'p2_validation_gaps.json', 'p2_resource_needs.json'].map(f => labelForRef(f));
   }
-  // R10 T20: P3→P4 gate — review the P3 plan artifacts (契约 §5.6)
   if (stage === 'p3') {
-    return [
-      { path: 'artifacts/p3_stage_plan.json', label: 'Stage Plan (p3_stage_plan)', type: 'json' },
-      { path: 'artifacts/p3_task_plans.json', label: 'Task Plan 批次 (p3_task_plans)', type: 'json' },
-      { path: 'artifacts/p3_task_graph.json', label: 'TaskGraph (p3_task_graph)', type: 'json' },
-    ];
+    return ['p3_stage_plan.json', 'p3_task_plans.json', 'p3_task_graph.json'].map(f => labelForRef(f));
   }
-  // p1 (default for other stages)
-  return [
-    { path: 'artifacts/p1_stage_plan.json', label: '阶段计划 (p1_stage_plan)', type: 'json' },
-    { path: 'artifacts/p1_execution_record.json', label: '执行记录 (p1_execution)', type: 'json' },
-    { path: 'artifacts/p1_construction_report.md', label: '施工报告 (p1_report)', type: 'markdown' },
-    { path: 'artifacts/p1_review_pass.json', label: 'Review 报告 (p1_review)', type: 'json' },
-  ];
+  // p1 (default): real StageReport names
+  return ['p1_start_plan.json', 'p1_construction.json', 'p1_acceptance.json'].map(f => labelForRef(f));
 }
 
 interface Props {
@@ -54,8 +70,8 @@ interface Props {
   onProfilingStart?: () => void;
 }
 
-export function GatePanel({ gate, projectId, onDecided, onProfilingStart }: Props) {
-  const materialLabels = getMaterialLabels(gate?.stage || 'p0');
+export function GatePanel({ gate, projectId, onDecided }: Props) {
+  const materialLabels = getMaterials(gate);
   const [expanded, setExpanded] = useState(false);
   const [activeMaterial, setActiveMaterial] = useState<string>('');
   const [materialContents, setMaterialContents] = useState<Record<string, string>>({});
@@ -63,10 +79,16 @@ export function GatePanel({ gate, projectId, onDecided, onProfilingStart }: Prop
   const [deciding, setDeciding] = useState(false);
   const [decisionFeedback, setDecisionFeedback] = useState<string | null>(null);
   const [reworkHint, setReworkHint] = useState(false);
-  const [profiling, setProfiling] = useState(false);  // R9-3G-C: auto-trigger P1 profiling
+  // UX-5: collect the user's reason for the decision (required on reject/request_changes).
+  const [reason, setReason] = useState('');
+  const [reasonError, setReasonError] = useState<string | null>(null);
 
   const gateId = gate?.gate_id;
-  const gateLabel = gate?.gate_type === 'stage_promotion' ? '阶段晋级 Gate' : (gate?.gate_type || 'Gate');
+  // B-PLAN-1: plan_review gates review the pre-execution stage plan (D-025/D-026).
+  const gateLabel = gate?.gate_type === 'stage_promotion' ? '阶段晋级 Gate'
+    : gate?.gate_type === 'plan_review' ? '计划审核 Gate'
+    : gate?.gate_type === 'source_pending' ? '源码补全 Gate'
+    : (gate?.gate_type || 'Gate');
 
   // Load material content when a material is selected
   const loadMaterial = useCallback(async (materialPath: string) => {
@@ -94,15 +116,23 @@ export function GatePanel({ gate, projectId, onDecided, onProfilingStart }: Prop
 
   const handleDecision = async (decision: string) => {
     if (!gateId) return;
+    // UX-5: reject / request_changes require a reason (no dead-end rejections).
+    const needsReason = decision === 'reject' || decision === 'request_changes';
+    if (needsReason && !reason.trim()) {
+      setReasonError('请填写拒绝/请求修改的原因（agent 将据此返工）');
+      return;
+    }
     setDeciding(true);
     setDecisionFeedback(null);
+    setReasonError(null);
     try {
       const runId = gate.run_id || 'unknown';
       const stage = gate.stage || 'p0';
       const resp = await fetch(`/api/projects/${projectId}/runs/${runId}/stages/${stage}/promotion-decision`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ decision, reason: `User ${decision} via GatePanel` }),
+        // UX-5: pass the real user reason (used downstream for rework-notes artifact).
+        body: JSON.stringify({ decision, reason: reason.trim() || `User ${decision} via GatePanel` }),
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
@@ -118,31 +148,13 @@ export function GatePanel({ gate, projectId, onDecided, onProfilingStart }: Prop
         return;
       }
 
-      // R9-3G-C: Auto-trigger P1 profiling when P0 gate is approved
-      if (decision === 'approve' && stage === 'p0') {
-        setProfiling(true);
-        setDecisionFeedback('P1 全量识别进行中…');
-        setExpanded(false);      // close Modal — user watches in AgentChat
-        onProfilingStart?.();    // switch to AgentChat tab
-        try {
-          const profileResp = await fetch(`/api/projects/${projectId}/profile`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({}),
-          });
-          if (!profileResp.ok) {
-            const errData = await profileResp.json().catch(() => ({}));
-            setDecisionFeedback(`P1 识别失败: ${(errData as any).detail || profileResp.status}`);
-          } else {
-            setDecisionFeedback('P1 全量识别完成。');
-          }
-        } catch (e: any) {
-          setDecisionFeedback(`P1 识别出错: ${e.message}`);
-        } finally {
-          setProfiling(false);
-        }
-      }
-
+      // B-PLAN-1 (R11-3): approve just resumes the LangGraph thread (promotion-decision
+      // above drives FlowRuntime.resume). The graph advances the stage itself —
+      // approving a P0 plan_review gate resumes into real P0 execution; approving the
+      // P0 promotion gate resumes into P1. We no longer POST /profile here (that was a
+      // separate, fabricated P1 path — p1_stage_plan/execution_record/construction_report/
+      // review_pass were template/hardcoded/always-pass; forbidden by D-101). P1 review
+      // materials now come from the real graph P1 node (RealP1Handler → StageReports).
       onDecided();
       setExpanded(false);
     } catch (e: any) {
@@ -175,7 +187,7 @@ export function GatePanel({ gate, projectId, onDecided, onProfilingStart }: Prop
         padding: '10px 16px', background: 'var(--amber-soft, #fff8e1)',
         borderBottom: '2px solid var(--amber)', flexShrink: 0,
         display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer',
-      }} onClick={() => setExpanded(true)}>
+      }} onClick={() => { setExpanded(true); setReason(''); setReasonError(null); }}>
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 14, fontWeight: 700 }}>⚠ {gateLabel}</div>
           <div style={{ fontSize: 12, marginTop: 2 }}>{gate?.summary || gate?.reason}</div>
@@ -186,8 +198,12 @@ export function GatePanel({ gate, projectId, onDecided, onProfilingStart }: Prop
 
       {/* Expanded Modal */}
       <Modal open={expanded} onClose={() => { setExpanded(false); setReworkHint(false); setDecisionFeedback(null); }}
-        title={`Gate 审核 — ${gate?.stage?.toUpperCase?.() || 'P0'} 阶段晋级`} width={800}>
-        <div style={{ display: 'flex', gap: 16, minHeight: 300 }}>
+        title={`Gate 审核 — ${gate?.stage?.toUpperCase?.() || 'P0'} · ${gateLabel}`} width={800}>
+        {gate?.gate_type === 'plan_review' && (
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 8 }}>
+            该阶段动作尚未执行。请审阅下方阶段计划后决定是否批准执行（批准后才会执行阶段动作）。
+          </div>
+        )}        <div style={{ display: 'flex', gap: 16, minHeight: 300 }}>
           {/* Left: Material list (40%) */}
           <div style={{ width: '40%', minWidth: 200, borderRight: '1px solid var(--color-border)', paddingRight: 12 }}>
             <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>审核材料</div>
@@ -229,29 +245,47 @@ export function GatePanel({ gate, projectId, onDecided, onProfilingStart }: Prop
           </div>
         </div>
 
-        {/* Feedback / Profiling status */}
+        {/* Feedback status */}
         {decisionFeedback && (
           <div style={{
             marginTop: 12, padding: '8px 12px', borderRadius: 6, fontSize: 13,
-            background: profiling ? 'var(--blue-soft, #e3f2fd)' :
-                        reworkHint ? 'var(--amber-soft, #fff8e1)' : 'var(--red-soft, #ffebee)',
-            color: profiling ? 'var(--color-primary)' :
-                   reworkHint ? 'var(--amber-text, #8d6e00)' : 'var(--red)',
+            background: reworkHint ? 'var(--amber-soft, #fff8e1)' : 'var(--red-soft, #ffebee)',
+            color: reworkHint ? 'var(--amber-text, #8d6e00)' : 'var(--red)',
           }}>
-            {profiling ? '⏳ ' : ''}{decisionFeedback}
+            {decisionFeedback}
           </div>
         )}
 
+        {/* UX-5: decision reason — required when rejecting / requesting changes */}
+        <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--color-border)' }}>
+          <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 4 }}>
+            决策原因 <span style={{ color: 'var(--red)' }}>*</span>
+            <span style={{ fontSize: 10, marginLeft: 6 }}>（拒绝/请求修改必填；该原因将作为返工要求交付给 agent）</span>
+          </div>
+          <textarea
+            value={reason}
+            onChange={e => { setReason(e.target.value); if (reasonError) setReasonError(null); }}
+            placeholder="例如：接入报告缺少数据库连接配置；请补充后重新提交…"
+            rows={3}
+            style={{
+              width: '100%', padding: '8px 10px', border: `1px solid ${reasonError ? 'var(--red)' : 'var(--color-border)'}`,
+              borderRadius: 6, fontSize: 12, resize: 'vertical', background: 'var(--color-surface)',
+              color: 'var(--color-text)', fontFamily: 'inherit', boxSizing: 'border-box',
+            }}
+          />
+          {reasonError && <div style={{ fontSize: 11, color: 'var(--red)', marginTop: 4 }}>{reasonError}</div>}
+        </div>
+
         {/* Bottom action bar */}
-        <div style={{ display: 'flex', gap: 8, marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--color-border)' }}>
-          <button className="btn sm" style={{ background: 'var(--green)', color: '#fff', fontSize: 12 }} disabled={deciding || profiling}
+        <div style={{ display: 'flex', gap: 8, marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--color-border)' }}>
+          <button className="btn sm" style={{ background: 'var(--green)', color: '#fff', fontSize: 12 }} disabled={deciding}
             onClick={() => handleDecision('approve')}>批准</button>
-          <button className="btn sm ghost" style={{ fontSize: 12 }} disabled={deciding || profiling}
+          <button className="btn sm ghost" style={{ fontSize: 12 }} disabled={deciding}
             onClick={() => handleDecision('request_changes')}>请求修改</button>
-          <button className="btn sm ghost" style={{ color: 'var(--red)', fontSize: 12 }} disabled={deciding || profiling}
+          <button className="btn sm ghost" style={{ color: 'var(--red)', fontSize: 12 }} disabled={deciding}
             onClick={() => handleDecision('reject')}>拒绝</button>
           <div style={{ flex: 1 }} />
-          <button className="btn sm ghost" style={{ fontSize: 12 }} onClick={() => { setExpanded(false); setReworkHint(false); setDecisionFeedback(null); }}>
+          <button className="btn sm ghost" style={{ fontSize: 12 }} onClick={() => { setExpanded(false); setReworkHint(false); setDecisionFeedback(null); setReason(''); setReasonError(null); }}>
             关闭
           </button>
         </div>

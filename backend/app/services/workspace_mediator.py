@@ -1,19 +1,25 @@
-"""Workspace mediator — controlled file read/write boundary for external platforms.
+"""Workspace mediator — unified controlled file read/write boundary for ALL write actors.
 
-D-088② / R9-5-5 T4: External platforms (e.g. OpenCode) MUST access the project
-workspace through this mediator.  It enforces:
+D-088② / R9-5-5 T4 (external platforms) → **升格 D-099 / R11-3-C1**: this mediator is
+the single write gatekeeper for BOTH platform-internal workers (P4 execution worker,
+Tools) AND external platforms (e.g. OpenCode).  Every write actor MUST route writes
+through this mediator — no actor may write the workspace via raw fs directly.  It enforces:
 
   - Read: workspace boundary guard (no path traversal, no escape).
-  - Write: output directory enforcement (only output_code/ and artifacts/ are writable).
-         source/ is READONLY — writes are rejected unconditionally.
+  - Write: output directory enforcement (only output_code/, artifacts/, patches/
+         are writable). source/ is READONLY — writes are rejected unconditionally
+         for every actor (platform-internal or external), D-099①.
+         patches/ is platform-writable for diff/patch drafts (D-099③ / D-104); it
+         stays read-only for USERS at the workspace_service API layer (READONLY_DIRS)
+         — "platform-writable, user-read-only".
   - Risk classification: L0-L3+ based on target directory and file type,
     fed back to the command reviewer / HITL for escalation decisions.
 
-Write risk levels (used by external_command_reviewer):
+Write risk levels (used by external_command_reviewer / P4 execution worker):
   L0 — read (no write)
   L1 — write to output_code/ ordinary file (new or overwrite)
-  L2 — write to artifacts/ or overwrite an existing output_code/ file with
-       the same name (content update)
+  L2 — write to artifacts/ or patches/, or overwrite an existing output_code/
+       file with the same name (content update)
   L3 — write a script/executable file (.py, .sh, .js, etc.) to output_code/
   L4 — write to any path outside the allowed write dirs but inside workspace
   L5 — path traversal attempt / escape outside workspace root
@@ -27,11 +33,14 @@ from pathlib import Path
 
 # ── Directory-level write policy ─────────────────────────────────────────
 
-# External platforms may ONLY write here (D-088②)
-_EXTERNAL_WRITABLE_DIRS = {"output_code", "artifacts"}
+# The writable dirs for any actor (platform-internal worker or external), D-099 / D-104.
+# patches/ holds diff/patch drafts (D-099③); platform-writable here, user-read-only at
+# the workspace_service API layer.
+_WRITABLE_DIRS = {"output_code", "artifacts", "patches"}
 
-# source/ is unconditionally read-only (D-088②)
-_READONLY_DIRS = {"source", "patches"}
+# source/ is unconditionally read-only for every actor (D-099①, 升格 D-088②).
+# (patches/ moved to _WRITABLE_DIRS per D-104 — it was over-restricted by C1 vs D-099③.)
+_READONLY_DIRS = {"source"}
 
 # File extensions that get a +1 risk bump inside output_code/
 _EXECUTABLE_EXTS = {
@@ -41,10 +50,12 @@ _EXECUTABLE_EXTS = {
 
 
 class WorkspaceMediator:
-    """Stateless mediator — validates read/write requests from external platforms.
+    """Stateless mediator — validates read/write requests from ANY write actor.
 
-    All methods raise ValueError with a clear reason on rejection so callers
-    can surface the denial back to OpenCode via ACP and write an Audit record.
+    Applies to platform-internal workers (P4 execution worker, Tools) and external
+    platforms (OpenCode) alike (D-099).  All methods raise ValueError with a clear
+    reason on rejection so callers can surface the denial (back to OpenCode via ACP,
+    or to the P4 worker) and write an Audit record.
     """
 
     def __init__(self, workspace_root: str) -> None:
@@ -81,14 +92,15 @@ class WorkspaceMediator:
         if top_dir in _READONLY_DIRS:
             raise ValueError(
                 f"Write rejected: {path_str!r} is inside read-only directory '{top_dir}/' "
-                "(source/patches/ are read-only for external platforms)."
+                "(source/ is read-only for ALL actors — platform-internal "
+                "and external, D-099①)."
             )
 
-        if top_dir not in _EXTERNAL_WRITABLE_DIRS:
+        if top_dir not in _WRITABLE_DIRS:
             raise ValueError(
                 f"Write rejected: {path_str!r} (top-level dir '{top_dir}/') is not in "
-                f"the allowed write directories {sorted(_EXTERNAL_WRITABLE_DIRS)}. "
-                "External platforms must write to output_code/ or artifacts/."
+                f"the allowed write directories {sorted(_WRITABLE_DIRS)}. "
+                "All actors must write to output_code/, artifacts/ or patches/ (D-099/D-104)."
             )
 
         risk = self._write_risk(target, top_dir)
@@ -125,8 +137,8 @@ class WorkspaceMediator:
         # L3: executable/script file types
         if target.suffix.lower() in _EXECUTABLE_EXTS and top_dir == "output_code":
             return "L3"
-        # L2: overwriting an existing file in output_code/, or writing to artifacts/
-        if top_dir == "artifacts":
+        # L2: writing to artifacts/ or patches/, or overwriting an existing output_code/ file
+        if top_dir in ("artifacts", "patches"):
             return "L2"
         if top_dir == "output_code" and target.exists():
             return "L2"

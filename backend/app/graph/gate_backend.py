@@ -31,6 +31,14 @@ class RealGateBackend:
                 f"{stage} 阶段源码导入失败，请补充凭据或切换为手动导入后重新执行。"
             )
             retry_action = metadata.get("retry_action") if metadata else None
+        elif gate_type == "plan_review":
+            # B-PLAN-1 (D-025/D-026): pre-execution plan review. Manual/Plan modes
+            # pause here so the user审核阶段计划 BEFORE any stage action executes.
+            _mode = (metadata or {}).get("mode", "plan")
+            reason = f"{stage} 阶段计划待审核（{_mode} 模式）：审阅计划后决定是否执行阶段动作"
+            summary = (f"{stage} 阶段起始计划已生成（目标 / 验收标准 / 计划动作）。"
+                       f"请审阅后决定：批准执行 / 请求修改 / 拒绝。")
+            retry_action = None
         else:
             reason = f"{stage} 小循环通过，请求阶段晋级"
             summary = f"{stage} 阶段已完成并产出三类审核报告，请审阅后决策。"
@@ -68,3 +76,25 @@ class RealGateBackend:
         gs = get_services().gate_service
         # drive_promotion=False: the LangGraph gate node drives stage transitions.
         gs.decide(gate_id, GateDecisionRequest(decision=decision), drive_promotion=False)
+
+    def find_stage_gate(self, *, project_id: str, run_id: str, stage: str,
+                        gate_type: str) -> Optional[dict]:
+        """Find the latest gate of a given type for (project, run, stage).
+
+        Used by the plan-review flow (B-PLAN-1) to stay idempotent across the
+        interrupt/resume re-run of the work node: on resume the node re-executes
+        from the top, so we must reuse the already-created plan_review gate (and
+        skip when it is already decided) instead of creating a duplicate.
+        Returns {gate_id, gate_status, decision} or None.
+        """
+        gs = get_services().gate_service
+        match = None
+        for g in gs.list_by_project(project_id):
+            if (g.stage or "").lower() == (stage or "").lower() \
+                    and g.gate_type == gate_type \
+                    and (g.run_id or "") == (run_id or ""):
+                match = g  # list_by_project is ordered by gate_id → last = latest
+        if match is None:
+            return None
+        return {"gate_id": match.gate_id, "gate_status": match.gate_status,
+                "decision": match.decision}

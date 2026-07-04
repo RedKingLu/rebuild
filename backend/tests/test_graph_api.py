@@ -37,7 +37,7 @@ def test_graph_http_drive_p0_p1(tmp_path, monkeypatch, isolated_data):
 
         # start graph → P0 real work, pause at P0 promotion Gate
         r = c.post(f"/api/projects/{pid}/graph/start",
-                   json={"execution_mode": "plan", "source_type": "manual"})
+                   json={"execution_mode": "auto", "source_type": "manual"})
         assert r.status_code == 200, r.text
         d = r.json()["data"]
         run_id = d["run_id"]

@@ -176,6 +176,45 @@ async def test_task_plan_batch_persists_and_links_stage_plan():
         db.close()
 
 
+async def test_task_plan_empty_batch_fails_not_completed():
+    """R11-7 (B-P3-NO-TASKPLANS) honesty: a model reply with no/unparseable task_plans
+    must NOT be judged completed with an empty batch (which let P3 review pass while the
+    TaskGraph then failed no_task_plans). Empty batch → failed, nothing persisted."""
+    svc = PlanningService(gateway=_FakeGateway(
+        overall="available",
+        call_result={"status": "completed", "content": _GOOD, "model": "m"}))
+    sp_id = await _make_stage_plan(svc)
+
+    # (c) model returns valid JSON but an empty task_plans array
+    svc._gateway = _FakeGateway(
+        overall="available",
+        call_result={"status": "completed",
+                     "content": json.dumps({"batch_objective": "空", "task_plans": []}),
+                     "model": "m"})
+    res = await svc.generate_task_plans("proj-t14", sp_id, run_id="run-14")
+    assert res.status == "failed"
+    assert res.task_plan_ids == []
+    assert "no_task_plans_generated" in res.reason
+
+    # (b) model reply not parseable → parse_error, still failed (not completed)
+    svc._gateway = _FakeGateway(
+        overall="available",
+        call_result={"status": "completed", "content": "not json at all", "model": "m"})
+    res2 = await svc.generate_task_plans("proj-t14", sp_id, run_id="run-14")
+    assert res2.status == "failed"
+    assert res2.parse_error is True
+    assert "task_plan_parse_error" in res2.reason
+
+    # nothing persisted for the empty batches
+    from app.core.database import get_session
+    from app.models.stage_plan import TaskPlan
+    db = get_session()
+    try:
+        assert db.query(TaskPlan).filter(TaskPlan.stage_plan_ref == sp_id).count() == 0
+    finally:
+        db.close()
+
+
 
 # ── T15: TaskGraph generation (必生, Q-R10-3) ─────────────────────────────────
 

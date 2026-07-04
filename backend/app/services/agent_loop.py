@@ -49,6 +49,9 @@ class AgentLoop:
         profiling_summary: Optional[str] = None,
         recent_traces: Optional[list[dict]] = None,
         file_count: int = 0,
+        # UX-3: specialist-agent routing + conversation history replay.
+        agent_type: str = "node_worker",
+        history: Optional[list[dict]] = None,
     ) -> AsyncIterator[str]:
         """Run agent chat with tool calling capability.
 
@@ -59,6 +62,10 @@ class AgentLoop:
         the user approves via the Gate decision endpoint and re-sends with
         confirm=True (mirrors the terminal execute_command pattern). No fake
         chat bubble stands in for execution (D-087 / STOP-4).
+
+        UX-3: agent_type selects the specialist persona (responsibilities/forbidden) via
+        context_assembler.build_system_prompt; history replays prior conversation turns so
+        the specialist remembers the dialogue across turns.
         """
         # T2.4/R9-5-4: load tool schemas from ToolRegistry (seed-driven, built-ins as fallback)
         try:
@@ -102,7 +109,7 @@ class AgentLoop:
             system_prompt = build_system_prompt(
                 project_id, stage,
                 project=project_dict, run=run_dict, node_state=node_state or None,
-                task_type="chat",
+                task_type="chat", agent_type=agent_type,
             )
             # Append dynamic fields not captured by C0-C6 layers
             if file_count > 0:
@@ -114,18 +121,43 @@ class AgentLoop:
             system_prompt = self._build_prompt_fallback(
                 project_name, project_id, stage, mode, file_count, profiling_summary, artifacts, recent_traces)
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message},
-        ]
+        # R11-3 FIX: the weak default model sometimes NARRATES intent ("好的，我先获取项目
+        # 信息…") and then stops WITHOUT emitting a tool call — leaving the user with a
+        # preamble and no real answer. Instruct it explicitly to call tools rather than
+        # announce them, and to base answers on real tool results (公理: No Evidence No Answer).
+        system_prompt += (
+            "\n\n【工具使用纪律】当你需要项目真实信息、阶段状态、产物内容或需要执行受控动作时，"
+            "必须直接调用相应工具获取真实数据后再作答；禁止只声称'我将获取/我先查看'却不实际调用工具。"
+            "回答必须基于工具返回的真实结果，不得脑补或编造项目数据。"
+        )
+
+        messages = [{"role": "system", "content": system_prompt}]
+        # UX-3: replay prior conversation turns so the specialist remembers the dialogue.
+        for h in history or []:
+            if not h or not isinstance(h, dict):
+                continue
+            role = h.get("role")
+            if role == "tool":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": h.get("tool_call_id", ""),
+                    "content": h.get("content", ""),
+                })
+            elif role in ("user", "agent", "assistant"):
+                messages.append({"role": role, "content": h.get("content", "")})
+        messages.append({"role": "user", "content": message})
 
         full_response = ""
         try:
             from app.dependencies import get_services
             gateway = get_services().model_gateway
 
-            # ── Multi-round tool calling loop (up to 3 rounds) ──
-            max_rounds = 3
+            # ── Multi-round tool calling loop ──
+            # R11-3 FIX: was 3 — too small once the model calls several tools (e.g.
+            # get_project_info + list_files + multiple read_artifact), it spent every
+            # round calling tools and never reached a synthesis round → user got only
+            # the preamble. Raised, plus a forced final synthesis (for/else below).
+            max_rounds = 6
             for round_num in range(max_rounds):
                 round_tool_calls: list[dict] = []
 
@@ -147,7 +179,12 @@ class AgentLoop:
                         for tc in frame["tool_calls"]:
                             idx = tc.index if hasattr(tc, "index") else 0
                             while len(round_tool_calls) <= idx:
-                                round_tool_calls.append({"id": "", "function": {"name": "", "arguments": ""}})
+                                # OpenAI/litellm require "type":"function" on each tool_call
+                                # in the assistant message fed back for the follow-up round.
+                                # Omitting it made the post-tool completion come back EMPTY
+                                # (provider accepted the malformed message but returned no
+                                # content) — the agent produced no final answer. (R11-3 FIX)
+                                round_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
                             if hasattr(tc, "id") and tc.id:
                                 round_tool_calls[idx]["id"] = tc.id
                             if tc.function:
@@ -213,6 +250,30 @@ class AgentLoop:
                     yield f"event: done\ndata: {json.dumps({'done': True, 'gate_pending': True, 'summary': '等待用户确认受控动作'}, ensure_ascii=False)}\n\n"
                     return
                 # Loop continues — next round may call more tools or return text
+            else:
+                # R11-3 FIX: all rounds were spent CALLING tools (e.g. reading many
+                # artifacts) without a final text round → the user would get only the
+                # preamble and no answer. Force one final synthesis with tools disabled
+                # so the model MUST produce the answer from the accumulated tool results.
+                async for frame in gateway.call_stream(
+                    messages=messages,
+                    max_tokens=2048,
+                    temperature=0.7,
+                    tools=None,
+                    source="api",
+                    project_id=project_id,
+                ):
+                    ftype = frame.get("type")
+                    if ftype == "token":
+                        full_response += frame["content"]
+                        yield f"event: delta\ndata: {json.dumps({'token': frame['content'], 'done': False}, ensure_ascii=False)}\n\n"
+                    elif ftype == "done":
+                        break
+                    elif ftype == "error":
+                        error_msg = f"[模型调用失败: {frame.get('error_message', frame.get('error_category', ''))}]"
+                        full_response += error_msg
+                        yield f"event: delta\ndata: {json.dumps({'token': error_msg, 'done': True, 'summary': error_msg}, ensure_ascii=False)}\n\n"
+                        return
 
         except Exception as e:
             logger.error(f"Agent streaming failed: {e}")

@@ -1,6 +1,6 @@
 /** MCP Service — MCP Server management API client (Phase 12). */
 
-import { get, post, put, del } from './client';
+import { get, post, put, del, unwrap } from './client';
 
 export interface MCPServer {
   mcp_id: string;
@@ -34,22 +34,22 @@ export interface MCPServerListData {
 
 export async function listMCPServers(limit = 10, offset = 0): Promise<MCPServerListData> {
   const resp = await get<MCPServerListData>(`/mcp?limit=${limit}&offset=${offset}`);
-  return resp as unknown as MCPServerListData;
+  return unwrap<MCPServerListData>(resp);
 }
 
 export async function getMCPServer(id: string): Promise<MCPServer> {
   const resp = await get<MCPServer>(`/mcp/${id}`);
-  return resp as unknown as MCPServer;
+  return unwrap<MCPServer>(resp);
 }
 
 export async function createMCPServer(data: Partial<MCPServer>): Promise<MCPServer> {
   const resp = await post<MCPServer>('/mcp', data);
-  return resp as unknown as MCPServer;
+  return unwrap<MCPServer>(resp);
 }
 
 export async function updateMCPServer(id: string, data: Partial<MCPServer>): Promise<MCPServer> {
   const resp = await put<MCPServer>(`/mcp/${id}`, data);
-  return resp as unknown as MCPServer;
+  return unwrap<MCPServer>(resp);
 }
 
 export async function deleteMCPServer(id: string): Promise<void> {
@@ -58,7 +58,7 @@ export async function deleteMCPServer(id: string): Promise<void> {
 
 export async function testMCPConnection(id: string): Promise<{ status: string; tools?: MCPServerTool[]; error?: string }> {
   const resp = await post<{ status: string; tools?: MCPServerTool[]; error?: string }>(`/mcp/${id}/test`);
-  return resp as unknown as { status: string; tools?: MCPServerTool[]; error?: string };
+  return unwrap<{ status: string; tools?: MCPServerTool[]; error?: string }>(resp);
 }
 
 // GitHub MCP preset

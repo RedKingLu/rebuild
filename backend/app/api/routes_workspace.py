@@ -506,11 +506,15 @@ async def get_context(project_id: str, stage: str | None = None):
 
 
 # ── P1 Profiling Summary (R9-3D) ─────────────────────────────────────────
+# B-P0-FAKE-1 (R11-3): P0 core artifacts are the REAL StageReports produced by the
+# LangGraph P0 node (StageLoop → StageReports) + the real intake_report. The old
+# p0_execution_record / p0_construction_report / p0_review_pass files were route-side
+# fabrications (template / hardcoded / always-pass) and are no longer produced (D-101).
 _P0_CORE_ARTIFACTS = [
     ("intake_report.json", "接入报告"),
-    ("p0_execution_record.json", "执行记录"),
-    ("p0_construction_report.md", "施工报告"),
-    ("p0_review_pass.json", "自检报告"),
+    ("p0_start_plan.json", "起始计划报告"),
+    ("p0_construction.json", "施工报告"),
+    ("p0_acceptance.json", "验收报告"),
 ]
 
 

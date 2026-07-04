@@ -57,6 +57,10 @@ class GraphState(TypedDict, total=False):
     # --- interrupt / resume bookkeeping (scalar) ---
     pending_gate: Optional[Dict]  # {gate_id, stage} set when a stage interrupts
     last_decision: Optional[str]  # approve / reject / request_changes (resume payload)
+    # B-PLAN-1: set by a work node when a pre-execution plan_review Gate was NOT
+    # approved (manual/plan mode). Signals the following {stage}_gate node to skip
+    # its promotion interrupt (no stage actions ran → no promotion Gate to decide).
+    plan_halt: Optional[str]  # the non-approve plan decision (reject / request_changes)
 
     # --- capability / mode (scalar; real values, not placeholders) ---
     transition_mode: Literal["langgraph", "manual"]

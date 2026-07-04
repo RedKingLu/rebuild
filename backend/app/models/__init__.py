@@ -19,6 +19,7 @@ from app.models.task_graph import TaskGraph, TaskNode, TaskGraphRun
 from app.models.task_node_run import TaskNodeRun
 from app.models.stage_plan import StagePlan, TaskPlan
 from app.models.plan_delta import PlanDelta
+from app.models.conversation import Conversation, ChatMessage
 
 __all__ = [
     "Base",
@@ -40,4 +41,5 @@ __all__ = [
     "TaskNodeRun",
     "StagePlan", "TaskPlan",
     "PlanDelta",
+    "Conversation", "ChatMessage",
 ]

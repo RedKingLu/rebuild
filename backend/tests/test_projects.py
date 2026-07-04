@@ -72,6 +72,27 @@ class TestProjectCRUD:
         resp = client.get(f"/api/projects/{pid}")
         assert resp.json()["data"]["name"] == "Updated Name"
 
+    def test_update_project_scope_valid(self, client):
+        """B-6: PATCH /projects/{id} accepts a valid external_platform_scope (server-validated
+        enum) and persists it — the value the backend P4 should_delegate() decision reads."""
+        p = _create_project(client, "Scope Valid")
+        pid = p["project_id"]
+
+        for scope in ("none", "coding_only", "all_stages"):
+            resp = client.patch(f"/api/projects/{pid}", json={"external_platform_scope": scope})
+            assert resp.status_code == 200, (scope, resp.status_code, resp.text)
+            assert resp.json()["data"]["external_platform_scope"] == scope
+
+    def test_update_project_scope_invalid_rejected(self, client):
+        """B-6: a bogus scope value is rejected by the validated enum (422), not silently stored —
+        should_delegate() must never see an unknown scope."""
+        p = _create_project(client, "Scope Invalid")
+        pid = p["project_id"]
+        resp = client.patch(f"/api/projects/{pid}", json={"external_platform_scope": "bogus_value"})
+        assert resp.status_code == 422, resp.text
+        # prior value (none) preserved
+        assert client.get(f"/api/projects/{pid}").json()["data"]["external_platform_scope"] in (None, "none")
+
     def test_delete_project(self, client):
         """DELETE endpoint soft-deletes (archives) a project."""
         p = _create_project(client, "To Delete")
@@ -204,7 +225,7 @@ class TestGitFailurePath:
 
         # Complete onboarding (creates Run + artifacts)
         resp = client.post(f"/api/projects/{pid}/onboarding/complete",
-                          json={"execution_mode": "plan"})
+                          json={"execution_mode": "auto"})
         assert resp.status_code == 200
 
         # Execute onboarding — git clone will fail
@@ -239,7 +260,7 @@ class TestGitFailurePath:
         """manual 路径不受 WP-1 影响 — 仍正常建 stage_promotion Gate。"""
         p = _create_project(client, "Manual OK Test", source_type="manual")
         pid = p["project_id"]
-        resp = client.post(f"/api/projects/{pid}/onboarding/complete", json={"execution_mode": "plan"})
+        resp = client.post(f"/api/projects/{pid}/onboarding/complete", json={"execution_mode": "auto"})
         assert resp.status_code == 200
 
         resp = client.post(f"/api/projects/{pid}/onboarding/execute")
@@ -392,7 +413,7 @@ class TestP0Idempotency:
         pid = p["project_id"]
 
         # Complete + execute to create P0 gate
-        client.post(f"/api/projects/{pid}/onboarding/complete", json={"execution_mode": "plan"})
+        client.post(f"/api/projects/{pid}/onboarding/complete", json={"execution_mode": "auto"})
         client.post(f"/api/projects/{pid}/onboarding/execute")
 
         # Get the gate and approve it

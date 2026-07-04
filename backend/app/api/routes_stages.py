@@ -169,8 +169,101 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
                 raise HTTPException(400, str(e))
 
     result["graph_driven"] = graph_driven
+
+    # UX-5: on reject / request_changes, persist the reason to a rework-notes artifact so
+    # the rework (Acceptance) agent knows exactly why this attempt failed. Best-effort — a
+    # notes write failure must not fail the decision itself.
+    if req.decision in ("reject", "request_changes") and (req.reason or "").strip():
+        try:
+            from app.services.workspace_service import append_rework_notes
+            result["rework_notes_ref"] = append_rework_notes(
+                project_id, stage, req.decision, req.reason.strip())
+        except Exception as e:
+            logger.warning("rework-notes write failed project=%s stage=%s: %s",
+                           project_id, stage, e)
+
     svc.trace_writer.write("gate_event", action="decide_promotion",
                            summary=f"Promotion decision: {req.decision} "
                                    f"({'graph-driven' if graph_driven else 'direct'})",
                            project_id=project_id, run_id=run_id, stage=stage)
     return SuccessEnvelope(data=result, meta=Meta())
+
+
+# ── UX-5 / UX-4 fix: TaskGraph node status for the task-overview top bar ─
+
+@router.get("/{stage}/taskgraph")
+async def get_taskgraph(project_id: str, run_id: str, stage: str):
+    """Return the active TaskGraph (if any) for (project, run, stage) with per-node
+    runtime status — the honest source for the UX-4 task-overview bar. Responds with an
+    empty node list (no active graph) rather than fabricating tasks: the frontend falls back
+    to the live task-context + real-time status when this is empty."""
+    svc = _svc()
+    from app.core.database import get_session
+    from app.models.task_graph import TaskGraph, TaskNode, TaskGraphRun
+    from app.models.task_node_run import TaskNodeRun
+    db = get_session()
+    try:
+        # Latest non-superseded graph run for this stage.
+        graph_run = (
+            db.query(TaskGraphRun)
+            .filter(TaskGraphRun.run_id == run_id, TaskGraphRun.stage == stage)
+            .order_by(TaskGraphRun.started_at.desc().nullslast()
+                      if hasattr(TaskGraphRun, "started_at") else TaskGraphRun.task_graph_run_id.desc())
+            .first()
+        )
+        graph_run_id = graph_run.task_graph_run_id if graph_run else None
+        graph_status = graph_run.graph_status if graph_run else None
+        # Graph definition: prefer the run's graph_id, else latest non-superseded for the stage.
+        graph_id = graph_run.task_graph_id if graph_run else None
+        graph = None
+        if graph_id is not None:
+            graph = db.get(TaskGraph, graph_id)
+        if graph is None:
+            graph = (
+                db.query(TaskGraph)
+                .filter(TaskGraph.run_id == run_id, TaskGraph.stage == stage,
+                        TaskGraph.graph_status != "superseded")
+                .order_by(TaskGraph.task_graph_id.desc())
+                .first()
+            )
+        if graph is None:
+            return SuccessEnvelope(
+                data={"graph_id": None, "graph_run_id": None, "graph_status": None,
+                      "nodes": []},
+                meta=Meta(source_status="real"),
+            )
+        nodes_def = (
+            db.query(TaskNode)
+            .filter(TaskNode.task_graph_id == graph.task_graph_id)
+            .order_by(TaskNode.node_id)
+            .all()
+        )
+        # Latest run per node definition (if a run exists).
+        node_status: dict[str, dict] = {}
+        if graph_run_id:
+            runs = (
+                db.query(TaskNodeRun)
+                .filter(TaskNodeRun.task_graph_run_id == graph_run_id)
+                .order_by(TaskNodeRun.started_at.asc().nullslast())
+                .all()
+            )
+            for r in runs:
+                node_status[r.node_id] = {"node_status": r.node_status,
+                                          "retry_count": r.retry_count or 0}
+        nodes = []
+        for nd in nodes_def:
+            st = node_status.get(nd.node_id, {})
+            nodes.append({
+                "node_id": nd.node_id,
+                "node_type": nd.node_type or "execution",
+                "title": nd.title or nd.node_id,
+                "status": st.get("node_status") or "pending",
+                "retry_count": st.get("retry_count", 0),
+            })
+        return SuccessEnvelope(
+            data={"graph_id": graph.task_graph_id, "graph_run_id": graph_run_id,
+                  "graph_status": graph_status, "nodes": nodes},
+            meta=Meta(source_status="real"),
+        )
+    finally:
+        db.close()

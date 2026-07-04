@@ -1,8 +1,14 @@
 """Project domain schemas."""
 
-from typing import Optional, Literal
+from typing import Literal, Optional
+
 from pydantic import BaseModel, Field
+
 from app.schemas.common import Meta, GraphPlaceholderFields
+
+# D-088 / R9-5-5: external platform delegation scope (B-6 switch). Server-validated enum so a
+# bogus value can\'t be persisted — should_delegate() relies on it for its decision.
+ExternalPlatformScope = Literal["none", "coding_only", "all_stages"]
 
 
 class ProjectCreate(BaseModel):
@@ -16,9 +22,7 @@ class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     coding_agent_ref: Optional[str] = None
-    # D-088 / R9-5-5: external platform delegation scope
-    # none | coding_only | all_stages
-    external_platform_scope: Optional[str] = None
+    external_platform_scope: Optional[ExternalPlatformScope] = None
     # D-098: per-project model strategy (global_unified / custom) + global model ref
     model_strategy_mode: Optional[str] = None
     global_model_ref: Optional[str] = None

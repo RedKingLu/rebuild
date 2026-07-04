@@ -97,6 +97,60 @@ _DECISION_TO_STATUS = {
 }
 
 
+# ── B-PLAN-1: pre-execution plan review (D-025 / D-026) ─────────────────────
+def _write_stage_plan_report(project_id: str, stage: str, handler) -> str:
+    """Produce the stage's 起始计划报告 ({stage}_start_plan.json) BEFORE execution so
+    the user can审核 it at the plan_review Gate. Same content StageLoop would write —
+    from the handler's declared goal / acceptance_criteria / planned_actions."""
+    from app.graph.stage_reports import StageReports
+    reports = StageReports(project_id, stage)
+    return reports.start_plan(
+        goal=getattr(handler, "goal", f"{stage} stage"),
+        acceptance_criteria=getattr(handler, "acceptance_criteria", []),
+        planned_actions=getattr(handler, "planned_actions", []),
+    )
+
+
+async def _run_plan_review(stage: str, project_id: str, run_id: str, mode: str,
+                           handler) -> str:
+    """Run the pre-execution plan_review Gate for manual/plan mode and return the
+    user decision. Idempotent across the interrupt/resume re-run of the work node:
+    on resume the node re-executes from the top, so an already-created (or decided)
+    plan_review Gate is reused/short-circuited instead of duplicated (D-025/D-026)."""
+    existing = None
+    if _gate_backend is not None and hasattr(_gate_backend, "find_stage_gate"):
+        try:
+            existing = _gate_backend.find_stage_gate(
+                project_id=project_id, run_id=run_id, stage=stage,
+                gate_type="plan_review")
+        except Exception:
+            existing = None
+
+    if existing:
+        status = existing.get("gate_status")
+        if status == "approved":
+            return "approve"
+        if status == "rejected":
+            return "reject"
+        if status == "changes_requested":
+            return "request_changes"
+        gid = existing.get("gate_id", "")  # waiting_decision → reuse (no duplicate)
+    else:
+        plan_ref = _write_stage_plan_report(project_id, stage, handler)
+        gid = ""
+        if _gate_backend is not None:
+            gid = _gate_backend.create(
+                project_id=project_id, run_id=run_id, stage=stage,
+                artifact_refs=[plan_ref], gate_type="plan_review",
+                metadata={"mode": mode})
+
+    decision = interrupt({"gate_id": gid, "stage": stage, "type": "plan_review"})
+    decision = (decision or "").strip() if isinstance(decision, str) else decision
+    if _gate_backend is not None and gid and decision in _DECISION_TO_STATUS:
+        _gate_backend.decide(gate_id=gid, decision=decision)
+    return decision if decision in _DECISION_TO_STATUS else "approve"
+
+
 # ── Node factories ────────────────────────────────────────────────────────
 def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
     async def work(state: GraphState) -> dict:
@@ -112,6 +166,27 @@ def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
                 "events": [_ev(stage, "future_r10",
                                f"{stage} node is a future_r10 stub (business in R10-R12)")],
             }
+
+        # B-PLAN-1 (D-025/D-026): pre-execution plan review. Manual/Plan modes pause
+        # at a plan_review Gate so the user审核阶段计划 BEFORE any stage action runs;
+        # Auto mode self-reviews (no user plan gate) and executes directly. Only an
+        # explicit "manual"/"plan" activates it — graph unit tests (no mode) are
+        # unaffected, and the route always sets execution_mode.
+        mode = (state.get("execution_mode") or "").lower()
+        if mode in ("manual", "plan"):
+            plan_decision = await _run_plan_review(stage, project_id, run_id, mode, handler)
+            if plan_decision != "approve":
+                # Plan not approved → do NOT execute stage actions. Signal the gate
+                # node to skip its promotion interrupt (no promotion Gate exists).
+                return {
+                    "current_stage": stage,
+                    "stage_status": {stage: "blocked"},
+                    "run_status": "blocked",
+                    "plan_halt": plan_decision,
+                    "events": [_ev(stage, "plan_not_approved",
+                                   f"{stage} 计划审核未通过（{plan_decision}）：阶段动作未执行",
+                                   decision=plan_decision)],
+                }
 
         loop = StageLoop(project_id, stage, tracer=_tracer, auditor=_auditor, max_rounds=2)
         res = await loop.run(
@@ -195,6 +270,21 @@ def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
 
 def make_gate_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
     async def gate(state: GraphState) -> dict:
+        # B-PLAN-1: if the work node halted at an un-approved plan_review Gate, there
+        # is no promotion Gate to decide. Skip the interrupt and route to END (reject)
+        # so we neither hang on a nonexistent promotion decision nor loop.
+        if state.get("plan_halt"):
+            ph = state.get("plan_halt")
+            return {
+                "last_decision": "reject",
+                "plan_halt": None,
+                "pending_gate": None,
+                "stage_status": {stage: "blocked"},
+                "run_status": "blocked",
+                "events": [_ev(stage, "promotion_skipped_plan_halt",
+                               f"{stage} 计划未批准（{ph}），跳过晋级门")],
+            }
+
         pg = state.get("pending_gate") or {}
         gate_id = pg.get("gate_id", "")
 

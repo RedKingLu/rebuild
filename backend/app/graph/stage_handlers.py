@@ -5,7 +5,14 @@ delegates to AssessmentService (model-driven risk/feasibility). P3 (R10 T17)
 delegates to PlanningService (Stage Plan → Task Plan(Batch) → TaskGraph 必生 →
 §5.6 Artifacts + §5.7 Evidence). So each graph node carries real work — not a stub.
 The three D-092 reports are produced by StageLoop; domain artifacts here.
-P4-P6 stay future_r11 stubs (Q-R10-3).
+P4 (R11-3-C5) runs a REAL platform-internal execution link: it loads the P3 TaskGraph
+and drives execution nodes through TaskGraphEngine + NodeLoop (9-step, edge strategies
+success/failure/retry/rework/gate). Each execution node's Node Worker is
+P4ExecutionWorker.execute_node — reads source/ (read-only), writes output_code/ +
+patches/ via WorkspaceMediator (D-099/D-104), derives Evidence from the real files;
+NodeLoop runs the independent Acceptance. The engine's _finalize honestly classifies
+failed/blocked/waiting_gate (never fakes completed). External-agent delegation (C6) and
+StagePageP4 (C8) are out of scope. P5-P6 stay future_r11 stubs.
 
 DOC-2: P1 handler returns the REAL identified item list from the profiler result as the single
 source of truth (replacing the hardcoded 14-item frontend/route list).
@@ -13,6 +20,7 @@ source of truth (replacing the hardcoded 14-item frontend/route list).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -37,6 +45,28 @@ def _source_file_count(project_id: str) -> int:
     skip = {".git", "node_modules", "__pycache__"}
     return sum(1 for p in src.rglob("*")
                if p.is_file() and not any(s in skip for s in p.parts))
+
+
+def _mediated_write(project_id: str, rel_path: str, content: str, *,
+                    auditor=None, stage: str, action: str) -> str:
+    """Write a stage report / artifact through WorkspaceMediator (the single write
+    gate, D-099⑥) + record an Audit (L2). source/ is unconditionally rejected and
+    escapes raise ValueError. Returns rel_path. Every execution actor writes via the
+    mediator — stage handlers no longer bypass it with raw write_text (B-P4-MEDIATOR-BYPASS).
+    """
+    from app.services.workspace_mediator import WorkspaceMediator
+    mediator = WorkspaceMediator(str(workspace_service.workspace_path(project_id)))
+    target, risk = mediator.check_write(rel_path)  # raises ValueError on source/ or escape
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    if auditor:
+        try:
+            auditor.write("workspace_write", risk_level=risk, action=action,
+                          decision="allowed", reason=f"wrote {rel_path}",
+                          project_id=project_id, stage=stage, transition_mode="real")
+        except Exception:
+            logger.warning("stage report audit write failed (advisory)", exc_info=True)
+    return rel_path
 
 
 class RealP0Handler:
@@ -92,8 +122,9 @@ class RealP0Handler:
             "materialization_status": materialized.get("materialization_status"),
             "generated_at": _now(),
         }
-        (art_dir / "intake_report.json").write_text(
-            json.dumps(intake, ensure_ascii=False, indent=2), encoding="utf-8")
+        _mediated_write(project_id, "artifacts/intake_report.json",
+                        json.dumps(intake, ensure_ascii=False, indent=2),
+                        auditor=self.auditor, stage="p0", action="write_intake_report")
 
         assembly_trace = context_package.get("assembly_trace", {})
 
@@ -279,10 +310,11 @@ class RealP2Handler:
         }
         refs: List[str] = []
         for name, payload in files.items():
-            (art_dir / name).write_text(
-                json.dumps({"project_id": project_id, "stage": "p2",
-                            "generated_at": _now(), **payload}, ensure_ascii=False, indent=2),
-                encoding="utf-8")
+            _mediated_write(project_id, f"artifacts/{name}",
+                            json.dumps({"project_id": project_id, "stage": "p2",
+                                        "generated_at": _now(), **payload},
+                                       ensure_ascii=False, indent=2),
+                            auditor=self.auditor, stage="p2", action="write_p2_artifact")
             refs.append(f"artifacts/{name}")
         return refs
 
@@ -296,11 +328,15 @@ class RealP2Handler:
                                                        "detail": reason}],
                                 recommendations=[rec], reviewer="p2_review_skill")
         issues = []
-        report = result.get("assessment_report") or {}
+        # assessment_report 应为对象；真实 LLM 可返回合法 JSON 但值为字符串/散文（非 dict），
+        # 此时 str 无 .get → 归一为 unparseable_output（走 ReviewPass 诚实返工），不崩溃不 500。
+        report = result.get("assessment_report")
+        if not isinstance(report, dict):
+            report = {} if report in (None, "") else {"raw": report, "parse_error": True}
         # unparseable model output → retry structured output (ReviewPass rework)
         if report.get("parse_error"):
             issues.append({"type": "unparseable_output",
-                           "detail": "模型输出非结构化，无法解析 6 类产出"})
+                           "detail": "模型输出 assessment_report 非结构化对象，无法解析 6 类产出"})
         # §4.9-6 / D-066: Evidence must be persisted
         if not result.get("evidence_refs"):
             issues.append({"type": "no_evidence", "detail": "P2 Evidence 未落库（D-066）"})
@@ -422,10 +458,11 @@ class RealP3Handler:
         }
         refs: List[str] = []
         for name, payload in files.items():
-            (art_dir / name).write_text(
-                json.dumps({"project_id": project_id, "stage": "p3",
-                            "generated_at": _now(), **payload}, ensure_ascii=False, indent=2),
-                encoding="utf-8")
+            _mediated_write(project_id, f"artifacts/{name}",
+                            json.dumps({"project_id": project_id, "stage": "p3",
+                                        "generated_at": _now(), **payload},
+                                       ensure_ascii=False, indent=2),
+                            auditor=self.auditor, stage="p3", action="write_p3_artifact")
             refs.append(f"artifacts/{name}")
         return refs
 
@@ -449,11 +486,335 @@ class RealP3Handler:
                             reviewer="p3_review_skill")
 
 
-def bootstrap_graph_handlers(force: bool = False) -> None:
-    """Register real P0/P1/P2/P3 handlers + real Gate backend + writers for the app graph.
+class RealP4Handler:
+    """P4 执行（R11-3-C5 TaskGraph 执行链路）: 加载 P3 TaskGraph，经 TaskGraphEngine + NodeLoop
+    按边策略推进 execution 节点。每个 execution 节点的 Node Worker = P4ExecutionWorker.execute_node
+    （读 source/ 只读→经 WorkspaceMediator 写 output_code/+patches/(D-099/D-104)→真实文件派生
+    Evidence，非 LLM 自报）；NodeLoop 9 步内含独立 Acceptance；边策略 success/failure/retry/rework/gate
+    由 engine 路由，有界重试超阈诚实降级/Gate。
 
-    Idempotent. Called at app startup. Tests do NOT call this (they inject fakes).
-    P4-P6 are intentionally NOT registered — they stay future_r11 stubs (Q-R10-3).
+    诚实状态（§5.10 / 公理3 / D-097 / V10 教训，绝不伪造 completed）：
+      - P3 TaskGraph 未找到或无 execution 节点 → blocked（缺前置输入）。
+      - engine _finalize 诚实归类：任一节点 failed→graph failed；waiting_gate→graph waiting_gate；
+        blocked→graph blocked；仅全部 completed/skipped→completed。
+      - handler status：graph_status==completed→completed，其余→blocked（交 StageLoop 升级 Gate）。
+    P4 handler 由 make_work_node 在 LangGraph p4_work 节点内调用，engine 是该节点的内部编排，不绕
+    主编排（D-037）。C5 只准备 P4→P5 Gate（由 make_work_node 在 review passed 时建），不推进 P5 业务。
+    C5 不接外部编程 Agent（C6）、不做 StagePageP4（C8）。node_type 路由依 R11-3-C2：execution。
+    """
+
+    goal = "P4 执行：经 TaskGraphEngine+NodeLoop 按边策略推进 P3 TaskGraph execution 节点，产出真实 output_code/patches 并过 Acceptance"
+    acceptance_criteria = [
+        "已加载 P3 TaskGraph 与 execution 节点",
+        "经 TaskGraphEngine+NodeLoop 执行至少一个真实 execution 节点，产出 output_code+patch/diff",
+        "NodeLoop 9 步 / Acceptance / 边策略均有证据（engine_events）",
+        "Evidence 来自真实落盘文件；source/ 未被修改，写 source 负路径被拒记 Audit",
+        "失败/阻塞/Gate 路径诚实归类，不静默、不伪造完成",
+        "只准备 P4→P5 Gate，不推进 P5 业务",
+    ]
+    planned_actions = ["load_p3_task_graph", "build_node_executors",
+                       "run_task_graph_engine", "nodeloop_9step_per_node",
+                       "acceptance_per_node", "aggregate_real_evidence"]
+
+    def __init__(self, tracer=None, auditor=None, gateway=None, aet=None):
+        self.tracer = tracer
+        self.auditor = auditor
+        self._gateway = gateway
+        self._aet = aet
+
+    def _services(self):
+        from app.dependencies import get_services
+        return get_services()
+
+    def _build_worker(self, project_id: str):
+        from app.services.p4_execution_worker import P4ExecutionWorker
+        gateway = self._gateway
+        aet = self._aet
+        if gateway is None or aet is None:
+            svc = self._services()
+            gateway = gateway if gateway is not None else svc.model_gateway
+            aet = aet if aet is not None else svc.aet_service
+        return P4ExecutionWorker(project_id, tracer=self.tracer, auditor=self.auditor,
+                                 aet=aet, gateway=gateway)
+
+    def _load_p3_task_graph(self, project_id: str) -> dict | None:
+        """Load the latest P3 TaskGraph (definition) + its nodes for this project.
+
+        Returns None when no P3 TaskGraph exists (P3 未完成 / 未生成). Read-only;
+        follows the version-then-recency ordering used by the workspace aggregate.
+        """
+        from app.core.database import get_session
+        from app.models.task_graph import TaskGraph, TaskNode
+        db = get_session()
+        try:
+            tg = (db.query(TaskGraph)
+                  .filter(TaskGraph.project_id == project_id, TaskGraph.stage == "p3")
+                  .order_by(TaskGraph.version.desc(), TaskGraph.created_at.desc())
+                  .first())
+            if tg is None:
+                return None
+            tns = (db.query(TaskNode)
+                   .filter(TaskNode.task_graph_id == tg.task_graph_id)
+                   .order_by(TaskNode.created_at).all())
+            nodes = [{"node_id": n.node_id, "node_type": n.node_type,
+                      "title": n.title, "risk_level": n.risk_level,
+                      "input_refs": n.input_refs or [],
+                      "permission_boundary": n.permission_boundary or "workspace_read",
+                      "stage": "p4"} for n in tns]
+            return {"task_graph_id": tg.task_graph_id, "stage_plan_ref": tg.stage_plan_ref,
+                    "graph_status": tg.graph_status, "edges": tg.edges or [],
+                    "edge_count": len(tg.edges or []), "nodes": nodes}
+        finally:
+            db.close()
+
+    async def execute(self, state: GraphState) -> dict:
+        project_id = state["project_id"]
+
+        # 读取 project/run/stage context（advisory，与 P2/P3 一致；task_type=execution）
+        context_package: dict = {}
+        try:
+            from app.services.context_assembler import assemble_context
+            context_package = assemble_context(
+                project_id, "p4",
+                node_state={"node_task": "P4 执行：按 P3 TaskGraph 执行 execution 节点"},
+                task_type="execution")
+        except Exception:
+            logger.warning("P4 context assembly failed (advisory, skeleton proceeds)",
+                           exc_info=True)  # 公理3: surface, not silent
+
+        assembly_trace = context_package.get("assembly_trace", {})
+        tg = self._load_p3_task_graph(project_id)
+        if tg is None:
+            return {"status": "blocked",
+                    "reason": "P3 TaskGraph 未找到（P3 未完成或未生成），P4 无法执行",
+                    "task_graph_ref": None, "assembly_trace": assembly_trace,
+                    "artifacts": [], "evidence_refs": []}
+
+        node_type_dist: dict = {}
+        for n in tg["nodes"]:
+            node_type_dist[n["node_type"]] = node_type_dist.get(n["node_type"], 0) + 1
+        exec_nodes = [n for n in tg["nodes"] if n["node_type"] == "execution"]
+        if not exec_nodes:
+            return {"status": "blocked",
+                    "reason": f"P3 TaskGraph {tg['task_graph_id']} 无 execution 节点"
+                              f"（node_type 分布 {node_type_dist}）",
+                    "task_graph_ref": tg["task_graph_id"], "assembly_trace": assembly_trace,
+                    "artifacts": [], "evidence_refs": []}
+
+        # C5：把 execution 节点接入 TaskGraphEngine + NodeLoop，按 TaskGraph 边策略推进。
+        # 每个 execution 节点的 Node Worker = P4ExecutionWorker.execute_node（真实写闭环）；
+        # 非 execution 节点走 engine 默认执行器。NodeLoop 9 步内含 Acceptance；边策略
+        # success/failure/retry/rework/gate 由 engine 路由；失败/阻塞/Gate 经 _finalize 诚实
+        # 归类（绝不伪造 completed）。engine 由 handler 在 LangGraph p4_work 节点内调用（D-037）。
+        run_id = state.get("run_id", "")
+        worker = self._build_worker(project_id)
+
+        # P3 TaskNode 无 acceptance_criteria 列 → NodeLoop step1 会因"缺 acceptance_criteria"
+        # 阻塞。为 execution 节点注入默认 P4 结构化验收标准（由真实产物落盘背书），worker 据此
+        # 产出 criteria_met 覆盖映射。注入到 tg["nodes"] 的同一节点对象，engine 与 worker 共享。
+        _P4_CRITERIA = ["产出 output_code 产物", "产出 patch/diff", "Evidence 来自真实落盘文件"]
+        for n in exec_nodes:
+            if not n.get("acceptance_criteria"):
+                n["acceptance_criteria"] = list(_P4_CRITERIA)
+
+        def _make_exec(nd: dict):
+            async def _fn():
+                return await worker.execute_node(nd, run_id=run_id)
+            return _fn
+        node_executors = {n["node_id"]: _make_exec(n) for n in exec_nodes}
+
+        from app.services.task_graph_service import TaskGraphEngine
+        mode = workspace_service.get_execution_mode(project_id)
+        engine = TaskGraphEngine(tracer=self.tracer, auditor=self.auditor)
+        eng = await engine.execute({"nodes": tg["nodes"], "edges": tg["edges"]},
+                                   node_executors=node_executors, project_id=project_id,
+                                   run_id=run_id, mode=mode)
+
+        # 证据/产物以真实落盘为准（D-066）：从 aet 汇集本 stage 的 Evidence + 其中的产物引用。
+        aet = self._aet if self._aet is not None else self._services().aet_service
+        try:
+            p4_ev = [e for e in aet.list_evidence(project_id, stage="p4")]
+        except Exception:
+            logger.warning("P4 evidence 汇集失败（advisory）", exc_info=True)
+            p4_ev = []
+        evidence_refs = [e.get("evidence_id") for e in p4_ev if e.get("evidence_id")]
+        artifacts: list[str] = []
+        patch_refs: list[str] = []
+        for e in p4_ev:
+            if e.get("output_code_ref"):
+                artifacts.append(e["output_code_ref"])
+            if e.get("patch_ref"):
+                artifacts.append(e["patch_ref"]); patch_refs.append(e["patch_ref"])
+        acceptance_results = [{"node_id": nid, **((r or {}).get("acceptance") or {})}
+                              for nid, r in eng.node_results.items()]
+
+        # C7: write a structured P4 execution-summary report (change manifest + patch index +
+        # per-node results) — the primary readable review material attached to the P4→P5 Gate.
+        summary_ref = self._write_execution_summary(
+            project_id, tg, exec_nodes, eng, p4_ev, patch_refs,
+            node_type_dist, acceptance_results)
+
+        # graph_status → handler status：completed→completed；其余（failed/waiting_gate/blocked/
+        # rework_required）→ blocked（诚实非 completed，交 StageLoop 升级 Gate / 准备 P4→P5 Gate）。
+        status = "completed" if eng.graph_status == "completed" else "blocked"
+
+        return {
+            "status": status,
+            "graph_status": eng.graph_status,
+            "reason": eng.reason or f"P4 TaskGraph 执行结果：{eng.graph_status}",
+            "task_graph_ref": tg["task_graph_id"],
+            "stage_plan_ref": tg["stage_plan_ref"],
+            "node_count": len(tg["nodes"]),
+            "execution_node_count": len(exec_nodes),
+            "completed_node_count": len(eng.completed_nodes),
+            "failed_node_count": len(eng.failed_nodes),
+            "gated_node_count": len(eng.gated_nodes),
+            "completed_nodes": eng.completed_nodes,
+            "failed_nodes": eng.failed_nodes,
+            "gated_nodes": eng.gated_nodes,
+            "node_type_distribution": node_type_dist,
+            "edge_count": tg["edge_count"],
+            "engine_events": eng.events,
+            "acceptance_results": acceptance_results,
+            "artifacts": artifacts + ([summary_ref] if summary_ref else []),
+            "evidence_refs": evidence_refs,
+            "patch_refs": patch_refs,
+            "assembly_trace": assembly_trace,
+        }
+
+    def _file_facts(self, project_id: str, rel_path: str) -> dict:
+        """Re-read a real workspace file through the mediator and return sha256/bytes
+        (honest evidence basis = real_file_on_disk). Empty dict if unreadable."""
+        from app.services.workspace_service import workspace_path
+        from app.services.workspace_mediator import WorkspaceMediator
+        try:
+            target = WorkspaceMediator(str(workspace_path(project_id))).guard_read(rel_path)
+            raw = target.read_bytes()
+            return {"path": rel_path,
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "bytes": len(raw)}
+        except Exception:
+            return {"path": rel_path, "sha256": "", "bytes": 0}
+
+    def _write_execution_summary(self, project_id, tg, exec_nodes, eng, p4_evidence,
+                                 patch_refs, node_type_dist,
+                                 acceptance_results) -> str | None:
+        """C7: persist a structured P4 execution summary to artifacts/p4_execution_summary.json.
+
+        Contains a change manifest (output_code files with real sha256/bytes), a patch index,
+        and per-node execution results — all derived from real on-disk files (never the model's
+        self-report). Returns the relative ref, or None if nothing to report.
+        """
+        evidence_refs = [e.get("evidence_id") for e in (p4_evidence or [])
+                         if e.get("evidence_id")]
+        artifacts = [e["output_code_ref"] for e in (p4_evidence or [])
+                     if e.get("output_code_ref")]
+        if not (artifacts or patch_refs or evidence_refs):
+            return None
+        from app.services.workspace_service import workspace_path
+        from datetime import datetime, timezone
+
+        def _now():
+            return datetime.now(timezone.utc).isoformat()
+
+        out_dir = workspace_path(project_id) / "artifacts"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Map output_code_ref → evidence_id so each output file carries its evidence links.
+        ev_by_output = {e["output_code_ref"]: e.get("evidence_id")
+                        for e in (p4_evidence or []) if e.get("output_code_ref")}
+        change_manifest = []
+        seen_out: set[str] = set()
+        for rel in artifacts:
+            if rel in seen_out or not rel.startswith("output_code/"):
+                continue
+            seen_out.add(rel)
+            facts = self._file_facts(project_id, rel)
+            ev = ev_by_output.get(rel)
+            change_manifest.append({**facts, "kind": "output_code",
+                                   "evidence_refs": [ev] if ev else []})
+        # Map patch path → source_ref, taken from the real Evidence objects.
+        src_by_patch = {e["patch_ref"]: e.get("source_ref")
+                        for e in (p4_evidence or [])
+                        if e.get("patch_ref") and e.get("source_ref")}
+        patch_index = []
+        for rel in dict.fromkeys(patch_refs):
+            facts = self._file_facts(project_id, rel)
+            patch_index.append({**facts, "kind": "patch",
+                               "source_ref": src_by_patch.get(rel)})
+
+        node_map = {n["node_id"]: n for n in tg.get("nodes", [])}
+        per_node = []
+        for nid in list(eng.completed_nodes) + list(eng.failed_nodes) + list(eng.gated_nodes):
+            ndef = node_map.get(nid, {})
+            res = (eng.node_results or {}).get(nid) or {}
+            per_node.append({
+                "node_id": nid,
+                "title": ndef.get("title") or nid,
+                "node_type": ndef.get("node_type") or "execution",
+                "status": res.get("node_status") or res.get("status") or "unknown",
+                "router": res.get("next_route", ""),
+                "node_run_id": res.get("task_node_run_id"),
+            })
+
+        summary = {
+            "stage": "p4",
+            "kind": "execution_summary",
+            "generated_at": _now(),
+            "graph_id": tg.get("task_graph_id"),
+            "graph_status": eng.graph_status,
+            "run_id": getattr(eng, "run_id", ""),
+            "node_count": len(tg.get("nodes", [])),
+            "execution_node_count": len(exec_nodes),
+            "completed_node_count": len(eng.completed_nodes),
+            "failed_node_count": len(eng.failed_nodes),
+            "gated_node_count": len(eng.gated_nodes),
+            "blocked_node_count": (len(eng.node_results) - len(eng.completed_nodes)
+                                   - len(eng.failed_nodes) - len(eng.gated_nodes)),
+            "node_type_distribution": node_type_dist,
+            "change_manifest": change_manifest,
+            "patch_index": patch_index,
+            "nodes": per_node,
+            "evidence_refs": evidence_refs,
+        }
+        out = out_dir / "p4_execution_summary.json"
+        ref = _mediated_write(project_id, f"artifacts/{out.name}",
+                              json.dumps(summary, ensure_ascii=False, indent=2),
+                              auditor=self.auditor, stage="p4",
+                              action="write_execution_summary")
+        logger.info("C7: wrote P4 execution summary %s (%d output_code, %d patches)",
+                    ref, len(change_manifest), len(patch_refs))
+        return ref
+
+    def review(self, result: dict) -> ReviewResult:
+        status = result.get("status")
+        if status != "completed":
+            reason = result.get("reason") or f"P4 未完成（status={status}）"
+            rec = ("P3 未产出 TaskGraph：先完成 P3 规划并通过 P3→P4 Gate" if status == "blocked"
+                   and not result.get("task_graph_ref")
+                   else "检查模型可用性 / 节点产物 / Acceptance 后重试")
+            return ReviewResult(passed=False,
+                                issues=[{"type": "p4_execution_not_completed", "detail": reason}],
+                                recommendations=[rec], reviewer="p4_review_skill")
+        # completed：须有真实产物 + Evidence（D-066），否则不放行（不伪造完成）。
+        issues = []
+        if not result.get("artifacts"):
+            issues.append({"type": "no_artifacts", "detail": "P4 未产出 output_code/patch 产物"})
+        if not result.get("evidence_refs"):
+            issues.append({"type": "no_evidence", "detail": "P4 Evidence 未落库（D-066）"})
+        return ReviewResult(passed=not issues, issues=issues,
+                            recommendations=["补齐执行产物与 Evidence 后重试"] if issues else [],
+                            reviewer="p4_review_skill")
+
+
+def bootstrap_graph_handlers(force: bool = False) -> None:
+    """Register real P0/P1/P2/P3 handlers + P4 skeleton + real Gate backend + writers.
+
+    Idempotent. Called at app startup. Tests do NOT call this directly (conftest
+    re-bootstraps with test services). P4 is a C5 TaskGraph execution handler (loads P3
+    TaskGraph, drives execution nodes via TaskGraphEngine+NodeLoop → output_code/+patches/
+    + Evidence + Acceptance + edge strategies; honest failed/blocked/waiting_gate — never
+    fakes completed. External-agent delegation lands in C6). P5-P6 stay future_r11 stubs.
     """
     global _bootstrapped
     if _bootstrapped and not force:
@@ -467,5 +828,6 @@ def bootstrap_graph_handlers(force: bool = False) -> None:
     nodes.register_handler("p1", RealP1Handler(svc.trace_writer, svc.audit_writer))
     nodes.register_handler("p2", RealP2Handler(svc.trace_writer, svc.audit_writer))
     nodes.register_handler("p3", RealP3Handler(svc.trace_writer, svc.audit_writer))
+    nodes.register_handler("p4", RealP4Handler(svc.trace_writer, svc.audit_writer))
     nodes.set_gate_backend(RealGateBackend())
     _bootstrapped = True

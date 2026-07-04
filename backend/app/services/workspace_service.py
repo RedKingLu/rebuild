@@ -364,7 +364,7 @@ def read_file(project_id: str, rel_path: str) -> dict:
         "bytes": len(content.encode("utf-8")),
         "editable": _is_writable_by_user(rel_path),
         "readonly": _is_readonly(rel_path),
-        "readonly_reason": "源码目录在 R8 阶段为只读，写入将在执行阶段（P4）开放" if _is_readonly(rel_path) else None,
+        "readonly_reason": "源码目录始终只读；P4 产出写入 output_code/（D-099）" if _is_readonly(rel_path) else None,
     }
 
 
@@ -380,7 +380,7 @@ def write_file(project_id: str, rel_path: str, content: str) -> dict:
     if not _is_writable_by_user(rel_path):
         if _is_readonly(rel_path):
             raise PermissionError(
-                f"源码目录为只读：{rel_path}。源码写入将在执行阶段（P4）开放。"
+                f"源码目录为只读：{rel_path}。源码目录始终只读；P4 产出写入 output_code/（D-099）。"
             )
         raise PermissionError(
             f"不允许写入此路径：{rel_path}。仅 materials/、reports/、.rebuild/user-notes/ 支持用户编辑。"
@@ -393,6 +393,36 @@ def write_file(project_id: str, rel_path: str, content: str) -> dict:
         "bytes": len(content.encode("utf-8")),
         "saved_at": _now(),
     }
+
+
+def append_rework_notes(project_id: str, stage: str, decision: str, reason: str) -> str:
+    """UX-5: append a rejection / request_changes reason to artifacts/{stage}_rework_notes.json.
+
+    Platform-only write (artifacts/ is platform-writable, D-099/D-104). Stores an append-only
+    list of {round, decision, reason, at} so the rework (Acceptance) agent can see exactly why
+    the prior attempt was rejected and what to fix — reasons never get lost. Returns the rel path.
+    """
+    rel = f"artifacts/{stage}_rework_notes.json"
+    target = _guard(project_id, Path(rel))
+    if not _is_writable_by_platform(rel):
+        raise PermissionError(f"artifacts/ 不可写：{rel}")
+    notes: list[dict] = []
+    if target.exists():
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                notes = data
+        except Exception:
+            notes = []
+    notes.append({
+        "round": len(notes) + 1,
+        "decision": decision,
+        "reason": reason,
+        "at": _now(),
+    })
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
+    return rel
 
 
 # ── Workspace aggregate (updated for real data) ─────────────────────────

@@ -147,9 +147,14 @@ class ModelGateway:
         max_tokens: int = 4096,
         temperature: float = 0.7,
         stream: bool = False,
+        timeout: Optional[float] = None,
         source: str = "api",  # "api" | "self_test" | "platform_assistant"
     ) -> dict:
-        """Execute a model call through the gateway."""
+        """Execute a model call through the gateway.
+
+        R11-7: `timeout` (seconds) overrides the adapter's fail-fast default for slow
+        domains (P3 planning); None keeps the default. Not a model/endpoint override —
+        the strategy still resolves the model (D-098)."""
         t0 = time.monotonic()
 
         # 1. Resolve model
@@ -186,6 +191,7 @@ class ModelGateway:
             max_tokens=max_tokens,
             temperature=temperature,
             stream=stream,
+            timeout=timeout,
         )
 
         # 5b. Runtime fallback: if call failed and no explicit override, try strategy fallback profiles
@@ -211,7 +217,7 @@ class ModelGateway:
                 fb_result = await self._adapter.complete(
                     model=fb_model, messages=messages, api_base=fb_base, api_key=fb_key,
                     api_format=fb_format, max_tokens=max_tokens, temperature=temperature,
-                    stream=stream,
+                    stream=stream, timeout=timeout,
                 )
                 if fb_result.status == "completed":
                     fb_result.fallback_used = True
@@ -327,112 +333,121 @@ class ModelGateway:
         tokens_committed = False
         stream_done = False
 
-        for try_profile, try_provider, try_reason, is_fb in profiles_to_try:
-            key_val, _ = self._resolve_key(try_provider, user_override is not None)
-            if not key_val:
-                last_error_cat = "credential_missing"
-                last_error_msg = f"No API key for {try_provider.provider_id}"
-                continue
+        # UX-1 FIX: the call-log write below MUST live in `finally`. Streaming consumers
+        # (agent_loop and every SSE endpoint) `break` out of their `async for` on the
+        # `done` frame — which triggers GeneratorExit at the suspended `yield frame`
+        # above/below and skips any code placed after the loop. Before this fix the
+        # post-loop persist never ran for broken-early streams, so ALL workspace
+        # (source="api") calls were silently dropped from call_log while non-streaming
+        # platform_assistant calls (which persist inline in call()) were the only rows.
+        try:
+            for try_profile, try_provider, try_reason, is_fb in profiles_to_try:
+                key_val, _ = self._resolve_key(try_provider, user_override is not None)
+                if not key_val:
+                    last_error_cat = "credential_missing"
+                    last_error_msg = f"No API key for {try_provider.provider_id}"
+                    continue
 
-            api_format = try_provider.api_format
-            api_base = (try_provider.endpoint_anthropic
-                        if api_format == "anthropic" and try_provider.endpoint_anthropic
-                        else try_provider.endpoint_openai or try_provider.endpoint_anthropic)
-            litellm_model = normalize_model_name(try_profile.model_name, api_format)
+                api_format = try_provider.api_format
+                api_base = (try_provider.endpoint_anthropic
+                            if api_format == "anthropic" and try_provider.endpoint_anthropic
+                            else try_provider.endpoint_openai or try_provider.endpoint_anthropic)
+                litellm_model = normalize_model_name(try_profile.model_name, api_format)
 
-            profile_failed_pre_token = False
+                profile_failed_pre_token = False
 
-            async for frame in self._adapter.stream_complete(
-                model=litellm_model, messages=messages, api_base=api_base, api_key=key_val,
-                max_tokens=max_tokens, temperature=temperature, tools=tools,
-            ):
-                ftype = frame.get("type")
+                async for frame in self._adapter.stream_complete(
+                    model=litellm_model, messages=messages, api_base=api_base, api_key=key_val,
+                    max_tokens=max_tokens, temperature=temperature, tools=tools,
+                ):
+                    ftype = frame.get("type")
 
-                if ftype == "error":
-                    if tokens_committed:
-                        # Committed to this profile — yield error, stop
+                    if ftype == "error":
+                        if tokens_committed:
+                            # Committed to this profile — yield error, stop
+                            call_id = frame.get("call_id", call_id)
+                            last_error_cat = frame.get("error_category", "stream_error")
+                            last_error_msg = frame.get("error_message", "")
+                            status = "failed"
+                            yield frame
+                            stream_done = True
+                            break
+                        else:
+                            # Pre-token — record, allow fallback
+                            last_error_cat = frame.get("error_category", "stream_error")
+                            last_error_msg = frame.get("error_message", "")
+                            call_id = frame.get("call_id", call_id)
+                            profile_failed_pre_token = True
+                            break
+
+                    elif ftype == "done":
+                        usage = frame.get("usage", {})
                         call_id = frame.get("call_id", call_id)
-                        last_error_cat = frame.get("error_category", "stream_error")
-                        last_error_msg = frame.get("error_message", "")
-                        status = "failed"
-                        yield frame
-                        stream_done = True
-                        break
-                    else:
-                        # Pre-token — record, allow fallback
-                        last_error_cat = frame.get("error_category", "stream_error")
-                        last_error_msg = frame.get("error_message", "")
-                        call_id = frame.get("call_id", call_id)
-                        profile_failed_pre_token = True
-                        break
-
-                elif ftype == "done":
-                    usage = frame.get("usage", {})
-                    call_id = frame.get("call_id", call_id)
-                    selected_profile = try_profile
-                    selected_provider = try_provider
-                    selected_reason = try_reason
-                    if is_fb:
-                        fallback_used = True
-                        fallback_from = profiles_to_try[0][0].profile_id
-                    status = "completed"
-                    last_error_cat = ""
-                    last_error_msg = ""
-                    yield frame
-                    stream_done = True
-                    break
-
-                else:
-                    # token / tool_calls — commit to this profile on first yield
-                    if not tokens_committed:
-                        tokens_committed = True
                         selected_profile = try_profile
                         selected_provider = try_provider
                         selected_reason = try_reason
                         if is_fb:
                             fallback_used = True
                             fallback_from = profiles_to_try[0][0].profile_id
-                    yield frame
+                        status = "completed"
+                        last_error_cat = ""
+                        last_error_msg = ""
+                        yield frame
+                        stream_done = True
+                        break
 
-            if stream_done:
-                break
-            if not profile_failed_pre_token:
-                stream_done = True
-                break
-            logger.info(
-                "call_stream: profile %s failed pre-token (%s), trying fallback",
-                try_profile.profile_id, last_error_cat,
-            )
+                    else:
+                        # token / tool_calls — commit to this profile on first yield
+                        if not tokens_committed:
+                            tokens_committed = True
+                            selected_profile = try_profile
+                            selected_provider = try_provider
+                            selected_reason = try_reason
+                            if is_fb:
+                                fallback_used = True
+                                fallback_from = profiles_to_try[0][0].profile_id
+                        yield frame
 
-        # If all profiles exhausted without any commit or done
-        if not stream_done and not tokens_committed:
-            yield {
-                "type": "error", "error_category": last_error_cat,
-                "error_message": last_error_msg, "call_id": call_id,
+                if stream_done:
+                    break
+                if not profile_failed_pre_token:
+                    stream_done = True
+                    break
+                logger.info(
+                    "call_stream: profile %s failed pre-token (%s), trying fallback",
+                    try_profile.profile_id, last_error_cat,
+                )
+
+            # If all profiles exhausted without any commit or done
+            if not stream_done and not tokens_committed:
+                yield {
+                    "type": "error", "error_category": last_error_cat,
+                    "error_message": last_error_msg, "call_id": call_id,
+                }
+        finally:
+            # Write call log (always — 公理3; runs even when the consumer breaks early
+            # and GeneratorExit unwinds through the yields above).
+            latency = (time.monotonic() - t0) * 1000
+            final_model = normalize_model_name(selected_profile.model_name, selected_provider.api_format)
+            call_record = {
+                "model_call_id": call_id,
+                "provider_id": selected_provider.provider_id,
+                "profile_id": selected_profile.profile_id,
+                "strategy_id": strategy_id,
+                "selected_model": final_model,
+                "selection_reason": selected_reason,
+                "status": status,
+                "latency_ms": round(latency, 1),
+                "error_category": last_error_cat,
+                "retry_count": 0,
+                "fallback_used": fallback_used,
+                "usage_summary": usage,
+                "source": source,
+                "created_at": _now_iso(),
+                "completed_at": _now_iso(),
             }
-
-        # Write call log (always — 公理3)
-        latency = (time.monotonic() - t0) * 1000
-        final_model = normalize_model_name(selected_profile.model_name, selected_provider.api_format)
-        call_record = {
-            "model_call_id": call_id,
-            "provider_id": selected_provider.provider_id,
-            "profile_id": selected_profile.profile_id,
-            "strategy_id": strategy_id,
-            "selected_model": final_model,
-            "selection_reason": selected_reason,
-            "status": status,
-            "latency_ms": round(latency, 1),
-            "error_category": last_error_cat,
-            "retry_count": 0,
-            "fallback_used": fallback_used,
-            "usage_summary": usage,
-            "source": source,
-            "created_at": _now_iso(),
-            "completed_at": _now_iso(),
-        }
-        self._calls.append(call_record)
-        self._persist_call(call_record)
+            self._calls.append(call_record)
+            self._persist_call(call_record)
 
     def resolve_call_target(self, *, user_override: Optional[str] = None,
                             strategy_id: str = "system-default",

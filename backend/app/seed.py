@@ -3,7 +3,7 @@
 Run once on startup if tables are empty.
 
 Skill 口径（R7 修订，2026-06-26）：
-- R 系列 3 个：均有真实 SKILL.md（skills/R-建设执行/）。
+- R 系列 3 个：均有真实 SKILL.md（skills/R-建设执行/，置于 source/ 之外与运行期隔离）。
 - P 系列 24 个：均有真实 SKILL.md（source/skills/{category}/），来源 ECC（MIT）改写为信创迁移语境。
   原 30 个候选中，6 个非迁移类（benchmark-methodology=市场对标 / content-engine=营销 /
   design-system=UI美学 / config-gc=harness运维 / agent-eval=工具选型 / dashboard-builder=运维监控）
@@ -12,7 +12,7 @@ Skill 口径（R7 修订，2026-06-26）：
 
 from sqlalchemy.orm import Session
 
-from app.models.agent_definition import AgentDefinition, AgentType, DefinitionStatus
+from app.models.agent_definition import AgentDefinition, AgentType, AgentCategory, DefinitionStatus
 from app.models.skill_definition import SkillDefinition, SkillSeries, SkillCategory, SkillStatus
 from app.models.resource_entry import ResourceEntry, ResourceType, SourceType, TrustLevel, RiskLevel, ResourceStatus
 from app.models.coding_agent_config import CodingAgentConfig, CodingAgentType, CodingAgentInvokeMode, CodingAgentStatus
@@ -21,6 +21,7 @@ from app.models.coding_agent_config import CodingAgentConfig, CodingAgentType, C
 AGENT_SEEDS = [
     {
         "agent_type": AgentType.node_worker,
+        "category": AgentCategory.system,
         "name": "Node Worker Agent",
         "version": "1.0.0",
         "status": DefinitionStatus.active,
@@ -41,6 +42,7 @@ AGENT_SEEDS = [
     },
     {
         "agent_type": AgentType.acceptance,
+        "category": AgentCategory.system,
         "name": "Acceptance Agent",
         "version": "1.0.0",
         "status": DefinitionStatus.active,
@@ -56,6 +58,7 @@ AGENT_SEEDS = [
     },
     {
         "agent_type": AgentType.auto_review,
+        "category": AgentCategory.system,
         "name": "Auto Review / Safety Agent",
         "version": "1.0.0",
         "status": DefinitionStatus.active,
@@ -71,6 +74,7 @@ AGENT_SEEDS = [
     },
     {
         "agent_type": AgentType.expert,
+        "category": AgentCategory.system,
         "name": "Expert Agent",
         "version": "1.0.0",
         "status": DefinitionStatus.active,
@@ -86,6 +90,7 @@ AGENT_SEEDS = [
     },
     {
         "agent_type": AgentType.conversation_gate,
+        "category": AgentCategory.system,
         "name": "Conversation / Gate Agent",
         "version": "1.0.0",
         "status": DefinitionStatus.active,
@@ -101,9 +106,15 @@ AGENT_SEEDS = [
     },
 ]
 
-# ── 目录路径常量（绝对路径，R7 规范）──
-_R_DIR = "/home/king/rebuild/skills/R-建设执行"
-_S_DIR = "/home/king/rebuild/source/skills"
+# ── 目录路径常量 ──
+# _S_DIR：P 系列平台运行期 Skill 素材根（source/ 下，会被平台运行期扫描/加载；派生自 settings.source_dir）。
+# _R_DIR：R 系列 = rebuild 自身建设用 Skill，【必须与平台运行期隔离】，故置于 source/ 之外的顶层 skills/
+#          （D-008-REV1 隔离原则；D-103 更正：R 系列建设 Skill 不得进入 source/，否则会被 rebuild 平台
+#          运行期资源扫描/加载误当作用户项目运行能力）。派生自 source_dir 的父目录（repo 根），不硬编码。
+import os as _os
+from app.core.config import settings as _settings
+_S_DIR = f"{_settings.source_dir}/skills"
+_R_DIR = f"{_os.path.dirname(_settings.source_dir)}/skills/R-建设执行"
 
 SKILL_SEEDS = [
     # ── R 系列（rebuild 自身建设，均有真实 SKILL.md）──
@@ -177,17 +188,20 @@ RESOURCE_SEEDS = [
     {"resource_type": ResourceType.agent, "name": "Acceptance Agent Registry Entry", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.internal_current, "source_trust_level": TrustLevel.trusted_current, "permission_scope": "read_only"},
 
     # Skill entries
-    {"resource_type": ResourceType.skill, "name": "R 系列建设 Skill（3 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.internal_current, "source_trust_level": TrustLevel.trusted_current, "description": "R-数据库施工规范 / R-资源创建登记 / R-工作准则，均有真实 SKILL.md（skills/R-建设执行/）"},
-    {"resource_type": ResourceType.skill, "name": "P 系列平台 Skill（24 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.community, "source_trust_level": TrustLevel.reviewed_reference, "source_path_or_ref": "/home/king/rebuild/source/skills/", "description": "来源 ECC(MIT) 改写为信创迁移语境，覆盖 P0-P6 + 跨阶段，均有真实 SKILL.md；原 30 候选剔除 6 个非迁移类（市场对标/营销/UI美学/harness运维/工具选型/运维监控）", "type_metadata": {"count": 24, "source_repo": "https://github.com/affaan-m/ECC", "license": "MIT", "dropped_non_migration": ["benchmark-methodology", "content-engine", "design-system", "config-gc", "agent-eval", "dashboard-builder"]}},
+    {"resource_type": ResourceType.skill, "name": "R 系列建设 Skill（3 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.internal_current, "source_trust_level": TrustLevel.trusted_current, "description": "R-数据库施工规范 / R-资源创建登记 / R-工作准则，均有真实 SKILL.md（skills/R-建设执行/，置于 source/ 之外与平台运行期隔离）"},
+    {"resource_type": ResourceType.skill, "name": "P 系列平台 Skill（24 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.community, "source_trust_level": TrustLevel.reviewed_reference, "source_path_or_ref": f"{_S_DIR}/", "description": "来源 ECC(MIT) 改写为信创迁移语境，覆盖 P0-P6 + 跨阶段，均有真实 SKILL.md；原 30 候选剔除 6 个非迁移类（市场对标/营销/UI美学/harness运维/工具选型/运维监控）", "type_metadata": {"count": 24, "source_repo": "https://github.com/affaan-m/ECC", "license": "MIT", "dropped_non_migration": ["benchmark-methodology", "content-engine", "design-system", "config-gc", "agent-eval", "dashboard-builder"]}},
 
-    # Tool entries
-    {"resource_type": ResourceType.tool, "name": "fs_read", "description": "读取 workspace 文件（只读）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)"}},
-    {"resource_type": ResourceType.tool, "name": "list_files", "description": "列举 workspace 目录与文件（只读）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)"}},
-    {"resource_type": ResourceType.tool, "name": "code_grep", "description": "按模式检索代码库（只读）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)"}},
-    {"resource_type": ResourceType.tool, "name": "fs_write_artifact", "description": "写出 Artifact 到 workspace（受控）", "status": ResourceStatus.active, "risk_level": RiskLevel.L2, "type_metadata": {"dry_run_supported": True, "write_scope": "workspace", "binds_via": "execution_provider(R8)"}},
-    {"resource_type": ResourceType.tool, "name": "generate_patch", "description": "生成补丁草案（不直接落盘，待确认）", "status": ResourceStatus.active, "risk_level": RiskLevel.L2, "type_metadata": {"dry_run_supported": True, "write_scope": "patch_draft", "binds_via": "execution_provider(R8)"}},
-    {"resource_type": ResourceType.tool, "name": "apply_patch_with_confirm", "description": "应用补丁到源码（外部写操作，需用户 Gate）", "status": ResourceStatus.active, "risk_level": RiskLevel.L4, "permission_scope": "write_with_gate", "type_metadata": {"dry_run_supported": True, "write_scope": "source", "requires_gate": True, "binds_via": "execution_provider(R8)"}},
-    {"resource_type": ResourceType.tool, "name": "run_safe_command", "description": "运行白名单内安全命令并采集 stdout/exit_code（测试白名单+审计）", "status": ResourceStatus.active, "risk_level": RiskLevel.L4, "permission_scope": "exec_with_gate", "type_metadata": {"dry_run_supported": False, "requires_gate": True, "binds_via": "execution_provider(R8)"}},
+    # Tool entries — B-TOOL-SCHEMA-1 (R11-3): every tool carries a real OpenAI
+    # `parameters` schema so the agent can call it WITH arguments (empty schema
+    # meant the LLM saw the tool but had no arg to fill). Param names match what
+    # tool_registry.execute_tool / _execute_* actually read.
+    {"resource_type": ResourceType.tool, "name": "fs_read", "description": "读取 workspace 内某个文件的内容（只读，限 workspace 内）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "要读取的文件路径，相对 workspace 根，如 source/xxx.cs 或 artifacts/intake_report.json"}}, "required": ["path"]}}},
+    {"resource_type": ResourceType.tool, "name": "list_files", "description": "列举 workspace 某个目录下的文件与子目录（只读）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "要列举的目录路径，相对 workspace 根，默认 source/"}}, "required": []}}},
+    {"resource_type": ResourceType.tool, "name": "code_grep", "description": "在 workspace 代码库中按文本/正则模式检索（只读）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "要检索的文本或正则模式"}, "path": {"type": "string", "description": "检索范围目录，相对 workspace 根，默认 source/"}}, "required": ["pattern"]}}},
+    {"resource_type": ResourceType.tool, "name": "fs_write_artifact", "description": "写出 Artifact 到 workspace（受控，经 WorkspaceMediator）", "status": ResourceStatus.active, "risk_level": RiskLevel.L2, "type_metadata": {"dry_run_supported": True, "write_scope": "workspace", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "产物写入路径，相对 workspace，须在 artifacts/ 或 output_code/ 下"}, "content": {"type": "string", "description": "要写入的文件内容"}}, "required": ["path", "content"]}}},
+    {"resource_type": ResourceType.tool, "name": "generate_patch", "description": "生成补丁草案写入 patches/（不直接落盘 source/，待确认）", "status": ResourceStatus.active, "risk_level": RiskLevel.L2, "type_metadata": {"dry_run_supported": True, "write_scope": "patch_draft", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"target_path": {"type": "string", "description": "补丁针对的目标文件路径（相对 workspace）"}, "diff": {"type": "string", "description": "unified diff 文本，或期望的新内容"}}, "required": ["target_path", "diff"]}}},
+    {"resource_type": ResourceType.tool, "name": "apply_patch_with_confirm", "description": "应用补丁到产出代码 output_code/（需用户 Gate；源码 source/ 始终只读，D-099）", "status": ResourceStatus.active, "risk_level": RiskLevel.L4, "permission_scope": "write_with_gate", "type_metadata": {"dry_run_supported": True, "write_scope": "output_code", "requires_gate": True, "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"patch_ref": {"type": "string", "description": "patches/ 下待应用的补丁草案引用路径"}, "target_path": {"type": "string", "description": "应用到 output_code/ 下的目标路径"}}, "required": ["patch_ref"]}}},
+    {"resource_type": ResourceType.tool, "name": "run_safe_command", "description": "运行白名单内安全命令并采集 stdout/exit_code（测试白名单+审计）", "status": ResourceStatus.active, "risk_level": RiskLevel.L4, "permission_scope": "exec_with_gate", "type_metadata": {"dry_run_supported": False, "requires_gate": True, "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "要执行的命令（须在白名单内），经 ExecutionProvider 隔离执行"}}, "required": ["command"]}}},
 
     # Hook entries
     {"resource_type": ResourceType.hook, "name": "pre-write Policy check", "description": "任何文件写操作前的 Policy 校验（PreToolUse，block 模式）", "status": ResourceStatus.active, "risk_level": RiskLevel.L2, "type_metadata": {"hook_point": "PreToolUse", "hook_mode": "block"}},

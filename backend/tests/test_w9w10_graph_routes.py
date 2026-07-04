@@ -51,7 +51,7 @@ def test_w9_promotion_decision_drives_graph(tmp_path, monkeypatch, isolated_data
 
         # start the graph → pauses at the P0 promotion Gate (real thread exists)
         d = c.post(f"/api/projects/{pid}/graph/start",
-                   json={"execution_mode": "plan", "source_type": "manual"}).json()["data"]
+                   json={"execution_mode": "auto", "source_type": "manual"}).json()["data"]
         run_id = d["run_id"]
         assert d["paused"] is True and d["pending_gate"]["stage"] == "p0"
 
@@ -81,7 +81,7 @@ def test_w10_resume_run_drives_graph(tmp_path, monkeypatch, isolated_data):
             "name": "W10", "source_type": "manual", "source_config": {},
         }).json()["data"]["project_id"]
         d = c.post(f"/api/projects/{pid}/graph/start",
-                   json={"execution_mode": "plan", "source_type": "manual"}).json()["data"]
+                   json={"execution_mode": "auto", "source_type": "manual"}).json()["data"]
         run_id = d["run_id"]
         assert d["paused"] is True
 

@@ -88,9 +88,13 @@ async def test_p3_handler_blocked_escalates(tmp_path, monkeypatch):
     assert aet.list_evidence("proj-1") == []                      # nothing faked
 
 
-def test_p3_registered_p4_not(tmp_path):
-    """P3 is a real handler after bootstrap; P4 stays a future_r11 stub (Q-R10-3)."""
+def test_p3_registered_p4_skeleton(tmp_path):
+    """P3 is a real handler after bootstrap; P4 is now a registered C3 skeleton
+    handler (R11-3-C3) — loads P3 TaskGraph, honest blocked/waiting_input, never
+    fakes completed. P5-P6 stay unregistered stubs."""
     from app.graph import nodes
     h = nodes.get_handler("p3")
     assert h is not None and h.__class__.__name__ == "RealP3Handler"
-    assert nodes.get_handler("p4") is None                        # P4 not registered
+    h4 = nodes.get_handler("p4")
+    assert h4 is not None and h4.__class__.__name__ == "RealP4Handler"  # C3: registered
+    assert nodes.get_handler("p5") is None                             # P5 still stub

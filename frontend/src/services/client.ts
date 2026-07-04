@@ -54,6 +54,21 @@ export function get<T>(path: string): Promise<ApiEnvelope<T>> {
   return request<T>(path);
 }
 
+/** Unwrap the unified envelope when present.
+ *
+ * Backend routes are inconsistent: some (/agents, /skills) return the payload at
+ * top level, others (/resources, /mcp, /resources/registry) wrap it in the unified
+ * ApiEnvelope ({status, data, meta,...}). Services that consume enveloped endpoints
+ * must unwrap `.data`; this helper handles both shapes so a route flipping between
+ * them can't silently return an empty list again (B-RESLIST-ENVELOPE-1). */
+export function unwrap<T>(resp: ApiEnvelope<T> | T): T {
+  if (resp && typeof resp === 'object'
+      && 'data' in resp && 'meta' in resp && 'status' in resp) {
+    return (resp as ApiEnvelope<T>).data;
+  }
+  return resp as T;
+}
+
 export function post<T>(path: string, body?: unknown): Promise<ApiEnvelope<T>> {
   return request<T>(path, {
     method: 'POST',

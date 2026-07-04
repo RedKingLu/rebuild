@@ -32,6 +32,7 @@ export interface Project {
   updated_at?: string;
   onboarding_done: boolean;
   coding_agent_ref?: string | null;  // D-078/R9-3A
+  external_platform_scope?: 'none' | 'coding_only' | 'all_stages';  // D-088 / R11-2 B-6
   mock_level: MockLevel;
 }
 

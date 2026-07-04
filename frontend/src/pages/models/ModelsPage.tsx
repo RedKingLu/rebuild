@@ -25,6 +25,10 @@ const CRED_LABEL: Record<string, string> = {
 const KEY_SOURCE_LABEL: Record<string, string> = {
   env: '环境变量', generic_fallback: '通用兜底', in_memory: '进程内存（重启失效）', none: '无',
 };
+// UX-1: call-log source codes → 中文标签. "api" = 工作区 Agent 执行链路（agent_loop 流式调用）。
+const SOURCE_LABELS: Record<string, string> = {
+  api: '工作区', platform_assistant: '平台助手', self_test: '连通自测',
+};
 
 // 真实能力标记徽章（颜色+中文文字双通道，06 §18）
 function CapabilityBadge({ marker }: { marker: string }) {
@@ -333,7 +337,7 @@ export function ModelsPage() {
                     <span className="tag" style={{ background: c.status === 'completed' ? 'var(--green)' : 'var(--red)', color: '#fff' }}>{c.status === 'completed' ? '成功' : c.status}</span>
                   </div>
                   <div className="sub" style={{ fontSize: 11 }}>
-                    {c.selected_model} · {c.provider_id} · 来源 {c.source} · {c.latency_ms}ms
+                    {c.selected_model} · {c.provider_id} · 来源 {SOURCE_LABELS[c.source] || c.source} · {c.latency_ms}ms
                   </div>
                   <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>
                     输入 {c.usage_summary?.prompt_tokens?.toLocaleString() ?? 0}

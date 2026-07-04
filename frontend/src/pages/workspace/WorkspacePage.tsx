@@ -17,11 +17,14 @@ import { StagePageP0 } from './StagePageP0';
 import { StagePageP1 } from './StagePageP1';
 import { StagePageP2 } from './StagePageP2';
 import { StagePageP3 } from './StagePageP3';
+import { StagePageP4 } from './StagePageP4';
 import { AgentChat, type SystemMessage } from '../../components/agent/AgentChat';
+import { ConversationList } from './ConversationList';
 import {
   fetchWorkspace, fetchFileTree, fetchMaterialTree, fetchSessions, fetchMode,
   type WorkspaceAggregate, type FileTreeResponse,
 } from '../../services/workspaceService';
+import { updateProject } from '../../services/projectService';
 import { connectEventStream } from '../../services/eventService';
 
 const STAGES: StageId[] = ['p0', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6'];
@@ -48,6 +51,8 @@ export function WorkspacePage() {
   const [onbDismissed, setOnbDismissed] = useState(false);
   const [p0SystemMessages, setP0SystemMessages] = useState<SystemMessage[]>([]);
   const [p0Executing, setP0Executing] = useState(false);
+  // UX-3: refresh token for the conversation sidebar after messages are persisted.
+  const [convoVersion, setConvoVersion] = useState(0);
 
   // ── UI state ──
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -64,6 +69,25 @@ export function WorkspacePage() {
 
   const project = data?.project;
   const run = data?.active_run;
+
+  // UX-3: when the run's stage changes, resolve the active conversation for that stage
+  // (server creates it lazily on first chat; here we just surface the latest active one).
+  useEffect(() => {
+    if (!id || !run?.current_stage) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { listConversations } = await import('../../services/conversationService');
+        const convos = await listConversations(id);
+        if (cancelled) return;
+        const stageConvos = convos.filter(c => c.stage === run.current_stage && c.status === 'active');
+        const latest = stageConvos.sort((a, b) =>
+          (b.last_message_at || b.created_at).localeCompare(a.last_message_at || a.created_at))[0];
+        if (latest) ws.setActiveConversation(latest.conversation_id);
+      } catch { /* best-effort */ }
+    })();
+    return () => { cancelled = true; };
+  }, [id, run?.current_stage]);
 
   // ── Data loading ──
   const loadData = useCallback(async () => {
@@ -190,7 +214,9 @@ export function WorkspacePage() {
     ws.openTab({ id: 'stage', title: STAGE_LABELS[stage], kind: 'stage', data: stage, closable: true });
   };
   const openFile = (path: string) => {
-    ws.openTab({ id: 'file:' + path, title: path.split('/').pop() || path, kind: 'file', data: { path }, closable: true });
+    // UX-2: file tab is a singleton by kind (原设计 "Tab 按类型单例"). Opening any file
+    // reuses the single 'file' tab and swaps its content — not one tab per path.
+    ws.openTab({ id: 'file', title: path.split('/').pop() || path, kind: 'file', data: { path }, closable: true });
   };
   const closeTab = (tabId: string) => ws.closeTab(tabId);
 
@@ -242,6 +268,8 @@ export function WorkspacePage() {
           <ModelGwChip />
           <ExecModeSwitch projectId={id!} />
           <CodingAgentSelector projectId={id!} currentRef={project?.coding_agent_ref} />
+          <DelegationScopeSwitch projectId={id!} scope={project?.external_platform_scope || 'none'}
+            hasAgent={!!project?.coding_agent_ref} />
           {project?.onboarding_done && onbDismissed && (
             <button className="btn sm ghost" title="重新打开引导向导" style={{ flexShrink: 0, fontSize: 11 }}
               onClick={() => setOnbDismissed(false)}>
@@ -288,7 +316,17 @@ export function WorkspacePage() {
             {ws.activity === 'stage' && <FlowRail run={run} onOpen={openStage} />}
             {ws.activity === 'files' && <FileTree tree={fileTree} loading={loading} onOpenFile={openFile} />}
             {ws.activity === 'materials' && <MaterialTree tree={materialTree} loading={loading} onOpenFile={openFile} />}
-            {ws.activity === 'agent' && <div className="empty" style={{ fontSize: 12 }}>Agent 对话见中央常驻 Tab</div>}
+            {ws.activity === 'agent' && (
+              <ConversationList
+                projectId={id!}
+                stage={run?.current_stage || 'p0'}
+                refreshKey={convoVersion}
+                onSelect={(conv) => {
+                  ws.setActiveConversation(conv.conversation_id);
+                  ws.setActiveTab('agent');
+                }}
+              />
+            )}
             {ws.activity === 'git' && <div className="empty" style={{ fontSize: 12 }}>Git：基础占位（范围内入口）</div>}
             {ws.activity === 'remote' && <div className="empty" style={{ fontSize: 12 }}>远程：基础占位（范围内入口）</div>}
             {ws.activity === 'search' && <div className="empty" style={{ fontSize: 12 }}>搜索：基础占位（范围内入口）</div>}
@@ -358,7 +396,18 @@ export function WorkspacePage() {
                   <span>文件数: {data?.file_index?.reduce?.((acc: number, r: any) => acc + (r.children?.length || 0), 0) || '—'}</span>
                 </div>
                 <div style={{ flex: 1, overflow: 'hidden' }}>
-                  <AgentChat projectId={id!} stage={run?.current_stage || 'p0'} systemMessages={p0SystemMessages} />
+                  <AgentChat
+                    projectId={id!}
+                    stage={run?.current_stage || 'p0'}
+                    systemMessages={p0SystemMessages}
+                    conversationId={ws.activeConversationId}
+                    onConversationChange={() => setConvoVersion(v => v + 1)}
+                    // UX-4 (corrected): real run state for the task-overview bar.
+                    // runId fetches the active TaskGraph node checklist; stage backs the
+                    // task-context + real-time status when no graph is active.
+                    runId={data?.active_run?.run_id || run?.run_id || null}
+                    runStatus={run?.run_status || undefined}
+                  />
                 </div>
               </div>
             )}
@@ -385,6 +434,11 @@ export function WorkspacePage() {
                 if (sid === 'p3') {
                   return <StagePageP3 projectId={id!} stageStatus={run?.stage_status?.p3} onReExecute={loadData} />;
                 }
+                // C8: P4 执行阶段页(真实后端 P4 状态，无 mock)
+                if (sid === 'p4') {
+                  return <StagePageP4 projectId={id!} runId={data?.active_run?.run_id || run?.run_id || undefined}
+                    stageStatus={run?.stage_status?.p4} onReExecute={loadData} />;
+                }
                 return (
                   <div style={{ fontSize: 13 }}>
                     <h3>{STAGE_LABELS[sid]}</h3>
@@ -395,6 +449,7 @@ export function WorkspacePage() {
             )}
             {!loading && tab?.kind === 'file' && (tab.data as any) && (
               <FileView
+                key={(tab.data as { path: string }).path}
                 projectId={id!}
                 filePath={(tab.data as { path: string }).path}
                 onClose={() => closeTab(tab.id)}
@@ -591,3 +646,52 @@ function CodingAgentSelector({ projectId, currentRef }: { projectId: string; cur
     </span>
   );
 }
+
+/** B-6: external platform delegation scope switch (D-088). Per-project; the OnboardingWizard
+ *  only sets this at creation. This control lets the user switch it later (none / coding_only /
+ *  all_states), persisting via PATCH /projects/{id}. Should_delegate() re-reads it live so the
+ *  next P4 execution honors the new choice — we never fake "already applied". */
+const SCOPE_OPTS: { value: 'none' | 'coding_only' | 'all_stages'; label: string }[] = [
+  { value: 'none', label: '自有' },
+  { value: 'coding_only', label: '委托 P4' },
+  { value: 'all_stages', label: '委托全部' },
+];
+
+function DelegationScopeSwitch({ projectId, scope, hasAgent }: {
+  projectId: string; scope: 'none' | 'coding_only' | 'all_stages'; hasAgent: boolean;
+}) {
+  const [val, setVal] = useState(scope);
+  useEffect(() => { setVal(scope); }, [scope]);
+
+  const onChange = async (next: 'none' | 'coding_only' | 'all_stages') => {
+    setVal(next);
+    try { await updateProject(projectId, { external_platform_scope: next }); }
+    catch { setVal(scope); /* revert on failure */ }
+  };
+
+  // "委托全部/委托 P4" without a coding agent is inert (should_delegate still False); hint that.
+  const needsAgent = val !== 'none';
+
+  return (
+    <span title="执行方式：自有=rebuild 内部全做；委托 P4=仅 P4 外部平台；委托全部=P0-P6 外部平台(高风险)"
+      style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 4 }}>
+      <Icon name="remote" size={13} style={{ color: val === 'none' ? 'var(--color-text-muted)' : 'var(--color-primary)' }} />
+      <span style={{ display: 'flex', border: '1px solid var(--color-border)', borderRadius: 6, overflow: 'hidden' }}>
+        {SCOPE_OPTS.map(o => (
+          <button key={o.value} title={o.value === 'none' ? '平台自有 Agent 全包' : o.value === 'coding_only' ? '仅 P4 委托外部平台' : '全部环节委托外部平台(高风险)'}
+            onClick={() => onChange(o.value)}
+            style={{
+              fontSize: 11, padding: '2px 7px', border: 'none', cursor: 'pointer',
+              background: val === o.value ? 'var(--color-primary-soft)' : 'transparent',
+              color: val === o.value ? 'var(--color-primary)' : 'var(--color-text-muted)',
+              borderRight: o.value !== 'all_stages' ? '1px solid var(--color-border)' : 'none',
+            }}>{o.label}</button>
+        ))}
+      </span>
+      {needsAgent && !hasAgent && (
+        <span style={{ fontSize: 10, color: 'var(--amber)' }} title="请先在上方选择一个外部编程平台,否则委托不生效">需选平台</span>
+      )}
+    </span>
+  );
+}
+

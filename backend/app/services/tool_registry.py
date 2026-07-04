@@ -335,22 +335,81 @@ async def _execute_mcp_tool(tool_name: str, args: dict, db: Optional[Session]) -
 
 
 async def _execute_read(tool_name: str, args: dict, project_id: str) -> dict:
-    """Local read-only tool execution within workspace."""
+    """Local read-only tool execution within workspace (write_scope=none).
+
+    B-TOOL-SCHEMA-1 (R11-3): dispatch by tool so the L1 read tools are genuinely
+    usable with their real params — fs_read reads a file, list_files lists a dir,
+    code_grep searches. All confined to the project workspace.
+    """
+    from app.services.workspace_service import workspace_path
+    ws = workspace_path(project_id)
+    ws_root = ws.resolve()
+
+    def _confine(rel: str):
+        full = (ws / rel).resolve()
+        if not str(full).startswith(str(ws_root)):
+            return None
+        return full
+
+    # ── list_files: list a directory ──
+    if tool_name == "list_files":
+        rel = args.get("path") or args.get("dir") or "source"
+        full = _confine(rel)
+        if full is None:
+            return {"error": "路径越界: 仅允许访问项目 workspace 内目录"}
+        if not full.exists() or not full.is_dir():
+            return {"error": f"目录不存在: {rel}"}
+        entries = []
+        for p in sorted(full.iterdir())[:500]:
+            entries.append({"name": p.name, "type": "dir" if p.is_dir() else "file"})
+        return {"path": rel, "count": len(entries), "entries": entries}
+
+    # ── code_grep: search a pattern under a directory ──
+    if tool_name == "code_grep":
+        import re
+        pattern = args.get("pattern") or args.get("query", "")
+        if not pattern:
+            return {"error": "需要 pattern 参数"}
+        rel = args.get("path") or "source"
+        base = _confine(rel)
+        if base is None:
+            return {"error": "路径越界: 仅允许检索 workspace 内目录"}
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return {"error": f"无效正则: {e}"}
+        skip = {".git", "node_modules", "__pycache__", ".venv"}
+        matches = []
+        scanned = 0
+        for p in base.rglob("*"):
+            if not p.is_file() or any(s in p.parts for s in skip):
+                continue
+            scanned += 1
+            if scanned > 5000:
+                break
+            try:
+                for i, line in enumerate(p.read_text("utf-8", errors="ignore").splitlines(), 1):
+                    if rx.search(line):
+                        matches.append({"file": str(p.relative_to(ws_root)), "line": i, "text": line.strip()[:200]})
+                        if len(matches) >= 100:
+                            break
+            except Exception:
+                continue
+            if len(matches) >= 100:
+                break
+        return {"pattern": pattern, "path": rel, "match_count": len(matches),
+                "matches": matches, "truncated": len(matches) >= 100}
+
+    # ── fs_read (default read-only): read a file's content ──
     target = args.get("path") or args.get("file") or args.get("artifact_path", "")
     if not target:
         return {"error": "需要 path/file/artifact_path 参数"}
-    try:
-        from app.services.workspace_service import workspace_path
-        ws = workspace_path(project_id)
-        # Confine to workspace
-        full = (ws / target).resolve()
-        if not str(full).startswith(str(ws.resolve())):
-            return {"error": "路径越界: 仅允许访问项目 workspace 内文件"}
-        if full.exists():
-            return {"content": full.read_text("utf-8", errors="replace")[:4000], "path": target}
-        return {"error": f"文件不存在: {target}"}
-    except Exception as e:
-        return {"error": str(e)}
+    full = _confine(target)
+    if full is None:
+        return {"error": "路径越界: 仅允许访问项目 workspace 内文件"}
+    if full.exists() and full.is_file():
+        return {"content": full.read_text("utf-8", errors="replace")[:4000], "path": target}
+    return {"error": f"文件不存在: {target}"}
 
 
 async def _execute_workspace_write(tool_name: str, args: dict, project_id: str, entry) -> dict:

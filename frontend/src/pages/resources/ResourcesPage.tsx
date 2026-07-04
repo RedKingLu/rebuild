@@ -512,7 +512,7 @@ export function ResourcesPage() {
       const [aR, sR, rR, mcpR, sumR] = await Promise.all([
         listAgents(undefined, undefined, PAGE, 0),
         listSkills('P', undefined, PAGE, 0),
-        listResources({ limit: PAGE, offset: 0 }),
+        listResources({ limit: 200, offset: 0 }),
         listMCPServers(PAGE, 0).catch(() => ({ servers: [], total: 0 })),
         getRegistrySummary().catch(() => null),
       ]);
@@ -544,7 +544,10 @@ export function ResourcesPage() {
   const fetchResPg = async (pg: number, t?: string) => {
     const tp = t !== undefined ? t : resTypeF;
     if (t !== undefined) setResTypeF(tp);
-    const r = await listResources(tp ? { type: tp, limit: PAGE, offset: pg * PAGE } : { limit: PAGE, offset: pg * PAGE });
+    // 全部（无 type 过滤）：其他资源 tab 按 type 分组是客户端过滤，须一次载入全部资源
+    // （否则 PAGE 上限会把排序靠后的 tool 等类型截断，导致"工具 tab 什么都没有"）。
+    // 选中具体 type 时走后端 type 过滤 + 分页。
+    const r = await listResources(tp ? { type: tp, limit: PAGE, offset: pg * PAGE } : { limit: 200, offset: 0 });
     setAllResources(r.resources || []); setResTot(r.total || 0); setResPg(pg);
   };
 
@@ -603,7 +606,7 @@ export function ResourcesPage() {
         <StatCard active={tab === 'agents'} onClick={() => setTab('agents')} title="Agent" value={`${agentTot}`} label={`系统 ${sysA.length} · 专家 ${expA.length}`} />
         <StatCard active={tab === 'skills'} onClick={() => setTab('skills')} title="Skill" value={`${skillTot}`} label="P 系列 · 产品流程 Skill" />
         <StatCard active={tab === 'mcp'} onClick={() => setTab('mcp')} title="MCP" value={`${mcpTot}`} label={`已连接 ${mcpConnected} · 共 ${mcpTot}`} />
-        <StatCard active={tab === 'other'} onClick={() => setTab('other')} title="其他资源" value={`${resTot}`} label="工具 · Hook · 策略 · 转换器" />
+        <StatCard active={tab === 'other'} onClick={() => setTab('other')} title="其他资源" value={`${otherR.length}`} label="工具 · Hook · 策略 · 转换器" />
       </div>
 
       {/* 操作栏 */}
@@ -785,7 +788,8 @@ export function ResourcesPage() {
             </div>
           ))}
           {otherR.length === 0 && <div className="empty"><p className="sub">暂无其他资源。</p></div>}
-          {resTot > PAGE && <Pager page={resPg} total={resTot} size={PAGE} onPage={fetchResPg} />}
+          {/* 仅在选中具体 type（后端分页）时显示分页；"全部"为客户端分组，一次载入全部 */}
+          {resTypeF && resTot > PAGE && <Pager page={resPg} total={resTot} size={PAGE} onPage={fetchResPg} />}
         </div>
       </>}
 

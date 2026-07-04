@@ -417,6 +417,56 @@ class TestCallLog:
         assert any(c["model_call_id"] == cid for c in calls)
 
 
+class TestCallStreamPersistOnBreak:
+    """UX-1 regression — streaming call log must survive an early-breaking consumer.
+
+    agent_loop (and every SSE endpoint) does `async for frame in call_stream(...): ...
+    break` on the `done` frame. Breaking out suspends the generator at its `yield`;
+    on close GeneratorExit unwinds through it. Before UX-1 the call-log write sat AFTER
+    the loop and was skipped, so ALL workspace (source="api") calls were dropped from
+    call_log — only the non-streaming platform_assistant path (call()) ever recorded.
+    """
+
+    @pytest.mark.asyncio
+    async def test_persists_completed_call_when_consumer_breaks_early(self, monkeypatch):
+        import uuid as _uuid
+        from app.services.model_gateway import ModelGateway
+        gw = ModelGateway()
+
+        # Resolve a real profile/provider from the shipped registry (no live-key dep).
+        profile, _reason, provider = gw._registry.resolve_model(strategy_id="system-default")
+        assert profile and provider, "registry ships at least one configured provider"
+
+        # Make key resolution succeed without a real env key.
+        monkeypatch.setattr(gw, "_resolve_key", lambda prov, explicit=False: ("test-key", "env"))
+
+        class _StubAdapter:
+            async def stream_complete(self, **kwargs):
+                yield {"type": "token", "content": "Hel", "call_id": "c1"}
+                yield {"type": "token", "content": "lo", "call_id": "c1"}
+                yield {"type": "done",
+                       "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                       "call_id": "c1"}
+        monkeypatch.setattr(gw, "_adapter", _StubAdapter())
+
+        marker = f"uxtest-{_uuid.uuid4().hex[:8]}"
+        got = []
+        agen = gw.call_stream(messages=[{"role": "user", "content": "hi"}], source=marker)
+        async for frame in agen:
+            if frame.get("type") == "token":
+                got.append(frame["content"])
+            elif frame.get("type") == "done":
+                break  # <-- the exact early-exit that dropped the record before UX-1
+        await agen.aclose()  # deterministically fire GeneratorExit (prod: prompt GC)
+
+        assert "".join(got) == "Hello"
+        calls, total = gw.list_calls(limit=100)
+        row = next((c for c in calls if c.get("source") == marker), None)
+        assert row is not None, "call_stream must persist a CallLog even on early break"
+        assert row["status"] == "completed"
+        assert row["usage_summary"]["total_tokens"] == 10
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # ModelGateway status tests
 # ═══════════════════════════════════════════════════════════════════════

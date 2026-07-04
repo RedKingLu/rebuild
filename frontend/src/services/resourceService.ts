@@ -1,6 +1,6 @@
 /** Resource Service — R6/R12 Resource Registry API client (Phase 12 扩展: 全 CRUD). */
 
-import { get, post, put, del } from './client';
+import { get, post, put, del, unwrap } from './client';
 
 export interface ResourceEntry {
   resource_id: string;
@@ -60,27 +60,27 @@ export async function listResources(params?: {
   if (params?.offset != null) q.set('offset', String(params.offset));
   const qs = q.toString() ? `?${q.toString()}` : '';
   const resp = await get<ResourceListData>(`/resources${qs}`);
-  return resp as unknown as ResourceListData;
+  return unwrap<ResourceListData>(resp);
 }
 
 export async function getResource(resourceId: string): Promise<ResourceEntry> {
   const resp = await get<ResourceEntry>(`/resources/${resourceId}`);
-  return resp as unknown as ResourceEntry;
+  return unwrap<ResourceEntry>(resp);
 }
 
 export async function getRegistrySummary(): Promise<RegistrySummary> {
   const resp = await get<RegistrySummary>('/resources/registry');
-  return resp as unknown as RegistrySummary;
+  return unwrap<RegistrySummary>(resp);
 }
 
 export async function createResource(data: Partial<ResourceEntry>): Promise<ResourceEntry> {
   const resp = await post<ResourceEntry>('/resources', data);
-  return resp as unknown as ResourceEntry;
+  return unwrap<ResourceEntry>(resp);
 }
 
 export async function updateResource(resourceId: string, data: Partial<ResourceEntry>): Promise<ResourceEntry> {
   const resp = await put<ResourceEntry>(`/resources/${resourceId}`, data);
-  return resp as unknown as ResourceEntry;
+  return unwrap<ResourceEntry>(resp);
 }
 
 export async function deleteResource(resourceId: string): Promise<void> {

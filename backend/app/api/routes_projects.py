@@ -586,121 +586,21 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
     except Exception:
         logger.warning("Evidence write failed", exc_info=True)
 
-    # 5b. Source Materialization — REAL import of source code (R9-3G fix).
-    #     For non-manual types, actually copy/clone source into workspace/source/.
+    # 5b. Source materialization is the P0 stage's real ACTION — it is performed by
+    #     the LangGraph P0 node (RealP0Handler.execute) when the graph is driven below,
+    #     NOT here. B-PLAN-1 (D-025): in manual/plan mode the graph pauses at a
+    #     plan_review Gate BEFORE the P0 node executes, so materialization only runs
+    #     after the user approves the接入计划（"审核通过后才执行动作"）. In auto mode the
+    #     node materializes immediately during the graph drive. The route no longer
+    #     pre-materializes (which used to run regardless of plan approval, and duplicated
+    #     the node's work). `materialized` stays None here; the response reflects the
+    #     Gate the graph resolves.
     materialized = None
     p0_artifact_refs = ["artifacts/intake_report.json"]
-    try:
-        from app.services.source_materializer import SourceMaterializer
-        src_type = project.source_type.value if hasattr(project.source_type, 'value') else str(project.source_type)
-        m = SourceMaterializer(trace_writer=svc_deps.trace_writer, audit_writer=svc_deps.audit_writer)
-        materialized = m.materialize(project_id, src_type, project.source_config or {})
-        if materialized.get("success") or materialized.get("materialization_status") in ("completed", "empty"):
-            svc_deps.trace_writer.write("source_materialized", action="onboarding_materialize",
-                summary=f"P0 materialized: {materialized.get('file_count', 0)} files ({materialized.get('materialization_status')})",
-                project_id=project_id)
-        else:
-            svc_deps.trace_writer.write("source_materialized", action="onboarding_materialize",
-                summary=f"P0 materialize: {materialized.get('materialization_status')} ({materialized.get('file_count', 0)} files)",
-                project_id=project_id)
-        # Generate source_index if we have files
-        if materialized.get("file_count", 0) > 0:
-            from app.services.source_materializer import generate_source_index
-            generate_source_index(project_id)
-    except Exception:
-        logger.warning("Source materialization failed", exc_info=True)
-        materialized = {"materialization_status": "error", "file_count": 0, "errors": ["Materialization exception"]}
-
-    # Append material artifacts to p0_artifact_refs
-    p0_artifact_refs.extend([
-        "artifacts/p0_execution_record.json",
-        "artifacts/p0_construction_report.md",
-        "artifacts/p0_review_pass.json",
-    ])
-
-    # 4b. P0 Review Pass (no Gate yet — Gate is created by Agent-driven /onboarding/execute)
-    from app.services.review_pass import ReviewPass, ReviewResult
-    from app.services.workspace_service import workspace_path as _wp
-
-    def _review_intake(_state) -> ReviewResult:
-        issues = []
-        if run is None:
-            issues.append({"type": "run_missing", "detail": "P0 Run was not created"})
-        if not (_wp(project_id) / "artifacts" / "intake_report.json").exists():
-            issues.append({"type": "intake_missing", "detail": "intake_report.json not generated"})
-        return ReviewResult(passed=not issues, issues=issues,
-                            recommendations=["重建 P0 接入产物"] if issues else [],
-                            reviewer="intake_review_skill")
-
-    rp = ReviewPass(max_rounds=2, tracer=svc_deps.trace_writer, auditor=svc_deps.audit_writer)
-    review_outcome = await rp.run(execute_fn=lambda: {"ok": True},
-                                  review_fn=_review_intake, project_id=project_id, stage="p0")
-
-    # 5. Generate P0 Gate review materials (R9-3G-B: 4 artifact files — generated NOW
-    #    so the Gate can reference them later in /onboarding/execute)
-    from datetime import datetime as _dt, timezone as _tz
-    _ts_now = _dt.now(_tz.utc).isoformat()
-    import json as _json
-
-    art_dir2 = workspace_path(project_id) / "artifacts"
-    art_dir2.mkdir(parents=True, exist_ok=True)
-
-    _p0_exec = {
-        "stage": "p0", "project_id": project_id,
-        "generated_at": _ts_now,
-        "steps": [
-            {"step": "environment_update", "status": "completed", "timestamp": _ts_now},
-            {"step": "source_materialized", "status": "completed" if materialized else "skipped_manual", "timestamp": _ts_now,
-             "files_imported": materialized.get("file_count", 0) if materialized else 0},
-            {"step": "onboarding_done", "status": "completed", "timestamp": _ts_now},
-            {"step": "run_created", "status": "completed" if run else "failed", "timestamp": _ts_now,
-             "run_id": run.run_id if run else None},
-            {"step": "intake_written", "status": "completed", "timestamp": _ts_now},
-            {"step": "evidence_written", "status": "completed", "timestamp": _ts_now},
-            {"step": "review_completed", "status": "completed", "timestamp": _ts_now},
-        ],
-    }
-    (art_dir2 / "p0_execution_record.json").write_text(
-        _json.dumps(_p0_exec, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    _p0_report = f"""# P0 接入施工报告
-
-- **项目**: {project.name}
-- **阶段**: P0 接入
-- **时间**: {_ts_now}
-- **执行模式**: {req.execution_mode}
-- **来源类型**: {project.source_type}
-- **源码导入**: {materialized.get('file_count', 0) if materialized else 0} 文件
-
-## 产物清单
-- intake_report.json
-- p0_execution_record.json
-- p0_construction_report.md
-- p0_review_pass.json
-
-## 自检结论
-P0 接入完成：环境配置已声明、{'源码已导入' if materialized else '手动项目（无源码导入）'}、Run 已创建、Evidence 候选已记录。
-
-## 备注
-本报告由 R9-3G Gate 附审材料系统自动生成。
-"""
-    (art_dir2 / "p0_construction_report.md").write_text(_p0_report, encoding="utf-8")
-
-    _p0_review = {
-        "stage": "p0", "project_id": project_id,
-        "generated_at": _ts_now,
-        "reviewer": review_outcome.get("reviewer", "intake_review_skill"),
-        "passed": review_outcome.get("passed", True),
-        "rounds": review_outcome.get("rounds", 1),
-        "issues": review_outcome.get("issues", []),
-        "recommendations": review_outcome.get("recommendations", []),
-    }
-    (art_dir2 / "p0_review_pass.json").write_text(
-        _json.dumps(_p0_review, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 6. Trace + Audit
     svc_deps.trace_writer.write("onboarding_complete", action="complete_onboarding",
-        summary=f"Onboarding completed: {project.name} (source: {materialized.get('file_count', 0) if materialized else 0} files)",
+        summary=f"Onboarding completed: {project.name} (P0 materialization deferred to graph node)",
         project_id=project_id)
     svc_deps.audit_writer.write(audit_type="onboarding_complete", action="complete_onboarding",
         decision="executed", risk_level="L2", project_id=project_id,
@@ -715,6 +615,9 @@ P0 接入完成：环境配置已声明、{'源码已导入' if materialized els
     gate_id = None
     gate_type = None
     checkpoint_ref = None
+    # B-P0-FAKE-1: review verdict + material refs come from the REAL graph Gate, not
+    # a fabricated always-pass. Unknown (None) until the graph drive resolves a Gate.
+    review_passed = None
     if run is not None:
         try:
             from app.graph.runtime import get_flow_runtime
@@ -736,8 +639,15 @@ P0 接入完成：环境配置已声明、{'源码已导入' if materialized els
                 gate_type = active_gate.gate_type
                 checkpoint_ref = active_gate.checkpoint_ref or run.run_id
                 svc.update(project_id, active_gate=gate_id)
+                # Real Gate materials (StageReports) — the single source for the review panel
+                if active_gate.artifact_refs:
+                    p0_artifact_refs = list(active_gate.artifact_refs)
+                # A stage_promotion gate means the P0 small loop passed the real review;
+                # source_pending means it escalated (review did not pass). Honest verdict.
+                review_passed = (gate_type == "stage_promotion")
         except Exception:
             logger.warning("T6b: gate lookup after graph drive failed", exc_info=True)
+
 
     _resp_data = {
         "project_id": project_id, "onboarding_done": True,
@@ -745,7 +655,8 @@ P0 接入完成：环境配置已声明、{'源码已导入' if materialized els
         "intake_artifact_id": intake_id,
         "evidence_candidates": evidence_candidates,
         "materialized": materialized,
-        "review": {"passed": review_outcome.get("passed"), "reviewer": "intake_review_skill"},
+        "review": {"passed": review_passed, "reviewer": "p0_review_skill",
+                    "source": "langgraph_p0_node"},
         "p0_artifacts": p0_artifact_refs,
         # T6b: Gate now created by the graph at complete time (graph_driven)
         "gate_id": gate_id,
@@ -1040,82 +951,29 @@ async def run_profiling(project_id: str, req: ProfilingRequest | None = None, db
             "next_stage": None,
         }, meta=Meta())
 
-    # Generate P1 Gate review materials (R9-3G-C: mirror B4 pattern)
-    from datetime import datetime as _dt2, timezone as _tz2
-    _ts_now2 = _dt2.now(_tz2.utc).isoformat()
-    import json as _json2
-
-    art_dir_p1 = _wp(project_id) / "artifacts"
-    art_dir_p1.mkdir(parents=True, exist_ok=True)
-
-    # p1_stage_plan.json
-    _p1_plan = {
-        "stage": "p1", "project_id": project_id,
-        "generated_at": _ts_now2,
-        "items": [
-            "tech_stack", "language_detection", "framework_detection",
-            "build_system", "package_manifest", "dependency_graph",
-            "database_schema", "api_surface", "entry_points",
-            "config_inventory", "security_baseline", "code_quality",
-            "deployment_artifacts", "container_readiness",
-        ],
-        "expected_artifacts": 13,
-    }
-    (art_dir_p1 / "p1_stage_plan.json").write_text(
-        _json2.dumps(_p1_plan, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # p1_execution_record.json
-    _p1_exec = {
-        "stage": "p1", "project_id": project_id,
-        "generated_at": _ts_now2,
-        "items_completed": result.get("items_completed", 0),
-        "gaps_count": result.get("gaps_count", 0),
-        "review_passed": review_outcome.get("passed", False),
-        "review_rounds": review_outcome.get("rounds", 1),
-    }
-    (art_dir_p1 / "p1_execution_record.json").write_text(
-        _json2.dumps(_p1_exec, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # p1_construction_report.md
-    _p1_report = f"""# P1 建档施工报告
-
-- **项目**: {project.name}
-- **阶段**: P1 全量识别
-- **时间**: {_ts_now2}
-- **完成项**: {result.get('items_completed', 0)} / 14
-
-## 产物清单
-- profiling_summary.md
-- p2_input_manifest.json
-- 13 个类别识别 JSON
-
-## 自检结论
-P1 全量识别完成：{result.get('items_completed', 0)} 项产出，{result.get('gaps_count', 0)} 个待确认项。
-
-## 备注
-本报告由 R9-3G-C Gate 附审材料系统自动生成。
-"""
-    (art_dir_p1 / "p1_construction_report.md").write_text(_p1_report, encoding="utf-8")
-
-    # p1_review_pass.json
-    _p1_review = {
-        "stage": "p1", "project_id": project_id,
-        "generated_at": _ts_now2,
-        "reviewer": review_outcome.get("reviewer", "profile_review_skill"),
-        "passed": review_outcome.get("passed", True),
-        "rounds": review_outcome.get("rounds", 1),
-        "issues": review_outcome.get("issues", []),
-        "recommendations": review_outcome.get("recommendations", []),
-    }
-    (art_dir_p1 / "p1_review_pass.json").write_text(
-        _json2.dumps(_p1_review, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    p1_artifact_refs = [
-        "artifacts/p1_stage_plan.json",
-        "artifacts/p1_execution_record.json",
-        "artifacts/p1_construction_report.md",
-        "artifacts/p1_review_pass.json",
-    ]
+    # B-PLAN-1 / B-P0-FAKE-1 (R11-3): produce the REAL three D-092 reports via
+    # StageReports (the same framework the graph P1 node uses) from the real profiler
+    # result + the real ReviewPass verdict. This replaces the old template / hardcoded
+    # (14-item) / always-pass p1_stage_plan / p1_execution_record / p1_construction_report
+    # / p1_review_pass files, which were fabrications forbidden by D-101. Gate refs =
+    # the real reports + the real profiler artifacts on disk.
+    from app.graph.stage_reports import StageReports
+    from app.graph.stage_handlers import RealP1Handler as _P1H
+    _reports = StageReports(project_id, "p1")
+    _reports.start_plan(goal=_P1H.goal, acceptance_criteria=list(_P1H.acceptance_criteria),
+                        planned_actions=list(_P1H.planned_actions))
+    _art = _wp(project_id) / "artifacts"
+    _produced = [f"artifacts/{p.name}" for p in sorted(_art.glob("*.json"))]
+    if (_art / "profiling_summary.md").exists():
+        _produced.append("artifacts/profiling_summary.md")
+    _reports.construction(rounds=review_outcome.get("rounds", []) or [],
+                          actions=list(_P1H.planned_actions),
+                          produced_artifacts=_produced)
+    _reports.acceptance(passed=bool(review_outcome.get("passed")),
+                        issues=[str(i) for i in review_outcome.get("issues", [])],
+                        recommendations=[str(r) for r in review_outcome.get("recommendations", [])],
+                        reviewer="profile_review_skill")
+    p1_artifact_refs = _reports.all_refs() + _produced
 
     # Create P1→P2 Gate
     gate_id = None
