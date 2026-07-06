@@ -22,6 +22,7 @@ export function FusionConfigPanel({ profile, onSaved, onClose }: {
     (profile.judge as unknown as JudgeConfig) || { profile_ref: '', temperature: 0 });
   const [synthesizer, setSynthesizer] = useState<SynthesizerConfig>(
     (profile.synthesizer as unknown as SynthesizerConfig) || { profile_ref: '' });
+  const [name, setName] = useState(profile.name || '');
   const [style, setStyle] = useState(profile.style || 'balanced');
   const [trigger, setTrigger] = useState(profile.trigger || 'manual');
   const [enabledStages, setEnabledStages] = useState<string[]>(profile.enabled_stages || []);
@@ -54,6 +55,7 @@ export function FusionConfigPanel({ profile, onSaved, onClose }: {
   async function handleSave() {
     setSaving(true); setValidation(null);
     const body: FusionProfileUpdate = {
+      name: name.trim() || profile.name,
       panel_participants: panel,
       judge: { profile_ref: judge.profile_ref, temperature: 0 },
       synthesizer: { profile_ref: synthesizer.profile_ref },
@@ -81,6 +83,14 @@ export function FusionConfigPanel({ profile, onSaved, onClose }: {
           ))}
         </div>
       )}
+
+      {/* 名称 */}
+      <section>
+        <b style={{ fontSize: 13 }}>聚合模型名称</b>
+        <input value={name} onChange={e => setName(e.target.value)}
+          placeholder="为这个聚合模型起个名字，用于在模型列表与触发历史中识别"
+          style={{ width: '100%', padding: '6px 8px', fontSize: 13, boxSizing: 'border-box', marginTop: 6 }} />
+      </section>
 
       {/* Panel */}
       <section>
