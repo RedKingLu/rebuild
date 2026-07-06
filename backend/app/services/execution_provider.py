@@ -143,23 +143,27 @@ class LocalSubprocessExecutionProvider:
 
 
 async def _run_subprocess(code: str, language: str, timeout: int,
-                         cwd: str | None = None) -> dict:
+                         cwd: str | None = None,
+                         enforce_whitelist: bool = True) -> dict:
     """Execute via python3 -c or bash -c in a clean environment.
 
     R9-3A: Accepts optional cwd to bind execution to project workspace (WP-A1.1).
+    R12-10: enforce_whitelist=False allows platform-internal P5 commands
+    (mvn/go/npm/cargo/make/cmake) while keeping DENY_SUBSTRINGS L5 check.
     """
     clean_env = _clean_env()
 
     if language in ("python", "python3"):
         cmd = ["python3", "-c", code]
     elif language in ("bash", "sh", "shell"):
-        first_word = (code.strip().split() or [""])[0].split("/")[-1]
-        if first_word and first_word not in ALLOWED_COMMANDS:
-            return {
-                "exit_code": 1, "stdout": "",
-                "stderr": f"命令不在允许列表中: {first_word}",
-                "provider": "local_subprocess", "fallback": False, "blocked": True,
-            }
+        if enforce_whitelist:
+            first_word = (code.strip().split() or [""])[0].split("/")[-1]
+            if first_word and first_word not in ALLOWED_COMMANDS:
+                return {
+                    "exit_code": 1, "stdout": "",
+                    "stderr": f"命令不在允许列表中: {first_word}",
+                    "provider": "local_subprocess", "fallback": False, "blocked": True,
+                }
         cmd = ["bash", "-c", code]
     else:
         cmd = ["python3", "-c", code]
@@ -289,6 +293,54 @@ class ContainerExecutionProvider:
         }
 
 
+class WorkspaceLocalExecutionProvider:
+    """R12-8: Workspace-bound local execution for P5 verification commands.
+
+    Unlike LocalSubprocessExecutionProvider (which enforces ALLOWED_COMMANDS
+    whitelist suitable only for tiny utility snippets), this provider runs
+    build/test/verify commands directly in the project workspace with full
+    toolchain access (mvn, npm, go, cargo, make, cmake, node, python3, etc).
+
+    Security model (D-088② / D-076):
+      - Still checks DENY_SUBSTRINGS (L5 hard block: sudo, curl|sh, rm -rf …).
+      - No ALLOWED_COMMANDS whitelist — P5 is platform-internal (trusted),
+        not user-supplied untrusted code.
+      - cwd is always the project workspace root (no escape).
+      - Risk is classified and audited, not silently elevated.
+
+    This solves B-P5-CONTAINER-CWD: ContainerExecutionProvider lacks cwd and
+    read-only-only mounts, which makes it architecturally unable to run real
+    project builds. For P5 trusted workspace execution, local with DENY check
+    + workspace-bound cwd is the correct seam.
+    """
+
+    name = "workspace_local"
+
+    async def execute(self, code: str, language: str = "bash",
+                      timeout: int = 30, model: str | None = None,
+                      cwd: str | None = None) -> dict:
+        import time
+        start = time.time()
+
+        denial = _check_dangerous(code)
+        if denial:
+            return {
+                "exit_code": 1, "stdout": "", "stderr": denial,
+                "elapsed_ms": 0, "provider": "workspace_local_security_block",
+                "execution_mode": "workspace_local", "fallback": True, "blocked": True,
+                "risk_level": "L5", "audited": False,
+            }
+
+        risk = _classify_risk(code, language)
+        result = await _run_subprocess(code, language, timeout, cwd=cwd,
+                                        enforce_whitelist=False)
+        result["elapsed_ms"] = int((time.time() - start) * 1000)
+        result["execution_mode"] = "workspace_local"
+        result["risk_level"] = risk
+        result["audited"] = False
+        return result
+
+
 def get_execution_provider(
     mode: str | None = None,
     remote_host_id: str | None = None,
@@ -297,11 +349,17 @@ def get_execution_provider(
     """Return the execution provider for the given mode.
 
     Priority: explicit mode arg > EXECUTION_MODE env var > "local".
-    When mode="remote", remote_host_id and db are required.
+    Modes:
+      - "local"           → LocalSubprocessExecutionProvider (ALLOWED_COMMANDS whitelist)
+      - "workspace_local" → WorkspaceLocalExecutionProvider (workspace-bound, no whitelist, DENY check)
+      - "container"       → ContainerExecutionProvider (docker sandbox, read-only)
+      - "remote"          → RemoteSSHExecutionProvider (paramiko SSH + SFTP)
     """
     resolved_mode = (mode or os.environ.get("EXECUTION_MODE") or "local").strip().lower()
     if resolved_mode == "container":
         return ContainerExecutionProvider()
+    if resolved_mode == "workspace_local":
+        return WorkspaceLocalExecutionProvider()
     if resolved_mode == "remote":
         if remote_host_id is None or db is None:
             raise ValueError(

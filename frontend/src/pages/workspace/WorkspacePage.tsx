@@ -18,6 +18,8 @@ import { StagePageP1 } from './StagePageP1';
 import { StagePageP2 } from './StagePageP2';
 import { StagePageP3 } from './StagePageP3';
 import { StagePageP4 } from './StagePageP4';
+import { StagePageP5 } from './StagePageP5';
+import { StagePageP6 } from './StagePageP6';
 import { AgentChat, type SystemMessage } from '../../components/agent/AgentChat';
 import { ConversationList } from './ConversationList';
 import {
@@ -438,6 +440,16 @@ export function WorkspacePage() {
                 if (sid === 'p4') {
                   return <StagePageP4 projectId={id!} runId={data?.active_run?.run_id || run?.run_id || undefined}
                     stageStatus={run?.stage_status?.p4} onReExecute={loadData} />;
+                }
+                // C7: P5 验证阶段页(真实后端 P5 全量验证结果 + P5→P6 Gate)
+                if (sid === 'p5') {
+                  return <StagePageP5 projectId={id!} runId={data?.active_run?.run_id || run?.run_id || undefined}
+                    stageStatus={run?.stage_status?.p5} onReExecute={loadData} />;
+                }
+                // C10: P6 交付阶段页(交付包 + 下载 + 最终 Gate)
+                if (sid === 'p6') {
+                  return <StagePageP6 projectId={id!} runId={data?.active_run?.run_id || run?.run_id || undefined}
+                    stageStatus={run?.stage_status?.p6} onReExecute={loadData} />;
                 }
                 return (
                   <div style={{ fontSize: 13 }}>

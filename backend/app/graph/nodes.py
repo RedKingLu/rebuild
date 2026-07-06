@@ -9,9 +9,10 @@ Design — work/gate node separation (RK: interrupt re-runs the whole node on re
                  Kept minimal so resume re-execution is cheap and side-effect-safe.
 
 Stage handlers are pluggable (register_handler): P0/P1/P2 wire to real services
-(SourceMaterializer / FullStackProfiler / AssessmentService via ReviewPass); P3-P6
-are `future_r10`/`future_r11` stubs that keep the graph structurally walkable without
-doing business (00-总规划 §1.2, G7 诚实标记). Tests inject fakes.
+(SourceMaterializer / FullStackProfiler / AssessmentService via ReviewPass); P3/P4/P5
+are real/skeleton handlers (P3 planning / P4 TaskGraph execution / P5 verification
+skeleton — C3 reads P4 input + creates validation plan, C5 runs real commands). P6
+stays a future stub (00-总规划 §1.2, G7 诚实标记). Tests inject fakes.
 """
 
 from __future__ import annotations
@@ -159,12 +160,12 @@ def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
         handler = get_handler(stage)
 
         if handler is None:
-            # P2-P6 stub: structurally walkable, no business (future_r10, G7 honest)
+            # P7+ stub: structurally walkable, no business (future, G7 honest)
             return {
                 "current_stage": stage,
-                "stage_status": {stage: "future_r10"},
-                "events": [_ev(stage, "future_r10",
-                               f"{stage} node is a future_r10 stub (business in R10-R12)")],
+                "stage_status": {stage: "future"},
+                "events": [_ev(stage, "future",
+                               f"{stage} node is a future stub (business in later R-series)")],
             }
 
         # B-PLAN-1 (D-025/D-026): pre-execution plan review. Manual/Plan modes pause

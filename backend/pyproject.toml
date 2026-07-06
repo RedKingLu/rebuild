@@ -38,6 +38,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+norecursedirs = ["rebuild-archive", "archive", ".archive", "node_modules", ".venv", "原始代码"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app", "tests"]

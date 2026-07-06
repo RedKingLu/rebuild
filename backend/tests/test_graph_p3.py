@@ -97,4 +97,5 @@ def test_p3_registered_p4_skeleton(tmp_path):
     assert h is not None and h.__class__.__name__ == "RealP3Handler"
     h4 = nodes.get_handler("p4")
     assert h4 is not None and h4.__class__.__name__ == "RealP4Handler"  # C3: registered
-    assert nodes.get_handler("p5") is None                             # P5 still stub
+    h5 = nodes.get_handler("p5")
+    assert h5 is not None and h5.__class__.__name__ == "RealP5Handler"  # R12-3-C3: registered skeleton

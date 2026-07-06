@@ -12,7 +12,9 @@ P4ExecutionWorker.execute_node — reads source/ (read-only), writes output_code
 patches/ via WorkspaceMediator (D-099/D-104), derives Evidence from the real files;
 NodeLoop runs the independent Acceptance. The engine's _finalize honestly classifies
 failed/blocked/waiting_gate (never fakes completed). External-agent delegation (C6) and
-StagePageP4 (C8) are out of scope. P5-P6 stay future_r11 stubs.
+StagePageP4 (C8) are out of scope. P5 (R12-3-C3) is a skeleton: reads P4 input via
+P5InputService (C1) + creates the P5ValidationPlan (C2), in honest blocked state until
+C5 runs real build/run/test/static commands. P6 stays a future stub.
 
 DOC-2: P1 handler returns the REAL identified item list from the profiler result as the single
 source of truth (replacing the hardcoded 14-item frontend/route list).
@@ -807,14 +809,519 @@ class RealP4Handler:
                             reviewer="p4_review_skill")
 
 
+class RealP5Handler:
+    """P5 验证（R12-3-C3 骨架 + C4 硬必需槽位真实验证）。
+
+    C4 完成 5 个硬必需槽位的真实验证：
+      1. output_code 存在且非空
+      2. patches 存在且与 output_code 对应
+      3. P4 Evidence basis 真实（sha256 校验）
+      4. P4 summary 可解析
+      5. P4→P5 Gate approved
+
+    C5 起执行有条件必需（构建/运行/测试/静态检查）真实命令。
+
+    诚实状态（V10 教训 / D-066 / D-101 / D-105①）：
+      - 缺失任一硬必需槽位 → P5 不得 completed（硬约束）
+      - 失败/缺失 → blocked / evidence_gap（不伪造）
+      - P5→P6 Gate 由 make_work_node 在 review passed 时创建（C7 起）
+      - P6 仍保持 stub
+      - 缺输入时 blocked
+
+    P5 handler 由 make_work_node 在 LangGraph p5_work 节点内调用（D-037 不绕主编排）。
+    """
+
+    goal = "P5 验证：读取 P4 产物，执行 5 个硬必需槽位真实验证，创建 10 槽位 validation plan，诚实标记状态"
+    acceptance_criteria = [
+        "P5 输入事实源已读取（P4 output_code/patches/Evidence refs + summary + Gate）",
+        "P5ValidationPlan 已创建（10 槽位）",
+        "P4→P5 Gate = approved",
+        "5 个硬必需槽位真实执行验证（不伪造）",
+        "缺失任一硬必需槽位 → P5 不 completed（硬约束）",
+        "有条件必需槽位标记为 evidence_gap（待 C5 真实命令验证）",
+    ]
+    planned_actions = ["read_p4_input_via_p5_input_service",
+                       "create_p5_validation_plan",
+                       "verify_hard_required_slots_real",
+                       "mark_conditional_evidence_gap",
+                       "emit_honest_status"]
+
+    def __init__(self, tracer=None, auditor=None, p5_input_service=None,
+                 p5_verification_service=None):
+        self.tracer = tracer
+        self.auditor = auditor
+        self._p5_input = p5_input_service
+        self._p5_verify = p5_verification_service
+
+    def _p5_input_service(self):
+        if self._p5_input is not None:
+            return self._p5_input
+        from app.services.p5_input_service import P5InputService
+        return P5InputService(self._services())
+
+    def _p5_verification_service(self):
+        if self._p5_verify is not None:
+            return self._p5_verify
+        from app.services.p5_verification_service import P5VerificationService
+        return P5VerificationService(tracer=self.tracer, auditor=self.auditor,
+                                     aet=self._services().aet_service)
+
+    def _services(self):
+        from app.dependencies import get_services
+        return get_services()
+
+    async def execute(self, state: GraphState) -> dict:
+        project_id = state["project_id"]
+        run_id = state.get("run_id", "")
+
+        # ① 读取 P4 输入事实源（C1 P5InputService）
+        input_svc = self._p5_input_service()
+        try:
+            p4_input = input_svc.read_p4_input(project_id, run_id)
+        except Exception as e:
+            logger.warning("P5: P4 input read failed (honest blocked): %s", e, exc_info=True)
+            return {"status": "blocked",
+                    "reason": f"P4 输入读取异常：{type(e).__name__}",
+                    "artifacts": [], "evidence_refs": []}
+
+        # ② Gate 未 approved → 诚实 blocked
+        if p4_input.blocked:
+            return {"status": "blocked",
+                    "reason": p4_input.blocked_reason,
+                    "p4_to_p5_gate_id": p4_input.p4_to_p5_gate_id,
+                    "p4_to_p5_gate_status": p4_input.p4_to_p5_gate_status,
+                    "evidence_gaps": p4_input.evidence_gaps,
+                    "artifacts": [], "evidence_refs": []}
+
+        # ③ 创建 P5ValidationPlan (C2)
+        from app.services.p5_validation_plan import (
+            create_p5_validation_plan, P5SlotStatus, transition_slot_status,
+            HARD_REQUIRED_SLOTS, CONDITIONAL_SLOTS, can_mark_completed,
+            plan_to_dict,
+        )
+        plan = create_p5_validation_plan(project_id, run_id)
+
+        # ④ C4: 5 个硬必需槽位真实验证（P5VerificationService）
+        verify_svc = self._p5_verification_service()
+        verify_results = verify_svc.verify_all_hard_required(project_id, p4_input)
+
+        for vr in verify_results:
+            slot = plan.get_slot(vr.slot_id)
+            if slot is not None:
+                # 状态转换：IN_PROGRESS → validated / validation_failed / evidence_gap
+                transition_slot_status(slot, P5SlotStatus.IN_PROGRESS)
+                transition_slot_status(slot, vr.status)
+                slot.evidence_refs = vr.evidence_refs
+                slot.artifacts = vr.artifacts
+                slot.details.update(vr.details)
+                for issue in vr.issues:
+                    slot.issues.append(issue)
+
+        # ⑤ C5: 有条件必需槽位真实命令验证（D-105① 全量包含）
+        conditional_results = verify_svc.verify_conditional_slots(project_id)
+        conditional_details = []
+        for vr in conditional_results:
+            slot = plan.get_slot(vr.slot_id)
+            if slot is not None:
+                if vr.status == P5SlotStatus.NOT_APPLICABLE:
+                    # R12-16: 命令-less 槽位（库类 run）直接 PENDING→NA，不经 IN_PROGRESS
+                    transition_slot_status(slot, P5SlotStatus.NOT_APPLICABLE)
+                    slot.details.update(vr.details)
+                else:
+                    transition_slot_status(slot, P5SlotStatus.IN_PROGRESS)
+                    if vr.status == P5SlotStatus.NEEDS_USER_INPUT:
+                        # 命令不可识别 → needs_user_input（诚实，不伪造）
+                        transition_slot_status(slot, P5SlotStatus.NEEDS_USER_INPUT)
+                        slot.needs_user_input_prompt = vr.details.get("command", "")
+                        slot.details.update(vr.details)
+                    else:
+                        # 真实命令执行结果
+                        transition_slot_status(slot, vr.status)
+                        slot.exit_code = vr.details.get("exit_code")
+                        slot.command = vr.details.get("command")
+                        slot.details.update(vr.details)
+                        for issue in vr.issues:
+                            slot.issues.append(issue)
+            conditional_details.append({
+                "slot_id": vr.slot_id,
+                "command": vr.details.get("command"),
+                "passed": vr.passed,
+                "status": vr.status,
+                "exit_code": vr.details.get("exit_code"),
+                "elapsed_ms": vr.details.get("elapsed_ms"),
+                "risk_level": vr.details.get("risk_level"),
+                "issues": [i.get("type") for i in vr.issues],
+                "gate_required": vr.details.get("gate_required", False),
+            })
+
+        can_complete, reason = can_mark_completed(plan)
+        plan.can_be_completed = can_complete
+        plan.blocked_reason = None if can_complete else reason
+
+        # ⑥ 汇总验证结果
+        hard_required_passed = sum(1 for vr in verify_results if vr.passed)
+        conditional_passed = sum(1 for vr in conditional_results if vr.passed)
+        conditional_gap = sum(1 for vr in conditional_results
+                              if vr.status == P5SlotStatus.EVIDENCE_GAP)
+        conditional_needs_input = sum(1 for vr in conditional_results
+                                      if vr.status == P5SlotStatus.NEEDS_USER_INPUT)
+
+        # ⑦ 持久化 P5 验证结果（R12-7 修复 B-P6-UNGATED-BY-P5 + R12-4-04）
+        plan_dict = plan_to_dict(plan)
+        self._persist_p5_validation_report(project_id, run_id, plan_dict,
+                                            verify_results, conditional_details)
+
+        # ⑧ Trace
+        if self.tracer:
+            self.tracer.write("stage_loop", action="p5_full_verification",
+                              summary=(f"P5 全量验证 {hard_required_passed}/5 硬必需 + "
+                                       f"{conditional_passed}/4 条件通过，"
+                                       f"gap={conditional_gap} needs_input={conditional_needs_input}"),
+                              project_id=project_id, run_id=run_id, stage="p5")
+        return {
+            "status": "completed" if can_complete else "blocked",
+            "reason": reason if not can_complete
+                      else "P5 全量验证通过（硬必需 + 条件必需真实命令）",
+            "p4_to_p5_gate_id": p4_input.p4_to_p5_gate_id,
+            "p4_output_code_refs": p4_input.output_code_refs,
+            "p4_patch_refs": p4_input.patch_refs,
+            "p4_evidence_refs": p4_input.evidence_refs,
+            "p4_summary_ref": p4_input.p4_summary_ref,
+            "p4_execution_summary": p4_input.p4_execution_summary,
+            "validation_plan": plan_dict,
+            "verify_results": [{"slot_id": vr.slot_id, "passed": vr.passed,
+                                "status": vr.status, "issues": vr.issues}
+                               for vr in verify_results],
+            "conditional_results": conditional_details,
+            "evidence_gaps": p4_input.evidence_gaps,
+            "artifacts": [],
+            "evidence_refs": p4_input.evidence_refs,
+        }
+
+    def review(self, result: dict) -> ReviewResult:
+        """C6: review 接入 P5FailureRouter 返工路由。"""
+        from app.services.p5_failure_router import P5FailureRouter, P5FailureType
+
+        status = result.get("status")
+        if status == "completed":
+            return ReviewResult(passed=True, issues=[], recommendations=[],
+                                reviewer="p5_review_skill")
+
+        # C6: 失败分类 → 路由决策
+        router = P5FailureRouter(max_retries=2)
+        failure_type = self._classify_failure(result)
+        route = router.route(failure_type, {"retry_count": 0, "result": result})
+
+        # Evidence Gap → 标记 Gate 需求
+        if route.gate_required:
+            result["gate_required"] = True
+            result["gate_reason"] = route.gate_reason
+            result["gate_failure_type"] = failure_type
+
+        # P4 rework 需求
+        if route.p4_rework_required:
+            result["p4_rework_required"] = True
+            result["p4_rework_reason"] = route.plan_delta_reason
+
+        # PlanDelta
+        if route.plan_delta_type:
+            result["plan_delta_type"] = route.plan_delta_type
+            result["plan_delta_reason"] = route.plan_delta_reason
+
+        # 构建 review issues（含返工建议）
+        issues = [{"type": f"p5_{failure_type}", "detail": route.action}]
+        recommendations = []
+        if route.retry_allowed:
+            recommendations.append(f"P5 有界重试（第 {route.retry_count} 次）")
+        if route.p4_rework_required:
+            recommendations.append("回 P4 执行修复（代码问题不在 P5 直接修改）")
+        if route.gate_required:
+            recommendations.append(f"创建 Gate：{route.gate_reason}")
+
+        # 构建 evidence_gap 详情
+        if failure_type in (P5FailureType.EVIDENCE_MISSING, P5FailureType.EVIDENCE_INVALID,
+                            P5FailureType.NEEDS_USER_INPUT, P5FailureType.L4_L5_RISK):
+            result["evidence_gap"] = {
+                "gap_id": f"p5_gap_{failure_type}",
+                "evidence_type": failure_type,
+                "description": route.gate_reason,
+                "blocking": route.blocked,
+            }
+
+        return ReviewResult(
+            passed=False,
+            issues=issues,
+            recommendations=recommendations,
+            reviewer="p5_review_skill",
+        )
+
+    def _persist_p5_validation_report(self, project_id, run_id, plan_dict,
+                                       verify_results, conditional_details):
+        """R12-7 持久化 P5 验证结果到工作区 artifacts/p5_validation_report.json。
+
+        供 P6 门禁（B-P6-UNGATED-BY-P5）与 StagePageP5（R12-4-04）复用。
+        单一事实源 = 工作区 JSON 文件（重启存活 + DB 持久化）。
+        """
+        try:
+            from datetime import datetime, timezone
+            report = {
+                "project_id": project_id,
+                "run_id": run_id,
+                "stage": "p5",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "validation_plan": plan_dict,
+                "verify_results": [{"slot_id": vr.slot_id, "passed": vr.passed,
+                                    "status": vr.status, "issues": vr.issues}
+                                   for vr in verify_results if not vr.passed],
+                "conditional_results": conditional_details,
+                "can_be_completed": plan_dict.get("can_be_completed", False),
+            }
+            ref = _mediated_write(project_id, "artifacts/p5_validation_report.json",
+                                  json.dumps(report, ensure_ascii=False, indent=2),
+                                  auditor=self.auditor, stage="p5",
+                                  action="write_p5_validation_report")
+            if self.tracer:
+                self.tracer.write("evidence_event", action="p5_validation_persisted",
+                                  summary=f"P5 验证报告持久化 {ref}",
+                                  project_id=project_id, run_id=run_id, stage="p5")
+        except Exception as e:
+            logger.warning("P5: persist validation report failed: %s", e, exc_info=True)
+
+    def _classify_failure(self, result: dict) -> str:
+        """从验证结果中分类失败类型（C6）。"""
+        from app.services.p5_failure_router import P5FailureType
+
+        reason = result.get("reason", "")
+        cond_results = result.get("conditional_results", [])
+
+        # 有条件必需槽位失败
+        for cr in cond_results:
+            if cr.get("gate_required"):
+                return P5FailureType.L4_L5_RISK
+            if cr.get("status") == "needs_user_input":
+                return P5FailureType.NEEDS_USER_INPUT
+            cmd = cr.get("command", "")
+            status = cr.get("status", "")
+            sid = cr.get("slot_id", "")
+            if status == "validation_failed":
+                if sid == "build_verified":
+                    return P5FailureType.BUILD_FAILED
+                if sid == "tests_pass":
+                    return P5FailureType.TEST_FAILED
+                if sid == "static_check":
+                    return P5FailureType.STATIC_CHECK_FAILED
+                if "timeout" in str(cr.get("stderr_tail", "")).lower():
+                    return P5FailureType.COMMAND_TIMEOUT
+                return P5FailureType.COMMAND_FAILED
+
+        # 硬必需槽位失败
+        if "output_code" in reason.lower() or "no output_code" in reason.lower():
+            return P5FailureType.OUTPUT_CODE_MISSING
+        if "patch" in reason.lower():
+            return P5FailureType.PATCH_MISSING
+        if "evidence" in reason.lower() and "missing" in reason.lower():
+            return P5FailureType.EVIDENCE_MISSING
+        if "evidence" in reason.lower() and ("invalid" in reason.lower() or "不一致" in reason):
+            return P5FailureType.EVIDENCE_INVALID
+        if "gate" in reason.lower() and ("未" in reason or "not" in reason.lower()):
+            return P5FailureType.NEEDS_USER_INPUT
+
+        return P5FailureType.COMMAND_FAILED
+
+
+class RealP6Handler:
+    """P6 交付（R12-3-C9）。
+
+    接入 P6 handler，实现交付阶段真实运行与最终 Gate。
+
+    职责：
+      - 读取 P5 passed evidence（P5InputService）+ 验证计划（P5ValidationPlan）。
+      - 生成交付报告、交付索引、交付包（P6DeliveryService，C8）。
+      - 创建 P6 最终 Gate / accepted-ready 状态。
+      - 不绕过用户最终 Gate。
+
+    诚实约束（D-023 / D-066 / D-105③）：
+      - P6 completed 必须以交付包 + Evidence index + 用户 Gate 为前提。
+      - P5 未通过时 P6 不得执行。
+      - 旧验证结果保留 superseded 关系。
+      - source 默认不包含在交付包中。
+      - 创建最终 Gate 前做多类证据校验。
+
+    P6 handler 由 make_work_node 在 LangGraph p6_work 节点内调用（D-037 不绕主编排）。
+    """
+
+    goal = "P6 交付：读取 P5 passed evidence，生成交付包 + 四类索引 + 交付报告，创建最终用户 Gate"
+    acceptance_criteria = [
+        "P5 completed 或用户接受风险",
+        "交付包已生成（output_code + patches + reports + indexes + manifests）",
+        "hash_manifest 完整（SHA-256）",
+        "risk_manifest 记录未通过项",
+        "P6 最终 Gate 真实创建（P 阶段晋级 Gate 必须用户授权）",
+        "source 默认不包含",
+    ]
+    planned_actions = ["read_p5_passed_evidence",
+                       "generate_delivery_package_via_p6_service",
+                       "validate_delivery_completeness",
+                       "create_p6_final_gate",
+                       "emit_accepted_ready"]
+
+    def __init__(self, tracer=None, auditor=None, p6_delivery_service=None):
+        self.tracer = tracer
+        self.auditor = auditor
+        self._p6_svc = p6_delivery_service
+
+    def _services(self):
+        from app.dependencies import get_services
+        return get_services()
+
+    def _p6_service(self):
+        if self._p6_svc is not None:
+            return self._p6_svc
+        from app.services.p6_delivery_service import P6DeliveryService
+        return P6DeliveryService(tracer=self.tracer, auditor=self.auditor)
+
+    @staticmethod
+    def _check_p5_validation_passed(project_id: str, run_id: str) -> bool:
+        """R12-7 检查 P5 验证是否通过（读取持久化结果）。"""
+        try:
+            from app.services.workspace_service import workspace_path
+            from app.services.workspace_mediator import WorkspaceMediator
+            report_path = workspace_path(project_id) / "artifacts" / "p5_validation_report.json"
+            if not report_path.exists():
+                return False
+            WorkspaceMediator(str(workspace_path(project_id))).guard_read(str(report_path))
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            return data.get("can_be_completed", False)
+        except Exception as e:
+            logger.warning("P6: P5 validation check failed: %s", e, exc_info=True)
+            return False
+
+    async def execute(self, state: GraphState) -> dict:
+        project_id = state["project_id"]
+        run_id = state.get("run_id", "")
+
+        # ① 读取 P5 passed evidence
+        from app.services.p5_input_service import P5InputService
+        input_svc = P5InputService()
+        try:
+            p4_input = input_svc.read_p4_input(project_id, run_id)
+        except Exception as e:
+            return {"status": "blocked",
+                    "reason": f"P5 输入读取异常：{type(e).__name__}",
+                    "artifacts": [], "evidence_refs": []}
+
+        if p4_input.blocked:
+            return {"status": "blocked",
+                    "reason": f"P5 未通过（{p4_input.blocked_reason}），P6 不得执行",
+                    "artifacts": [], "evidence_refs": []}
+
+        # R12-7 修复 B-P6-UNGATED-BY-P5：读取 P5 验证结果（非仅 P4→P5 gate）
+        p5_passed = self._check_p5_validation_passed(project_id, run_id)
+        if not p5_passed:
+            return {"status": "blocked",
+                    "reason": "P5 验证未通过（读取 p5_validation_report.json），P6 不得执行",
+                    "artifacts": [], "evidence_refs": []}
+
+        # ② 生成交付包（P6DeliveryService，C8）
+        p6_svc = self._p6_service()
+        validation_plan = p4_input.p4_execution_summary or {}
+        pkg = p6_svc.generate_delivery_package(project_id, run_id,
+                                                p5_plan=validation_plan)
+
+        if pkg.risk_manifest.get("blocking"):
+            return {"status": "blocked",
+                    "reason": f"交付包生成阻断：{pkg.risk_manifest.get('error', '')}",
+                    "artifacts": [], "evidence_refs": []}
+
+        # ③ 创建 P6 最终 Gate（用户最终授权，D-023）
+        gate_id = self._create_p6_final_gate(project_id, run_id, pkg)
+
+        # ④ 组装输出
+        return {
+            "status": "completed",
+            "reason": "P6 交付包已生成 + 最终 Gate 已创建（待用户批准）",
+            "p6_delivery_package": {
+                "delivery_manifest": pkg.delivery_manifest,
+                "risk_manifest": pkg.risk_manifest,
+                "hash_manifest": pkg.hash_manifest,
+                "p6_delivery_report": pkg.p6_delivery_report,
+            },
+            "p5_validation_report": pkg.p5_validation_report,
+            "indexes": pkg.indexes,
+            "desensitization": {
+                "ok": pkg.desensitization_ok,
+                "issues": pkg.desensitization_issues,
+            },
+            "p6_final_gate_id": gate_id,
+            "p5_evidence_refs": p4_input.evidence_refs,
+            "artifacts": [],
+            "evidence_refs": p4_input.evidence_refs or [],
+        }
+
+    def _create_p6_final_gate(self, project_id: str, run_id: str, pkg) -> str | None:
+        """创建 P6 最终 Gate（用户最终授权，D-023）。"""
+        try:
+            svc = self._services()
+            risk_count = pkg.risk_manifest.get("risk_count", 0)
+            has_blocking = pkg.risk_manifest.get("has_blocking", False)
+            summary_parts = [
+                f"交付包已生成（{pkg.delivery_manifest.get('contents', {}).get('output_code_count', 0)} 产出 + "
+                f"{pkg.delivery_manifest.get('contents', {}).get('patch_count', 0)} 补丁）",
+            ]
+            if risk_count > 0:
+                summary_parts.append(f"{risk_count} 项风险")
+            if not pkg.desensitization_ok:
+                summary_parts.append(f"⚠ 脱敏扫描 {len(pkg.desensitization_issues)} 项需确认")
+
+            gate = svc.gate_service.create(
+                project_id=project_id,
+                run_id=run_id,
+                stage="p6",
+                gate_type="stage_promotion",
+                reason="P6 交付最终授权",
+                summary="；".join(summary_parts),
+                risk_level="L3" if has_blocking else "L1",
+                options=["approve", "reject", "request_changes"],
+                evidence_refs=pkg.p5_validation_report.get("evidence_refs", []),
+            )
+            if self.tracer:
+                self.tracer.write("gate_event", action="create_p6_final_gate",
+                                  summary=f"P6 最终 Gate {gate.gate_id} 创建",
+                                  project_id=project_id, run_id=run_id, stage="p6")
+            return gate.gate_id
+        except Exception as e:
+            logger.warning("P6: final gate create failed: %s", e, exc_info=True)
+            return None
+
+    def review(self, result: dict) -> ReviewResult:
+        status = result.get("status")
+        if status == "completed":
+            gate_id = result.get("p6_final_gate_id")
+            if gate_id:
+                return ReviewResult(passed=True, issues=[], recommendations=[],
+                                    reviewer="p6_review_skill")
+            # 无 Gate 但 completed — 标记需要创建（不应发生但诚实处理）
+            return ReviewResult(passed=False,
+                                issues=[{"type": "no_gate_created",
+                                         "detail": "P6 completed 但未创建最终 Gate（D-023 违规）"}],
+                                recommendations=["创建 P6 最终 Gate 后重试"],
+                                reviewer="p6_review_skill")
+        reason = result.get("reason") or "P6 未完成"
+        return ReviewResult(passed=False,
+                            issues=[{"type": "p6_not_completed", "detail": reason}],
+                            recommendations=["等待 P5 完成 + P5→P6 Gate approved 后重试"],
+                            reviewer="p6_review_skill")
+
+
 def bootstrap_graph_handlers(force: bool = False) -> None:
-    """Register real P0/P1/P2/P3 handlers + P4 skeleton + real Gate backend + writers.
+    """Register real P0/P1/P2/P3/P4/P5/P6 handlers + real Gate backend + writers.
 
     Idempotent. Called at app startup. Tests do NOT call this directly (conftest
-    re-bootstraps with test services). P4 is a C5 TaskGraph execution handler (loads P3
-    TaskGraph, drives execution nodes via TaskGraphEngine+NodeLoop → output_code/+patches/
-    + Evidence + Acceptance + edge strategies; honest failed/blocked/waiting_gate — never
-    fakes completed. External-agent delegation lands in C6). P5-P6 stay future_r11 stubs.
+    re-bootstraps with test services). P4/C5 TaskGraph execution; P5/C6 validation;
+    P6/C8 delivery. Real handlers for all 6 stages now registered.
+
+    R12-3-C9: P6 handler 不再只是 future stub，注册为 RealP6Handler。
+    不绕过 LangGraph 主编排（D-037）。P6 最终 Gate 由 RealP6Handler 创建。
     """
     global _bootstrapped
     if _bootstrapped and not force:
@@ -829,5 +1336,7 @@ def bootstrap_graph_handlers(force: bool = False) -> None:
     nodes.register_handler("p2", RealP2Handler(svc.trace_writer, svc.audit_writer))
     nodes.register_handler("p3", RealP3Handler(svc.trace_writer, svc.audit_writer))
     nodes.register_handler("p4", RealP4Handler(svc.trace_writer, svc.audit_writer))
+    nodes.register_handler("p5", RealP5Handler(svc.trace_writer, svc.audit_writer))
+    nodes.register_handler("p6", RealP6Handler(svc.trace_writer, svc.audit_writer))
     nodes.set_gate_backend(RealGateBackend())
     _bootstrapped = True

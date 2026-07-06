@@ -106,6 +106,13 @@ app.include_router(runs_router, prefix="/api")
 from app.api.routes_stages import router as stages_router
 app.include_router(stages_router, prefix="/api")
 
+# R12-3-C1: P5 输入事实源路由（DB refs + 工作区路径，D-105②）
+from app.api.routes_p5_input import router as p5_input_router
+app.include_router(p5_input_router, prefix="/api")
+# R12-3-C10: P6 交付包路由（package + download）
+from app.api.routes_p6_delivery import router as p6_delivery_router
+app.include_router(p6_delivery_router, prefix="/api")
+
 # W8: Gate / Authorization
 from app.api.routes_gates import router as gates_router
 app.include_router(gates_router, prefix="/api")

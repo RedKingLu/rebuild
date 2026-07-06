@@ -109,4 +109,5 @@ def test_p4_registered_after_bootstrap():
     from app.graph import nodes
     h = nodes.get_handler("p4")
     assert h is not None and h.__class__.__name__ == "RealP4Handler"
-    assert nodes.get_handler("p5") is None            # P5 仍为未注册 stub
+    h5 = nodes.get_handler("p5")
+    assert h5 is not None and h5.__class__.__name__ == "RealP5Handler"  # R12-3-C3: registered skeleton
