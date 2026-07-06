@@ -18,6 +18,7 @@ import {
   toggleFusionProfile, triggerFusion, listFusionRuns, getFusionRun,
   type FusionProfile, type FusionRun,
 } from '../../services/fusionService';
+import { listProfiles, type ModelProfileInfo } from '../../services/modelService';
 import { FusionRunDetail } from './components/FusionRunDetail';
 import { FusionConfigPanel } from './components/FusionConfigPanel';
 
@@ -30,6 +31,7 @@ const STYLE: Record<string, { label: string }> = {
 export function FusionPage() {
   const [tab, setTab] = useState<Tab>('profiles');
   const [profiles, setProfiles] = useState<FusionProfile[]>([]);
+  const [modelCandidates, setModelCandidates] = useState<ModelProfileInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -41,10 +43,19 @@ export function FusionPage() {
 
   const [triggering, setTriggering] = useState<string | null>(null);
 
+  // 可参与聚合的模型候选（排除 rebuild-fusion 虚拟服务商，防 Fusion 套 Fusion）
+  const candidateProfiles = modelCandidates.filter(p => p.provider_id !== 'rebuild-fusion');
+
   async function refresh() {
     setLoading(true); setError(null);
-    try { setProfiles(await listFusionProfiles()); }
-    catch (e) { setError((e as Error).message); }
+    try {
+      const [fp, mp] = await Promise.all([
+        listFusionProfiles(),
+        listProfiles().then(r => (r as any).data?.profiles || r.profiles || []).catch(() => []),
+      ]);
+      setProfiles(fp);
+      setModelCandidates(Array.isArray(mp) ? mp : []);
+    } catch (e) { setError((e as Error).message); }
     finally { setLoading(false); }
   }
 
@@ -80,13 +91,14 @@ export function FusionPage() {
   }
 
   async function handleCreateProfile() {
-    // 默认创建一个最小 Profile（default-off, manual），用户到 tab 2 配置。
+    // 默认填入首个可用参与模型，创建一个可直接触发/配置的 Profile（default-off, manual）。
+    const first = candidateProfiles[0];
     try {
       await createFusionProfile({
         name: `聚合模型 ${profiles.length + 1}`,
-        panel_participants: [],
-        judge: { profile_ref: '' },
-        synthesizer: { profile_ref: '' },
+        panel_participants: first ? [{ profile_ref: first.profile_id, perspective: 'general' }] : [],
+        judge: { profile_ref: first?.profile_id ?? '' },
+        synthesizer: { profile_ref: first?.profile_id ?? '' },
         global_config: { trigger: 'manual', style: 'balanced', self_moa_enabled: true },
       });
       await refresh();
