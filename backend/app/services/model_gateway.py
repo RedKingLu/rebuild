@@ -46,6 +46,133 @@ class ModelGateway:
         self._registry = registry or get_provider_registry()
         self._adapter = LiteLLMAdapter()
         self._calls: list[dict] = []  # in-memory call log (volatile)
+        self._fusion_service = None  # lazy R13-6
+
+    # ── R13-6: Fusion dispatch helpers ─────────────────────────────────
+
+    @property
+    def fusion_service(self):
+        """Lazy FusionProfileService (R13-4 config service). Re-created per call to
+        get a fresh DB session — call() may be invoked from long-lived singletons."""
+        if self._fusion_service is None:
+            from app.core.database import get_session
+            from app.services.fusion_profile_service import FusionProfileService
+            self._fusion_service = FusionProfileService(get_session())
+        return self._fusion_service
+
+    def _load_fusion_profile(self, virtual_ref: str) -> Optional[object]:
+        """Look up a FusionProfile DB row by its virtual_profile_ref. Returns None
+        if the ref is not a registered Fusion virtual model (→ ordinary model path)."""
+        from app.models.fusion_profile import FusionProfile
+        try:
+            svc = self.fusion_service
+            row = svc.db.query(FusionProfile).filter(
+                FusionProfile.virtual_profile_ref == virtual_ref).first()
+            return row
+        except Exception:
+            return None
+
+    async def _dispatch_fusion(self, fp, messages, *, source, project_id=None, stage=None,
+                               strategy_id="system-default"):
+        """Run FusionExecutionEngine for a resolved Fusion virtual profile and return
+        the result in the SAME shape as an ordinary model call (上层透明)."""
+        from app.services.fusion_execution_engine import FusionExecutionEngine
+        from app.dependencies import get_services
+
+        services = get_services()
+        engine = FusionExecutionEngine(
+            db=self.fusion_service.db,
+            gateway=self,
+            trace_writer=services.trace_writer,
+            audit_writer=services.audit_writer,
+            adapter=self._adapter,
+        )
+        msgs = messages
+        result = await engine.execute(
+            fp, msgs, project_id=project_id, stage=stage, source=source)
+
+        # 普通模型调用格式 — 完全等价；外加 fusion_metadata 供需要溯源的上层使用。
+        return {
+            "call_id": f"fusion-{result.fusion_run_id}",
+            "status": result.status,
+            "content": result.content if result.status == "completed" else "",
+            "model": fp.virtual_profile_ref,
+            "profile_id": fp.virtual_profile_ref,
+            "provider_id": "fusion",
+            "selection_reason": f"fusion:{result.strategy}",
+            "latency_ms": result.fusion_metadata.get("latency_sum_ms", 0),
+            "error_category": "" if result.status != "failed" else "fusion_failed",
+            "error_message": result.error_message,
+            "usage_summary": self._fusion_usage(result),
+            "retry_count": 0,
+            "fallback_used": result.degraded,
+            "fusion_metadata": result.fusion_metadata,
+            "fusion_run_id": result.fusion_run_id,
+            "fusion_profile_id": result.fusion_profile_id,
+        }
+
+    @staticmethod
+    def _fusion_usage(result) -> dict:
+        md = result.fusion_metadata or {}
+        usage = md.get("usage_summary", {})
+        if not usage:
+            # 从 panel 输出聚合一个估算用量
+            total_prompt = sum((p.get("prompt_tokens", 0) for p in md.get("panel_outputs", [])))
+            total_completion = sum((p.get("completion_tokens", 0) for p in md.get("panel_outputs", [])))
+            usage = {"prompt_tokens": total_prompt, "completion_tokens": total_completion,
+                     "total_tokens": total_prompt + total_completion}
+        return usage
+
+    def _soft_fusion_profile(self, preferred_ref: Optional[str], strategy_id: str):
+        """按 SOFT 优先级链（preferred_ref → strategy 默认）判断"有效候选 ref"是否指向
+        一个 Fusion 虚拟模型；是则返回对应 FusionProfile，否则 None。
+
+        这让"选中 Fusion 模型"经 **任一来源**（项目默认 / Agent 默认 / strategy 默认）
+        都能像普通模型一样透明分派到 FusionExecutionEngine（AC-U3）。user_override（HARD）
+        由调用方单独处理，不经此软链。若更高优先级已命中一个普通已配置模型，则该普通模型
+        获胜，不分派 Fusion（返回 None）。"""
+        strategy = self._registry.get_strategy(strategy_id)
+        chain: list[str] = []
+        if preferred_ref:
+            chain.append(preferred_ref)
+        if strategy and strategy.default_profile_ref:
+            chain.append(strategy.default_profile_ref)
+        for ref in chain:
+            if not isinstance(ref, str) or not ref:
+                continue
+            if ref.startswith("fusion/"):
+                fp = self._load_fusion_profile(ref)
+                if fp is not None:
+                    return fp
+                # fusion 引用但无此 profile → 诚实回落到下一优先级
+                continue
+            prof = self._registry.get_profile(ref)
+            if prof and prof.status == "configured":
+                return None  # 普通已配置模型在更高优先级获胜，不分派 Fusion
+        return None
+
+    async def _dispatch_fusion_stream(self, fp, messages, *, source, project_id, strategy_id):
+        """把一次 Fusion 聚合结果以 token 流式回吐（上层透明，与普通流式等价）。
+        Panel 内部并发 fan-out 对上层不可见，仅回吐最终单一 content。"""
+        fusion_run_id = f"scall_{uuid.uuid4().hex[:12]}"
+        try:
+            result = await self._dispatch_fusion(
+                fp, messages, source=source, project_id=project_id,
+                stage=None, strategy_id=strategy_id)
+            if result["status"] == "completed":
+                for ch in result.get("content", ""):
+                    yield {"type": "token", "content": ch, "call_id": result["call_id"]}
+                yield {"type": "done", "usage": result["usage_summary"],
+                       "call_id": result["call_id"]}
+            else:
+                yield {"type": "error",
+                       "error_category": result.get("error_category", "fusion_failed"),
+                       "error_message": result.get("error_message", "Fusion 聚合失败"),
+                       "call_id": result["call_id"]}
+        except Exception:
+            logger.exception("call_stream fusion dispatch failed")
+            yield {"type": "error", "error_category": "fusion_failed",
+                   "error_message": "Fusion 聚合异常", "call_id": fusion_run_id}
 
     @property
     def registry(self) -> ProviderRegistry:
@@ -152,10 +279,27 @@ class ModelGateway:
     ) -> dict:
         """Execute a model call through the gateway.
 
-        R11-7: `timeout` (seconds) overrides the adapter's fail-fast default for slow
-        domains (P3 planning); None keeps the default. Not a model/endpoint override —
-        the strategy still resolves the model (D-098)."""
+        R13-6: when user_override starts with "fusion/", the caller has selected a Fusion
+        virtual model — dispatch directly to the aggregation engine, bypassing the
+        yaml-based registry (Fusion profiles are DB entities, not yaml entries).
+        This is the entry point for Agent/Skill/P0-P6 selecting Fusion just like any
+        other model (方案 E: 与普通模型没有差别)."""
         t0 = time.monotonic()
+
+        # R13-6: 虚拟模型前缀分派（必须在 resolve_model 之前，因为 registry 不含 DB 虚拟模型）
+        if user_override and user_override.startswith("fusion/"):
+            fp = self._load_fusion_profile(user_override)
+            if fp is not None:
+                return await self._dispatch_fusion(fp, messages, source=source)
+            return _call_error("fusion_not_found",
+                               f"Fusion virtual model '{user_override}' 不存在", "fusion_lookup")
+
+        # R13-8-FIX: 软优先级链（strategy 默认）命中 Fusion → 透明分派（像普通模型；AC-U3）。
+        # call() 无 project 上下文，preferred_ref 由 call_stream 承载；此处覆盖 strategy 默认为 Fusion 的情形。
+        if user_override is None:
+            soft_fp = self._soft_fusion_profile(None, strategy_id)
+            if soft_fp is not None:
+                return await self._dispatch_fusion(soft_fp, messages, source=source)
 
         # 1. Resolve model
         profile, reason, provider = self._registry.resolve_model(
@@ -164,6 +308,11 @@ class ModelGateway:
 
         if not profile or not provider:
             return _call_error("not_configured", "No configured model available", reason)
+
+        # R13-6: resolved 结果碰巧是一个 Fusion virtual_ref（防御性分派，罕见路径）
+        fusion_fp = self._load_fusion_profile(profile.profile_id)
+        if fusion_fp is not None:
+            return await self._dispatch_fusion(fusion_fp, messages, source=source)
 
         # 2. Get API key — try credential_ref first, then env fallback
         explicit_provider = user_override is not None
@@ -293,6 +442,30 @@ class ModelGateway:
 
         # 1. Resolve primary model
         preferred_ref = self._project_preferred_ref(project_id, agent_ref)
+
+        # R13-6: 虚拟模型前缀流式分派（user_override 显式选中 Fusion，HARD）
+        if user_override and user_override.startswith("fusion/"):
+            fp = self._load_fusion_profile(user_override)
+            if fp is None:
+                yield {"type": "error", "error_category": "fusion_not_found",
+                       "error_message": f"Fusion 虚拟模型 '{user_override}' 不存在",
+                       "call_id": f"scall_{uuid.uuid4().hex[:12]}"}
+                return
+            async for fr in self._dispatch_fusion_stream(
+                    fp, messages, source=source, project_id=project_id, strategy_id=strategy_id):
+                yield fr
+            return
+
+        # R13-8-FIX: 软优先级链（项目默认 / Agent 默认 / strategy 默认）命中 Fusion → 透明流式分派。
+        # 这让 Agent 在 P0-P6 真实流程里把 Fusion 设为默认模型即可像普通模型一样使用（AC-U3）。
+        if user_override is None:
+            soft_fp = self._soft_fusion_profile(preferred_ref, strategy_id)
+            if soft_fp is not None:
+                async for fr in self._dispatch_fusion_stream(
+                        soft_fp, messages, source=source, project_id=project_id, strategy_id=strategy_id):
+                    yield fr
+                return
+
         profile, reason, provider = self._registry.resolve_model(
             user_override=user_override, strategy_id=strategy_id, preferred_ref=preferred_ref,
         )

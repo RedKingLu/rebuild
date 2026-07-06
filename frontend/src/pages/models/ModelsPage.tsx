@@ -5,6 +5,7 @@
  * 平台助手已移至全局浮动弹窗（PlatformAssistant），本页不再内嵌助手对话。
  */
 import { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import {
   listProviders, listProfiles, listStrategies,
   selfTest, listCalls, deleteProvider, deleteStrategy, getUsage,
@@ -259,8 +260,12 @@ export function ModelsPage() {
                     <span key={t} className="tag" style={{ fontSize: 10, background: 'var(--surface-2)', color: 'var(--fg)' }}>{t}</span>
                   ))}
                   {p.is_fusion_capable && (
-                    <span className="tag" title="能力标记：该模型可参与「聚合(Fusion)」多模型审议。聚合的配置与触发在独立的「聚合」页（默认关闭，R13 真实化），此处仅标记能力，不在模型页配置。"
-                      style={{ fontSize: 10, background: 'var(--violet, #8b5cf6)', color: '#fff' }}>可参与聚合(Fusion)</span>
+                    <Link to="/fusion" className="tag" title="能力标记：该模型可参与「聚合(Fusion)」多模型审议。点击查看 / 配置聚合。"
+                      style={{ fontSize: 10, background: 'var(--violet, #8b5cf6)', color: '#fff', textDecoration: 'none' }}>可参与聚合(Fusion) →</Link>
+                  )}
+                  {p.provider_id === 'rebuild-fusion' && (
+                    <Link to="/fusion" className="tag" title="Fusion 聚合模型：像普通模型一样在策略 / Agent 默认 / 助手中选用；点击进入 /fusion 配置。"
+                      style={{ fontSize: 10, background: 'var(--violet, #8b5cf6)', color: '#fff', textDecoration: 'none' }}>聚合模型 · 配置 →</Link>
                   )}
                 </div>
                 {p.recommended_use && <div className="sub" style={{ fontSize: 11, marginTop: 6 }}>推荐：{p.recommended_use}</div>}

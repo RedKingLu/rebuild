@@ -31,6 +31,11 @@ class CallLog(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     source: Mapped[str] = mapped_column(String(50), default="api")  # api / self_test / platform_assistant
+    # ── R13-4: 3 fusion sub-call-tree columns (additive; nullable for plain api calls) ──
+    fusion_parent_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    call_type: Mapped[str] = mapped_column(String(32), default="api", index=True)
+    # api / fusion_panel / fusion_judge / fusion_synthesizer / self_moa_sample / self_test / platform_assistant
+    fusion_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )
@@ -55,6 +60,9 @@ class CallLog(Base):
                 "total_tokens": self.total_tokens,
             },
             "source": self.source,
+            "fusion_parent_id": self.fusion_parent_id,
+            "call_type": self.call_type,
+            "fusion_run_id": self.fusion_run_id,
             "created_at": self.created_at.isoformat() if self.created_at else "",
             "completed_at": self.completed_at.isoformat() if self.completed_at else "",
         }

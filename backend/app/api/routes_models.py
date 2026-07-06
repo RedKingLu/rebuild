@@ -34,9 +34,105 @@ from app.schemas.model import (
 model_router = APIRouter(prefix="/model", tags=["models"])
 assistant_router = APIRouter(prefix="/assistant", tags=["assistant"])
 
+# R13-8-FIX: Fusion 作为一等模型接入——固定虚拟服务商 id（无自有 Key）。
+FUSION_PROVIDER_ID = "rebuild-fusion"
+
 
 def _gateway():
     return get_services().model_gateway
+
+
+def _fusion_availability(fp, gw) -> tuple[str, str]:
+    """按底层参与模型可用性诚实计算一个 Fusion 虚拟模型的 (status, capability_marker)。
+
+    - 未启用 → not_connected / disabled
+    - 启用且 ≥1 参与模型已配置 → configured / real_available（可被选用）
+    - 启用但无参与模型可达 → not_connected / not_connected（诚实降级，不伪装可用）
+    rebuild-fusion 无自有 Key，credential 永远不参与判定、不回显。
+    """
+    if not fp.enabled:
+        return "not_connected", "disabled"
+    reg = gw.registry
+    refs = [p.get("profile_ref") for p in (fp.panel_participants or []) if isinstance(p, dict)]
+    reachable = 0
+    for ref in refs:
+        prof = reg.get_profile(ref) if ref else None
+        if prof and prof.status == "configured":
+            reachable += 1
+    if reachable >= 1:
+        return "configured", "real_available"
+    return "not_connected", "not_connected"
+
+
+def _fusion_profiles_raw() -> list:
+    """读取全部 FusionProfile（真实 DB 行）。失败返回空（诚实，不阻断普通模型列表）。"""
+    try:
+        from app.core.database import get_session
+        from app.services.fusion_profile_service import FusionProfileService
+        db = get_session()
+        try:
+            rows, _ = FusionProfileService(db).list_all(limit=200, offset=0)
+            return list(rows)
+        finally:
+            db.close()
+    except Exception:
+        return []
+
+
+def _fusion_provider_response(gw) -> ProviderResponse:
+    """合成 rebuild-fusion 虚拟服务商条目（聚合能力，无 Key，source_status=real）。"""
+    rows = _fusion_profiles_raw()
+    markers = [_fusion_availability(fp, gw)[1] for fp in rows]
+    if any(m == "real_available" for m in markers):
+        cap, status = "real_available", "available"
+    elif rows:
+        cap, status = "configured_not_verified", "not_connected"
+    else:
+        cap, status = "not_checked", "not_connected"
+    return ProviderResponse(
+        provider_id=FUSION_PROVIDER_ID,
+        provider_name="Fusion 聚合",
+        provider_type="fusion",
+        api_format="openai",
+        endpoint_openai="", endpoint_anthropic="",
+        credential_status="configured",  # 无自有 Key，不要求填 Key、不回显
+        key_source="none",
+        status=status,
+        model_count=len(rows),
+        origin="seed",
+        note="多模型聚合虚拟服务商（Panel→Judge→Synthesizer）。无自有密钥，凭据继承底层参与模型。配置入口：/fusion。",
+        homepage="",
+        last_checked_at="",
+        capability_marker=cap,
+        source_status="real",
+        capability_status=status,
+    )
+
+
+def _fusion_profile_responses(gw) -> list[ModelProfileResponse]:
+    """把每个 FusionProfile 呈现为一个可选"模型"（profile_id=virtual_profile_ref）。"""
+    out: list[ModelProfileResponse] = []
+    for fp in _fusion_profiles_raw():
+        status, cap = _fusion_availability(fp, gw)
+        n = len(fp.panel_participants or [])
+        out.append(ModelProfileResponse(
+            profile_id=fp.virtual_profile_ref,
+            provider_id=FUSION_PROVIDER_ID,
+            model_name=fp.name,
+            display_name=fp.name,
+            capability_tags=["fusion", "aggregation"],
+            cost_tier="high",
+            supports_streaming=True,
+            supports_tool_calling=False,
+            is_fusion_capable=False,  # Fusion 自身不能作为聚合参与模型（防递归）
+            context_window_note=f"聚合 {n} 个参与模型",
+            recommended_use="多模型聚合审议（Panel→Judge→Synthesizer）",
+            not_recommended_use="",
+            status=status,
+            source_status="real",
+            capability_status=cap,
+        ))
+    return out
 
 
 def _provider_resp(p: dict) -> ProviderResponse:
@@ -87,6 +183,8 @@ async def list_providers():
     gw = _gateway()
     providers = gw.list_providers()
     resp = [_provider_resp(p) for p in providers]
+    # R13-8-FIX: 并入 rebuild-fusion 虚拟服务商（聚合能力，无 Key）——像普通服务商一样被看到。
+    resp.append(_fusion_provider_response(gw))
     get_services().trace_writer.write("state_change", action="list_providers",
                                        summary=f"{len(resp)} providers")
     return SuccessEnvelope(
@@ -254,6 +352,10 @@ async def list_profiles(provider_id: str = Query(default="", description="Filter
         )
         for p in profiles
     ]
+    # R13-8-FIX: 并入 Fusion 虚拟模型（每个 FusionProfile = 一个可选模型）——像普通模型一样被选用。
+    # 仅当无 provider 过滤，或明确过滤 rebuild-fusion 时并入。
+    if not provider_id or provider_id == FUSION_PROVIDER_ID:
+        resp.extend(_fusion_profile_responses(gw))
     return SuccessEnvelope(
         data=ModelProfileListData(profiles=resp).model_dump(),
         meta=Meta(source_status="configured" if resp else "not_configured",
