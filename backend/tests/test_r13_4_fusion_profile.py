@@ -85,12 +85,17 @@ class TestProfileCrud:
 
     def test_delete(self, client):
         d = _create(client)
-        r = client.delete(f"/api/fusion/profiles/{d['fusion_profile_id']}")
-        # not implemented in R13-4 (returns 405 Method Not Allowed or 404 try)
-        assert r.status_code in (404, 405)
-        # list still contains it (no delete endpoint this round)
-        if r.status_code == 405:
-            assert True
+        pid = d["fusion_profile_id"]
+        # DELETE 返回 200 + envelope deleted=True
+        r = client.delete(f"/api/fusion/profiles/{pid}")
+        assert r.status_code == 200, r.text
+        assert r.json().get("data", {}).get("deleted") is True
+        # 已删除 → GET 404
+        assert client.get(f"/api/fusion/profiles/{pid}").status_code == 404
+        # 重复删除 → 404
+        assert client.delete(f"/api/fusion/profiles/{pid}").status_code == 404
+        # 不存在的 id → 404
+        assert client.delete("/api/fusion/profiles/fp-nonexistent").status_code == 404
 
 
 # ── 2. Hard default constraints ────────────────────────────────────────

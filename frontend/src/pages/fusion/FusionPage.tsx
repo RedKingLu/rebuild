@@ -15,7 +15,7 @@ import { Modal } from '../../components/ui/Modal';
 import { StatusBadge } from '../../components/ui/StatusBadge';
 import {
   listFusionProfiles, createFusionProfile, updateFusionProfile,
-  toggleFusionProfile, triggerFusion, listFusionRuns, getFusionRun,
+  toggleFusionProfile, deleteFusionProfile, triggerFusion, listFusionRuns, getFusionRun,
   type FusionProfile, type FusionRun,
 } from '../../services/fusionService';
 import { listProfiles, type ModelProfileInfo } from '../../services/modelService';
@@ -91,10 +91,10 @@ export function FusionPage() {
   }
 
   async function handleCreateProfile() {
-    // 默认填入首个可用参与模型，创建一个可直接触发/配置的 Profile（default-off, manual）。
+    // 默认填入首个可用参与模型，创建后立即打开配置弹窗，用户完成配置再启用/触发。
     const first = candidateProfiles[0];
     try {
-      await createFusionProfile({
+      const fp = await createFusionProfile({
         name: `聚合模型 ${profiles.length + 1}`,
         panel_participants: first ? [{ profile_ref: first.profile_id, perspective: 'general' }] : [],
         judge: { profile_ref: first?.profile_id ?? '' },
@@ -102,8 +102,14 @@ export function FusionPage() {
         global_config: { trigger: 'manual', style: 'balanced', self_moa_enabled: true },
       });
       await refresh();
-      setTab('profiles');
+      setConfigProfile(fp); // 打开配置弹窗，让用户核对/调整参与模型
     } catch (e) { setError((e as Error).message); }
+  }
+
+  async function handleDelete(p: FusionProfile) {
+    if (!confirm(`确认删除聚合模型「${p.name}」？将级联清除其触发历史与子调用记录，且不可恢复。`)) return;
+    try { await deleteFusionProfile(p.fusion_profile_id); await refresh(); }
+    catch (e) { setError((e as Error).message); }
   }
 
   async function handleSelectRun(runId: string) {
@@ -192,6 +198,9 @@ export function FusionPage() {
                   </button>
                   <button className="btn sm ghost" onClick={() => { setHistoryProfile(p); setTab('history'); }}>
                     <Icon name="trace" size={13} />触发历史
+                  </button>
+                  <button className="btn sm ghost" onClick={() => handleDelete(p)} title="删除聚合模型（级联清除历史）">
+                    <Icon name="delete" size={13} />删除
                   </button>
                 </div>
               </div>

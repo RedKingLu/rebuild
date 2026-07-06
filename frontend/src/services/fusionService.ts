@@ -199,6 +199,12 @@ export async function toggleFusionProfile(id: string): Promise<FusionProfile> {
   return unwrap(r);
 }
 
+/** DELETE /api/fusion/profiles/{id} — 删除聚合模型（级联清理 runs/participants） */
+export async function deleteFusionProfile(id: string): Promise<void> {
+  const r = await del(`/fusion/profiles/${id}`);
+  unwrap(r);
+}
+
 /** POST /api/fusion/profiles/{id}/validate — 校验（防递归 / 异构 / 预算 / 超时） */
 export async function validateFusionProfile(id: string): Promise<ValidationResult> {
   const r = await post<ValidationResult>(`/fusion/profiles/${id}/validate`, {});

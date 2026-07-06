@@ -105,6 +105,17 @@ def update_profile(profile_id: str, req: FusionProfileUpdate, svc: FusionProfile
     )
 
 
+# ── DELETE /api/fusion/profiles/{id} ─────────────────────────────────
+
+@fusion_router.delete("/profiles/{profile_id}")
+def delete_profile(profile_id: str, svc: FusionProfileService = Depends(_svc)):
+    ok = svc.delete(profile_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Fusion profile not found")
+    return SuccessEnvelope(data={"deleted": True, "fusion_profile_id": profile_id},
+                          meta=Meta(source_status="real"))
+
+
 # ── POST /api/fusion/profiles/{id}/toggle ────────────────────────────
 
 @fusion_router.post("/profiles/{profile_id}/toggle")
