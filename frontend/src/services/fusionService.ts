@@ -10,7 +10,7 @@
  * 设计遵循：中文优先 / 密钥脱敏（本 service 永不处理 Key）/ 线性图标约定（Skill §4.4）。
  */
 
-import { get, post, put, unwrap } from './client';
+import { get, post, put, del, unwrap } from './client';
 
 // ── DTO ────────────────────────────────────────────────────────────────
 
