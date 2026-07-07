@@ -173,8 +173,8 @@ class FusionExecutionEngine:
         if not provider:
             return None
         api_format = provider.api_format
-        from app.providers.provider_registry import normalize_model_name
-        litellm_model = normalize_model_name(profile.model_name, api_format)
+        from app.providers.provider_registry import resolve_api_model_name
+        litellm_model = resolve_api_model_name(profile, api_format)
         api_base = (provider.endpoint_anthropic
                     if api_format == "anthropic" and provider.endpoint_anthropic
                     else provider.endpoint_openai or provider.endpoint_anthropic)

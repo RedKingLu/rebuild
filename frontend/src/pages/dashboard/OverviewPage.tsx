@@ -2,7 +2,6 @@ import { useNavigate } from 'react-router-dom';
 import { STAGE_LABELS } from '../../types';
 import type { Project } from '../../types';
 import { Icon, type IconKey } from '../../components/ui/Icon';
-import { MockBadge } from '../../components/ui/StatusBadge';
 import { useState, useEffect } from 'react';
 import { fetchProjects, fetchProject } from '../../services/projectService';
 import { listResources } from '../../services/resourceService';
@@ -242,7 +241,9 @@ export function OverviewPage() {
         <div className="card">
           <div className="spread">
             <b>上次退出的项目</b>
-            <MockBadge level="mock" />
+            {lastProject && lastProject.active_gate && (
+              <span className="tag amber" style={{ fontSize: 11 }}>等待 Gate 决策</span>
+            )}
           </div>
           {lastLoading ? (
             <div className="empty" style={{ padding: '24px 0', textAlign: 'center' }}>加载中...</div>
@@ -265,7 +266,7 @@ export function OverviewPage() {
             </div>
           ) : (
             <div className="empty" style={{ padding: '24px 0', textAlign: 'center' }}>
-              暂无退出记录，<a href="#" onClick={(e) => { e.preventDefault(); nav('/projects'); }}>前往项目列表</a>
+              暂无，<a href="#" onClick={(e) => { e.preventDefault(); nav('/projects'); }}>前往项目列表</a>点击进入工作区后此处将显示最近一次访问的项目
             </div>
           )}
         </div>

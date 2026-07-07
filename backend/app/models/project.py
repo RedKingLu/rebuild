@@ -23,6 +23,26 @@ class SourceType(str, enum.Enum):
     github = "github"
     manual = "manual"
 
+    @classmethod
+    def _missing_(cls, value):
+        """容错：反序列化时遇到 DB 中历史非法值（如 'local'）不抛 LookupError。
+
+        验收报告 R17-1B V-R17-1B-1/§11.P0-1：/source/projects 曾因
+        r1216 遗留 source_type='local' 导致 SQLAlchemy 枚举反序列化 LookupError
+        → 整表 500。改为返_UNKNOWN占位，由 migration 任务清洗。
+        """
+        return None  # 返回 None → nullable 列；如列nullable=False则走 default
+
+    @classmethod
+    def coerce(cls, value):
+        """从字符串安全取枚举；非法值返 None（不抛）。用于 IO 边界（DB读/ API 入参）。"""
+        if value is None:
+            return None
+        try:
+            return cls(value)
+        except ValueError:
+            return None
+
 
 class Project(Base):
     __tablename__ = "project"

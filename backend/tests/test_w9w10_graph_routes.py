@@ -12,8 +12,27 @@ test_r9_chain.py (19 cases) which remains green.
 """
 
 import json
+import os
+import time
 
 import pytest
+
+
+def _wait_for_project_stage(c, pid, expected, timeout=None):
+    """Poll the project DB until it reaches `expected` stage. R17-6: promotion-decision
+    drives the graph fire-and-forget in a background thread (transition_mode=
+    real_background), so the p0→p1 advance + DB sync land shortly AFTER the 200
+    response — mirror test_r9_chain._wait_for_stage rather than reading immediately."""
+    if timeout is None:
+        timeout = int(os.environ.get("R176_GRAPH_WAIT_TIMEOUT", "120"))
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = c.get(f"/api/projects/{pid}").json()["data"]["current_stage"]
+        if last == expected:
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"stage never reached {expected} in {timeout}s, last={last}")
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +81,9 @@ def test_w9_promotion_decision_drives_graph(tmp_path, monkeypatch, isolated_data
         result = r.json()["data"]
         assert result["graph_driven"] is True            # resumed via FlowRuntime
 
-        # graph advanced to p1 AND project DB was synced from graph state
+        # R17-6: graph advance runs in the background thread → wait for the DB sync,
+        # then assert graph/state + project DB both reflect p1 (no divergence).
+        _wait_for_project_stage(c, pid, "p1")
         s = c.get(f"/api/projects/{pid}/graph/state", params={"run_id": run_id}).json()["data"]
         assert s["current_stage"] == "p1"
         proj = c.get(f"/api/projects/{pid}").json()["data"]

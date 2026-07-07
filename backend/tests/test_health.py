@@ -8,7 +8,10 @@ def test_health(client):
     assert data["status"] == "ok"
     assert data["platform"] == "rebuild"
     assert data["version"] == "V26.1.1"
-    assert data["r_stage"] == "R10"
+    # R17-2 V-R17-1B-1/P1-4：r_stage 改为动态读 settings.r_stage（config.py 默认 R17），
+    # 不再硬编码 R10。测试只验证值在合法 R_STAGES 枚举内。
+    from app.core.status import R_STAGES
+    assert data["r_stage"] in R_STAGES
 
 
 def test_version(client):

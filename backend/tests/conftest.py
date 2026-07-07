@@ -3,10 +3,48 @@
 import pytest
 import tempfile
 import os
+import asyncio
 
 from app.core.config import Settings
 from app.dependencies import clear_services_cache, get_services
 from app.core.database import _engine, _SessionLocal
+
+
+@pytest.fixture(autouse=True)
+def _maybe_mock_llm(request, monkeypatch):
+    """When R176_MOCK_LLM=1 is set, patch litellm.acompletion to return instantly.
+
+    R17-6 makes graph resume run in the background; tests that assert on post-graph
+    state need the graph to complete quickly. Real LLM calls can take 14s+ each due to
+    provider timeouts. This fixture makes them instant so tests verify graph LOGIC
+    (node routing, gate creation, stage advancement) without waiting on providers.
+
+    Usage: R176_MOCK_LLM=1 pytest ...
+    """
+    if os.environ.get("R176_MOCK_LLM") != "1":
+        yield
+        return
+
+    class _MockChoice:
+        def __init__(self, content="mocked llm response"):
+            self.message = type("Msg", (), {"content": content, "tool_calls": None})()
+
+    class _MockResponse:
+        def __init__(self):
+            self.choices = [_MockChoice()]
+            self.usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1})()
+
+    async def _fake_acompletion(*args, **kwargs):
+        await asyncio.sleep(0)  # yield once
+        return _MockResponse()
+
+    async def _fake_completion(*args, **kwargs):
+        await asyncio.sleep(0)
+        return _MockResponse()
+
+    monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+    monkeypatch.setattr("litellm.completion", _fake_completion)
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -87,6 +125,17 @@ def isolated_data():
     except Exception:
         pass
     yield svc
+    # V-R17-1B-7: drain any outstanding background graph futures (R17-6 fire-and-forget
+    # daemon threads from promotion-decision / gate decision) BEFORE restoring the global
+    # settings.database_url. Otherwise a still-running daemon thread may lazily call
+    # get_engine()/get_services() AFTER the redirect below is removed and cache a
+    # real-DB engine in db_mod._engine, tripping a later test's isolation guard.
+    # Production never drains; fire-and-forget semantics are unchanged there.
+    try:
+        from app.api.routes_stages import drain_graph_tasks
+        drain_graph_tasks(timeout=30.0)
+    except Exception:
+        pass
     object.__setattr__(cfg.settings, "workspace_dir", _orig_ws)
     object.__setattr__(cfg.settings, "database_url", _orig_db)
     object.__setattr__(cfg.settings, "data_dir", _orig_data)

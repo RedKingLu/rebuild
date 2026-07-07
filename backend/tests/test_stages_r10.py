@@ -39,6 +39,8 @@ def test_get_stages_reflects_real_stage_plan_ref(client, project_run):
     assert by_code["P3"]["stage_plan_ref"] is None         # no plan yet
 
 
-def test_health_r_stage_is_r10(client):
-    assert client.get("/api/health").json()["r_stage"] == "R10"
-    assert client.get("/api/version").json()["r_stage"] == "R10"
+def test_health_r_stage_is_current(client):
+    # R17-2 V-R17-1B-1/P1-4：r_stage 动态化，只验证值落在合法 R_STAGES 内。
+    from app.core.status import R_STAGES
+    assert client.get("/api/health").json()["r_stage"] in R_STAGES
+    assert client.get("/api/version").json()["r_stage"] in R_STAGES

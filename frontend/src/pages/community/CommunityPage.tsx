@@ -74,7 +74,7 @@ export function CommunityPage() {
         </div>
 
         <footer style={{ marginTop: 32, padding: '20px 0', borderTop: '1px solid #30363d', fontSize: 12, color: '#6e7681', textAlign: 'center' }}>
-          rebuild 社区 · 当前版本 V26.1.1（R3 前端体验壳）· 正式社区功能 R15 建设
+          rebuild 社区 · 当前版本 V26.1.1（R17 前端体验壳）· 正式社区功能 R15 建设
         </footer>
       </main>
     </div>

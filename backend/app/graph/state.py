@@ -61,6 +61,9 @@ class GraphState(TypedDict, total=False):
     # approved (manual/plan mode). Signals the following {stage}_gate node to skip
     # its promotion interrupt (no stage actions ran → no promotion Gate to decide).
     plan_halt: Optional[str]  # the non-approve plan decision (reject / request_changes)
+    # R17-3: plan_presentation 两阶段流程标记。True 表示 plan_review 已批准，
+    # work 节点应执行完整 StageLoop（而非 plan_only 模式）。
+    plan_approved: Optional[bool]
 
     # --- capability / mode (scalar; real values, not placeholders) ---
     transition_mode: Literal["langgraph", "manual"]

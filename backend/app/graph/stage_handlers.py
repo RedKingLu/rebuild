@@ -79,7 +79,11 @@ class RealP0Handler:
         "Workspace 已初始化", "来源已识别并尝试物化", "intake 产物已生成",
         "非手动项目源码非空（或明确阻断引导）",
     ]
-    planned_actions = ["materialize_source", "generate_source_index", "write_intake_report"]
+    planned_actions = [
+        "物化源码（从 Git/本地/ZIP/URL 导入）",
+        "生成源码索引（目录结构·技术栈·文件清单）",
+        "写入接入报告（intake_report.json）",
+    ]
 
     def __init__(self, tracer=None, auditor=None):
         self.tracer = tracer
@@ -161,7 +165,11 @@ class RealP1Handler:
     acceptance_criteria = [
         "至少产出 1 项识别产物", "profiling_summary.md 已生成", "p2_input_manifest.json 已生成",
     ]
-    planned_actions = ["full_stack_profile", "build_summary", "build_p2_manifest"]
+    planned_actions = [
+        "全量识别项目结构/技术栈/依赖/配置",
+        "生成 profiling_summary.md 摘要",
+        "构建 P2 输入清单（p2_input_manifest.json）",
+    ]
 
     def __init__(self, tracer=None, auditor=None):
         self.tracer = tracer
@@ -230,7 +238,11 @@ class RealP2Handler:
         "资源需求建议已生成或明确无需求", "P2 Evidence 已落库（§4.7 五项，D-066）",
         "模型输出已标记为辅助分析而非事实（analysis_only）",
     ]
-    planned_actions = ["assess_with_llm", "write_p2_artifacts", "persist_p2_evidence"]
+    planned_actions = [
+        "调用模型执行六类风险/阻塞/缺口/资源评估",
+        "写入 P2 评估产物（风险/阻塞/验证缺口/资源需求）",
+        "落库 P2 Evidence（§4.7 五项，D-066）",
+    ]
 
     def __init__(self, tracer=None, auditor=None, assessment_service=None):
         self.tracer = tracer
@@ -366,8 +378,13 @@ class RealP3Handler:
         "Stage Plan 已生成", "Task Plan(Batch) 已生成", "TaskGraph 已生成（Q-R10-3 必生）",
         "边策略显式且通过校验", "P3 Evidence 已落库（§5.7 六项，D-066）", "高风险动作已标识",
     ]
-    planned_actions = ["generate_stage_plan", "generate_task_plans", "generate_task_graph",
-                       "write_p3_artifacts", "persist_p3_evidence"]
+    planned_actions = [
+        "生成 Stage Plan（目标/范围/风险/策略）",
+        "批量生成 Task Plan（Batch）",
+        "生成 TaskGraph（节点/边/执行策略，必生）",
+        "写入 P3 产物（stage_plan/task_plans/task_graph）",
+        "落库 P3 Evidence（§5.7 六项，D-066）",
+    ]
 
     def __init__(self, tracer=None, auditor=None, planning_service=None):
         self.tracer = tracer
@@ -514,9 +531,14 @@ class RealP4Handler:
         "失败/阻塞/Gate 路径诚实归类，不静默、不伪造完成",
         "只准备 P4→P5 Gate，不推进 P5 业务",
     ]
-    planned_actions = ["load_p3_task_graph", "build_node_executors",
-                       "run_task_graph_engine", "nodeloop_9step_per_node",
-                       "acceptance_per_node", "aggregate_real_evidence"]
+    planned_actions = [
+        "加载 P3 TaskGraph 与 execution 节点",
+        "构建节点执行器（P4ExecutionWorker）",
+        "驱动 TaskGraphEngine 按边策略执行",
+        "NodeLoop 9 步（含 Acceptance + 边路由）",
+        "节点独立验收（输出产物·sha256·Evidence 校验）",
+        "汇集真实产物/patch/Evidence（D-066）",
+    ]
 
     def __init__(self, tracer=None, auditor=None, gateway=None, aet=None):
         self.tracer = tracer
@@ -840,11 +862,13 @@ class RealP5Handler:
         "缺失任一硬必需槽位 → P5 不 completed（硬约束）",
         "有条件必需槽位标记为 evidence_gap（待 C5 真实命令验证）",
     ]
-    planned_actions = ["read_p4_input_via_p5_input_service",
-                       "create_p5_validation_plan",
-                       "verify_hard_required_slots_real",
-                       "mark_conditional_evidence_gap",
-                       "emit_honest_status"]
+    planned_actions = [
+        "读取 P4 输入事实源（output_code/patches/Evidence/summary/Gate）",
+        "创建 P5ValidationPlan（10 槽位）",
+        "真实验证 5 个硬必需槽位（不伪造）",
+        "执行有条件必需槽位真实命令（构建/运行/测试/静态检查）",
+        "诚实输出 P5 状态并持久化验证报告",
+    ]
 
     def __init__(self, tracer=None, auditor=None, p5_input_service=None,
                  p5_verification_service=None):
@@ -1159,11 +1183,13 @@ class RealP6Handler:
         "P6 最终 Gate 真实创建（P 阶段晋级 Gate 必须用户授权）",
         "source 默认不包含",
     ]
-    planned_actions = ["read_p5_passed_evidence",
-                       "generate_delivery_package_via_p6_service",
-                       "validate_delivery_completeness",
-                       "create_p6_final_gate",
-                       "emit_accepted_ready"]
+    planned_actions = [
+        "读取 P5 passed evidence 与验证报告",
+        "生成交付包（output_code+patches+索引+清单）",
+        "校验交付完整性（hash_manifest + 脱敏 + 风险清单）",
+        "创建 P6 最终 Gate（用户授权，D-023）",
+        "输出 accepted-ready 状态",
+    ]
 
     def __init__(self, tracer=None, auditor=None, p6_delivery_service=None):
         self.tracer = tracer

@@ -51,7 +51,7 @@ export function FusionPage() {
     try {
       const [fp, mp] = await Promise.all([
         listFusionProfiles(),
-        listProfiles().then(r => (r as any).data?.profiles || r.profiles || []).catch(() => []),
+        listProfiles().then(r => r.data?.profiles ?? []).catch(() => []),
       ]);
       setProfiles(fp);
       setModelCandidates(Array.isArray(mp) ? mp : []);

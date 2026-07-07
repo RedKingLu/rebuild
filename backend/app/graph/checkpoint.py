@@ -66,6 +66,26 @@ def thread_config(run_id: str) -> dict:
     return {"configurable": {"thread_id": run_id}}
 
 
+async def open_standalone_checkpointer() -> tuple[aiosqlite.Connection, AsyncSqliteSaver]:
+    """Open a NON-singleton checkpointer bound to the CURRENT event loop.
+
+    For background-thread graph drivers (routes_stages._run_graph_bg) that run on
+    their own throwaway loop: they must NOT reuse or mutate the process-global
+    singleton, which stays bound to the main/uvicorn loop and backs concurrent
+    graph/state reads. Sharing one aiosqlite connection across loops (the old
+    close+reopen-the-global hack) left the global singleton bound to the throwaway
+    loop, which dies on asyncio.run() exit → "Cannot operate on a closed database"
+    on the next main-loop read. The caller OWNS the returned connection and MUST
+    close it (writes commit to the shared sqlite file, so the main-loop checkpointer
+    still sees them via its own connection).
+    """
+    conn = await aiosqlite.connect(str(checkpoint_path()))
+    saver = AsyncSqliteSaver(conn)
+    await saver.setup()
+    return conn, saver
+
+
+
 async def close_checkpointer() -> None:
     """Close the singleton checkpointer connection (app shutdown / test teardown)."""
     global _conn, _saver, _lock

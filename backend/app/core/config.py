@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # Workspace root — per-project isolated directories (D-050)
     workspace_dir: str = "/home/king/rebuild/工作区"
 
+    # R17-2 V-R17-1B-1/P1-4：当前建设阶段（单一事实源，供 /api/health 与 /api/version 输出）。
+    # 随 R 阶段推进手动更新；未知时返 "unknown"（不硬编码过期值）。
+    r_stage: str = "R17"
+
     # R7 GitHub OAuth
     # redirect_uri 必须与 GitHub OAuth App 注册的回调一致，且在 dev/容器两套拓扑下不变：
     # 后端统一监听 8000 → 注册一次即可两套通用（端口标准见 06-容器化部署与执行隔离规范 §1.1）。

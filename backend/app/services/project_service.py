@@ -1,11 +1,14 @@
 """Project service — DB-backed CRUD operations on projects."""
 
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models.project import Project, ProjectStatus, SourceType
 from app.schemas.project import ProjectCreate
+
+logger = logging.getLogger("rebuild.project_service")
 
 
 class ProjectService:
@@ -32,7 +35,21 @@ class ProjectService:
         if limit is not None:
             q = q.limit(limit)
         q = q.offset(offset)
-        return q.all()
+        # R17-2 V-R17-1B-1/P0：source_type 枚举容错。DB 历史非法值（如 'local'）
+        # 触发 SQLAlchemy LookupError 时，降级跳过该行并记 warning，而非整表 500。
+        # SourceType._missing_ 已返 None；但 SAEnum 反序列化早于 Python Enum，故仍需此兜底。
+        rows = []
+        try:
+            rows = q.all()
+        except LookupError as exc:
+            logger.warning("ProjectService.list: 枚举反序列化失败，降级逐行加载: %s", exc)
+            for row in q.yield_per(50):
+                try:
+                    _ = row.source_type  # 触发列加载
+                    rows.append(row)
+                except LookupError:
+                    logger.warning("ProjectService.list: 跳过非法 source_type 行 id=%s", row.project_id)
+        return rows
 
     def get(self, project_id: str) -> Optional[Project]:
         return self.db.get(Project, project_id)

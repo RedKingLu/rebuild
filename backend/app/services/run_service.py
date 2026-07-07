@@ -92,9 +92,13 @@ class RunService:
             r = db.get(Run, run_id)
             if r is None:
                 return None
-            ss = r.stage_status or {}
-            ss[stage_code.upper()] = status
-            r.stage_status = ss
+            # R17-2 V-R17-1B-4 修复：
+            # 1) 去 .upper() — 与 Run.create 的小写 key（p0/p1/...）保持一致，避免大小写分裂
+            # 2) 赋新 dict 而非就地 mutate — SQLAlchemy JSON 列不追踪就地 mutation，
+            #    重赋新对象才触发 dirty → UPDATE
+            new_ss = dict(r.stage_status or {})
+            new_ss[stage_code.lower()] = status
+            r.stage_status = new_ss
             r.updated_at = datetime.now(timezone.utc)
             db.commit()
             db.refresh(r)

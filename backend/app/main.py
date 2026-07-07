@@ -142,6 +142,10 @@ app.include_router(dashboard_router, prefix="/api")
 from app.api.routes_events import router as events_router
 app.include_router(events_router, prefix="/api")
 
+# R13-4: Fusion configuration API (Fusion as a virtual model, 方案 E)
+from app.api.routes_fusion import fusion_router
+app.include_router(fusion_router, prefix="/api")
+
 # R6: Agent / Skill / Resource Registry / Credential (BYOK)
 from app.api.routes_agents import agent_router
 app.include_router(agent_router, prefix="/api")

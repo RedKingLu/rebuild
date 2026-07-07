@@ -33,8 +33,8 @@ providers:
     provider_name: "MaaS (icompify)"
     provider_type: "openai_compatible"
     api_format: "openai"
-    endpoint_openai: "http://maas.icompify.com:32788/v1"
-    endpoint_anthropic: "http://maas.icompify.com:32788/anthropic"
+    endpoint_openai: "https://api.icompify.com/v1"
+    endpoint_anthropic: "https://api.icompify.com/anthropic"
     env_key_var: "LLM_API_KEY"
     models:
       - model_name: "deepseek-v4-pro"

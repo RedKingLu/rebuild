@@ -62,6 +62,7 @@ class StageLoop:
         review_fn: Callable[[dict], ReviewResult],
         read_context_fn: Optional[Callable[[], dict]] = None,
         self_check_fn: Optional[Callable[[dict], List[str]]] = None,
+        plan_only: bool = False,
     ) -> StageLoopResult:
         reports = StageReports(self.project_id, self.stage)
 
@@ -72,6 +73,12 @@ class StageLoop:
             self.tracer.write("stage_loop", action="start_plan",
                               summary=f"{self.stage} start plan: {goal}",
                               project_id=self.project_id)
+
+        # R17-3: plan_only 模式 — 只生成计划，不执行。用于 plan_presentation gate 展示。
+        if plan_only:
+            return StageLoopResult(stage=self.stage, passed=True, escalated_to_gate=False,
+                                   result={}, rounds=[], report_refs=reports.all_refs(),
+                                   escalation_reason=None)
 
         # read context (C0-C6 assembly接入点 → R9-5-3)
         context = read_context_fn() if read_context_fn else {}

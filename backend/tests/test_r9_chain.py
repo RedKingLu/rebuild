@@ -11,6 +11,7 @@ Covers the P0→P1 minimal real chain end to end through the real API:
 """
 
 import os
+import time
 import pytest
 
 
@@ -62,14 +63,48 @@ def test_onboarding_creates_run_intake_and_gate(client, project_id):
 
 # ── Gate decision closure ─────────────────────────────────────────────────
 
-def _make_gate(client, project_id, stage="p0"):
+def _ensure_task_graph(run_id: str, stage: str):
+    """R17-2 V-R17-1B-2: gate 晋级强绑阶段产物。给测试 run 注入 task_graph 以满足校验。"""
+    from app.core.database import get_session
+    from app.models.task_graph import TaskGraph
+    import uuid
+    db = get_session()
+    try:
+        tg = db.query(TaskGraph).filter(TaskGraph.run_id == run_id, TaskGraph.stage == stage).first()
+        if tg is None:
+            tg = TaskGraph(task_graph_id=f"tg-test-{uuid.uuid4().hex[:8]}", project_id="",
+                           run_id=run_id, stage=stage, title=f"test gate {stage}", graph_status="completed")
+            db.add(tg)
+            db.commit()
+    finally:
+        db.close()
+
+
+def _make_gate(client, project_id, stage="p0", mode="auto"):
+    """创建 gate。R17-3: 默认 auto 模式跳过 plan gates（直接 stage_promotion）；
+    mode="plan"/"manual" 走两阶段流程（plan_review → plan_presentation → stage_promotion）。"""
     client.post(f"/api/projects/{project_id}/onboarding/complete",
-                json={"execution_mode": "plan"})
-    # R9-3G: Gate is created by Agent-driven /onboarding/execute
+                json={"execution_mode": mode})
     exec_resp = client.post(f"/api/projects/{project_id}/onboarding/execute")
-    assert exec_resp.status_code == 200
+    assert exec_resp.status_code == 200, exec_resp.text
     g = client.get(f"/api/projects/{project_id}/gates/active").json()["data"]
+    # R17-2: 注入 task_graph 以满足 gate 晋级强绑阶段产物校验
+    _ensure_task_graph(g.get("run_id", ""), g.get("stage", "p0"))
     return g
+
+
+def _wait_for_stage(client, project_id, expected, timeout=None):
+    """Poll until the project reaches `expected` stage (graph runs in background thread)."""
+    if timeout is None:
+        timeout = int(os.environ.get("R176_GRAPH_WAIT_TIMEOUT", "120"))
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = client.get(f"/api/projects/{project_id}").json()["data"]["current_stage"]
+        if last == expected:
+            return True
+        time.sleep(0.5)
+    raise AssertionError(f"stage never reached {expected} in {timeout}s, last={last}")
 
 
 def test_gate_approve_advances_stage(client, project_id):
@@ -78,8 +113,10 @@ def test_gate_approve_advances_stage(client, project_id):
     r = client.post(f"/api/projects/{project_id}/runs/{run_id}/stages/p0/promotion-decision",
                     json={"decision": "approve"})
     assert r.status_code == 200
+    assert r.json()["data"]["transition_mode"] == "real_background"  # async graph
+    _wait_for_stage(client, project_id, "p1")      # advanced in background thread
     proj = client.get(f"/api/projects/{project_id}").json()["data"]
-    assert proj["current_stage"] == "p1"      # advanced
+    assert proj["current_stage"] == "p1"
     assert proj.get("active_gate") in (None, "")
 
 
@@ -130,10 +167,12 @@ def test_promotion_decision_illegal_value_rejected(client, project_id):
     proj = client.get(f"/api/projects/{project_id}").json()["data"]
     assert proj["current_stage"] == "p0"       # not advanced
 
-    # Legal decision still works
+    # Legal decision still works (graph runs in background)
     r2 = client.post(f"/api/projects/{project_id}/runs/{run_id}/stages/p0/promotion-decision",
                      json={"decision": "approve"})
     assert r2.status_code == 200
+    assert r2.json()["data"]["transition_mode"] == "real_background"
+    _wait_for_stage(client, project_id, "p1")
     proj2 = client.get(f"/api/projects/{project_id}").json()["data"]
     assert proj2["current_stage"] == "p1"
 

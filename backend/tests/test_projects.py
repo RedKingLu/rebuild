@@ -421,10 +421,32 @@ class TestP0Idempotency:
         gates = gates_resp.json()["data"]["gates"]
         assert len(gates) > 0
         gate_id = gates[0]["gate_id"]
-        client.post(f"/api/projects/{pid}/gates/{gate_id}/decision", json={"decision": "approve"})
-
-        # Verify P1 state
+        run_id = gates[0]["run_id"]
+        stage = gates[0].get("stage", "p0")
+        # R17-2 V-R17-1B-2: 注入 task_graph 以满足 gate 晋级强绑阶段产物校验
+        from app.core.database import get_session
+        from app.models.task_graph import TaskGraph
+        import uuid
+        db = get_session()
+        try:
+            tg = db.query(TaskGraph).filter(TaskGraph.run_id == run_id, TaskGraph.stage == stage).first()
+            if tg is None:
+                tg = TaskGraph(task_graph_id=f"tg-test-{uuid.uuid4().hex[:8]}", project_id=pid,
+                               run_id=run_id, stage=stage, title=f"test gate {stage}", graph_status="completed")
+                db.add(tg)
+                db.commit()
+        finally:
+            db.close()
+        approve_resp = client.post(f"/api/projects/{pid}/gates/{gate_id}/decision", json={"decision": "approve"})
+        assert approve_resp.status_code == 200
+        # R17-6: graph runs in background thread — poll for P1
+        import time, os
+        _timeout = int(os.environ.get("R176_GRAPH_WAIT_TIMEOUT", "120"))
+        _deadline = time.time() + _timeout
         proj = client.get(f"/api/projects/{pid}").json()["data"]
+        while proj["current_stage"] != "p1" and time.time() < _deadline:
+            time.sleep(0.5)
+            proj = client.get(f"/api/projects/{pid}").json()["data"]
         assert proj["current_stage"] == "p1", f"Expected p1, got {proj['current_stage']}"
 
         # Now try to execute P0 again — must return 409

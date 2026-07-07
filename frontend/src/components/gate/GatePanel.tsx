@@ -2,7 +2,7 @@
  *  Click banner → Modal with left material list + right content preview.
  *  Supports approve / request_changes / reject decisions.
  */
-import { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Modal } from '../ui/Modal';
 
 interface MaterialItem {
@@ -86,7 +86,8 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
   const gateId = gate?.gate_id;
   // B-PLAN-1: plan_review gates review the pre-execution stage plan (D-025/D-026).
   const gateLabel = gate?.gate_type === 'stage_promotion' ? '阶段晋级 Gate'
-    : gate?.gate_type === 'plan_review' ? '计划审核 Gate'
+    : gate?.gate_type === 'plan_review' ? '项目启动确认'
+    : gate?.gate_type === 'plan_presentation' ? '接入计划审核 Gate'
     : gate?.gate_type === 'source_pending' ? '源码补全 Gate'
     : (gate?.gate_type || 'Gate');
 
@@ -180,6 +181,168 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
     });
   };
 
+  // Chinese field label mapping
+  const FIELD_LABELS: Record<string, string> = {
+    stage: '阶段', kind: '报告类型', generated_at: '生成时间', goal: '目标',
+    acceptance_criteria: '验收标准', planned_actions: '计划步骤', status: '状态',
+    verdict: '裁决', summary: '摘要', evidence_refs: '证据引用', error: '错误信息',
+    project_id: '项目 ID', artifact_type: '产物类型', source_type: '源码类型',
+    file_count: '文件数量', materialization_status: '物化状态', artifact_id: '产物 ID',
+    objective: '目标', scope: '范围', risk_level: '风险等级', gate_policy: 'Gate 策略',
+    completion_criteria: '完成标准', node_count: '节点数', edge_count: '边数',
+    degraded: '降级模式', graph_status: '执行状态', batch_id: '批次 ID',
+    task_plan_refs: '任务计划引用', batch_risk_level: '批次风险等级',
+    gate_required: '需要 Gate', stage_plan_ref: 'Stage Plan 引用',
+    task_graph_ref: 'TaskGraph 引用', analysis_only: '仅供分析', model_used: '使用模型',
+    report: '评估报告', items: '条目', actions_taken: '已执行操作',
+    criteria_results: '标准结果', plan_summary: '计划摘要', key_decisions: '关键决策',
+    estimated_tasks: '预估任务数', milestones: '里程碑',
+  };
+
+  // Collapsible long-string component (inline function component)
+  function LongValue({ text }: { text: string }) {
+    const [open, setOpen] = useState(false);
+    if (text.length <= 200) return <span style={{ fontSize: 12 }}>{text}</span>;
+    return (
+      <span style={{ fontSize: 12 }}>
+        {open ? text : `${text.slice(0, 200)}…`}
+        <button onClick={() => setOpen(!open)}
+          style={{ marginLeft: 4, fontSize: 11, color: 'var(--color-primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+          {open ? '收起' : '展开'}
+        </button>
+      </span>
+    );
+  }
+
+  // Generic field card renderer
+  function renderFieldCard(key: string, value: unknown, depth = 0): React.ReactNode {
+    const label = FIELD_LABELS[key] || key;
+    const keyStyle: React.CSSProperties = { fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600, minWidth: 80, marginRight: 8, flexShrink: 0 };
+    const rowStyle: React.CSSProperties = { display: 'flex', alignItems: 'flex-start', marginBottom: 6, paddingLeft: depth * 12 };
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'boolean') return <div key={key} style={rowStyle}><span style={keyStyle}>{label}</span><span style={{ fontSize: 12 }}>{value ? '✓' : '✗'}</span></div>;
+    if (typeof value === 'number') return <div key={key} style={rowStyle}><span style={keyStyle}>{label}</span><span style={{ fontSize: 12 }}>{String(value)}</span></div>;
+    if (typeof value === 'string') return <div key={key} style={rowStyle}><span style={keyStyle}>{label}</span><LongValue text={value} /></div>;
+    if (Array.isArray(value)) {
+      if (value.length === 0) return null;
+      const isStringArr = value.every((v: unknown) => typeof v === 'string');
+      return (
+        <div key={key} style={{ marginBottom: 8, paddingLeft: depth * 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)', marginBottom: 4 }}>{label}：</div>
+          {isStringArr
+            ? (value as string[]).map((v, i) => <div key={i} style={{ fontSize: 12, marginLeft: 12, marginBottom: 2 }}>• {v}</div>)
+            : (value as object[]).map((v, i) => (
+              <div key={i} style={{ marginLeft: 12, marginBottom: 6, padding: '6px 8px', background: 'var(--color-surface-subtle)', borderRadius: 4 }}>
+                {typeof v === 'object' && v !== null
+                  ? Object.entries(v as Record<string, unknown>).map(([k2, v2]) => renderFieldCard(k2, v2, 0))
+                  : <span style={{ fontSize: 12 }}>{String(v)}</span>}
+              </div>
+            ))
+          }
+        </div>
+      );
+    }
+    if (typeof value === 'object') {
+      const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => v !== null && v !== undefined);
+      if (entries.length === 0) return null;
+      return (
+        <div key={key} style={{ marginBottom: 8, paddingLeft: depth * 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)', marginBottom: 4 }}>{label}：</div>
+          <div style={{ marginLeft: 12, padding: '6px 8px', background: 'var(--color-surface-subtle)', borderRadius: 4 }}>
+            {entries.map(([k2, v2]) => renderFieldCard(k2, v2, 0))}
+          </div>
+        </div>
+      );
+    }
+    return null;
+  }
+
+  // Smart JSON renderer: branches on kind/artifact_type, falls back to field cards
+  function renderJsonContent(rawContent: string): React.ReactNode {
+    let j: Record<string, unknown>;
+    try { j = JSON.parse(rawContent); } catch {
+      return <pre style={{ fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-all', background: 'var(--color-surface-subtle)', padding: 12, borderRadius: 6, margin: 0 }}>{rawContent}</pre>;
+    }
+    const kind = j.kind as string | undefined;
+    // start_plan
+    if (kind === 'start_plan' || (j.goal && j.planned_actions)) {
+      return (
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>{j.goal as string || '接入计划'}</div>
+          {Array.isArray(j.acceptance_criteria) && (
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: 'var(--color-text-muted)' }}>验收标准：</div>
+              {(j.acceptance_criteria as string[]).map((c, i) => <div key={i} style={{ fontSize: 12, marginLeft: 12, marginBottom: 2 }}>✓ {c}</div>)}
+            </div>
+          )}
+          {Array.isArray(j.planned_actions) && (
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: 'var(--color-text-muted)' }}>计划步骤：</div>
+              {(j.planned_actions as string[]).map((a, i) => <div key={i} style={{ fontSize: 12, marginLeft: 12, marginBottom: 2 }}>{i + 1}. {a}</div>)}
+            </div>
+          )}
+        </div>
+      );
+    }
+    // construction report
+    if (kind === 'construction') {
+      return (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>施工报告 — {(j.stage as string || '').toUpperCase()}</div>
+          {renderFieldCard('status', j.status)}{renderFieldCard('summary', j.summary)}
+          {renderFieldCard('actions_taken', j.actions_taken)}{renderFieldCard('generated_at', j.generated_at)}
+        </div>
+      );
+    }
+    // acceptance report
+    if (kind === 'acceptance') {
+      return (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>验收报告 — {(j.stage as string || '').toUpperCase()}</div>
+          {renderFieldCard('verdict', j.verdict)}{renderFieldCard('criteria_results', j.criteria_results)}
+          {renderFieldCard('evidence_refs', j.evidence_refs)}{renderFieldCard('generated_at', j.generated_at)}
+        </div>
+      );
+    }
+    // stage_plan
+    if (kind === 'stage_plan' || j.artifact_type === 'stage_plan') {
+      return (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Stage Plan — {(j.stage as string || '').toUpperCase()}</div>
+          {renderFieldCard('objective', j.objective)}{renderFieldCard('scope', j.scope)}
+          {renderFieldCard('risk_level', j.risk_level)}{renderFieldCard('gate_policy', j.gate_policy)}
+          {renderFieldCard('completion_criteria', j.completion_criteria)}
+          {renderFieldCard('plan_summary', j.plan_summary)}{renderFieldCard('key_decisions', j.key_decisions)}
+          {renderFieldCard('estimated_tasks', j.estimated_tasks)}{renderFieldCard('generated_at', j.generated_at)}
+        </div>
+      );
+    }
+    // task_graph
+    if (kind === 'task_graph' || j.artifact_type === 'task_graph') {
+      const nodeCount = j.node_count as number | undefined;
+      return (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>TaskGraph — {(j.stage as string || '').toUpperCase()}</div>
+          {nodeCount !== undefined && nodeCount > 50
+            ? <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>任务图共 {nodeCount} 节点 / {(j.edge_count as number) || 0} 条边（图较大，仅显示摘要）</div>
+            : <>{renderFieldCard('node_count', j.node_count)}{renderFieldCard('edge_count', j.edge_count)}{renderFieldCard('degraded', j.degraded)}{renderFieldCard('milestones', j.milestones)}</>
+          }
+          {renderFieldCard('generated_at', j.generated_at)}
+        </div>
+      );
+    }
+    // generic field cards for all other JSON
+    const skipKeys = new Set(['project_id', 'artifact_id']);
+    return (
+      <div>
+        {!!j.stage && <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
+          {FIELD_LABELS[j.artifact_type as string] || (j.artifact_type as string) || '报告'} — {(j.stage as string).toUpperCase()}
+        </div>}
+        {Object.entries(j).filter(([k]) => !skipKeys.has(k)).map(([k, v]) => renderFieldCard(k, v))}
+      </div>
+    );
+  }
+
   // Collapsed banner (always visible when gate is active)
   return (
     <>
@@ -199,51 +362,61 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
       {/* Expanded Modal */}
       <Modal open={expanded} onClose={() => { setExpanded(false); setReworkHint(false); setDecisionFeedback(null); }}
         title={`Gate 审核 — ${gate?.stage?.toUpperCase?.() || 'P0'} · ${gateLabel}`} width={800}>
-        {gate?.gate_type === 'plan_review' && (
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 8 }}>
-            该阶段动作尚未执行。请审阅下方阶段计划后决定是否批准执行（批准后才会执行阶段动作）。
+        {gate?.gate_type === 'plan_review' ? (
+          <div style={{ padding: '12px 0' }}>
+            <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+              {gate?.summary || `欢迎进入工作台，是否开始 ${gate?.stage?.toUpperCase() || 'P0'} 接入？`}
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--color-text-muted)', lineHeight: 1.8, marginBottom: 8 }}>
+              {gate?.reason}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.8 }}>
+              <div>• 批准后 agent 将生成接入计划供您审核</div>
+              <div>• 您也可以选择「请求修改」调整方向，或「拒绝」终止接入</div>
+            </div>
           </div>
-        )}        <div style={{ display: 'flex', gap: 16, minHeight: 300 }}>
-          {/* Left: Material list (40%) */}
-          <div style={{ width: '40%', minWidth: 200, borderRight: '1px solid var(--color-border)', paddingRight: 12 }}>
-            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>审核材料</div>
-            {materialLabels.map(m => (
-              <div key={m.path}
-                onClick={() => { setActiveMaterial(m.path); loadMaterial(m.path); }}
-                style={{
-                  padding: '8px 10px', marginBottom: 4, borderRadius: 6, cursor: 'pointer',
-                  fontSize: 12,
-                  background: activeMaterial === m.path ? 'var(--color-primary-soft)' : 'var(--color-surface-subtle)',
-                  color: activeMaterial === m.path ? 'var(--color-primary)' : 'var(--color-text)',
-                  fontWeight: activeMaterial === m.path ? 600 : 400,
-                }}>
-                {m.label}
+        ) : (
+          <div>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 8 }}>
+              请审阅下方阶段材料后决定（批准后进入下一阶段）。
+            </div>
+            <div style={{ display: 'flex', gap: 16, minHeight: 300 }}>
+              <div style={{ width: '40%', minWidth: 200, borderRight: '1px solid var(--color-border)', paddingRight: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>审核材料</div>
+                {materialLabels.map(m => (
+                  <div key={m.path}
+                    onClick={() => { setActiveMaterial(m.path); loadMaterial(m.path); }}
+                    style={{
+                      padding: '8px 10px', marginBottom: 4, borderRadius: 6, cursor: 'pointer',
+                      fontSize: 12,
+                      background: activeMaterial === m.path ? 'var(--color-primary-soft)' : 'var(--color-surface-subtle)',
+                      color: activeMaterial === m.path ? 'var(--color-primary)' : 'var(--color-text)',
+                      fontWeight: activeMaterial === m.path ? 600 : 400,
+                    }}>
+                    {m.label}
+                  </div>
+                ))}
               </div>
-            ))}
+              <div style={{ flex: 1, overflow: 'auto', maxHeight: '50vh' }}>
+                {!content && loadingMaterial && (
+                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>加载中…</div>
+                )}
+                {content === '// 文件不可用或尚未生成' && (
+                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>该材料尚未生成或不可用。</div>
+                )}
+                {content && activeMat?.type === 'json' && (
+                  <div style={{ padding: '4px 0' }}>{renderJsonContent(content)}</div>
+                )}
+                {content && activeMat?.type === 'markdown' && (
+                  <div style={{ padding: '4px 0' }}>{renderMarkdown(content)}</div>
+                )}
+                {!content && !loadingMaterial && (
+                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>点击左侧材料查看内容</div>
+                )}
+              </div>
+            </div>
           </div>
-
-          {/* Right: Material content (60%) */}
-          <div style={{ flex: 1, overflow: 'auto', maxHeight: '50vh' }}>
-            {!content && loadingMaterial && (
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>加载中…</div>
-            )}
-            {content === '// 文件不可用或尚未生成' && (
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>该材料尚未生成或不可用。</div>
-            )}
-            {content && activeMat?.type === 'json' && (
-              <pre style={{ fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-                background: 'var(--color-surface-subtle)', padding: 12, borderRadius: 6, margin: 0 }}>
-                {(() => { try { return JSON.stringify(JSON.parse(content), null, 2); } catch { return content; } })()}
-              </pre>
-            )}
-            {content && activeMat?.type === 'markdown' && (
-              <div style={{ padding: '4px 0' }}>{renderMarkdown(content)}</div>
-            )}
-            {!content && !loadingMaterial && (
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>点击左侧材料查看内容</div>
-            )}
-          </div>
-        </div>
+        )}
 
         {/* Feedback status */}
         {decisionFeedback && (

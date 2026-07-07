@@ -44,7 +44,7 @@ function renderContent(sectionId: string, nav: ReturnType<typeof useNavigate>) {
             在用户拥有源代码的前提下，帮助用户完成项目迁移、重构、验证与交付。
           </p>
           <p style={{ fontSize: 13, color: 'var(--ink-2)', lineHeight: 1.7 }}>
-            当前版本 V26.1.1，处于 R3 前端体验壳阶段。平台核心闭环：接入源代码 → 建立事实源 → 评估风险 →
+            当前版本 V26.1.1，处于 R17 前端体验壳阶段。平台核心闭环：接入源代码 → 建立事实源 → 评估风险 →
             制定方案 → 受控执行 → 验证评审 → 交付归档。
           </p>
           <div className="cardgrid" style={{ marginTop: 16 }}>
@@ -163,7 +163,7 @@ export function DocsPage() {
         </nav>
         <div style={{ borderTop: '1px solid var(--line)', margin: '8px 14px', paddingTop: 8 }}>
           <div className="hash" style={{ fontSize: 11 }}>当前版本：V26.1.1</div>
-          <div className="hash" style={{ fontSize: 11 }}>当前阶段：R3 前端体验壳</div>
+          <div className="hash" style={{ fontSize: 11 }}>当前阶段：R17 前端体验壳</div>
           <span className="tag placeholder-tag" style={{ marginTop: 6 }}>占位</span>
         </div>
       </aside>

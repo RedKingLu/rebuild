@@ -15,6 +15,16 @@ from app.schemas.gate import GateDecisionRequest
 logger = logging.getLogger("rebuild.gate_backend")
 
 
+def _project_name(project_id: str) -> str:
+    """取项目名（欢迎语用）。失败返 None。"""
+    try:
+        from app.dependencies import get_services
+        p = get_services().project_service.get(project_id)
+        return p.name if p else None
+    except Exception:
+        return None
+
+
 class RealGateBackend:
     def create(self, *, project_id: str, run_id: str, stage: str,
                artifact_refs: List[str],
@@ -32,12 +42,19 @@ class RealGateBackend:
             )
             retry_action = metadata.get("retry_action") if metadata else None
         elif gate_type == "plan_review":
-            # B-PLAN-1 (D-025/D-026): pre-execution plan review. Manual/Plan modes
-            # pause here so the user审核阶段计划 BEFORE any stage action executes.
-            _mode = (metadata or {}).get("mode", "plan")
-            reason = f"{stage} 阶段计划待审核（{_mode} 模式）：审阅计划后决定是否执行阶段动作"
-            summary = (f"{stage} 阶段起始计划已生成（目标 / 验收标准 / 计划动作）。"
-                       f"请审阅后决定：批准执行 / 请求修改 / 拒绝。")
+            # R17-3: plan_review gate = 欢迎 + 确认开始（不显示计划内容）。
+            # 用户同意后 agent 才开始工作 → 生成计划 → 创建 plan_presentation gate 展示计划。
+            _proj = _project_name(project_id) or "当前项目"
+            reason = (f"欢迎进入「{_proj}」工作台。{stage.upper()} 接入将导入源码、"
+                      f"登记材料与初始风险，产出可信接入输入。")
+            summary = f"欢迎进入「{_proj}」工作台，是否开始 {stage.upper()} 接入？"
+            retry_action = None
+        elif gate_type == "plan_presentation":
+            # R17-3: 展示 agent 生成的接入计划，用户/Agent 审核后再执行。
+            _proj = _project_name(project_id) or "当前项目"
+            reason = (f"「{_proj}」{stage.upper()} 接入计划已生成。请审阅计划后决定"
+                      f"是否执行（批准后 agent 将按计划执行阶段动作）。")
+            summary = f"{stage.upper()} 接入计划已生成，请审阅后决定是否执行。"
             retry_action = None
         else:
             reason = f"{stage} 小循环通过，请求阶段晋级"

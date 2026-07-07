@@ -12,6 +12,7 @@ the graph checkpoint thread survives across requests for the plan-approval resum
 No mock, no fabricated pass — asserts on the live gate type + real artifacts on disk.
 """
 
+import time
 import pytest
 
 from app.services import workspace_service
@@ -66,21 +67,54 @@ def test_plan_mode_pauses_at_plan_review_before_execution(tmp_path, monkeypatch,
         assert gate["gate_type"] == "plan_review", f"expected plan_review, got {gate['gate_type']}"
 
         # 2) the plan is available for review, but execution has NOT happened yet
+        # R17-3: plan_review gate 不再挂 start_plan.json 作为审核材料（前端显示欢迎语而非 JSON）。
+        # start_plan 仍写入工作区供后续 stage_promotion gate 使用。
         art = _artifacts(pid)
         assert (art / "p0_start_plan.json").exists(), "plan (起始计划) must be produced for review"
-        assert "p0_start_plan.json" in " ".join(gate.get("artifact_refs") or [])
         assert not (art / "p0_acceptance.json").exists(), \
             "stage actions must NOT run before the plan is approved (审核通过后才执行动作)"
 
-        # 3) approve the plan → graph resumes → executes → pauses at the promotion gate
+        # R17-3 两阶段流程：plan_review 批准 → plan_presentation gate（展示计划）
         run_id = d["run_id"]
-        r = c.post(f"/api/projects/{pid}/runs/{run_id}/stages/p0/promotion-decision",
-                   json={"decision": "approve", "reason": "approve plan"})
-        assert r.status_code == 200, r.text
+        gid1 = gate["gate_id"]
+        r1 = c.post(f"/api/projects/{pid}/gates/{gid1}/decision",
+                    json={"decision": "approve"})
+        assert r1.status_code == 200, r1.text
+        assert r1.json()["data"].get("transition_mode") == "real_background"
 
+        # R17-6: graph runs in background thread — poll for the plan_presentation gate
+        import os
+        _timeout = int(os.environ.get("R176_GRAPH_WAIT_TIMEOUT", "120"))
+        _deadline = time.time() + _timeout
+        gate_presentation = _active_gate(c, pid)
+        while (gate_presentation is None or gate_presentation["gate_type"] != "plan_presentation") \
+                and time.time() < _deadline:
+            time.sleep(0.5)
+            gate_presentation = _active_gate(c, pid)
+        assert gate_presentation is not None and gate_presentation["gate_type"] == "plan_presentation", \
+            f"after plan_review approve, plan_presentation gate should appear, got {gate_presentation}"
+        # plan_presentation 含 start_plan 但不含执行结果
+        assert (art / "p0_start_plan.json").exists()
+        assert not (art / "p0_acceptance.json").exists(), \
+            "执行结果不应在 plan_presentation 阶段生成"
+
+        # 3) 批准 plan_presentation → agent 执行 → stage_promotion gate（含完整结果）
+        gid2 = gate_presentation["gate_id"]
+        r2 = c.post(f"/api/projects/{pid}/gates/{gid2}/decision",
+                    json={"decision": "approve"})
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["data"].get("transition_mode") == "real_background"
+
+        # R17-6: graph runs in background thread — poll for the stage_promotion gate
+        _timeout = int(os.environ.get("R176_GRAPH_WAIT_TIMEOUT", "120"))
+        _deadline = time.time() + _timeout
         gate2 = _active_gate(c, pid)
+        while (gate2 is None or gate2["gate_type"] != "stage_promotion") \
+                and time.time() < _deadline:
+            time.sleep(0.5)
+            gate2 = _active_gate(c, pid)
         assert gate2 is not None and gate2["gate_type"] == "stage_promotion", \
-            f"after plan approval the promotion gate should appear, got {gate2}"
+            f"after plan_presentation approve, stage_promotion gate should appear, got {gate2}"
         assert (art / "p0_acceptance.json").exists(), \
             "stage actions (and the real acceptance report) must run after plan approval"
 

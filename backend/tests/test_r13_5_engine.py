@@ -46,6 +46,9 @@ class FakeProfile:
         self.profile_id = profile_id
         self.provider_id = provider_id
         self.model_name = model_name
+        # 与真实 ModelProfileInfo 契约一致：api_model_name 缺省表示"用 model_name 派生"
+        # （resolve_api_model_name 走 normalize_model_name 加 litellm 前缀）。
+        self.api_model_name = None
         self.status = "configured"
 
 

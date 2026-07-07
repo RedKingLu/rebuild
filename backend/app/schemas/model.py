@@ -31,6 +31,9 @@ class ProviderResponse(BaseModel):
 
 class ImportModelInput(BaseModel):
     model_name: str
+    # 设置后原样发送给 litellm（不走 normalize 加 openai/ 前缀）；
+    # 用于不接受 litellm 前缀的自定义端点（如 LongCat、部分国产 MaaS）
+    api_model_name: str = ""
     display_name: str = ""
     capability_tags: list[str] = Field(default_factory=list)
     cost_tier: str = "medium"

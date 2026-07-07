@@ -57,9 +57,11 @@ interface Props {
   agentRole?: string;
   latestRequest?: string;
   status: TaskOverviewStatus;
+  /** R17-3: 当前 active gate（用于 plan_review 等待态显示"计划审核中"） */
+  activeGate?: { gate_type: string; gate_status: string; stage: string } | null;
 }
 
-export function TaskOverview({ projectId, runId, stage, agentRole, latestRequest, status }: Props) {
+export function TaskOverview({ projectId, runId, stage, agentRole, latestRequest, status, activeGate }: Props) {
   const [graph, setGraph] = useState<TaskGraphData | null>(null);
 
   useEffect(() => {
@@ -88,7 +90,11 @@ export function TaskOverview({ projectId, runId, stage, agentRole, latestRequest
     auto_review: '审核 Agent', expert: '专家 Agent',
   };
 
+  // R17-3: plan_review gate 等待态优先于 agent 自身的 status.phase
+  const isPlanReviewPending = activeGate?.gate_type === 'plan_review' && activeGate?.gate_status === 'waiting_decision';
+
   const statusLine = () => {
+    if (isPlanReviewPending) return { icon: '⏸', text: '等待计划审核', color: 'var(--amber)' };
     switch (status.phase) {
       case 'thinking': return { icon: '💭', text: '思考中…', color: 'var(--color-primary)' };
       case 'tool': return { icon: '🔧', text: `调用工具 ${status.toolName || ''}${status.toolTotal ? ` (${status.toolIndex}/${status.toolTotal})` : ''}`, color: 'var(--color-primary)' };
@@ -153,7 +159,7 @@ export function TaskOverview({ projectId, runId, stage, agentRole, latestRequest
           flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           fontSize: 12, color: latestRequest ? 'var(--color-text)' : 'var(--color-text-muted)',
         }}>
-          {latestRequest || (hasGraph ? '执行任务清单' : '暂无进行中的任务')}
+          {latestRequest || (isPlanReviewPending ? `${(activeGate?.stage || stage).toUpperCase()} 计划审核中…` : (hasGraph ? '执行任务清单' : '暂无进行中的任务'))}
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0, fontSize: 11, color: st.color }}>
           <span>{st.icon}</span><span>{st.text}</span>

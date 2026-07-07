@@ -92,3 +92,23 @@ def _migrate_add_columns_on_engine(engine) -> None:
         _add_if_missing("p_gate", "checkpoint_ref", "VARCHAR(64)")
         _add_if_missing("p_gate", "interrupt_ref", "VARCHAR(64)")
 
+        # R13-4: call_log 3 fusion columns (additive; Alembic is authoritative on PG)
+        _add_if_missing("call_log", "fusion_parent_id", "VARCHAR(36)")
+        _add_if_missing("call_log", "call_type", "VARCHAR(32)")
+        _add_if_missing("call_log", "fusion_run_id", "VARCHAR(36)")
+
+    # R13-4: call_log fusion indexes (additive). SQLite has no IF NOT EXISTS on
+    # CREATE INDEX, so attempt/ignore. Idempotent across restarts.
+    if str(engine.url).startswith("sqlite"):
+        with engine.connect() as conn:
+            for _idx_stmt in (
+                "CREATE INDEX IF NOT EXISTS ix_call_log_fusion_parent_id ON call_log (fusion_parent_id)",
+                "CREATE INDEX IF NOT EXISTS ix_call_log_fusion_run_id ON call_log (fusion_run_id)",
+                "CREATE INDEX IF NOT EXISTS ix_call_log_call_type ON call_log (call_type)",
+            ):
+                try:
+                    conn.execute(_sa.text(_idx_stmt))
+                    conn.commit()
+                except Exception:
+                    pass  # already exists
+

@@ -28,6 +28,7 @@ class Services:
         self._workspace_service = None
         self._event_service = None
         self._model_gateway = None
+        self._fusion_profile_service = None
 
     @property
     def model_gateway(self):
@@ -104,6 +105,17 @@ class Services:
             from app.services.event_service import EventService
             self._event_service = EventService(self)
         return self._event_service
+
+    @property
+    def fusion_profile_service(self):
+        """Fusion config service (R13-4). Per-request DB session — gateway code
+        (R13-6) calls this to look up a FusionProfile by virtual_profile_ref."""
+        if self._fusion_profile_service is None:
+            from app.services.fusion_profile_service import FusionProfileService
+            from app.core.database import get_session
+            db = get_session()
+            self._fusion_profile_service = FusionProfileService(db)
+        return self._fusion_profile_service
 
 
 def get_services(settings: Settings | None = None) -> Services:

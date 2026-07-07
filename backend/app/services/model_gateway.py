@@ -20,6 +20,7 @@ from app.providers.provider_registry import (
     StrategyInfo,
     get_provider_registry,
     normalize_model_name,
+    resolve_api_model_name,
     _resolve_api_key,
 )
 from app.core.audit_writer import AuditWriter
@@ -328,7 +329,7 @@ class ModelGateway:
             api_base = provider.endpoint_openai or provider.endpoint_anthropic
 
         # 4. Normalize model name
-        litellm_model = normalize_model_name(profile.model_name, api_format)
+        litellm_model = resolve_api_model_name(profile, api_format)
 
         # 5. Execute via adapter
         result = await self._adapter.complete(
@@ -362,7 +363,7 @@ class ModelGateway:
                 fb_base = (fb_provider.endpoint_anthropic
                            if fb_format == "anthropic" and fb_provider.endpoint_anthropic
                            else fb_provider.endpoint_openai or fb_provider.endpoint_anthropic)
-                fb_model = normalize_model_name(fb_profile.model_name, fb_format)
+                fb_model = resolve_api_model_name(fb_profile, fb_format)
                 fb_result = await self._adapter.complete(
                     model=fb_model, messages=messages, api_base=fb_base, api_key=fb_key,
                     api_format=fb_format, max_tokens=max_tokens, temperature=temperature,
@@ -525,7 +526,7 @@ class ModelGateway:
                 api_base = (try_provider.endpoint_anthropic
                             if api_format == "anthropic" and try_provider.endpoint_anthropic
                             else try_provider.endpoint_openai or try_provider.endpoint_anthropic)
-                litellm_model = normalize_model_name(try_profile.model_name, api_format)
+                litellm_model = resolve_api_model_name(try_profile, api_format)
 
                 profile_failed_pre_token = False
 
@@ -601,7 +602,7 @@ class ModelGateway:
             # Write call log (always — 公理3; runs even when the consumer breaks early
             # and GeneratorExit unwinds through the yields above).
             latency = (time.monotonic() - t0) * 1000
-            final_model = normalize_model_name(selected_profile.model_name, selected_provider.api_format)
+            final_model = resolve_api_model_name(selected_profile, selected_provider.api_format)
             call_record = {
                 "model_call_id": call_id,
                 "provider_id": selected_provider.provider_id,
@@ -652,7 +653,7 @@ class ModelGateway:
         else:
             api_base = provider.endpoint_openai or provider.endpoint_anthropic
         return {
-            "model": normalize_model_name(profile.model_name, api_format),
+            "model": resolve_api_model_name(profile, api_format),
             "api_base": api_base,
             "api_key": key_val,
             "api_format": api_format,
@@ -721,7 +722,7 @@ class ModelGateway:
         else:
             api_base = provider.endpoint_openai or provider.endpoint_anthropic
 
-        litellm_model = normalize_model_name(profile.model_name, api_format)
+        litellm_model = resolve_api_model_name(profile, api_format)
 
         # Execute connectivity test
         result = await self._adapter.test_connectivity(

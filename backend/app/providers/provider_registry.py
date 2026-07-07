@@ -67,6 +67,7 @@ class ModelProfileInfo:
     profile_id: str  # "{provider_id}/{model_name}"
     provider_id: str
     model_name: str
+    api_model_name: str = ""  # 发送时原样使用（不走 normalize 加前缀）；用于不接受 litellm 前缀的自定义端点（如 LongCat）
     display_name: str = ""
     capability_tags: list[str] = field(default_factory=list)
     cost_tier: str = "medium"
@@ -118,6 +119,12 @@ def normalize_model_name(model_name: str, api_format: str) -> str:
         return model_name
     prefix = API_FORMAT_PREFIX.get(api_format, "openai")
     return f"{prefix}/{model_name}"
+
+
+def resolve_api_model_name(profile: "ModelProfileInfo", api_format: str) -> str:
+    """决定实际发送给 litellm 的模型名：优先用 api_model_name 原样发送，
+    否则走 normalize_model_name 自动加 openai/ 前缀。"""
+    return profile.api_model_name or normalize_model_name(profile.model_name, api_format)
 
 
 def _compute_capability_marker(credential_status: str, status: str, error_category: str) -> str:
@@ -190,6 +197,7 @@ class ProviderRegistry:
                 profile_id=profile_id,
                 provider_id=p["provider_id"],
                 model_name=m["model_name"],
+                api_model_name=m.get("api_model_name", ""),
                 display_name=m.get("display_name", m["model_name"]),
                 capability_tags=m.get("capability_tags", []),
                 cost_tier=m.get("cost_tier", "medium"),
@@ -451,6 +459,7 @@ class ProviderRegistry:
                     profile_id=profile_id,
                     provider_id=provider_id,
                     model_name=m["model_name"],
+                    api_model_name=m.get("api_model_name", ""),
                     display_name=m.get("display_name", m["model_name"]),
                     capability_tags=m.get("capability_tags", []),
                     cost_tier=m.get("cost_tier", "medium"),

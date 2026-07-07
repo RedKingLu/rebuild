@@ -190,6 +190,14 @@ class GateService:
         cur = (g.stage or (getattr(project, "current_stage", None) if project else None) or "p0").lower()
 
         if decision == "approve":
+            # R17-2 V-R17-1B-2/P1: gate 晋级强绑阶段产物。stage_promotion 前校验该
+            # run+stage 有真实产物（task_graph 存在），杜绝空壳晋级。plan_review 豁免。
+            if g.gate_type == "stage_promotion" and g.run_id:
+                if not self._stage_has_real_artifact(g.run_id, cur):
+                    raise ValueError(
+                        f"阶段 {cur} 晋级被拒绝：run {g.run_id} 在该阶段无真实产物"
+                        f"（task_graph 未创建）。请先完成阶段执行再申请晋级。"
+                    )
             try:
                 nxt = STAGE_ORDER[STAGE_ORDER.index(cur) + 1]
             except (ValueError, IndexError):
@@ -219,6 +227,28 @@ class GateService:
                     ps.update(g.project_id, active_gate="")
                 except Exception:
                     _logger.warning(f"_apply_promotion: request_changes update failed for project {g.project_id}", exc_info=True)
+
+    def _stage_has_real_artifact(self, run_id: str, stage: str) -> bool:
+        """校验某 run 在某阶段是否有真实产物（task_graph 存在）。
+
+        最小阈值：task_graph 表有 run_id+stage 记录。未来可加 artifact/output_code。
+        """
+        db = self._db()
+        try:
+            from app.models.task_graph import TaskGraph
+            return (
+                db.query(TaskGraph)
+                .filter(TaskGraph.run_id == run_id, TaskGraph.stage == stage)
+                .limit(1)
+                .count()
+                > 0
+            )
+        except Exception as exc:
+            # task_graph 表不存在时（旧环境）降级放行，避免阻断
+            _logger.warning("_stage_has_real_artifact 查询失败，降级放行: %s", exc)
+            return True
+        finally:
+            db.close()
 
     def policy_check(self, req: PolicyCheckRequest) -> PolicyCheckResponse:
         from app.services.mode_policy import authorize_action, risk_for_action

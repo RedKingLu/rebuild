@@ -11,6 +11,8 @@ Endpoints:
   POST /api/assistant/chat     — platform assistant chat
 """
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Query
 
 from app.dependencies import get_services
@@ -505,6 +507,34 @@ async def self_test(req: SelfTestRequest):
             )
 
     _last_self_test[cooldown_key] = now
+
+    # Fusion 虚拟服务商无自有凭据，"连通自测"降级为参与者可用性探测，不走凭据校验。
+    if req.provider_id == FUSION_PROVIDER_ID:
+        gw = _gateway()
+        rows = _fusion_profiles_raw()
+        enabled = [fp for fp in rows if fp.enabled] if rows else []
+        if enabled:
+            sample = _fusion_availability(enabled[0], gw)
+            status, cap = sample
+        elif rows:
+            status, cap = "configured_not_verified", "not_connected"
+        else:
+            status, cap = "not_configured", "not_checked"
+        return SuccessEnvelope(
+            data=SelfTestResponse(
+                provider_id=FUSION_PROVIDER_ID,
+                profile_id="",
+                model=f"{len(rows)} 个聚合模型",
+                status=status,
+                latency_ms=0,
+                credential_status="configured",
+                error_category="",
+                error_message="",
+                checked_at=datetime.now(timezone.utc).isoformat(),
+                call_id="",
+            ).model_dump(),
+            meta=Meta(source_status=cap, capability_status="available" if cap == "real_available" else "not_connected"),
+        )
 
     gw = _gateway()
     result = await gw.self_test(req.provider_id, req.profile_id)

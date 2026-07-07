@@ -1,10 +1,12 @@
 """Stage API routes."""
 
+import asyncio as _asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
 
 from app.dependencies import get_services
+from app.graph.runtime import graph_thread_active
 from app.schemas.stage import StagePlanRequest, PromotionRequest, PromotionDecision
 from app.schemas.common import SuccessEnvelope, Meta
 
@@ -68,7 +70,6 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
     (no double-advancement, no stale-gate fallback). Non-graph runs fall back to
     stage_service.promote(drive_promotion=True) for direct advancement."""
     import uuid as _uuid
-    from app.graph.runtime import get_flow_runtime, graph_thread_active
     from app.services.gate_service import VALID_DECISIONS
 
     svc = _svc()
@@ -83,29 +84,19 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
 
 
     graph_driven = False
-    graph_state = None
     if await graph_thread_active(run_id):
         try:
-            graph_state = await get_flow_runtime().resume(run_id, req.decision)
+            # R17-6: fire-and-forget graph resume; HTTP returns immediately.
+            _ensure_graph_task(_run_graph_bg(run_id, req.decision, project_id, stage))
             graph_driven = True
         except Exception as e:
-            logger.warning("graph resume failed for run=%s: %s", run_id, e)
+            logger.warning("graph task launch failed for run=%s: %s", run_id, e)
             graph_driven = False
 
-    if graph_driven and graph_state:
-        # Graph handled the gate decision internally (make_gate_node → _gate_backend.decide).
-        # Sync DB from graph state: set current_stage and clear active_gate.
-        nxt = graph_state.get("current_stage")
-        if nxt:
-            try:
-                svc.project_service.update(project_id, current_stage=nxt, active_gate="")
-            except Exception as e:
-                logger.warning("DB sync current_stage failed project=%s: %s", project_id, e)
-        for st, status in (graph_state.get("stage_status") or {}).items():
-            try:
-                svc.run_service.set_stage_status(run_id, st, status)
-            except Exception as e:
-                logger.warning("DB sync stage_status failed run=%s stage=%s: %s", run_id, st, e)
+    if graph_driven:
+        # R17-6: graph resumed in the background; DB sync happens there on completion.
+        # Transition is accepted (202-equivalent semantics): client should rely on SSE
+        # for the next gate / stage change rather than polling this response.
         result = {
             "promotion_id": f"promo-{_uuid.uuid4().hex[:8]}",
             "gate_id": "",
@@ -115,7 +106,7 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
                 "approve": "approved", "reject": "rejected",
                 "request_changes": "changes_requested"}.get(req.decision, "unknown"),
             "audit_ref": None,
-            "transition_mode": "real",
+            "transition_mode": "real_background",
         }
     else:
         # Non-graph (or graph resume failed with partial side-effects): direct path.
@@ -166,7 +157,9 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
                 result = svc.stage_service.promote(
                     project_id, run_id, stage, req, drive_promotion=True)
             except ValueError as e:
-                raise HTTPException(400, str(e))
+                # R17-2 V-R17-1B-2: 无产物晋级拒绝统一 422（非法值仍 400）
+                code = 422 if "无真实产物" in str(e) else 400
+                raise HTTPException(code, str(e))
 
     result["graph_driven"] = graph_driven
 
@@ -267,3 +260,114 @@ async def get_taskgraph(project_id: str, run_id: str, stage: str):
         )
     finally:
         db.close()
+
+
+# ── R17-6: background graph runner ──────────────────────────────────────────
+
+
+import threading as _threading
+
+# Registry of outstanding background graph futures. Production never reads this
+# (fire-and-forget), but the test isolation teardown drains it (drain_graph_tasks)
+# BEFORE restoring the global settings.database_url — otherwise a still-running
+# daemon thread can lazily call get_engine()/get_services() AFTER the redirect is
+# removed and bind the module-global engine to the REAL .data/rebuild.db, which the
+# next test's isolation guard then (correctly) rejects. See V-R17-1B-7.
+_graph_tasks: list = []
+_graph_tasks_lock = _threading.Lock()
+
+
+def _ensure_graph_task(coro):
+    """Run a graph-coroutine in a dedicated daemon thread with its own event loop.
+
+    Why a thread instead of loop.create_task():
+      - In production (FastAPI async), the graph can run for minutes (LLM calls,
+        source materialization). Offloading to a thread keeps the event loop free
+        for health checks, SSE, and other requests.
+      - In tests (sync TestClient), there is no running loop to tick between requests,
+        so loop.create_task() would never actually run the coroutine. A dedicated
+        thread with asyncio.run() drives the graph to completion regardless.
+
+    The returned Future supports .result(timeout) for tests that want to wait.
+    """
+    import concurrent.futures
+    def _runner():
+        return _asyncio.run(coro)
+    fut = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(_runner)
+    # Register the future so tests can drain it before tearing down DB isolation.
+    # Prune finished futures so the list does not grow unbounded in long-lived
+    # production processes.
+    with _graph_tasks_lock:
+        _graph_tasks.append(fut)
+        _graph_tasks[:] = [f for f in _graph_tasks if not f.done()]
+    return fut
+
+
+def drain_graph_tasks(timeout: float = 30.0) -> None:
+    """Test-only: block until all outstanding background graph futures finish.
+
+    Called by the test isolation teardown (conftest.isolated_data) BEFORE it
+    restores the global settings.database_url, guaranteeing no daemon thread lazily
+    binds the module engine to the real DB after the redirect is removed. Production
+    never calls this — fire-and-forget semantics are unchanged there.
+    """
+    with _graph_tasks_lock:
+        pending = [f for f in _graph_tasks if not f.done()]
+    for f in pending:
+        try:
+            f.result(timeout=timeout)
+        except Exception:
+            # A background graph failure is logged/audited inside _run_graph_bg;
+            # here we only care that the thread has stopped touching globals.
+            pass
+    with _graph_tasks_lock:
+        _graph_tasks[:] = [f for f in _graph_tasks if not f.done()]
+
+
+async def _run_graph_bg(run_id: str, decision: str, project_id: str, stage: str):
+    """Background graph resume: run to completion, log and audit on failure.
+    Mirrors the post-resume DB sync the sync path used to do, keeping
+    project.state fresh once the graph actually completes.
+
+    NOTE: This runs in a dedicated thread with its own event loop (see
+    _ensure_graph_task). LangGraph's async SqliteSaver binds its internal
+    asyncio.Lock + connection to the loop that first creates it. We therefore run
+    the resume on an ISOLATED checkpointer+graph bound to THIS thread's loop and
+    NEVER touch the process-global checkpointer / FlowRuntime — those stay bound to
+    the main (uvicorn / TestClient) loop and back concurrent graph/state reads. The
+    old approach closed+reopened the global singleton here, which left it bound to
+    this throwaway loop; once the loop dies at asyncio.run() exit, the next
+    main-loop read hit "Cannot operate on a closed database". Writes commit to the
+    shared sqlite file, so the main-loop checkpointer still sees the advanced state.
+    """
+    svc = get_services()
+    try:
+        from app.graph.checkpoint import open_standalone_checkpointer, thread_config
+        from app.graph.graph import build_graph
+        from langgraph.types import Command
+        conn, saver = await open_standalone_checkpointer()
+        try:
+            g = build_graph().compile(checkpointer=saver)
+            graph_state = await g.ainvoke(Command(resume=decision),
+                                          config=thread_config(run_id))
+        finally:
+            await conn.close()
+        nxt = graph_state.get("current_stage")
+        if nxt:
+            try:
+                svc.project_service.update(project_id, current_stage=nxt, active_gate="")
+            except Exception:
+                pass
+        for st, status in (graph_state.get("stage_status") or {}).items():
+            try:
+                svc.run_service.set_stage_status(run_id, st, status)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("background graph run failed run=%s: %s", run_id, e, exc_info=True)
+        try:
+            svc.trace_writer.write("graph_error", action="graph_bg_failed",
+                                   summary=f"Graph background resume failed: {e}",
+                                   project_id=project_id, run_id=run_id, stage=stage)
+        except Exception:
+            pass

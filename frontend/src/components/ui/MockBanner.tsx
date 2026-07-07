@@ -13,7 +13,7 @@ export function GlobalMockBanner() {
   if (dismissed) return null;
   return (
     <div className="banner mock-banner" style={{ borderRadius: 0, borderLeft: 0, borderRight: 0, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-      <span>⚠ 当前为前端体验壳（R6），部分页面为静态演示 [mock]；模型/供应商/资源/集成/项目/概览页已真实接入后端。</span>
+      <span>⚠ 当前为前端体验壳（R17），部分页面为静态演示 [mock]；模型/供应商/资源/集成/项目/概览页已真实接入后端。</span>
       <button className="btn sm ghost" onClick={dismiss} style={{ flexShrink: 0 }}>✕</button>
     </div>
   );

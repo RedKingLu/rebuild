@@ -49,6 +49,8 @@ interface Props {
   // runId fetches the active TaskGraph; if omitted, the bar shows task-context + live status.
   runId?: string | null;
   runStatus?: string;
+  // R17-3: 当前 active gate（plan_review 等待态 → TaskOverview 显示"计划审核中"）
+  activeGate?: { gate_type: string; gate_status: string; stage: string } | null;
 }
 
 /** UX-4: a timeline entry. user/agent are chat bubbles; tool is a structured
@@ -63,7 +65,7 @@ interface DisplayEntry {
 
 export function AgentChat({ projectId, stage, reviewEvents, systemMessages = [],
   conversationId, onConversationChange,
-  runId, runStatus }: Props) {
+  runId, runStatus, activeGate }: Props) {
   const execMode = useWorkspaceStore(s => s.execMode);
   const [entries, setEntries] = useState<DisplayEntry[]>([]);
   const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
@@ -388,7 +390,8 @@ export function AgentChat({ projectId, stage, reviewEvents, systemMessages = [],
           This is NOT the 7-stage project pipeline. */}
       <TaskOverview projectId={projectId} runId={runId || undefined}
         stage={stage} agentRole={currentConversation?.agent_role || undefined}
-        latestRequest={latestRequest} status={taskStatus} />
+        latestRequest={latestRequest} status={taskStatus}
+        activeGate={activeGate} />
 
       {/* Mode + specialist indicator */}
       <div style={{
