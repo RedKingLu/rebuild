@@ -33,7 +33,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.services.workspace_service import workspace_path
+from app.services.workspace_service import (
+    workspace_path,
+    resolve_default_remote_host_id,
+    BindingStatus,
+)
 from app.services.execution_provider import get_execution_provider
 from app.services.p5_validation_plan import P5SlotStatus
 
@@ -212,12 +216,29 @@ class P5CommandExecutionService:
 
     def execute_slot_command(self, project_id: str, slot_id: str, command: str,
                               timeout: int = 120) -> P5CommandResult:
-        """执行单个槽位命令，返回执行结果 + 验证状态。"""
+        """执行单个槽位命令，返回执行结果 + 验证状态。
+
+        R14-4: 当 Workspace 绑定了默认 remote 环境时，自动分派到
+        get_execution_provider(mode="remote", remote_host_id, db)。
+        """
         result = P5CommandResult(slot_id=slot_id, command=command)
         env_mode = self._mode or os.environ.get("EXECUTION_MODE", "local")
 
+        # R14-4: resolve default remote host for this workspace (G3 fix).
+        remote_host_id = resolve_default_remote_host_id(project_id)
+
         try:
-            provider = get_execution_provider(mode=env_mode)
+            if env_mode == "remote" or remote_host_id:
+                # Workspace bound to a remote host → route to it.
+                # remote_host_id may be None if binding resolves but DB lookup fails,
+                # in which case the factory raises ValueError (caught below).
+                from app.core.database import get_session
+                with get_session() as db:
+                    provider = get_execution_provider(
+                        mode="remote", remote_host_id=remote_host_id, db=db,
+                    )
+            else:
+                provider = get_execution_provider(mode=env_mode)
         except Exception as e:
             result.failure_reason = f"ExecutionProvider 初始化失败：{e}"
             result.status = "validation_failed"
@@ -242,6 +263,34 @@ class P5CommandExecutionService:
         result.stderr = exec_result.get("stderr", "")[:5000]
         result.blocked = exec_result.get("blocked", False)
         result.risk_level = exec_result.get("risk_level", "L0")
+
+        # R14-4 WP4: persist RemoteInvocation when routed to a remote provider.
+        if (env_mode == "remote" or remote_host_id) and exec_result.get("provider") == "remote_ssh":
+            try:
+                from app.core.database import get_session
+                from app.services.invocation_service import record_invocation
+                from app.services.workspace_service import get_environment_block
+                _env_blk = get_environment_block(project_id)
+                _binding_id = _env_blk.get("default_binding_id")
+                with get_session() as _db:
+                    _inv = record_invocation(
+                        db=_db,
+                        workspace_id=project_id,
+                        binding_id=_binding_id,
+                        provider="remote_ssh",
+                        command_digest=__import__("hashlib").sha256(
+                            command.encode()).hexdigest()[:16],
+                        exit_code=result.exit_code,
+                        risk_level=result.risk_level,
+                        elapsed_ms=elapsed,
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                        trigger="p_stage",
+                    )
+                    result.invocation_id = _inv.invocation_id
+                    result.audit_ref = _inv.audit_ref
+            except Exception as e:
+                logger.warning("RemoteInvocation record failed (non-fatal): %s", e)
 
         # L4/L5 高风险 → Gate 拦截
         if result.risk_level in ("L4", "L5"):

@@ -22,6 +22,7 @@ import { StagePageP5 } from './StagePageP5';
 import { StagePageP6 } from './StagePageP6';
 import { AgentChat, type SystemMessage } from '../../components/agent/AgentChat';
 import { ConversationList } from './ConversationList';
+import { RemoteEnvironmentPanel } from './RemoteEnvironmentPanel';
 import {
   fetchWorkspace, fetchFileTree, fetchMaterialTree, fetchSessions, fetchMode,
   type WorkspaceAggregate, type FileTreeResponse,
@@ -90,6 +91,11 @@ export function WorkspacePage() {
     })();
     return () => { cancelled = true; };
   }, [id, run?.current_stage]);
+
+  // R17-5: record "last visited project" on entry, powers OverviewPage "上次退出项目"
+  useEffect(() => {
+    if (id) localStorage.setItem('lastProjectId', id);
+  }, [id]);
 
   // ── Data loading ──
   const loadData = useCallback(async () => {
@@ -265,6 +271,7 @@ export function WorkspacePage() {
           } label={
             data?.active_gate?.gate_status === 'rejected' ? 'Gate 已拒绝' :
             data?.active_gate?.gate_status === 'changes_requested' ? '需返工' :
+            data?.active_gate?.gate_type === 'plan_review' ? '等待计划审核' :
             data?.active_gate ? '等待 Gate' : '无待决 Gate'
           } tone={data?.active_gate?.gate_status === 'rejected' || data?.active_gate?.gate_status === 'changes_requested' ? 'red' : data?.active_gate ? 'amber' : 'grey'} />
           <ModelGwChip />
@@ -330,7 +337,7 @@ export function WorkspacePage() {
               />
             )}
             {ws.activity === 'git' && <div className="empty" style={{ fontSize: 12 }}>Git：基础占位（范围内入口）</div>}
-            {ws.activity === 'remote' && <div className="empty" style={{ fontSize: 12 }}>远程：基础占位（范围内入口）</div>}
+            {ws.activity === 'remote' && <RemoteEnvironmentPanel projectId={id!} />}
             {ws.activity === 'search' && <div className="empty" style={{ fontSize: 12 }}>搜索：基础占位（范围内入口）</div>}
           </div>
         )}
@@ -409,6 +416,8 @@ export function WorkspacePage() {
                     // task-context + real-time status when no graph is active.
                     runId={data?.active_run?.run_id || run?.run_id || null}
                     runStatus={run?.run_status || undefined}
+                    // R17-3: plan_review gate 等待态 → TaskOverview 显示"计划审核中"
+                    activeGate={data?.active_gate || null}
                   />
                 </div>
               </div>

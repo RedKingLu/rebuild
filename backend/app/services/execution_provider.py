@@ -345,6 +345,8 @@ def get_execution_provider(
     mode: str | None = None,
     remote_host_id: str | None = None,
     db=None,
+    *,
+    trust_on_first_use: bool = False,
 ) -> "ExecutionProvider":
     """Return the execution provider for the given mode.
 
@@ -354,6 +356,10 @@ def get_execution_provider(
       - "workspace_local" → WorkspaceLocalExecutionProvider (workspace-bound, no whitelist, DENY check)
       - "container"       → ContainerExecutionProvider (docker sandbox, read-only)
       - "remote"          → RemoteSSHExecutionProvider (paramiko SSH + SFTP)
+
+    trust_on_first_use: for the remote mode, accept unknown host keys on first
+    connection and persist the fingerprint (TOFU, D-093).  Default False =
+    reject unknown hosts.
     """
     resolved_mode = (mode or os.environ.get("EXECUTION_MODE") or "local").strip().lower()
     if resolved_mode == "container":
@@ -370,5 +376,5 @@ def get_execution_provider(
         host = RemoteService(db).get(remote_host_id)
         if host is None:
             raise ValueError(f"RemoteHost not found: {remote_host_id}")
-        return RemoteSSHExecutionProvider(host, db)
+        return RemoteSSHExecutionProvider(host, db, trust_on_first_use=trust_on_first_use)
     return LocalSubprocessExecutionProvider()

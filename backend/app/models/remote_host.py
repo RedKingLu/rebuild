@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, Enum as SAEnum, Integer, Boolean
+from sqlalchemy import String, Text, DateTime, Enum as SAEnum, Integer, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
 import enum
 
@@ -55,3 +55,8 @@ class RemoteHost(Base):
     # R9-5-6 T6: SSH host key fingerprint (SHA-256 hex) for strict host verification.
     # None = not yet registered (trust_on_first_use or reject on connect).
     host_key_fingerprint: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # R14-4: Declared environment metadata (from user input or auto-detection / G8).
+    # JSON string: {"os":"Ubuntu 24.04","python":"3.12","services":[{"name":"sshd","port":22}]}
+    environment_tags: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # R14-4 / DD-V7.0: execution driver. "ssh" now; reserved: "ironic","vm","docker","k8s"
+    driver: Mapped[str] = mapped_column(String(30), server_default="ssh", nullable=False)

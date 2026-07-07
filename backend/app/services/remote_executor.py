@@ -136,6 +136,69 @@ class RemoteSSHExecutionProvider:
         self._mode = mode
         self._tofu = trust_on_first_use
 
+    async def detect_environment(self) -> dict:
+        """G8: read-only remote OS / runtime / service fingerprint.
+
+        Runs a battery of read-only commands via one SSH session and returns a
+        structured dict suitable for RemoteHost.environment_tags.  Never writes,
+        never mutates.  Returns partial results on failure (honest, per D-105).
+        """
+        import hashlib as _hl
+        result: dict = {
+            "ok": False,
+            "os": None,
+            "kernel": None,
+            "arch": None,
+            "python": None,
+            "services": [],
+            "探测命令指纹": [],
+            "error": None,
+        }
+        # Several read-only commands.  Each is individually safe and avoids
+        # /dev/null redirection (which matches the DENY list).  Honest on error.
+        try:
+            r_rel = await self.execute("cat /etc/os-release || true", timeout=10)
+            if r_rel.get("blocked"):
+                result["error"] = "探测命令被安全策略拦截"
+                return result
+            rel_out = r_rel.get("stdout", "")
+            uname_out = (await self.execute("uname -a", timeout=10)).get("stdout", "").strip()
+            py_raw = (await self.execute("python3 --version 2>&1 || true", timeout=10)).get("stdout", "").strip()
+            tools_raw = (await self.execute("command -v docker node go java mvn gradle || true", timeout=10)).get("stdout", "")
+            ports_raw = (await self.execute("ss -tlnp | awk '{print $4}' | grep -E ':(22|3306|5432|6379|8080|5236|54321|5866)$' | sort -u || true", timeout=10)).get("stdout", "")
+        except Exception as exc:
+            result["error"] = _safe_str(exc)
+            return result
+
+        # Parse /etc/os-release
+        for line in rel_out.splitlines():
+            if line.startswith("PRETTY_NAME="):
+                result["os"] = line.split("=", 1)[1].strip('"')
+            elif line.startswith("VERSION_ID=") and result["os"]:
+                result["os"] = f"{result['os']} {line.split('=', 1)[1].strip('\"')}"
+        result["os"] = (result["os"] or "").strip() or None
+        # kernel / arch from uname -a
+        result["kernel"] = uname_out or None
+        # python
+        if py_raw.startswith("Python "):
+            result["python"] = py_raw.split()[1]
+        # runtime tools present
+        for tool in ("docker", "node", "go", "java", "mvn", "gradle"):
+            if f"/{tool}" in tools_raw:
+                result["探测命令指纹"].append(tool)
+        # port→service fingerprint
+        known_ports = {"3306": "mysql", "5432": "postgres", "6379": "redis",
+                       "8080": "tomcat/spring", "5236": "dameng", "54321": "kingbase",
+                       "5866": "highgo"}
+        for p, svc in known_ports.items():
+            if f":{p}" in ports_raw:
+                result["services"].append({"name": svc, "port": int(p), "status": "detected"})
+        # sshd always present (we're connected through it)
+        if not any(s["name"] == "sshd" for s in result["services"]):
+            result["services"].insert(0, {"name": "sshd", "port": 22, "status": "connected"})
+        result["ok"] = True
+        return result
+
     async def execute(
         self,
         code: str,
@@ -457,6 +520,16 @@ def _safe_str(exc: Exception) -> str:
     msg = str(exc)
     # Truncate if suspiciously long (might contain credential data)
     return msg[:256] if len(msg) > 256 else msg
+
+
+def _between(text: str, start: str, end: str) -> str:
+    """Return text between start and end markers (exclusive)."""
+    try:
+        s = text.index(start) + len(start)
+        e = text.index(end, s)
+        return text[s:e].strip()
+    except ValueError:
+        return ""
 
 
 def _classify_transfer_risk(action: str, remote_path: str) -> str:

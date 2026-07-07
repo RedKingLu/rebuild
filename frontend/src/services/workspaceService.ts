@@ -1,6 +1,6 @@
 /** Workspace API service — file read/write, material tree, terminal execution. */
 
-import { get, put, post } from './client';
+import { get, put, post, del } from './client';
 import type { Project, Run, Gate, Artifact, EvidenceGap, Trace, Audit } from '../types';
 
 export interface WorkspaceAggregate {
@@ -142,4 +142,58 @@ export async function fetchMode(projectId: string): Promise<string> {
 export async function updateMode(projectId: string, mode: string): Promise<string> {
   const resp = await put<{ execution_mode: string }>(`/projects/${projectId}/mode`, { mode });
   return resp.data.execution_mode;
+}
+
+// ── R14-4: Environment binding / invocation / detection ────────────────
+
+export interface EnvironmentBlock {
+  default_binding_id: string | null;
+  bindings: string[];
+}
+
+export interface RemoteInvocationItem {
+  invocation_id: string;
+  provider: string;
+  trigger: string;
+  command_digest: string;
+  exit_code: number;
+  risk_level: string;
+  elapsed_ms: number;
+  status: string;
+  stdout_ref: string | null;
+  stderr_ref: string | null;
+  audit_ref: string | null;
+  started_at: string | null;
+}
+
+export async function fetchEnvBlock(projectId: string): Promise<EnvironmentBlock> {
+  const resp = await get<EnvironmentBlock>(`/projects/${projectId}/environment/block`);
+  return resp.data;
+}
+
+export async function addBinding(projectId: string, remoteHostId: string, isDefault = false, remoteWorkdir?: string): Promise<EnvironmentBlock> {
+  const resp = await post<EnvironmentBlock>(`/projects/${projectId}/environment/bindings`, {
+    remote_host_id: remoteHostId, is_default: isDefault, remote_workdir: remoteWorkdir,
+  });
+  return resp.data;
+}
+
+export async function setDefaultBinding(projectId: string, bindingId: string | null): Promise<EnvironmentBlock> {
+  const resp = await post<EnvironmentBlock>(`/projects/${projectId}/environment/default`, { binding_id: bindingId });
+  return resp.data;
+}
+
+export async function removeBinding(projectId: string, bindingId: string): Promise<EnvironmentBlock> {
+  const resp = await del<EnvironmentBlock>(`/projects/${projectId}/environment/bindings/${bindingId}`);
+  return resp.data;
+}
+
+export async function fetchInvocations(projectId: string, limit = 20): Promise<RemoteInvocationItem[]> {
+  const resp = await get<{ items: RemoteInvocationItem[] }>(`/projects/${projectId}/environment/invocations`, { limit });
+  return resp.data.items;
+}
+
+export async function detectEnvironment(projectId: string, remoteHostId: string): Promise<Record<string, any>> {
+  const resp = await get<Record<string, any>>(`/projects/${projectId}/environment/detect/${remoteHostId}`);
+  return resp.data;
 }

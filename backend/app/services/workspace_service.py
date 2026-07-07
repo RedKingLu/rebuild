@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.core.config import settings
+from app.models.workspace_environment_binding import WorkspaceEnvironmentBinding, BindingStatus
 from app.schemas.workspace import WorkspaceAggregateResponse, GraphStatus, FileIndex
 from app.schemas.project import ProjectResponse
 from app.schemas.common import Meta
@@ -134,6 +135,120 @@ def get_execution_mode(project_id: str) -> str:
         except Exception:
             pass
     return "plan"
+
+
+# ── Workspace Environment binding (R14-4, single source in workspace.json) ─
+# The `environment` block in workspace.json is the ONE control source for which
+# remote host a workspace is bound to and which is the default — mirroring the
+# execution_mode single-source principle (workspace_service.py:97 comment).
+#
+# environment: { "default_binding_id": <id|null>, "bindings": [<id>, ...] }
+
+def _environment_block(project_id: str) -> dict:
+    """Read the environment block from workspace.json. Creates defaults if missing."""
+    meta_file = workspace_path(project_id) / ".rebuild" / "workspace.json"
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    else:
+        meta = {}
+    if "environment" not in meta or not isinstance(meta["environment"], dict):
+        meta["environment"] = {"default_binding_id": None, "bindings": []}
+    return meta["environment"]
+
+
+def _write_environment_block(project_id: str, env: dict) -> None:
+    """Persist the environment block back to workspace.json."""
+    meta_file = workspace_path(project_id) / ".rebuild" / "workspace.json"
+    meta_file.parent.mkdir(parents=True, exist_ok=True)
+    meta: dict = {}
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    meta["environment"] = env
+    meta["environment_updated_at"] = _now()
+    meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_environment_block(project_id: str) -> dict:
+    """Public: read the workspace's environment block."""
+    return _environment_block(project_id)
+
+
+def add_binding_to_workspace(project_id: str, binding_id: str, set_default: bool = False) -> dict:
+    """Register a binding_id in the workspace environment block.
+    Optionally sets it as the default (clearing any prior default)."""
+    return _with_binding_mutations(project_id, binding_id, add=True, set_default=set_default)
+
+
+def remove_binding_from_workspace(project_id: str, binding_id: str) -> dict:
+    """Remove a binding_id from the workspace environment block."""
+    return _with_binding_mutations(project_id, binding_id, add=False, set_default=False)
+
+
+def set_default_binding(project_id: str, binding_id: str | None) -> dict:
+    """Set the default binding. If binding_id is not in the block, it is added."""
+    env = _environment_block(project_id)
+    if binding_id is not None:
+        if binding_id not in env.get("bindings", []):
+            env.setdefault("bindings", []).append(binding_id)
+        env["default_binding_id"] = binding_id
+    else:
+        env["default_binding_id"] = None
+    _write_environment_block(project_id, env)
+    return env
+
+
+def _with_binding_mutations(project_id: str, binding_id: str, *, add: bool, set_default: bool) -> dict:
+    """Shared helper for add/remove/set_default mutations.
+
+    Rule: a workspace may have multiple bindings but at most one default.
+    - add + set_default=True  → add to list, make it the default.
+    - add + set_default=False → add to list only if no default exists, else
+                                 do NOT steal the default.
+    - remove                  → drop from list; clear default if it was default.
+    """
+    env = _environment_block(project_id)
+    bindings = env.get("bindings", [])
+    if add:
+        if binding_id not in bindings:
+            bindings.append(binding_id)
+        env["bindings"] = bindings
+        has_default = env.get("default_binding_id") is not None
+        if set_default:
+            env["default_binding_id"] = binding_id
+        elif not has_default:
+            # First binding becomes default by convenience.
+            env["default_binding_id"] = binding_id
+    else:
+        env["bindings"] = [b for b in bindings if b != binding_id]
+        if env.get("default_binding_id") == binding_id:
+            env["default_binding_id"] = None
+    _write_environment_block(project_id, env)
+    return env
+
+
+def resolve_default_remote_host_id(project_id: str) -> str | None:
+    """Resolve the remote_host_id bound as the default environment, if any.
+    Returns None when the workspace uses a local/container default."""
+    env = _environment_block(project_id)
+    default_id = env.get("default_binding_id")
+    if not default_id:
+        return None
+    # Lazy import to avoid circular dependency; returns the FK host id if active.
+    try:
+        from app.core.database import get_session  # noqa: E402
+        with get_session() as db:
+            binding = db.get(WorkspaceEnvironmentBinding, default_id)
+            if binding and binding.status == BindingStatus.active:
+                return binding.remote_host_id
+    except Exception:
+        return None
+    return None
 
 
 # ── Environment Profile (D-051) ─────────────────────────────────────────

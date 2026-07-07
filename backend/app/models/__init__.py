@@ -8,6 +8,8 @@ from app.models.mcp_server import MCPServer
 from app.models.project import Project, ProjectStatus
 from app.models.git_host import GitHost, GitHostStatus, GitPlatform
 from app.models.remote_host import RemoteHost, HostType, RemoteHostStatus
+from app.models.workspace_environment_binding import WorkspaceEnvironmentBinding, BindingStatus
+from app.models.remote_invocation import RemoteInvocation, InvocationTrigger, InvocationProvider
 from app.models.integration_config import IntegrationConfig, IntegrationType, IntegrationStatus
 from app.models.git_account import GitAccount, GitAccountPlatform, AccountStatus
 from app.models.coding_agent_config import (
@@ -20,6 +22,7 @@ from app.models.task_node_run import TaskNodeRun
 from app.models.stage_plan import StagePlan, TaskPlan
 from app.models.plan_delta import PlanDelta
 from app.models.conversation import Conversation, ChatMessage
+from app.models.fusion_profile import FusionProfile, FusionRun, FusionRunParticipant
 
 __all__ = [
     "Base",
@@ -32,6 +35,8 @@ __all__ = [
     "Project", "ProjectStatus",
     "GitHost", "GitHostStatus", "GitPlatform",
     "RemoteHost", "HostType", "RemoteHostStatus",
+    "WorkspaceEnvironmentBinding", "BindingStatus",
+    "RemoteInvocation", "InvocationTrigger", "InvocationProvider",
     "IntegrationConfig", "IntegrationType", "IntegrationStatus",
     "GitAccount", "GitAccountPlatform", "AccountStatus",
     "CodingAgentConfig", "CodingAgentType", "CodingAgentInvokeMode", "CodingAgentStatus",
@@ -42,4 +47,5 @@ __all__ = [
     "StagePlan", "TaskPlan",
     "PlanDelta",
     "Conversation", "ChatMessage",
+    "FusionProfile", "FusionRun", "FusionRunParticipant",
 ]

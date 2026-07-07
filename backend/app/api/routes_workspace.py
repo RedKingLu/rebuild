@@ -110,6 +110,156 @@ async def put_environment(project_id: str, req: EnvironmentUpdateRequest):
     return SuccessEnvelope(data=profile, meta=Meta(source_status="real", capability_status="available"))
 
 
+# ── Environment binding (R14-4) ─────────────────────────────────────────
+# Workspace ↔ RemoteHost binding, default-environment selection, invocation
+# history and read-only environment detection (G8).
+
+class BindingCreateRequest(BaseModel):
+    remote_host_id: str
+    is_default: bool = False
+    remote_workdir: str | None = None
+
+
+class BindingSetDefaultRequest(BaseModel):
+    binding_id: str | None = None
+
+
+@router.get("/environment/block")
+async def get_env_block(project_id: str):
+    """Read the workspace environment block (single source of truth)."""
+    from app.services.workspace_service import get_environment_block
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    env = get_environment_block(project_id)
+    return SuccessEnvelope(data=env, meta=Meta(source_status="real", capability_status="available"))
+
+
+class BindingAddResponse(BaseModel):
+    env: dict
+
+
+@router.post("/environment/bindings")
+async def post_binding(project_id: str, req: BindingCreateRequest):
+    """Bind a remote host to this workspace. Optionally set as default."""
+    from app.core.database import get_session
+    from app.services.workspace_service import add_binding_to_workspace
+    from app.models.workspace_environment_binding import WorkspaceEnvironmentBinding
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    # Validate remote_host exists.
+    with get_session() as db:
+        host = db.get(__import__("app.models", fromlist=["RemoteHost"]).RemoteHost, req.remote_host_id)
+        if host is None:
+            raise HTTPException(404, f"RemoteHost {req.remote_host_id} not found")
+        existing = db.query(WorkspaceEnvironmentBinding).filter_by(
+            workspace_id=project_id, remote_host_id=req.remote_host_id).first()
+        binding_id = existing.binding_id if existing else None
+        if existing is None:
+            b = WorkspaceEnvironmentBinding(
+                workspace_id=project_id,
+                remote_host_id=req.remote_host_id,
+                remote_workdir=req.remote_workdir or f"/workspace/{project_id}",
+            )
+            db.add(b)
+            db.commit()
+            db.refresh(b)
+            binding_id = b.binding_id
+    env = add_binding_to_workspace(project_id, binding_id, set_default=req.is_default)
+    svc.trace_writer.write("workspace_action", action="add_binding",
+                           summary=f"Binding {binding_id} → workspace {project_id}",
+                           project_id=project_id, extras={"binding_id": binding_id})
+    return SuccessEnvelope(data=env, meta=Meta(source_status="real", capability_status="available"))
+
+
+@router.post("/environment/default")
+async def post_default_binding(project_id: str, req: BindingSetDefaultRequest):
+    """Set (or clear) the default binding for this workspace."""
+    from app.services.workspace_service import set_default_binding
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    env = set_default_binding(project_id, req.binding_id)
+    return SuccessEnvelope(data=env, meta=Meta(source_status="real", capability_status="available"))
+
+
+@router.delete("/environment/bindings/{binding_id}")
+async def delete_binding(project_id: str, binding_id: str):
+    """Remove a binding from the workspace block (soft: keep row, drop ref)."""
+    from app.core.database import get_session
+    from app.models.workspace_environment_binding import WorkspaceEnvironmentBinding
+    from app.services.workspace_service import remove_binding_from_workspace
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    with get_session() as db:
+        b = db.get(WorkspaceEnvironmentBinding, binding_id)
+        if b is not None:
+            b.status = __import__("app.models", fromlist=["BindingStatus"]).BindingStatus.disabled
+            db.commit()
+    env = remove_binding_from_workspace(project_id, binding_id)
+    return SuccessEnvelope(data=env, meta=Meta(source_status="real", capability_status="available"))
+
+
+@router.get("/environment/invocations")
+async def get_invocations(project_id: str, limit: int = 20):
+    """Recent remote invocations for this workspace (history panel)."""
+    from app.core.database import get_session
+    from app.models.remote_invocation import RemoteInvocation
+    from sqlalchemy import desc
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    with get_session() as db:
+        rows = (db.query(RemoteInvocation)
+                .filter_by(workspace_id=project_id)
+                .order_by(desc(RemoteInvocation.started_at))
+                .limit(limit).all())
+        items = [{
+            "invocation_id": r.invocation_id,
+            "provider": r.provider.value,
+            "trigger": r.trigger.value,
+            "command_digest": r.command_digest,
+            "exit_code": r.exit_code,
+            "risk_level": r.risk_level,
+            "elapsed_ms": r.elapsed_ms,
+            "status": r.status,
+            "stdout_ref": r.stdout_ref,
+            "stderr_ref": r.stderr_ref,
+            "audit_ref": r.audit_ref,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+        } for r in rows]
+    return SuccessEnvelope(data={"items": items}, meta=Meta(source_status="real", capability_status="available"))
+
+
+@router.get("/environment/detect/{remote_host_id}")
+async def get_detect_environment(project_id: str, remote_host_id: str):
+    """G8: read-only OS/runtime/service fingerprint of a remote host."""
+    from app.core.database import get_session
+    from app.models.remote_host import RemoteHost
+    from app.services.execution_provider import get_execution_provider
+    svc = get_services()
+    project = svc.project_service.get(project_id)
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    with get_session() as db:
+        host = db.get(RemoteHost, remote_host_id)
+        if host is None:
+            raise HTTPException(404, f"RemoteHost {remote_host_id} not found")
+        provider = get_execution_provider(mode="remote", remote_host_id=remote_host_id, db=db)
+        result = await provider.detect_environment()
+    return SuccessEnvelope(data=result, meta=Meta(
+        source_status="real",
+        capability_status="available" if result.get("ok") else "error",
+    ))
+
+
 # ── File tree ─────────────────────────────────────────────────────────────
 
 @router.get("/files")
