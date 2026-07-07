@@ -58,10 +58,17 @@ def record_invocation(
     trigger: str = "user",
     status: str | None = None,
     audit_ref: str | None = None,
+    trace_ref: str | None = None,
+    artifact_ref: str | None = None,
     error_message: str | None = None,
 ) -> RemoteInvocation:
     """Persist a RemoteInvocation + save stdout/stderr to workspace logs.
-    Returns the created RemoteInvocation."""
+    Returns the created RemoteInvocation.
+
+    R14-6 (B-R14-INV-REF-1): trace_ref / audit_ref / artifact_ref are now real
+    back-link parameters. Callers on the P5 remote path pass the tracer trace_id
+    and auditor audit_id so the columns are no longer dead.
+    """
     invocation_id = str(uuid.uuid4())
     # Cap stored copy (matches existing 5000 cap in p5_command_service).
     stdout_ref = _write_ref(workspace_id, invocation_id, "out", stdout[:65536])
@@ -83,6 +90,8 @@ def record_invocation(
         status=status,
         stdout_ref=stdout_ref,
         stderr_ref=stderr_ref,
+        artifact_ref=artifact_ref,
+        trace_ref=trace_ref,
         audit_ref=audit_ref,
         error_message=error_message,
         started_at=_now(),

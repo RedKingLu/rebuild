@@ -191,6 +191,69 @@ class TestInvocationRecording:
 
 
 # ══════════════════════════════════════════════════════════════════
+# WP2b: Multi-binding on a real DB session (R14-6, B-R14-MULTIBIND-1)
+# ══════════════════════════════════════════════════════════════════
+
+class TestMultiBindingRealDB:
+    def _mk_host(self, db, i: int) -> str:
+        h = RemoteHost(
+            name=f"h{i}", host_type=HostType.virtual_machine,
+            address=f"10.9.0.{i}", status=RemoteHostStatus.connected,
+        )
+        db.add(h)
+        db.commit()
+        db.refresh(h)
+        return h.remote_host_id
+
+    def test_three_bindings_same_workspace_commit(self):
+        """A workspace may bind >=3 remote hosts (all non-default) — no IntegrityError."""
+        from app.core.database import get_session
+        with get_session() as db:
+            host_ids = [self._mk_host(db, i) for i in range(3)]
+            for hid in host_ids:
+                db.add(WorkspaceEnvironmentBinding(
+                    workspace_id="ws-multi", remote_host_id=hid, is_default=False,
+                ))
+            db.commit()  # must NOT raise: partial index only guards is_default=1
+            rows = (db.query(WorkspaceEnvironmentBinding)
+                    .filter_by(workspace_id="ws-multi").all())
+            assert len(rows) == 3
+            assert sum(1 for r in rows if r.is_default) == 0
+
+    def test_one_default_plus_many_nondefault(self):
+        """One default + several non-default bindings coexist for a workspace."""
+        from app.core.database import get_session
+        with get_session() as db:
+            host_ids = [self._mk_host(db, 10 + i) for i in range(3)]
+            db.add(WorkspaceEnvironmentBinding(
+                workspace_id="ws-def", remote_host_id=host_ids[0], is_default=True))
+            db.add(WorkspaceEnvironmentBinding(
+                workspace_id="ws-def", remote_host_id=host_ids[1], is_default=False))
+            db.add(WorkspaceEnvironmentBinding(
+                workspace_id="ws-def", remote_host_id=host_ids[2], is_default=False))
+            db.commit()
+            rows = (db.query(WorkspaceEnvironmentBinding)
+                    .filter_by(workspace_id="ws-def").all())
+            assert len(rows) == 3
+            assert sum(1 for r in rows if r.is_default) == 1
+
+    def test_two_defaults_rejected(self):
+        """The partial unique index enforces at most one default per workspace."""
+        from sqlalchemy.exc import IntegrityError
+        from app.core.database import get_session
+        with get_session() as db:
+            host_ids = [self._mk_host(db, 20 + i) for i in range(2)]
+            db.add(WorkspaceEnvironmentBinding(
+                workspace_id="ws-two", remote_host_id=host_ids[0], is_default=True))
+            db.commit()
+            db.add(WorkspaceEnvironmentBinding(
+                workspace_id="ws-two", remote_host_id=host_ids[1], is_default=True))
+            with pytest.raises(IntegrityError):
+                db.commit()
+            db.rollback()
+
+
+# ══════════════════════════════════════════════════════════════════
 # WP5: Read-only detection (G8)
 # ══════════════════════════════════════════════════════════════════
 

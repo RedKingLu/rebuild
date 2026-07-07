@@ -124,6 +124,28 @@ class BindingSetDefaultRequest(BaseModel):
     binding_id: str | None = None
 
 
+def _sync_db_default(db, workspace_id: str, default_binding_id: str | None) -> None:
+    """Keep DB WorkspaceEnvironmentBinding.is_default in sync with workspace.json's
+    authoritative default_binding_id (R14-6, B-R14-MULTIBIND-1).
+
+    Clears every default row for the workspace first, flushes, then marks the one
+    default — so the partial unique index (WHERE is_default = 1) is never
+    transiently violated within the transaction.
+    """
+    from app.models.workspace_environment_binding import WorkspaceEnvironmentBinding
+    rows = (db.query(WorkspaceEnvironmentBinding)
+            .filter_by(workspace_id=workspace_id).all())
+    for r in rows:
+        if r.is_default:
+            r.is_default = False
+    db.flush()
+    if default_binding_id:
+        b = db.get(WorkspaceEnvironmentBinding, default_binding_id)
+        if b is not None and b.workspace_id == workspace_id:
+            b.is_default = True
+    db.commit()
+
+
 @router.get("/environment/block")
 async def get_env_block(project_id: str):
     """Read the workspace environment block (single source of truth)."""
@@ -169,6 +191,10 @@ async def post_binding(project_id: str, req: BindingCreateRequest):
             db.refresh(b)
             binding_id = b.binding_id
     env = add_binding_to_workspace(project_id, binding_id, set_default=req.is_default)
+    # R14-6: mirror workspace.json's authoritative default onto the DB is_default
+    # column so it is a live, index-enforced value (not a dead column).
+    with get_session() as db:
+        _sync_db_default(db, project_id, env.get("default_binding_id"))
     svc.trace_writer.write("workspace_action", action="add_binding",
                            summary=f"Binding {binding_id} → workspace {project_id}",
                            project_id=project_id, extras={"binding_id": binding_id})
@@ -184,6 +210,9 @@ async def post_default_binding(project_id: str, req: BindingSetDefaultRequest):
     if project is None:
         raise HTTPException(404, f"Project {project_id} not found")
     env = set_default_binding(project_id, req.binding_id)
+    from app.core.database import get_session
+    with get_session() as db:
+        _sync_db_default(db, project_id, env.get("default_binding_id"))
     return SuccessEnvelope(data=env, meta=Meta(source_status="real", capability_status="available"))
 
 
@@ -232,6 +261,8 @@ async def get_invocations(project_id: str, limit: int = 20):
             "status": r.status,
             "stdout_ref": r.stdout_ref,
             "stderr_ref": r.stderr_ref,
+            "artifact_ref": r.artifact_ref,
+            "trace_ref": r.trace_ref,
             "audit_ref": r.audit_ref,
             "started_at": r.started_at.isoformat() if r.started_at else None,
         } for r in rows]

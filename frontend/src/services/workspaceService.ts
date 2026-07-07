@@ -189,7 +189,7 @@ export async function removeBinding(projectId: string, bindingId: string): Promi
 }
 
 export async function fetchInvocations(projectId: string, limit = 20): Promise<RemoteInvocationItem[]> {
-  const resp = await get<{ items: RemoteInvocationItem[] }>(`/projects/${projectId}/environment/invocations`, { limit });
+  const resp = await get<{ items: RemoteInvocationItem[] }>(`/projects/${projectId}/environment/invocations?limit=${limit}`);
   return resp.data.items;
 }
 

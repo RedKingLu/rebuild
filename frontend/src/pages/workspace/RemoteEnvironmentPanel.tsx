@@ -7,7 +7,6 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
-import { Icon } from '../../components/ui/Icon';
 import {
   listRemoteHosts, type RemoteHostInfo,
 } from '../../services/integrationService';

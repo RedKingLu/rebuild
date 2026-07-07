@@ -272,20 +272,52 @@ class P5CommandExecutionService:
                 from app.services.workspace_service import get_environment_block
                 _env_blk = get_environment_block(project_id)
                 _binding_id = _env_blk.get("default_binding_id")
+                _digest = __import__("hashlib").sha256(command.encode()).hexdigest()[:16]
+                # R14-6 (B-R14-INV-REF-1): write a real audit + trace entry for the
+                # remote execution and back-link them onto the invocation, so
+                # audit_ref / trace_ref are no longer dead columns. Done before the
+                # L4/L5 early-return below so high-risk invocations are linked too.
+                _audit_ref = None
+                if self.auditor:
+                    _a = self.auditor.write(
+                        "remote_invocation",
+                        risk_level=result.risk_level,
+                        action=f"p5_remote_exec_{slot_id}",
+                        decision="blocked" if result.blocked else "executed",
+                        reason=f"P5 {slot_id} remote_ssh exit={result.exit_code}",
+                        project_id=project_id, stage="p5",
+                        transition_mode="real",
+                        command_digest=_digest,
+                    )
+                    _audit_ref = _a.get("audit_id") if isinstance(_a, dict) else getattr(_a, "audit_id", None)
+                _trace_ref = None
+                if self.tracer:
+                    _t = self.tracer.write(
+                        "evidence_event",
+                        action=f"p5_remote_invocation_{slot_id}",
+                        summary=(f"P5 {slot_id} remote_ssh: exit={result.exit_code}, "
+                                 f"{elapsed}ms, risk={result.risk_level}"),
+                        project_id=project_id, stage="p5",
+                        transition_mode="real",
+                        extras={"slot_id": slot_id, "command_digest": _digest,
+                                "exit_code": result.exit_code, "risk_level": result.risk_level},
+                    )
+                    _trace_ref = _t.get("trace_id") if isinstance(_t, dict) else getattr(_t, "trace_id", None)
                 with get_session() as _db:
                     _inv = record_invocation(
                         db=_db,
                         workspace_id=project_id,
                         binding_id=_binding_id,
                         provider="remote_ssh",
-                        command_digest=__import__("hashlib").sha256(
-                            command.encode()).hexdigest()[:16],
+                        command_digest=_digest,
                         exit_code=result.exit_code,
                         risk_level=result.risk_level,
                         elapsed_ms=elapsed,
                         stdout=result.stdout,
                         stderr=result.stderr,
                         trigger="p_stage",
+                        audit_ref=_audit_ref,
+                        trace_ref=_trace_ref,
                     )
                     result.invocation_id = _inv.invocation_id
                     result.audit_ref = _inv.audit_ref

@@ -12,7 +12,7 @@ This binding is the missing link between Workspace and the remote execution base
 import enum
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, Enum as SAEnum, Boolean, ForeignKey, UniqueConstraint
+from sqlalchemy import String, DateTime, Enum as SAEnum, Boolean, ForeignKey, Index, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -49,6 +49,12 @@ class WorkspaceEnvironmentBinding(Base):
     )
 
     __table_args__ = (
-        # One default binding per workspace.
-        UniqueConstraint("workspace_id", "is_default", name="uq_binding_workspace_default"),
+        # At most one *default* binding per workspace, while any number of
+        # non-default bindings may coexist. R14-6 (B-R14-MULTIBIND-1): a full
+        # UNIQUE(workspace_id, is_default) rejected the 2nd non-default binding;
+        # a partial unique index (WHERE is_default = 1) fixes that.
+        Index(
+            "uq_binding_workspace_default", "workspace_id", unique=True,
+            sqlite_where=text("is_default = 1"),
+        ),
     )
