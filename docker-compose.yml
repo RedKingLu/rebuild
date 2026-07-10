@@ -66,6 +66,40 @@ services:
       - "5432:5432"
     restart: unless-stopped
 
+  # ── R15-4 独立社区服务（profile=community）。默认不启动，不影响主平台。 ──
+  # 端口：community-backend 8001 / community-frontend 8081（登记入 06-容器化规范 §1.1）。
+  # 独立 SQLite（命名卷 community-data），不共享主平台 DB。
+  community-backend:
+    build:
+      context: ./community/backend
+    image: rebuild-community-backend:local
+    profiles: ["community"]
+    environment:
+      COMMUNITY_DATA_DIR: /app/.data
+      COMMUNITY_DATABASE_URL: ${COMMUNITY_DATABASE_URL:-sqlite:////app/.data/community.db}
+    volumes:
+      - community-data:/app/.data
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/status',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+  community-frontend:
+    build:
+      context: ./community/frontend
+    image: rebuild-community-frontend:local
+    profiles: ["community"]
+    depends_on:
+      - community-backend
+    ports:
+      - "8081:80"
+    restart: unless-stopped
+
   # ── Phase C2 scaffold：执行沙箱镜像。默认只构建、不常驻（profile=sandbox）。 ──
   # 真实执行由 backend 通过短生命周期 exec/容器驱动；此处提供镜像与硬化基线。
   execution-sandbox:
@@ -88,3 +122,4 @@ services:
 volumes:
   backend-data:
   pg-data:
+  community-data:
