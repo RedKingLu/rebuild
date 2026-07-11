@@ -238,6 +238,15 @@ export function WorkspacePage() {
 
   const tab = ws.tabs.find(t => t.id === ws.activeTab);
 
+  // WP-A (B-R17X-PLANREVIEW-1 前端侧): 引导完成后平台不自动执行 P0。改为展示一次性
+  // 「欢迎 + 启动」初始态，用户点「开始」才触发 executeP0Agent（POST /onboarding/execute）。
+  // 判断只用现有 run 字段：引导浮窗未展示、P0 尚未启动（无 run 或 stage_status.p0 为空/pending）、
+  // 未在执行、无待决 Gate。已在运行的项目（p0 in_progress/completed/... 或存在 Gate）不显示。
+  const wizardOpen = !!project && !project.onboarding_done && !onbDismissed;
+  const p0Status = run?.stage_status?.p0;
+  const p0NotStarted = !p0Status || p0Status === 'pending';
+  const showWelcome = !!project && !loading && !wizardOpen && p0NotStarted && !p0Executing && !data?.active_gate;
+
   if (error && loading) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', flexDirection: 'column', gap: 12 }}>
@@ -271,7 +280,7 @@ export function WorkspacePage() {
           } label={
             data?.active_gate?.gate_status === 'rejected' ? 'Gate 已拒绝' :
             data?.active_gate?.gate_status === 'changes_requested' ? '需返工' :
-            data?.active_gate?.gate_type === 'plan_review' ? '等待计划审核' :
+            data?.active_gate?.gate_type === 'plan_presentation' ? '等待计划审核' :
             data?.active_gate ? '等待 Gate' : '无待决 Gate'
           } tone={data?.active_gate?.gate_status === 'rejected' || data?.active_gate?.gate_status === 'changes_requested' ? 'red' : data?.active_gate ? 'amber' : 'grey'} />
           <ModelGwChip />
@@ -377,17 +386,30 @@ export function WorkspacePage() {
               sourceType={project.source_type}
               initialMode={ws.execMode}
               codingAgentRef={project.coding_agent_ref}
-              onDone={() => { setOnbDismissed(true); executeP0Agent(); }}
+              onDone={() => { setOnbDismissed(true); }}
             />
           )}
 
-          {/* R9-3B: Hide placeholder banner when wizard is shown */}
-          {project && !project.onboarding_done && onbDismissed && (
-            <div style={{ padding: '6px 12px', background: 'var(--color-surface-subtle)', borderBottom: '1px solid var(--color-border)', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
-              <Icon name="run" size={14} />
-              <span style={{ color: 'var(--color-text-muted)' }}>
-                项目已接入，工作区可直接使用；<b>引导向导</b>已跳过。可在设置中重新打开。
-              </span>
+          {/* WP-A (B-R17X-PLANREVIEW-1): 一次性「欢迎 + 启动」初始态 — 引导完成后、
+              首次 P0 执行前展示。点「开始」才触发 executeP0Agent（POST /onboarding/execute）。
+              之后各阶段由 stage_promotion Gate 控制，不再每阶段弹欢迎。 */}
+          {showWelcome && (
+            <div style={{ padding: '36px 24px', display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', gap: 12, borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface-subtle)', flexShrink: 0 }}>
+              <div style={{ width: 48, height: 48, borderRadius: 12, background: 'var(--color-primary-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Icon name="run" size={26} style={{ color: 'var(--color-primary)' }} />
+              </div>
+              <div style={{ fontSize: 18, fontWeight: 700 }}>欢迎进入 rebuild 平台</div>
+              <div style={{ fontSize: 13, color: 'var(--color-text-muted)', maxWidth: 480, lineHeight: 1.7 }}>
+                项目「{project?.name || id}」已完成引导配置。点击「开始」启动 P0 项目接入——平台将拉取源码、生成接入报告，并进入 P0→P1 审核 Gate。
+              </div>
+              <button className="btn" style={{ marginTop: 4, padding: '8px 28px', fontSize: 14, display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                disabled={p0Executing}
+                onClick={() => { ws.setActiveTab('agent'); executeP0Agent(); }}>
+                <Icon name="run" size={15} /> {p0Executing ? '正在启动…' : '开始'}
+              </button>
+              <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
+                开始后各阶段由阶段晋级 Gate 控制，不会再显示本欢迎页。
+              </div>
             </div>
           )}
 
@@ -416,7 +438,7 @@ export function WorkspacePage() {
                     // task-context + real-time status when no graph is active.
                     runId={data?.active_run?.run_id || run?.run_id || null}
                     runStatus={run?.run_status || undefined}
-                    // R17-3: plan_review gate 等待态 → TaskOverview 显示"计划审核中"
+                    // R17-X: plan_presentation gate 等待态 → TaskOverview 显示"计划审核中"（原 plan_review 欢迎门已删除）
                     activeGate={data?.active_gate || null}
                   />
                 </div>

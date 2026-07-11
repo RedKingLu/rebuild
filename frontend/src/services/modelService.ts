@@ -4,7 +4,7 @@
  * self-test, call log, and platform assistant chat.
  */
 
-import { get, post, del, put } from './client';
+import { get, post, del, put, unwrap } from './client';
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -290,3 +290,103 @@ export const CAPABILITY_MARKERS: Record<string, { label: string; color: string }
   unknown:                 { label: '状态未知',     color: 'var(--gray)' },
   not_checked:             { label: '未检测',       color: 'var(--gray)' },
 };
+
+// ── R15-4-C8/C9: ModelCatalog (持久化资料库) ────────────────────────
+export interface ModelCatalogEntry {
+  catalog_id: string;
+  model_id: string;
+  provider_id: string;
+  display_name: string;
+  family: string;
+  model_version: string;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  capability_tags: string[];
+  task_tags: string[];
+  input_modalities: string[];
+  output_modalities: string[];
+  license: string | null;
+  availability_status: string;
+  official_icon_url: string | null;
+  official_url: string | null;
+  source: string;
+  pricing_input?: string | null;
+  pricing_output?: string | null;
+  speed_level?: string | null;
+  latency_level?: string | null;
+}
+
+export async function listModelCatalog(params: {
+  provider?: string; family?: string; availability?: string; task?: string;
+} = {}): Promise<{ total: number; models: ModelCatalogEntry[] }> {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => v && qs.set(k, v));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const resp = await get<{ total: number; offset: number; models: ModelCatalogEntry[] }>(`/model-catalog${suffix}`);
+  return unwrap<{ total: number; models: ModelCatalogEntry[] }>(resp);
+}
+
+// ── R15-4-C10: AgentModelEvalResult（导入评测结果，展示非引擎） ──────
+export interface ModelEvalResult {
+  eval_id: string;
+  model_id: string;
+  catalog_id: string | null;
+  agent_type: string | null;
+  task_type: string | null;
+  scenario: string | null;
+  metric: string | null;
+  score: number | null;
+  success_rate: number | null;
+  cost_level: string | null;
+  latency_level: string | null;
+  sample_count: number | null;
+  eval_method: string | null;
+  eval_version: string | null;
+  source: string | null;
+  published_at: string | null;
+  limitations: string | null;
+}
+
+export async function listModelEvaluations(params: {
+  model_id?: string; task_type?: string; scenario?: string; agent_type?: string;
+} = {}): Promise<{ total: number; evaluations: ModelEvalResult[] }> {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => v && qs.set(k, v));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const resp = await get<{ total: number; evaluations: ModelEvalResult[] }>(`/model-evaluations${suffix}`);
+  return unwrap<{ total: number; evaluations: ModelEvalResult[] }>(resp);
+}
+
+export async function importEvaluationsCsv(file: File): Promise<{ imported: number; errors?: string[] }> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const resp = await fetch("/api/model-evaluations/import-csv", { method: "POST", body: fd });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+    throw new Error(err.detail || "CSV 导入失败");
+  }
+  const json = await resp.json();
+  return json.data as { imported: number; errors?: string[] };
+}
+
+export interface EvalCompareRow extends ModelEvalResult {
+  rank?: number;
+}
+
+export interface EvalCompareData {
+  task_type: string;
+  scenario: string;
+  rows: EvalCompareRow[];
+  rank_by: string;
+  note: string;
+}
+
+export async function compareEvaluations(task_type: string, scenario: string,
+                                        model_ids: string[] = []): Promise<EvalCompareData> {
+  const qs = new URLSearchParams();
+  qs.set("task_type", task_type);
+  qs.set("scenario", scenario);
+  model_ids.forEach((m) => qs.append("model_ids", m));
+  const resp = await get<EvalCompareData>(`/model-evaluations/compare?${qs.toString()}`);
+  return unwrap<EvalCompareData>(resp);
+}

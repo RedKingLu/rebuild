@@ -54,8 +54,12 @@ class RegistryService:
         status: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        include_deleted: bool = False,
     ) -> tuple[list[ResourceEntry], int]:
         q = self.db.query(ResourceEntry)
+        if not include_deleted:
+            # Soft-delete filter (R15-4-C1): 默认只返回未删除资源
+            q = q.filter(ResourceEntry.deleted_at.is_(None))
         if resource_type:
             q = q.filter(ResourceEntry.resource_type == ResourceType(resource_type))
         if source_type:
@@ -93,11 +97,27 @@ class RegistryService:
         self.db.refresh(entry)
         return entry
 
-    def delete(self, resource_id: str) -> bool:
+    def set_enabled(self, resource_id: str, enabled: bool) -> ResourceEntry | None:
+        """Enable/disable a resource (R15-4-C1). Returns None if not found or soft-deleted."""
         entry = self.get(resource_id)
-        if entry is None:
+        if entry is None or entry.deleted_at is not None:
+            return None
+        entry.enabled = enabled
+        entry.updated_at = datetime.now(timezone.utc)
+        self.db.commit()
+        self.db.refresh(entry)
+        return entry
+
+    def delete(self, resource_id: str) -> bool:
+        """Soft-delete (R15-4-C1): write deleted_at instead of hard delete.
+
+        Idempotent-ish: an already soft-deleted row is treated as not found.
+        """
+        entry = self.get(resource_id)
+        if entry is None or entry.deleted_at is not None:
             return False
-        self.db.delete(entry)
+        entry.deleted_at = datetime.now(timezone.utc)
+        entry.updated_at = datetime.now(timezone.utc)
         self.db.commit()
         return True
 
@@ -162,6 +182,13 @@ class RegistryService:
             "source_status": entry.source_status,
             "capability_status": entry.capability_status,
             "enabled": entry.enabled,
+            "package_url": entry.package_url,
+            "checksum_sha256": entry.checksum_sha256,
+            "manifest_json": entry.manifest_json,
+            "download_count": entry.download_count,
+            "icon_url": entry.icon_url,
+            "deleted_at": entry.deleted_at,
+            "imported_version": entry.imported_version,
             "created_at": entry.created_at,
             "updated_at": entry.updated_at,
         }

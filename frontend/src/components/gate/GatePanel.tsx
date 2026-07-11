@@ -84,9 +84,10 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
   const [reasonError, setReasonError] = useState<string | null>(null);
 
   const gateId = gate?.gate_id;
-  // B-PLAN-1: plan_review gates review the pre-execution stage plan (D-025/D-026).
+  // R17-X (B-R17X-PLANREVIEW-1): the per-stage plan_review「欢迎门」was removed. The
+  // one-time 欢迎/启动 step now lives in WorkspacePage; stage flow is controlled by the
+  // stage_promotion Gate. plan_presentation (接入计划审核) is retained.
   const gateLabel = gate?.gate_type === 'stage_promotion' ? '阶段晋级 Gate'
-    : gate?.gate_type === 'plan_review' ? '项目启动确认'
     : gate?.gate_type === 'plan_presentation' ? '接入计划审核 Gate'
     : gate?.gate_type === 'source_pending' ? '源码补全 Gate'
     : (gate?.gate_type || 'Gate');
@@ -151,11 +152,11 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
 
       // B-PLAN-1 (R11-3): approve just resumes the LangGraph thread (promotion-decision
       // above drives FlowRuntime.resume). The graph advances the stage itself —
-      // approving a P0 plan_review gate resumes into real P0 execution; approving the
-      // P0 promotion gate resumes into P1. We no longer POST /profile here (that was a
-      // separate, fabricated P1 path — p1_stage_plan/execution_record/construction_report/
-      // review_pass were template/hardcoded/always-pass; forbidden by D-101). P1 review
-      // materials now come from the real graph P1 node (RealP1Handler → StageReports).
+      // approving a promotion gate resumes the stage into the next one. We no longer
+      // POST /profile here (that was a separate, fabricated P1 path — p1_stage_plan/
+      // execution_record/construction_report/review_pass were template/hardcoded/
+      // always-pass; forbidden by D-101). P1 review materials now come from the real
+      // graph P1 node (RealP1Handler → StageReports).
       onDecided();
       setExpanded(false);
     } catch (e: any) {
@@ -362,20 +363,7 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
       {/* Expanded Modal */}
       <Modal open={expanded} onClose={() => { setExpanded(false); setReworkHint(false); setDecisionFeedback(null); }}
         title={`Gate 审核 — ${gate?.stage?.toUpperCase?.() || 'P0'} · ${gateLabel}`} width={800}>
-        {gate?.gate_type === 'plan_review' ? (
-          <div style={{ padding: '12px 0' }}>
-            <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
-              {gate?.summary || `欢迎进入工作台，是否开始 ${gate?.stage?.toUpperCase() || 'P0'} 接入？`}
-            </div>
-            <div style={{ fontSize: 13, color: 'var(--color-text-muted)', lineHeight: 1.8, marginBottom: 8 }}>
-              {gate?.reason}
-            </div>
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.8 }}>
-              <div>• 批准后 agent 将生成接入计划供您审核</div>
-              <div>• 您也可以选择「请求修改」调整方向，或「拒绝」终止接入</div>
-            </div>
-          </div>
-        ) : (
+        {(
           <div>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 8 }}>
               请审阅下方阶段材料后决定（批准后进入下一阶段）。

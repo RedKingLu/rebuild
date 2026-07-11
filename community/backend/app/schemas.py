@@ -11,6 +11,7 @@ class StatusResponse(BaseModel):
     resource_count: int
     model_count: int
     evaluation_count: int
+    doc_count: int = 0
 
 
 class ResourceCard(BaseModel):
@@ -67,6 +68,20 @@ class ManifestResponse(BaseModel):
     dependencies: list = []
 
 
+# R16-B E3: 社区资源版本历史响应（仅当前版本有真实 checksum/files，历史版本用于追溯展示）
+class CommunityResourceVersion(BaseModel):
+    version: str
+    manifest_ref: str = ""          # 指向 /resources/{id}/versions/{v}/manifest（当前版本唯一有效）
+    deprecated: bool = False
+
+
+class VersionListResponse(BaseModel):
+    resource_id: str
+    versions: list[CommunityResourceVersion]
+    current_version: str
+    note: str = ""                  # 诚实说明：如 "当前仅支持导入最新版本；历史版本记录用于追溯"
+
+
 class NewsItem(BaseModel):
     id: str
     title: str
@@ -81,6 +96,29 @@ class NewsItem(BaseModel):
 
 class NewsResponse(BaseModel):
     news: list[NewsItem]
+
+
+class CommunityDocItem(BaseModel):
+    slug: str
+    title: str
+    summary: str = ""
+    category: str = ""
+    tags: list[str] = []
+    version: str = "1.0.0"
+    source: str = "community"
+    updated_at: datetime | None = None
+    created_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class CommunityDocDetail(CommunityDocItem):
+    body_markdown: str = ""
+
+
+class CommunityDocListResponse(BaseModel):
+    docs: list[CommunityDocItem]
+    total: int
 
 
 class ModelEntry(BaseModel):

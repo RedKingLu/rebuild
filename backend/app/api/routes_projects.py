@@ -536,6 +536,14 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
             run_req = _RunCreate(run_goal=f"P0 接入：{project.name}", mode=req.execution_mode)
             run = RunService(svc_deps).create(project_id, run_req)
             svc.update(project_id, current_run_id=run.run_id, current_stage="p0")
+            # R17-X 联调修复: complete 不再驱动 P0 图，故 P0 尚未真正开始执行。
+            # RunService.create 默认写 stage_status.p0="in_progress"（那是"图已驱动"语义），
+            # 这里回退为 "pending"，使状态诚实（已创建、未启动），前端据此显示一次性「欢迎页」；
+            # 用户点「开始」→ POST /onboarding/execute 驱动图时再由 init_state 置 in_progress。
+            try:
+                RunService(svc_deps).set_stage_status(run.run_id, "p0", "pending")
+            except Exception:
+                logger.warning("R17-X: reset p0 stage_status to pending failed", exc_info=True)
     except Exception:
         logger.warning("Run creation failed", exc_info=True)
 
@@ -606,69 +614,31 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
         decision="executed", risk_level="L2", project_id=project_id,
         reason=f"P0 onboarding: {project.name}")
 
-    # 7. T6b / W8 full cutover (Approach A): the LangGraph P0 node is now the sole
-    #    P0 execution path and the Gate authority. /onboarding/complete drives the
-    #    graph, which materializes + creates the P0→P1 Gate. /onboarding/execute
-    #    becomes an idempotent trigger returning the existing gate.
-    #    Graceful degradation: if the graph drive fails, gate stays None and the
-    #    client may still call /onboarding/execute (legacy fallback).
-    gate_id = None
-    gate_type = None
-    checkpoint_ref = None
-    # B-P0-FAKE-1: review verdict + material refs come from the REAL graph Gate, not
-    # a fabricated always-pass. Unknown (None) until the graph drive resolves a Gate.
-    review_passed = None
-    if run is not None:
-        try:
-            from app.graph.runtime import get_flow_runtime
-            _src = project.source_type.value if hasattr(project.source_type, "value") else str(project.source_type)
-            init_state = {
-                "run_id": run.run_id, "project_id": project_id,
-                "run_goal": f"P0 接入：{project.name}", "run_status": "running",
-                "source_type": _src, "source_config": project.source_config or {},
-                "execution_mode": req.execution_mode,
-                "stage_status": {"p0": "in_progress"}, "current_stage": "p0",
-            }
-            await get_flow_runtime().start(run.run_id, init_state)
-        except Exception:
-            logger.warning("T6b: graph P0 drive failed (client may fall back to /execute)", exc_info=True)
-        try:
-            active_gate = svc_deps.gate_service.get_active(project_id)
-            if active_gate and active_gate.run_id == run.run_id:
-                gate_id = active_gate.gate_id
-                gate_type = active_gate.gate_type
-                checkpoint_ref = active_gate.checkpoint_ref or run.run_id
-                svc.update(project_id, active_gate=gate_id)
-                # Real Gate materials (StageReports) — the single source for the review panel
-                if active_gate.artifact_refs:
-                    p0_artifact_refs = list(active_gate.artifact_refs)
-                # A stage_promotion gate means the P0 small loop passed the real review;
-                # source_pending means it escalated (review did not pass). Honest verdict.
-                review_passed = (gate_type == "stage_promotion")
-        except Exception:
-            logger.warning("T6b: gate lookup after graph drive failed", exc_info=True)
-
-
+    # 7. R17-X 联调修复（用户裁决，回退 T6b/W8 Approach A 的 "complete 自动驱动图"）:
+    #    /onboarding/complete 不再自动驱动 P0 图，也不再创建 P0→P1 Gate。complete 只完成
+    #    profile 保存 / Run 创建 / execution_mode 持久化(workspace.json 单一控制源) / intake /
+    #    evidence 候选 / materialized(占位)。P0 图驱动完全交给用户在前端「欢迎页」点击「开始」
+    #    触发的 POST /onboarding/execute（P0 规范主入口，B-R17X-DUALENTRY-2）。这样引导完成后
+    #    平台不会自动执行 P0——先显示一次性「欢迎进入平台」界面，用户点「开始」后才正式启动 P0
+    #    图执行；欢迎+启动为一次性（仅 P0 前一次），之后各阶段由 stage_promotion Gate 控制。
+    #    因此 complete 返回 graph_driven=False / gate_id=None / review.passed=None（不假装已建 Gate）。
     _resp_data = {
         "project_id": project_id, "onboarding_done": True,
         "run_id": run.run_id if run else None,
         "intake_artifact_id": intake_id,
         "evidence_candidates": evidence_candidates,
         "materialized": materialized,
-        "review": {"passed": review_passed, "reviewer": "p0_review_skill",
+        # complete 不再审核（P0 审核由 execute 驱动的图节点产出），verdict 未知(None)
+        "review": {"passed": None, "reviewer": "p0_review_skill",
                     "source": "langgraph_p0_node"},
         "p0_artifacts": p0_artifact_refs,
-        # T6b: Gate now created by the graph at complete time (graph_driven)
-        "gate_id": gate_id,
-        "gate_type": gate_type,
-        "checkpoint_ref": checkpoint_ref,
-        "graph_driven": gate_id is not None,
-        "next": ("Gate 已由 LangGraph 图创建，前往 P0→P1 Gate 审批"
-                 if gate_id else "调用 POST /onboarding/execute 以图驱动创建 Gate"),
+        # R17-X: complete 不自动驱动图、不创建 Gate — 交由 POST /onboarding/execute
+        "gate_id": None,
+        "gate_type": None,
+        "checkpoint_ref": None,
+        "graph_driven": False,
+        "next": "点击『开始』(POST /onboarding/execute) 启动 P0 图执行",
     }
-    # WP-1: surface retry_action for source_pending gates so clients can guide recovery
-    if gate_type == "source_pending":
-        _resp_data["retry_action"] = "update_source_config"
     return SuccessEnvelope(data=_resp_data, meta=Meta())
 
 
@@ -683,11 +653,12 @@ class ProfilingRequest(_BaseModel):
 
 @router.post("/{project_id}/onboarding/execute")
 async def execute_onboarding(project_id: str, db: Session = Depends(get_db)):
-    """P0 execution delegate — WP-6: thin trigger that drives the LangGraph P0 node.
+    """P0 canonical entry (规范主入口, B-R17X-DUALENTRY-2) — the thin SSE trigger that
+    drives the LangGraph P0 node. This is the production P0 启动入口.
 
     Streams SSE events from the real graph execution (FlowRuntime.astream_events).
     Gate created by the graph carries real checkpoint_ref (thread_id=run_id).
-    Falls back to the legacy inline pipeline if FlowRuntime is unavailable.
+    Falls back to the legacy inline pipeline only if FlowRuntime is unavailable.
 
     Call this AFTER /onboarding/complete.
     """
@@ -770,6 +741,24 @@ async def execute_onboarding(project_id: str, db: Session = Depends(get_db)):
         await _asyncio.sleep(0.05)
 
         rt = get_flow_runtime()
+        # R17-X D-联调-2: drive the graph with the user's REAL chosen execution_mode.
+        # workspace.json is the single control source (set by /onboarding/complete via
+        # set_execution_mode, and by the top-bar ExecModeSwitch). Previously this was a
+        # hardcoded "plan" bug — auto/manual selections silently ran as plan. Fallback to
+        # the Run's execution_mode snapshot, then "plan".
+        _exec_mode = None
+        try:
+            from app.services.workspace_service import get_execution_mode as _get_mode
+            _exec_mode = _get_mode(project_id)
+        except Exception:
+            _exec_mode = None
+        if not _exec_mode:
+            try:
+                from app.services.run_service import RunService as _RS
+                _run_now = _RS(svc_deps).get(run_id)
+                _exec_mode = getattr(_run_now, "execution_mode", None) or "plan"
+            except Exception:
+                _exec_mode = "plan"
         init_state = {
             "run_id": run_id,
             "project_id": project_id,
@@ -777,7 +766,7 @@ async def execute_onboarding(project_id: str, db: Session = Depends(get_db)):
             "run_status": "running",
             "source_type": _src_type_str(),
             "source_config": project.source_config or {},
-            "execution_mode": "plan",
+            "execution_mode": _exec_mode,
             "stage_status": {"p0": "in_progress"},
             "current_stage": "p0",
         }

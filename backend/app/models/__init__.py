@@ -23,6 +23,8 @@ from app.models.stage_plan import StagePlan, TaskPlan
 from app.models.plan_delta import PlanDelta
 from app.models.conversation import Conversation, ChatMessage
 from app.models.fusion_profile import FusionProfile, FusionRun, FusionRunParticipant
+from app.models.model_catalog import ModelCatalogEntry
+from app.models.agent_model_eval import AgentModelEvalResult
 
 __all__ = [
     "Base",
@@ -48,4 +50,6 @@ __all__ = [
     "PlanDelta",
     "Conversation", "ChatMessage",
     "FusionProfile", "FusionRun", "FusionRunParticipant",
+    "ModelCatalogEntry",
+    "AgentModelEvalResult",
 ]

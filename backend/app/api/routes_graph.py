@@ -58,7 +58,11 @@ def _src_type(project) -> str:
 
 @router.post("/{project_id}/graph/start")
 async def graph_start(project_id: str, req: GraphStartRequest, db: Session = Depends(get_db)):
-    """Create a Run (graph thread) and start the P0-P6 graph; pauses at the P0 promotion Gate."""
+    """Create a Run (graph thread) and start the P0-P6 graph; pauses at the P0 promotion Gate.
+
+    仅供调试 / 测试：生产环境 P0 启动一律走 POST /projects/{id}/onboarding/execute
+    （规范主入口，B-R17X-DUALENTRY-2）。本端点保留可用，仅用于直接驱动图的调试与测试场景。
+    """
     svc = ProjectService(db)
     deps = get_services()
     project = svc.get(project_id)

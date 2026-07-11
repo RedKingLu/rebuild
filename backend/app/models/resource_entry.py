@@ -108,7 +108,9 @@ class ResourceEntry(Base):
     supersedes: Mapped[str | None] = mapped_column(String(255), nullable=True)
     superseded_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    # Review
+    # Review — DEPRECATED (R15-4-C1, D-061 修订执行注 2026-07-09)
+    # 保留列用于历史兼容，已退出启用/禁用/导入/Agent 使用主链路。
+    # 社区资源合格性由发布侧保证；平台内统一 启用/禁用/软删除 + L1-L5 动作风险。
     review_status: Mapped[str] = mapped_column(String(50), default="not_reviewed")
     reviewer: Mapped[str | None] = mapped_column(String(255), nullable=True)
     review_notes: Mapped[str] = mapped_column(Text, default="")
@@ -120,6 +122,20 @@ class ResourceEntry(Base):
     source_status: Mapped[str] = mapped_column(String(50), default="real")
     capability_status: Mapped[str] = mapped_column(String(50), default="active")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # Distribution fields (R15-4-C2) — 社区资源分发/包/校验/图标
+    package_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    manifest_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    download_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    icon_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    # Soft delete (R15-4-C1) — 删除写 deleted_at，不再硬删；列表默认过滤 IS NULL
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # R16-B E3: community resource imported version (追溯). 社区 seed 当前仅对最新版本落库有效，
+    # 历史版本记录用于追溯展示（不阻塞导入主链路）。社区无 per-version checksum，导入取当前版本。
+    imported_version: Mapped[str | None] = mapped_column(String(50), nullable=True, index=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

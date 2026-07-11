@@ -44,18 +44,26 @@ def test_onboarding_creates_run_intake_and_gate(client, project_id):
     assert d["onboarding_done"] is True
     assert d["run_id"]
     assert d["intake_artifact_id"]
-    assert d["review"]["passed"] is True      # Review Pass ran and passed
     assert "p0_artifacts" in d  # materials prepared
-    # T6b / W8 full cutover (Approach A): the LangGraph P0 node is the sole P0 path
-    # and Gate authority — /onboarding/complete drives the graph which creates the
-    # P0→P1 Gate at complete time.
-    assert d.get("gate_id"), "complete should now create the P0→P1 Gate (graph-driven)"
-    assert d.get("graph_driven") is True
-    active = client.get(f"/api/projects/{project_id}/gates/active").json()["data"]
-    assert active is not None and active["gate_status"] == "waiting_decision"
-    # /onboarding/execute remains an idempotent trigger — returns the existing gate
+    # R17-X 联调修复（用户裁决，回退 T6b/W8 "complete 自动驱动"）: /onboarding/complete
+    # 不再自动驱动 P0 图，也不再创建 P0→P1 Gate，也不假装已审核。P0 图执行完全交给用户
+    # 点「开始」触发的 POST /onboarding/execute。
+    assert d["review"]["passed"] is None, "complete 不再审核，verdict 未知(None)"
+    assert d.get("gate_id") is None, "complete 不应创建 Gate（不自动执行）"
+    assert d.get("graph_driven") is False, "complete 不驱动图"
+    # 回归锁: complete 后 project 无 active P0 gate（证明不自动执行 P0）
+    active_after_complete = client.get(f"/api/projects/{project_id}/gates/active").json()["data"]
+    assert active_after_complete is None, \
+        f"complete 后不得有 active gate（P0 尚未启动），got {active_after_complete}"
+
+    # 用户点「开始」→ POST /onboarding/execute 才驱动图并创建 P0→P1 Gate
     exec_resp = client.post(f"/api/projects/{project_id}/onboarding/execute")
     assert exec_resp.status_code == 200
+    active = client.get(f"/api/projects/{project_id}/gates/active").json()["data"]
+    assert active is not None and active["gate_status"] == "waiting_decision"
+    # /onboarding/execute is idempotent — a second call returns the same gate (no duplicate)
+    exec_resp2 = client.post(f"/api/projects/{project_id}/onboarding/execute")
+    assert exec_resp2.status_code == 200
     active2 = client.get(f"/api/projects/{project_id}/gates/active").json()["data"]
     assert active2 is not None and active2["gate_status"] == "waiting_decision"
     assert active2["gate_id"] == active["gate_id"]  # same gate (no duplicate)
@@ -81,8 +89,8 @@ def _ensure_task_graph(run_id: str, stage: str):
 
 
 def _make_gate(client, project_id, stage="p0", mode="auto"):
-    """创建 gate。R17-3: 默认 auto 模式跳过 plan gates（直接 stage_promotion）；
-    mode="plan"/"manual" 走两阶段流程（plan_review → plan_presentation → stage_promotion）。"""
+    """创建 gate。R17-X: 默认 auto 模式跳过 plan gate（直接 stage_promotion）；
+    mode="plan"/"manual" 走两阶段流程（plan_presentation → stage_promotion，欢迎门已删除）。"""
     client.post(f"/api/projects/{project_id}/onboarding/complete",
                 json={"execution_mode": mode})
     exec_resp = client.post(f"/api/projects/{project_id}/onboarding/execute")

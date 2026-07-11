@@ -1,13 +1,34 @@
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useSettingsStore } from '../../stores';
+import { communityService } from '../../services/communityService';
 import { Icon, type IconKey } from '../ui/Icon';
+
+// 独立社区站点地址（可配置，不硬编码到长期路径）。默认指向本地社区前端 dev 端口 8081。
+const COMMUNITY_URL = (import.meta.env.VITE_COMMUNITY_URL as string | undefined) || 'http://localhost:8081';
 
 const NAV: { group: string; items: [string, string, IconKey][] }[] = [
   { group: '工作台', items: [['overview', '概览', 'overview'], ['projects', '项目', 'project']] },
   { group: '能力', items: [['resources', '资源', 'resource'], ['integrations', '集成', 'integration'], ['models', '模型', 'model'], ['fusion', '聚合', 'fusion']] },
-  { group: '知识与社区', items: [['cases', '案例', 'case'], ['knowledge', '知识', 'knowledge'], ['community', '社区', 'community'], ['docs', '文档', 'docs']] },
+  // docs 已移除（R15-4-C7）：文档入口下线，内容迁移为知识包。
+  { group: '知识与社区', items: [['cases', '案例', 'case'], ['knowledge', '知识', 'knowledge'], ['community', '社区', 'community']] },
   { group: '系统', items: [['settings', '设置', 'settings']] },
 ];
+
+// 社区 = 纯链接跳独立站点（R15-R16 返工 A1）：先探测可用性，不可达时诚实提示，不静默跳死链。
+async function openCommunity() {
+  try {
+    const s = await communityService.status();
+    if (s.status === 'unreachable') {
+      window.alert('社区服务未部署或未启用，暂时无法打开独立社区站点。');
+      return;
+    }
+  } catch {
+    window.alert('社区服务未部署或未启用，暂时无法打开独立社区站点。');
+    return;
+  }
+  window.open(COMMUNITY_URL, '_blank', 'noopener,noreferrer');
+}
+
 
 export function MainNav() {
   const { pathname } = useLocation();
@@ -45,11 +66,16 @@ export function MainNav() {
                   title={collapsed ? label : undefined}
                   style={collapsed ? { justifyContent: 'center', padding: '8px 0' } : undefined}
                   onClick={() => {
-                    if (k === 'community' || k === 'docs') { window.open('/' + k, '_blank'); return; }
+                    if (k === 'community') { void openCommunity(); return; }
                     nav(k === 'overview' ? '/' : '/' + k);
                   }}>
                   <span className="ic" style={isActive ? { color: 'var(--color-primary)' } : {}}><Icon name={icon} size={20} /></span>
                   {!collapsed && <span className="lbl">{label}</span>}
+                  {!collapsed && k === 'community' && (
+                    <span className="ic" title="在新标签打开独立社区站点" style={{ marginLeft: 'auto', color: 'var(--ink-3)' }}>
+                      <Icon name="externalLink" size={14} />
+                    </span>
+                  )}
                 </button>
               );
             })}

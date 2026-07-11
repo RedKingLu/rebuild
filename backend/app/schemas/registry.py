@@ -87,6 +87,15 @@ class ResourceResponse(BaseModel):
     source_status: str = "real"
     capability_status: str = "active"
     enabled: bool = True
+    # Distribution fields (R15-4-C2) + soft delete (C1)
+    package_url: str | None = None
+    checksum_sha256: str | None = None
+    manifest_json: dict | None = None
+    download_count: int = 0
+    icon_url: str | None = None
+    deleted_at: datetime | None = None
+    # R16-B E3: community resource imported version (追溯，不阻塞导入主链路)
+    imported_version: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

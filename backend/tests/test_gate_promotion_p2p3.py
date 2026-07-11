@@ -53,6 +53,11 @@ def test_p2_promotion_gate_create_and_approve(client, project_run):
     data = r.json()["data"]
     assert data["decision"] == "approve" and data["gate_status"] == "approved"
     assert "graph_driven" in data
+    # B-R17X-STATEDUP-3: no active graph thread → non-graph DIRECT promote branch
+    # (transition_mode "real", not the graph "real_background"); the removed
+    # already_decided fallback must not be hit.
+    assert data["graph_driven"] is False
+    assert data["transition_mode"] == "real"
 
 
 def _new_run(client, pid):

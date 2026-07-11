@@ -152,7 +152,7 @@ def _to_result(entry, query: str, score: float) -> dict:
                 snippet = body[:160].replace("\n", " ")
         except Exception:
             logger.debug("knowledge _to_result: failed to read snippet from body_path %r", body_path, exc_info=True)
-        snippet = (entry.description or "")[:160]
+            snippet = (entry.description or "")[:160]
     return {
         "resource_id": entry.resource_id,
         "name": entry.name,

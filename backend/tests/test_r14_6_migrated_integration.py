@@ -120,12 +120,85 @@ class TestMigratedSchema:
         finally:
             c.close()
 
-    def test_alembic_current_is_r14_head(self, tmp_path):
+    def test_alembic_current_is_head(self, tmp_path):
         db_url, db_file = _migrate_fresh_db(tmp_path)
         c = sqlite3.connect(db_file)
         try:
             ver = c.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-            assert ver == "a8b9c0d1e2f3", ver
+            # R15-4 C1/C2 c4f1a9d7e2b8, C8 7c407d04e07b, C10 39528fb4d798;
+            # R16-B E3 e4f5a6b7c8d9 (imported_version). Alembic head must be R16-B.
+            assert ver == "e4f5a6b7c8d9", ver
+        finally:
+            c.close()
+
+
+# Pre-R15 resource_entry schema: exactly the columns create_all produced before
+# R15-4, i.e. WITHOUT the 6 distribution/soft-delete columns. Used to prove the
+# R15-4 migration (c4f1a9d7e2b8) ADDS them on a real DB — the same "tests green
+# != real DB" guard the R14 tests above enforce.
+_PRE_R15_RESOURCE_ENTRY_DDL = """
+CREATE TABLE resource_entry (
+    resource_id VARCHAR(36) NOT NULL PRIMARY KEY,
+    resource_type VARCHAR(32) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    version VARCHAR(50),
+    source_type VARCHAR(32),
+    source_trust_level VARCHAR(32),
+    review_status VARCHAR(50),
+    reviewer VARCHAR(255),
+    review_notes TEXT,
+    enabled BOOLEAN NOT NULL,
+    created_at DATETIME
+)
+"""
+
+
+class TestR15Migration:
+    """R15-4-C1/C2: prove distribution + soft-delete columns come FROM the migration."""
+
+    def test_r15_migration_adds_distribution_columns(self, tmp_path):
+        import app.core.config as cfg
+        from app.dependencies import clear_services_cache
+        import app.core.database as db_mod
+        from alembic.config import Config
+        from alembic import command
+
+        db_file = tmp_path / "r15mig" / "rebuild.db"
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        db_url = f"sqlite:///{db_file}"
+        object.__setattr__(cfg.settings, "database_url", db_url)
+        object.__setattr__(cfg.settings, "data_dir", str(tmp_path / "r15mig"))
+        db_mod._engine = None
+        db_mod._SessionLocal = None
+        clear_services_cache()
+
+        # Pre-R15 state: resource_entry WITHOUT the new columns, stamped at R14 head.
+        c = sqlite3.connect(db_file)
+        c.execute(_PRE_R15_RESOURCE_ENTRY_DDL)
+        c.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        c.execute("INSERT INTO alembic_version (version_num) VALUES (?)", ("a8b9c0d1e2f3",))
+        c.commit()
+        c.close()
+
+        alembic_cfg = Config(str(BACKEND / "alembic.ini"))
+        alembic_cfg.set_main_option("script_location", str(BACKEND / "alembic"))
+        command.upgrade(alembic_cfg, "head")
+
+        c = sqlite3.connect(db_file)
+        try:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(resource_entry)").fetchall()]
+            for col in ("package_url", "checksum_sha256", "manifest_json",
+                        "download_count", "icon_url", "deleted_at"):
+                assert col in cols, f"{col} not added by migration; cols={cols}"
+            # review columns intentionally KEPT (deprecated, D-061 修订), not dropped
+            assert "review_status" in cols
+            assert "reviewer" in cols
+            # R16-B E3 must ALSO have added imported_version
+            assert "imported_version" in cols, f"imported_version missing; cols={cols}"
+            ver = c.execute("SELECT version_num FROM alembic_version").fetchone()[0]
+            # R15-4 = 39528fb4d798; R16-B E3 = e4f5a6b7c8d9 (current head).
+            assert ver == "e4f5a6b7c8d9", ver
         finally:
             c.close()
 

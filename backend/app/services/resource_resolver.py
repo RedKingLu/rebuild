@@ -150,25 +150,28 @@ def _resolve_tier_online(
     stage: str,
     exclude_ids: Optional[set] = None,
 ) -> list[ResolvedResource]:
-    """Tier 3: online community source (static provider, D-089/R15 留接口)."""
+    """Tier 3: online community source (R15-4 真实检索 + 静态 fallback)."""
+    exclude = exclude_ids or set()
     try:
-        from app.services.online_source_provider import get_static_online_resources
-        resources = get_static_online_resources(resource_types, stage)
-        exclude = exclude_ids or set()
+        from app.services.online_source_provider import search_community_resources
+        rtype = resource_types[0] if resource_types else None
+        res = search_community_resources(query=None, type=rtype, limit=20)
+        items = res.get("items") or []
         return [
             ResolvedResource(
-                resource_id=r["resource_id"],
-                name=r["name"],
-                resource_type=r.get("resource_type", "knowledge"),
+                resource_id=c["resource_id"],
+                name=c.get("name") or c["resource_id"],
+                resource_type=c.get("resource_type", "knowledge"),
                 hit_tier="online",
-                schedulable=False,  # online resources require import first (D-089)
+                schedulable=False,  # online resources require import first (D-089/C4)
                 dispatch="online_import_required",
-                description=r.get("description", ""),
-                source=r.get("url", ""),
-                metadata={"online_source": "static_R15"},
+                description=c.get("description", ""),
+                source=c.get("url") or c["resource_id"],
+                metadata={"online_source": c.get("online_source", "community"),
+                          "community_available": res.get("community_available", False)},
             )
-            for r in resources
-            if r["resource_id"] not in exclude
+            for c in items
+            if c.get("resource_id") not in exclude
         ]
     except Exception as e:
         logger.debug("_resolve_tier_online failed: %s", e)

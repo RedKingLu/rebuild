@@ -1,7 +1,6 @@
 """Resource Registry API routes — unified resource CRUD + query."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -74,79 +73,88 @@ def update_resource(resource_id: str, data: ResourceUpdate, svc: RegistryService
 
 @registry_router.delete("/{resource_id}", response_model=SuccessEnvelope)
 def delete_resource(resource_id: str, svc: RegistryService = Depends(get_service)):
+    """Soft-delete a resource (R15-4-C1): writes deleted_at, does not hard-delete."""
     if not svc.delete(resource_id):
         raise HTTPException(status_code=404, detail="Resource not found")
     return SuccessEnvelope(success=True, detail="Resource deleted")
 
 
-# ── Review state machine (T6.2 / D-061) ─────────────────────────────────
+# ── Enable / Disable (R15-4-C1) ─────────────────────────────────────────
+# 平台内社区资源统一 启用/禁用/软删除；不再走 review 状态机。
 
-class ReviewRequest(BaseModel):
-    decision: str          # "approve" | "reject"
-    reviewer: str = ""
-    review_notes: str = ""
-
-
-@registry_router.post("/{resource_id}/review", response_model=SuccessEnvelope)
-def review_resource(
-    resource_id: str,
-    body: ReviewRequest,
-    svc: RegistryService = Depends(get_service),
-):
-    """Approve or reject a community/user-provided resource.
-
-    approve → status=active, source_trust_level=reviewed_reference
-    reject  → status=blocked, source_trust_level=blocked
-    """
-    if body.decision not in ("approve", "reject"):
-        raise HTTPException(status_code=400, detail="decision 必须是 'approve' 或 'reject'")
-
-    entry = svc.get(resource_id)
+@registry_router.patch("/{resource_id}/enable", response_model=SuccessEnvelope)
+def enable_resource(resource_id: str, svc: RegistryService = Depends(get_service)):
+    entry = svc.set_enabled(resource_id, True)
     if entry is None:
         raise HTTPException(status_code=404, detail="Resource not found")
+    return SuccessEnvelope(data=svc.to_response(entry), detail="Resource enabled")
 
-    from datetime import datetime, timezone
-    from app.models.resource_entry import ResourceStatus, TrustLevel
-    now = datetime.now(timezone.utc)
 
-    if body.decision == "approve":
-        entry.status = ResourceStatus.active
-        entry.source_trust_level = TrustLevel.reviewed_reference
-        entry.review_status = "approved"
-    else:
-        entry.status = ResourceStatus.blocked
-        entry.source_trust_level = TrustLevel.blocked
-        entry.review_status = "rejected"
+@registry_router.patch("/{resource_id}/disable", response_model=SuccessEnvelope)
+def disable_resource(resource_id: str, svc: RegistryService = Depends(get_service)):
+    entry = svc.set_enabled(resource_id, False)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    return SuccessEnvelope(data=svc.to_response(entry), detail="Resource disabled")
 
-    entry.reviewer = body.reviewer or "platform"
-    entry.review_notes = body.review_notes
-    entry.updated_at = now
-    svc.db.commit()
-    svc.db.refresh(entry)
 
-    return SuccessEnvelope(
-        data=RegistryService.to_response(entry),
-        meta={"review_decision": body.decision, "resource_id": resource_id},
+# ── Review state machine — DEPRECATED (R15-4-C1, D-061 修订执行注 2026-07-09) ──
+# 社区资源合格性由发布侧保证；平台内不设资源审核状态机。approve/reject 退出主链路。
+# 端点保留但返回 410 Gone，引导使用 启用/禁用/软删除 + L1-L5 动作风险。
+
+@registry_router.post("/{resource_id}/review")
+def review_resource_gone(resource_id: str):
+    """DEPRECATED (410 Gone). 社区资源审核门已于 R15-4 废弃（D-061 修订）。
+
+    请改用 PATCH /resources/{id}/enable、PATCH /resources/{id}/disable、
+    DELETE /resources/{id}（软删除）。高危动作风险仍由 L1-L5 动作层处理。
+    """
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "resource review 状态机已废弃（R15-4，D-061 修订）：社区资源合格性由发布侧保证，"
+            "平台内统一 启用/禁用/软删除 + L1-L5 动作风险。请改用 "
+            "PATCH /resources/{id}/enable | /disable | DELETE /resources/{id}。"
+        ),
     )
 
 
-# ── T5.3: knowledge search endpoint ──────────────────────────────────────────
+# T5.3 knowledge search endpoint moved to routes_knowledge.py (knowledge_router,
+# prefix=/knowledge) so its URL is /api/knowledge/search, consistent with
+# /api/knowledge/import-package. It was briefly on registry_router (prefix=/resources)
+# which produced the misleading /api/resources/knowledge/search path.
 
-@registry_router.get("/knowledge/search")
-def search_knowledge(
-    q: str = "",
-    scope: str = "all",
-    limit: int = Query(default=10, le=50),
-    svc: RegistryService = Depends(get_service),
-):
-    """Full-text search over knowledge resources (T5.3/R9-5-4).
 
-    scope: "all" | "platform" | "user" | "community"
-    Returns results with retrieval_mode, snippet, score.
-    """
-    from app.services.knowledge_search import search
-    results = search(q.strip(), svc.db, limit=limit, scope=scope)
+def _read_body(entry) -> str | None:
+    """Read a knowledge/case resource's Markdown body from its stored body_path."""
+    meta = entry.type_metadata or {}
+    body_path = meta.get("body_path")
+    if body_path:
+        from pathlib import Path
+        p = Path(body_path)
+        if p.exists():
+            return p.read_text(encoding="utf-8", errors="replace")
+    # fall back to source_path_or_ref directory's body.md
+    ref = entry.source_path_or_ref
+    if ref:
+        from pathlib import Path
+        p = Path(ref)
+        candidate = p / "body.md" if p.is_dir() else p.parent / "body.md"
+        if candidate.exists():
+            return candidate.read_text(encoding="utf-8", errors="replace")
+    return None
+
+
+# ── T5.3b: knowledge/case content (Markdown body) ────────────────────────
+
+@registry_router.get("/{resource_id}/content")
+def resource_content(resource_id: str, svc: RegistryService = Depends(get_service)):
+    """Return the Markdown body of a knowledge/case resource (R15-4-C7)."""
+    entry = svc.get(resource_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    body = _read_body(entry)
     return SuccessEnvelope(
-        data={"results": results, "query": q, "scope": scope, "count": len(results)},
-        meta={"source_status": "real", "retrieval_mode": results[0]["retrieval_mode"] if results else "fulltext_like"},
+        data={"resource_id": resource_id, "content": body, "content_type": "text/markdown"},
+        meta={"source_status": "real", "has_body": body is not None},
     )

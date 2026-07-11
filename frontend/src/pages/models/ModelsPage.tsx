@@ -5,11 +5,10 @@
  * 平台助手已移至全局浮动弹窗（PlatformAssistant），本页不再内嵌助手对话。
  */
 import { useState, useEffect, useCallback } from 'react';
-import { Link } from 'react-router-dom';
 import {
   listProviders, listProfiles, listStrategies,
   selfTest, listCalls, deleteProvider, deleteStrategy, getUsage,
-  CAPABILITY_MARKERS,
+  CAPABILITY_MARKERS, listModelEvaluations,
   type ProviderInfo, type ModelProfileInfo, type StrategyInfo,
   type SelfTestResult, type CallLogEntry, type UsageInfo,
 } from '../../services/modelService';
@@ -18,8 +17,9 @@ import { EditProviderModal } from '../../components/models/EditProviderModal';
 import { StrategyEditModal } from '../../components/models/StrategyEditModal';
 import { CreateStrategyModal } from '../../components/models/CreateStrategyModal';
 import { Icon } from '../../components/ui/Icon';
+import { ModelCatalogTab } from '../../components/models/ModelCatalogTab';
+import { ModelEvalTab } from '../../components/models/ModelEvalTab';
 
-const COST_TIER_LABEL: Record<string, string> = { low: '低成本', medium: '中等', high: '高成本' };
 const CRED_LABEL: Record<string, string> = {
   configured: '已配置', missing: '未配置', invalid: '凭据无效', redacted: '已脱敏', not_checked: '未检测',
 };
@@ -39,13 +39,14 @@ function CapabilityBadge({ marker }: { marker: string }) {
   );
 }
 
-type Tab = 'providers' | 'catalog' | 'strategies' | 'usage';
+type Tab = 'providers' | 'catalog' | 'eval' | 'strategies' | 'usage';
 
 export function ModelsPage() {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [profiles, setProfiles] = useState<ModelProfileInfo[]>([]);
   const [strategies, setStrategies] = useState<StrategyInfo[]>([]);
   const [calls, setCalls] = useState<CallLogEntry[]>([]);
+  const [evalCount, setEvalCount] = useState(0);
   const [usage, setUsage] = useState<UsageInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -56,7 +57,7 @@ export function ModelsPage() {
   const [editProvider, setEditProvider] = useState<ProviderInfo | null>(null);
   const [editStrategy, setEditStrategy] = useState<StrategyInfo | null>(null);
   const [showCreateStrategy, setShowCreateStrategy] = useState(false);
-  const [catalogFilter, setCatalogFilter] = useState<string>('');
+  // catalogFilter moved into ModelCatalogTab (R15-4-C9).
   const [callPage, setCallPage] = useState(0);
   const [callTotal, setCallTotal] = useState(0);
   const PAGE_SIZE = 10;
@@ -75,6 +76,9 @@ export function ModelsPage() {
       setCallTotal(callsResp.data?.total || 0);
       setCallPage(0);
       setUsage(usageResp.data || null);
+      // eval results (display-only); failure is non-fatal
+      try { listModelEvaluations().then((d) => setEvalCount(d.total)).catch(() => {}); }
+      catch { /* ignore */ }
     } catch (e) {
       setError(e instanceof Error ? e.message : '加载模型数据失败');
     } finally {
@@ -155,6 +159,8 @@ export function ModelsPage() {
           label={`已配置 / 总数 · ${reachableCount} 个已连通`} />
         <StatCard active={tab === 'catalog'} onClick={() => setTab('catalog')}
           title="模型" value={`${profiles.length}`} label="可用模型 Profile（点击查看目录）" />
+        <StatCard active={tab === 'eval'} onClick={() => setTab('eval')}
+          title="评测" value={`${evalCount}`} label="导入的 Agent×Model 评测结果（展示）" />
         <StatCard active={tab === 'strategies'} onClick={() => setTab('strategies')}
           title="默认模型" value={defaultStrategy?.default_profile_ref || '—'} valueSize={14}
           label="系统默认策略（点击查看）" />
@@ -166,7 +172,7 @@ export function ModelsPage() {
       {/* 操作条：仅保留当前面板标题 + 动作（tab 切换已由上方四个统计框承担） */}
       <div className="row" style={{ marginTop: 14, marginBottom: 10, alignItems: 'center' }}>
         <b style={{ fontSize: 14 }}>
-          {{ providers: '服务商', catalog: '模型目录', strategies: '模型策略', usage: '用量与调用' }[tab]}
+          {{ providers: '服务商', catalog: '模型目录', eval: '评测结果', strategies: '模型策略', usage: '用量与调用' }[tab]}
         </b>
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
           {tab === 'providers' && <button className="btn sm" onClick={() => setShowAdd(true)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="add" size={14} />添加供应商</button>}
@@ -230,54 +236,11 @@ export function ModelsPage() {
         </div>
       )}
 
-      {/* 模型目录 */}
-      {tab === 'catalog' && (
-        <div>
-          {/* 顶部供应商筛选（横向） */}
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
-            <span className="sub" style={{ fontSize: 12, marginRight: 4 }}>供应商：</span>
-            <button className={`btn sm ${catalogFilter === '' ? '' : 'ghost'}`} onClick={() => setCatalogFilter('')}>全部</button>
-            {providers.map(p => (
-              <button key={p.provider_id} className={`btn sm ${catalogFilter === p.provider_id ? '' : 'ghost'}`}
-                onClick={() => setCatalogFilter(p.provider_id)}>{p.provider_name}</button>
-            ))}
-          </div>
-          {/* 模型卡片网格 */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 10, alignContent: 'start' }}>
-            {profiles.filter(p => !catalogFilter || p.provider_id === catalogFilter).map(p => (
-              <div key={p.profile_id} className="card" style={{ padding: 12 }}>
-                <div className="spread">
-                  <b>{p.display_name}</b>
-                  <CapabilityBadge marker={
-                    p.status === 'configured'
-                      ? (providers.find(pr => pr.provider_id === p.provider_id)?.capability_marker === 'real_available' ? 'real_available' : 'configured_not_verified')
-                      : 'not_connected'
-                  } />
-                </div>
-                <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>{p.model_name} · {COST_TIER_LABEL[p.cost_tier] || p.cost_tier}</div>
-                <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                  {p.capability_tags.map(t => (
-                    <span key={t} className="tag" style={{ fontSize: 10, background: 'var(--surface-2)', color: 'var(--fg)' }}>{t}</span>
-                  ))}
-                  {p.is_fusion_capable && (
-                    <Link to="/fusion" className="tag" title="能力标记：该模型可参与「聚合(Fusion)」多模型审议。点击查看 / 配置聚合。"
-                      style={{ fontSize: 10, background: 'var(--violet, #8b5cf6)', color: '#fff', textDecoration: 'none' }}>可参与聚合(Fusion) →</Link>
-                  )}
-                  {p.provider_id === 'rebuild-fusion' && (
-                    <Link to="/fusion" className="tag" title="Fusion 聚合模型：像普通模型一样在策略 / Agent 默认 / 助手中选用；点击进入 /fusion 配置。"
-                      style={{ fontSize: 10, background: 'var(--violet, #8b5cf6)', color: '#fff', textDecoration: 'none' }}>聚合模型 · 配置 →</Link>
-                  )}
-                </div>
-                {p.recommended_use && <div className="sub" style={{ fontSize: 11, marginTop: 6 }}>推荐：{p.recommended_use}</div>}
-                {p.context_window_note && <div className="sub" style={{ fontSize: 11 }}>上下文：{p.context_window_note}</div>}
-              </div>
-            ))}
-            {profiles.filter(p => !catalogFilter || p.provider_id === catalogFilter).length === 0 && (
-              <div className="empty"><p className="sub">该供应商暂无模型。</p></div>
-            )}
-          </div>
-        </div>
-      )}
+      {/* 模型目录（R15-4-C9：持久化 ModelCatalog 数据源，非内存 Profile） */}
+      {tab === 'catalog' && <ModelCatalogTab />}
+
+      {/* 评测结果（R15-4-C10：导入评测结果展示，非自动评测引擎） */}
+      {tab === 'eval' && <ModelEvalTab />}
 
       {/* 策略 */}
       {tab === 'strategies' && (

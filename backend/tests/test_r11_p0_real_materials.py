@@ -34,6 +34,10 @@ def test_fabricated_p0_files_are_not_produced(client):
     pid = _make_manual_project(client)
     resp = client.post(f"/api/projects/{pid}/onboarding/complete", json={"execution_mode": "auto"})
     assert resp.status_code == 200, resp.text
+    # R17-X 联调修复: complete 不再自动驱动 P0 图。P0 图执行（含真实材料产出）由用户点
+    # 「开始」触发的 POST /onboarding/execute 完成 — 故先驱动 execute，再断言产物。
+    exec_resp = client.post(f"/api/projects/{pid}/onboarding/execute")
+    assert exec_resp.status_code == 200, exec_resp.text
 
     art = _artifacts_dir(pid)
     for fabricated in ("p0_execution_record.json", "p0_construction_report.md", "p0_review_pass.json"):
@@ -46,6 +50,9 @@ def test_real_stage_reports_are_produced(client):
     pid = _make_manual_project(client)
     resp = client.post(f"/api/projects/{pid}/onboarding/complete", json={"execution_mode": "auto"})
     assert resp.status_code == 200, resp.text
+    # R17-X: 真实 StageReports 由 execute 驱动的图 P0 节点产出（complete 不再驱动图）
+    exec_resp = client.post(f"/api/projects/{pid}/onboarding/execute")
+    assert exec_resp.status_code == 200, exec_resp.text
 
     art = _artifacts_dir(pid)
     for real in ("p0_start_plan.json", "p0_construction.json", "p0_acceptance.json"):
@@ -71,11 +78,14 @@ def test_gate_artifact_refs_point_to_real_reports(client):
     pid = _make_manual_project(client)
     resp = client.post(f"/api/projects/{pid}/onboarding/complete", json={"execution_mode": "auto"})
     assert resp.status_code == 200, resp.text
+    # R17-X: P0 Gate 由 execute 驱动的图创建（complete 不再创建 Gate）
+    exec_resp = client.post(f"/api/projects/{pid}/onboarding/execute")
+    assert exec_resp.status_code == 200, exec_resp.text
 
     # the aggregate exposes the active gate the frontend GatePanel renders from
     agg = client.get(f"/api/projects/{pid}/workspace").json()["data"]
     gate = agg.get("active_gate")
-    assert gate is not None, "No active P0 gate after onboarding/complete"
+    assert gate is not None, "No active P0 gate after onboarding/execute"
     refs = gate.get("artifact_refs") or []
     assert refs, "Gate has no artifact_refs — panel would fall back to hardcoded names"
     joined = " ".join(refs)
@@ -90,6 +100,8 @@ def test_stage_artifacts_p0_lists_real_names(client):
     """The /stage-artifacts/p0 core list must be the real StageReport names."""
     pid = _make_manual_project(client)
     client.post(f"/api/projects/{pid}/onboarding/complete", json={"execution_mode": "auto"})
+    # R17-X: 真实 P0 产物由 execute 驱动的图产出（complete 不再驱动图）
+    client.post(f"/api/projects/{pid}/onboarding/execute")
     d = client.get(f"/api/projects/{pid}/stage-artifacts/p0").json()["data"]
     names = {a["name"] for a in d["artifacts"]}
     assert {"p0_start_plan.json", "p0_construction.json", "p0_acceptance.json"} <= names, \

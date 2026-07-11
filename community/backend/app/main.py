@@ -20,14 +20,16 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db, init_db
 from app.models import (
-    CommunityResource, CommunityNews, CommunityModelEntry, CommunityEvaluation,
+    CommunityResource, CommunityDoc, CommunityNews, CommunityModelEntry,
+    CommunityEvaluation,
 )
 from app import seed
 from app import schemas
 
-app = FastAPI(title="rebuild community", version=seed.VERSION)
+app = FastAPI(title="rebuild community", version=seed.VERSION,
+                docs_url=None, redoc_url=None)  # free /docs for content docs (R16-E1)
 
-COMMUNITY_VERSION = seed.VERSION
+COMMUNITY_VERSION = seed.VERSION  # R16-E1: bumped to reflect docs addition
 
 
 @app.on_event("startup")
@@ -49,7 +51,32 @@ def status(db: Session = Depends(get_db)) -> schemas.StatusResponse:
         resource_count=db.query(CommunityResource).count(),
         model_count=db.query(CommunityModelEntry).count(),
         evaluation_count=db.query(CommunityEvaluation).count(),
+        doc_count=db.query(CommunityDoc).count(),
     )
+
+
+# ── GET /docs  (R16-E1: community online documentation) ────────────────
+@app.get("/docs", response_model=schemas.CommunityDocListResponse)
+def docs_list(
+    category: str | None = None,
+    db: Session = Depends(get_db),
+) -> schemas.CommunityDocListResponse:
+    q_ = db.query(CommunityDoc).order_by(CommunityDoc.updated_at.desc())
+    if category:
+        q_ = q_.filter(CommunityDoc.category == category)
+    items = q_.all()
+    return schemas.CommunityDocListResponse(
+        docs=[schemas.CommunityDocItem.model_validate(d) for d in items],
+        total=len(items),
+    )
+
+
+@app.get("/docs/{slug}", response_model=schemas.CommunityDocDetail)
+def docs_detail(slug: str, db: Session = Depends(get_db)) -> schemas.CommunityDocDetail:
+    item = db.get(CommunityDoc, slug)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Doc not found")
+    return schemas.CommunityDocDetail.model_validate(item)
 
 
 # ── GET /news ──────────────────────────────────────────────────────────
@@ -102,6 +129,57 @@ def resource_detail(resource_id: str, db: Session = Depends(get_db)) -> schemas.
     if item is None:
         raise HTTPException(status_code=404, detail="Resource not found")
     return schemas.ResourceDetail.model_validate(item)
+
+
+# ── R16-B E3: GET /resources/{id}/versions ────────────────────────────
+@app.get("/resources/{resource_id}/versions", response_model=schemas.VersionListResponse)
+def resource_versions(resource_id: str, db: Session = Depends(get_db)) -> schemas.VersionListResponse:
+    """List available versions of a community resource.
+
+    Honesty note (Q-R16B-2 方案 A): community seed only stores ONE real checksum/files
+    for the *current* version. Historical versions are recorded here for traceability
+    only — importing any old version will download+verify the CURRENT package and warn
+    the user. We do NOT pretend to have per-version binaries.
+    """
+    item = db.get(CommunityResource, resource_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    current = item.version
+    v_list = []
+    for v in (item.versions or []):
+        v_list.append(schemas.CommunityResourceVersion(
+            version=v,
+            manifest_ref=f"/resources/{resource_id}/versions/{v}/manifest" if v == current else "",
+            deprecated=(v != current),
+        ))
+    return schemas.VersionListResponse(
+        resource_id=item.id,
+        versions=v_list,
+        current_version=current,
+        note="当前仅支持导入最新版本；历史版本记录用于版本追溯。",
+    )
+
+
+@app.get("/resources/{resource_id}/versions/{version}/manifest", response_model=schemas.ManifestResponse)
+def resource_version_manifest(resource_id: str, version: str, db: Session = Depends(get_db)) -> schemas.ManifestResponse:
+    """Per-version manifest. Only the current version has real files/checksum; others 404."""
+    item = db.get(CommunityResource, resource_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    if version != item.version:
+        raise HTTPException(status_code=404, detail="仅当前版本有有效的 manifest/files/checksum")
+    files = [
+        schemas.ManifestFile(name=f.get("name", ""), size=f.get("size", 0))
+        for f in (item.files or [])
+    ]
+    return schemas.ManifestResponse(
+        resource_id=item.id,
+        version=item.version,
+        type=item.resource_type,
+        files=files,
+        checksum_sha256=item.checksum_sha256,
+        dependencies=item.dependencies or [],
+    )
 
 
 # ── GET /resources/{id}/manifest ───────────────────────────────────────

@@ -1,18 +1,22 @@
-"""AgentModelEvalResult API (R15-4-C10): imported eval results — display only.
+"""AgentModelEvalResult API (R15-4-C10 + R16-B E4): imported eval results — display only.
 
 Endpoints:
-  GET  /api/model-evaluations          query by model_id / task_type / scenario
-  POST /api/model-evaluations/import   import eval results (no auto-eval engine)
+  GET  /api/model-evaluations              query by model_id / task_type / scenario / agent_type
+  POST /api/model-evaluations/import       JSON import (no auto-eval engine)
+  POST /api/model-evaluations/import-csv   CSV import (stdlib csv, no new dependency)
+  GET  /api/model-evaluations/compare      cross-model comparison for a task+scenario
 
 Red line #9/#10/#11: this is a catalog of IMPORTED results. The page must show
 source/eval_method/limitations/sample_count for every row and must never present
-rankings as the model's global capability.
+rankings as the model's global capability. No auto-eval / no Elo / no user voting.
 """
 from __future__ import annotations
 
+import csv
+import io
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -51,6 +55,7 @@ def list_evaluations(
     model_id: str | None = None,
     task_type: str | None = None,
     scenario: str | None = None,
+    agent_type: str | None = None,   # R16-B E4: extra filter dimension
     db: Session = Depends(get_db),
 ) -> dict:
     stmt = select(AgentModelEvalResult)
@@ -60,6 +65,8 @@ def list_evaluations(
         stmt = stmt.where(AgentModelEvalResult.task_type == task_type)
     if scenario:
         stmt = stmt.where(AgentModelEvalResult.scenario == scenario)
+    if agent_type:
+        stmt = stmt.where(AgentModelEvalResult.agent_type == agent_type)
     items = db.execute(stmt.order_by(AgentModelEvalResult.score.desc())).scalars().all()
     return SuccessEnvelope(
         data={"total": len(items), "evaluations": [_to_dict(e) for e in items]},
@@ -126,6 +133,113 @@ def import_evaluations(body: EvalImportRequest, db: Session = Depends(get_db)) -
     return SuccessEnvelope(
         data={"imported": imported, "total": db.query(AgentModelEvalResult).count()},
         meta=Meta(),
+    ).model_dump()
+
+
+@eval_router.post("/import-csv")
+async def import_evaluations_csv(file: UploadFile = File(...),
+                                db: Session = Depends(get_db)) -> dict:
+    """CSV import for evaluation results (R16-B E4).
+
+    CSV header must include at least: eval_id, model_id. Optional columns map to
+    EvalImportItem fields (task_type, scenario, metric, score, success_rate,
+    sample_count, source, eval_method, limitations, agent_type, cost_level,
+    latency_level, eval_version, published_at). Uses stdlib csv (no new dependency).
+    Idempotent on eval_id; duplicate rows update in place. No auto-eval is performed.
+    """
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=422, detail="评测导入文件必须是 .csv 文件")
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except Exception:
+        text = raw.decode("latin-1", errors="replace")
+
+    reader = csv.DictReader(io.StringIO(text))
+    allowed = {f for f in EvalImportItem.model_fields}
+    # EvalImportItem requires eval_id + model_id; ensure present
+    imported = 0
+    errors: list[str] = []
+    for lineno, row in enumerate(reader, start=2):
+        if not row.get("eval_id") or not row.get("model_id"):
+            errors.append(f"第 {lineno} 行缺少 eval_id 或 model_id，已跳过")
+            continue
+        # whitelist columns to EvalImportItem fields
+        cleaned = {k: v for k, v in row.items() if k in allowed and v is not None and v != ""}
+        cleaned.setdefault("eval_id", row.get("eval_id", ""))
+        cleaned.setdefault("model_id", row.get("model_id", ""))
+        try:
+            item = EvalImportItem.model_validate(cleaned)
+        except Exception as e:
+            errors.append(f"第 {lineno} 行校验失败：{e}")
+            continue
+        existing = db.get(AgentModelEvalResult, item.eval_id)
+        row_ = existing or AgentModelEvalResult(eval_id=item.eval_id)
+        for field, value in item.model_dump(exclude={"eval_id"}).items():
+            setattr(row_, field, value)
+        if item.published_at:
+            try:
+                from datetime import datetime as _dt
+                row_.published_at = _dt.fromisoformat(item.published_at)
+            except Exception:
+                row_.published_at = None
+        if existing is None:
+            db.add(row_)
+        imported += 1
+    db.commit()
+    return SuccessEnvelope(
+        data={"imported": imported,
+              "total": db.query(AgentModelEvalResult).count(),
+              "errors": errors[:20]},
+        meta={"source_status": "real", "warning": "CSV 导入必须包含来源与方法学说明；结果非平台自动评测。" if not errors else None},
+    ).model_dump()
+
+
+@eval_router.get("/compare")
+def compare_evaluations(
+    task_type: str = Query(...),
+    scenario: str = Query(...),
+    model_ids: list[str] = Query(default=[]),   # ?model_ids=a&model_ids=b
+    db: Session = Depends(get_db),
+) -> dict:
+    """Cross-model comparison for one task+scenario (R16-B E4).
+
+    Returns up to N models (default all matching) with score/rate/samples/method so
+    the frontend can render a horizontal comparison table. Rankings are derived from
+    imported data (score.desc) and MUST be framed as imported-data-only, never a global
+    capability verdict — the frontend adds the red-line #9 disclaimer.
+    """
+    if not model_ids:
+        # distinct models for this task+scenario
+        rows = db.execute(
+            select(AgentModelEvalResult.model_id).where(
+                AgentModelEvalResult.task_type == task_type,
+                AgentModelEvalResult.scenario == scenario,
+            ).distinct()
+        ).scalars().all()
+        model_ids = list(rows)
+    items = db.execute(
+        select(AgentModelEvalResult).where(
+            AgentModelEvalResult.task_type == task_type,
+            AgentModelEvalResult.scenario == scenario,
+            AgentModelEvalResult.model_id.in_(model_ids),
+        ).order_by(AgentModelEvalResult.score.desc())
+    ).scalars().all()
+
+    # group by model_id, keep best metric row per model for the compare table
+    best: dict[str, dict] = {}
+    for it in items:
+        if it.model_id not in best:
+            best[it.model_id] = _to_dict(it)
+    return SuccessEnvelope(
+        data={
+            "task_type": task_type,
+            "scenario": scenario,
+            "rows": list(best.values()),
+            "rank_by": "score",
+            "note": "排名按导入评测分数降序，仅反映本次导入数据，不代表模型全局能力。",
+        },
+        meta={"source_status": "real"},
     ).model_dump()
 
 

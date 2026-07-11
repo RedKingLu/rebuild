@@ -240,7 +240,7 @@ class AgentLoop:
                             continue
 
                     # Authorized (auto_approved / approved) or low-risk read → execute
-                    result = await self._execute_tool(fn_name, fn_args, project_id, project_name, stage, file_count, artifacts)
+                    result = await self._execute_tool(fn_name, fn_args, project_id, project_name, stage, file_count, artifacts, run_id=run_id)
                     yield f"event: tool\ndata: {json.dumps({'tool': fn_name, 'result': str(result)[:200]}, ensure_ascii=False)}\n\n"
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result, ensure_ascii=False)})
 
@@ -325,14 +325,15 @@ class AgentLoop:
         return "\n\n".join(parts)
 
     async def _execute_tool(self, name: str, args: dict, project_id: str, project_name: str,
-                            stage: str, file_count: int, artifacts: list[str] | None) -> dict:
+                            stage: str, file_count: int, artifacts: list[str] | None,
+                            run_id: str = "") -> dict:
         """Execute a tool call — routes via tool_registry.execute_tool() (T2.4/R9-5-4)."""
         try:
             from app.services.tool_registry import execute_tool
             from app.core.database import get_session
             db = get_session()
             try:
-                return await execute_tool(name, args, project_id, stage=stage, db=db)
+                return await execute_tool(name, args, project_id, stage=stage, db=db, run_id=run_id)
             finally:
                 db.close()
         except Exception as e:

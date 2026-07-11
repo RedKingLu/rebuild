@@ -180,8 +180,8 @@ export function OverviewPage() {
   // ── Row 3 底部链接（保持不变）──
   const links = [
     { to: '/community', ic: 'community' as IconKey, title: '社区', ext: true, desc: '案例市场、Skill 市场、模板（新标签页）' },
-    { to: '/docs', ic: 'docs' as IconKey, title: '文档', ext: true, desc: '平台使用文档与 Wiki（新标签页）' },
-    { to: '/knowledge', ic: 'knowledge' as IconKey, title: '知识', ext: false, desc: '平台自带文档与我的笔记' },
+    // docs 入口已移除（R15-4-C7）：文档内容迁移为知识包，指向 /knowledge。
+    { to: '/knowledge', ic: 'knowledge' as IconKey, title: '知识', ext: false, desc: '平台自带文档（知识包）与我的笔记' },
   ];
 
   // ── Stat card helper ──

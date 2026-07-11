@@ -291,3 +291,58 @@ def seed_all(db: Session) -> dict:
 
     db.commit()
     return counts
+
+
+# ── R15-4-C8: ModelCatalog seeder (from model_profiles.yaml) ────────────────
+
+def seed_model_catalog(db: Session) -> int:
+    """Seed ModelCatalogEntry from config/model_profiles.yaml (idempotent).
+
+    Only seeds when the catalog table is empty, so it never overwrites operator
+    edits. Coexists with the runtime ModelProfile/ModelGateway in-memory structs.
+    """
+    from datetime import datetime, timezone
+    from app.models.model_catalog import ModelCatalogEntry
+    if db.query(ModelCatalogEntry).count() > 0:
+        return 0
+
+    import yaml
+    from pathlib import Path
+    cfg_path = Path(__file__).resolve().parent / "config" / "model_profiles.yaml"
+    if not cfg_path.exists():
+        return 0
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+
+    now = datetime.now(timezone.utc)
+    n = 0
+    for prov in data.get("providers", []):
+        prov_id = prov.get("provider_id", "")
+        for m in prov.get("models", []):
+            model_id = m.get("model_name", "")
+            if not model_id:
+                continue
+            catalog_id = f"{prov_id}/{model_id}"
+            context = m.get("context_window")
+            # allow numeric context_window; yaml note is a string like "1M tokens"
+            if isinstance(context, str):
+                context = None
+            db.add(ModelCatalogEntry(
+                catalog_id=catalog_id,
+                model_id=model_id,
+                provider_id=prov_id,
+                display_name=m.get("display_name", model_id),
+                family=model_id.split("-")[0] if "-" in model_id else model_id,
+                model_version=model_id,
+                context_window=context,
+                capability_tags=m.get("capability_tags") or [],
+                task_tags=[],
+                availability_status="available",
+                official_url=None,
+                official_icon_url=None,
+                license=None,
+                source="seed",
+                updated_at=now,
+            ))
+            n += 1
+    db.commit()
+    return n

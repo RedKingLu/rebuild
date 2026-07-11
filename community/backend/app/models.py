@@ -46,6 +46,27 @@ class CommunityResource(Base):
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class CommunityDoc(Base):
+    """Community online documentation (R16-E1). Read-only, seeded by 发布侧.
+
+    Stored in the independent community SQLite (NOT shared with the platform DB,
+    NOT the platform's Knowledge registry). Trusted release-side seed content.
+    No body_path indirection — Markdown lives in-column (trusted seed only).
+    """
+    __tablename__ = "community_doc"
+
+    slug: Mapped[str] = mapped_column(String(128), primary_key=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    body_markdown: Mapped[str] = mapped_column(Text, default="")   # Markdown 正文
+    category: Mapped[str] = mapped_column(String(64), default="")
+    tags: Mapped[list | None] = mapped_column(JSON, default=list)
+    version: Mapped[str] = mapped_column(String(50), default="1.0.0")
+    source: Mapped[str] = mapped_column(String(32), default="community")   # official|community
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class CommunityNews(Base):
     __tablename__ = "community_news"
 

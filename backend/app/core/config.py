@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     # 随 R 阶段推进手动更新；未知时返 "unknown"（不硬编码过期值）。
     r_stage: str = "R17"
 
+    # R15-4 Community Connector：独立社区服务 base URL（可切换本地/未来远程官方社区）。
+    # 端口标准：community-backend 8001（见 06-容器化部署与执行隔离规范 §1.1）。
+    community_base_url: str = "http://localhost:8001"
+
     # R7 GitHub OAuth
     # redirect_uri 必须与 GitHub OAuth App 注册的回调一致，且在 dev/容器两套拓扑下不变：
     # 后端统一监听 8000 → 注册一次即可两套通用（端口标准见 06-容器化部署与执行隔离规范 §1.1）。
@@ -57,6 +61,10 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def community_base_url_normalized(self) -> str:
+        return self.community_base_url.rstrip("/")
 
 
 # Module-level singleton for convenience (used by database, alembic, etc.)

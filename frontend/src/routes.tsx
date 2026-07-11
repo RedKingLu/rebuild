@@ -16,8 +16,9 @@ import { ModelsPage } from './pages/models/ModelsPage';
 import { FusionPage } from './pages/fusion/FusionPage';
 import { CasesPage } from './pages/cases/CasesPage';
 import { KnowledgePage } from './pages/knowledge/KnowledgePage';
-import { CommunityPage } from './pages/community/CommunityPage';
-import { DocsPage } from './pages/docs/DocsPage';
+// CommunityPage removed (R15-R16 返工 A2/A3): 平台内社区镜像页下线，社区入口改为跳独立站点；
+// /community 旧路径回落 404。
+// DocsPage removed (R15-4-C7): Docs/Help 入口下线，内容迁移为 knowledge 包。
 import { SettingsPage } from './pages/settings/SettingsPage';
 import { NotFoundPage } from './pages/errors/NotFoundPage';
 
@@ -56,8 +57,6 @@ export const router = createBrowserRouter([
     element: <WorkspaceLayout />,
     children: [
       { path: '/projects/:id/workspace', element: wrap(<WorkspacePage />) },
-      { path: '/community', element: wrap(<CommunityPage />) },
-      { path: '/docs', element: wrap(<DocsPage />) },
     ],
   },
   // 404

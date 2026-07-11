@@ -9,7 +9,8 @@ Execution routing by write_scope / binds_via (type_metadata):
   write_scope=none  → local read-only direct execution
   write_scope=workspace → workspace-confined write
   write_scope=system / execute_scope → ExecutionProvider.execute()
-  risk_level≥L3    → TODO: R9-5-7 HITL gate接线占位（当前返回 risk_flagged）
+  risk_level≥L3    → OD-06: create a real action_approval Gate (GateService) and
+                     return awaiting_approval; honest risk_flagged if no Gate backend.
 
 Built-in 3 tools (get_project_info/read_artifact/run_profiling) remain available
 as seed-driven tools so capability is not lost when Registry is empty.
@@ -72,6 +73,28 @@ _BUILTIN_SCHEMAS = [
         "_tool_id": "builtin:run_profiling",
         "_risk_level": "L1",
         "_write_scope": "workspace",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "introduce_community_resource",
+            "description": (
+                "从社区检索资源：按关键词/类型搜索独立社区服务；若该资源已导入并启用则直接返回（不再审批）；"
+                "否则创建一道真实的人工审批门（community_resource_introduction），用户同意后才下载(sha256校验)并导入。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词（资源名/描述）"},
+                    "resource_type": {"type": "string", "description": "资源类型过滤，如 case/tool/skill/knowledge/template"},
+                },
+                "required": [],
+            },
+        },
+        "_source": "builtin",
+        "_tool_id": "builtin:introduce_community_resource",
+        "_risk_level": "L2",
+        "_write_scope": "none",
     },
 ]
 
@@ -205,6 +228,7 @@ async def execute_tool(
     stage: str = "p0",
     db: Optional[Session] = None,
     tracer=None,
+    run_id: str = "",
 ) -> dict:
     """Execute a tool by name, routing via write_scope / binds_via.
 
@@ -214,7 +238,8 @@ async def execute_tool(
     - write_scope=none → local read (workspace/source)
     - write_scope=workspace → workspace-confined write
     - write_scope=execute → ExecutionProvider.execute()
-    - risk_level≥L3 → risk_flagged (TODO: R9-5-7 HITL接线)
+    - risk_level≥L3 → OD-06: create a real action_approval Gate (awaiting_approval);
+                      honest risk_flagged if no Gate backend is available.
 
     Writes Trace on every call (公理3 / T2.3).
     """
@@ -246,15 +271,12 @@ async def execute_tool(
     if tool_entry is None:
         return await _execute_builtin(tool_name, args, project_id, stage)
 
-    # Risk gate check (T2.3 / S3: full HITL→R9-5-7, current: flag+trace)
+    # Risk gate (T2.3 / OD-06): an L3+ tool must NOT execute silently — create a real
+    # action_approval Gate through the existing GateService kernel and return
+    # awaiting_approval. Honest degradation if no Gate backend (see _create_risk_gate).
     risk = tool_entry.risk_level.value if hasattr(tool_entry.risk_level, "value") else "L0"
     if _RISK_ORDER.index(risk) >= _RISK_ORDER.index(_GATE_RISK_THRESHOLD):
-        result = {
-            "status": "risk_flagged",
-            "risk_level": risk,
-            "tool_name": tool_name,
-            "message": f"工具风险等级 {risk} ≥ {_GATE_RISK_THRESHOLD}，需人工审核（TODO: R9-5-7 HITL接线）",
-        }
+        result = _create_risk_gate(project_id, run_id, stage, tool_name, risk)
         _write_trace(tracer, project_id, tool_name, args, result)
         return result
 
@@ -308,6 +330,17 @@ async def _execute_builtin(tool_name: str, args: dict, project_id: str, stage: s
             return {"status": "completed", "items_completed": result.get("items_completed", 0)}
         except Exception as e:
             return {"error": f"全量识别执行失败: {e}"}
+    if tool_name == "introduce_community_resource":
+        from app.services.community_introduction import introduce
+        from app.core.database import get_session
+        project_id = project_id or "proj-agent-autointro"
+        query = (args or {}).get("query")
+        rtype = (args or {}).get("resource_type")
+        db = get_session()
+        try:
+            return introduce(db, query=query, type=rtype, project_id=project_id, stage=stage)
+        finally:
+            db.close()
     return {"error": f"未知内置工具: {tool_name}"}
 
 
@@ -435,6 +468,56 @@ async def _execute_via_provider(tool_name: str, args: dict, project_id: str, ent
         return result
     except Exception as e:
         return {"error": f"ExecutionProvider failed: {e}"}
+
+
+def _create_risk_gate(project_id: str, run_id: str, stage: str,
+                      tool_name: str, risk: str) -> dict:
+    """OD-06: an L3+ tool requires human approval before it runs. Create a real
+    action_approval Gate through the existing GateService kernel (DB-persisted +
+    audited — the same kernel as agent_loop._create_action_gate). action_approval
+    Gates do NOT drive stage promotion (公理6).
+
+    Honest degradation (红线：不得伪造 gate)：when no GateService is available in the
+    current runtime context, return an explicit risk_flagged status explaining why —
+    never fabricate a gate_id / awaiting_approval.
+    """
+    try:
+        from app.dependencies import get_services
+        gs = get_services().gate_service
+    except Exception as e:
+        return {
+            "status": "risk_flagged",
+            "risk_level": risk,
+            "tool_name": tool_name,
+            "message": (f"工具风险等级 {risk} ≥ {_GATE_RISK_THRESHOLD}，需人工审批；"
+                        f"但当前运行上下文无可用 Gate 服务（{e}），未创建审批门。"),
+        }
+    try:
+        gate = gs.create(
+            project_id=project_id, run_id=run_id or "", stage=stage,
+            gate_type="action_approval", risk_level=risk,
+            reason=f"高风险工具 {tool_name}（风险 {risk}）执行前需人工审批",
+            summary=f"Agent 拟执行高风险工具 {tool_name}（{risk}），请审批",
+            options=["approve", "reject"],
+        )
+    except Exception as e:
+        logger.warning("action_approval gate create failed for tool %s: %s", tool_name, e)
+        return {
+            "status": "risk_flagged",
+            "risk_level": risk,
+            "tool_name": tool_name,
+            "message": (f"工具风险等级 {risk} ≥ {_GATE_RISK_THRESHOLD}，需人工审批；"
+                        f"创建 action_approval Gate 失败（{e}）。"),
+        }
+    return {
+        "status": "awaiting_approval",
+        "risk_level": risk,
+        "tool_name": tool_name,
+        "gate_id": gate.gate_id,
+        "gate_type": "action_approval",
+        "message": (f"工具风险等级 {risk} ≥ {_GATE_RISK_THRESHOLD}，已创建 action_approval "
+                    f"Gate（{gate.gate_id}）等待人工审批后方可执行。"),
+    }
 
 
 def _write_trace(tracer, project_id: str, tool_name: str, args: dict, result: dict) -> None:

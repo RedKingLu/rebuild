@@ -41,11 +41,14 @@ async def lifespan(app: FastAPI):
     init_db()
     db = get_session()
     try:
-        from app.seed import seed_all
+        from app.seed import seed_all, seed_model_catalog
         counts = seed_all(db)
-        if any(v > 0 for v in counts.values()):
+        catalog_n = seed_model_catalog(db)
+        eval_n = seed_exemplar_evaluations(db)
+        if any(v > 0 for v in counts.values()) or catalog_n > 0 or eval_n > 0:
             import logging
-            logging.getLogger("uvicorn").info(f"R6 seed data: {counts}")
+            logging.getLogger("uvicorn").info(
+                f"R6 seed data: {counts}, model_catalog: {catalog_n}, eval: {eval_n}")
     finally:
         db.close()
     get_services(settings)
@@ -190,3 +193,23 @@ app.include_router(toggle_router, prefix="/api")
 # R9-5-1: graph driver endpoints (drive the real P0-P6 LangGraph over HTTP)
 from app.api.routes_graph import router as graph_router
 app.include_router(graph_router, prefix="/api")
+
+# R15-4: Community Connector — proxy + import from the independent community service
+from app.api.routes_community import community_router
+app.include_router(community_router)  # prefix already /api/community
+
+# R15-4-C7: Knowledge package zip importer + knowledge content
+from app.api.routes_knowledge import knowledge_router
+app.include_router(knowledge_router, prefix="/api")
+
+# R15-4-C8: ModelCatalog persistent catalog
+from app.api.routes_model_catalog import catalog_router
+app.include_router(catalog_router, prefix="/api")
+
+# R15-4-C10: AgentModelEvalResult (imported eval results, display-only)
+from app.api.routes_model_eval import eval_router, seed_exemplar_evaluations
+app.include_router(eval_router, prefix="/api")
+
+# R15-4-C11: OfficialSource empty seam (returns not_connected; no real API)
+from app.api.routes_official_sources import official_router
+app.include_router(official_router, prefix="/api")

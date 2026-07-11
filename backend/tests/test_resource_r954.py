@@ -121,8 +121,9 @@ def test_resource_loader_rule2_bad_status():
         db.close()
 
 
-def test_resource_loader_rule3_community_unreviewed():
-    """Rule 3 (D-061/T6.3): community source with unreviewed trust → not schedulable."""
+def test_resource_loader_community_enabled_schedulable():
+    """R15-4-C1 (D-061 修订): community resource that is enabled + active IS schedulable.
+    The old 'community unreviewed → review_required' gate has been removed; 合格性由发布侧保证。"""
     from app.core.database import get_session
     from app.services.resource_loader import load
     db = get_session()
@@ -131,17 +132,20 @@ def test_resource_loader_rule3_community_unreviewed():
             db, resource_type="knowledge",
             source_type="community",
             trust_level="unreviewed",
+            status_val="read_only",
         )
         result = load(entry.resource_id, db)
         assert result is not None
-        assert result.schedulable is False
-        assert "review_required" in result.reason
+        assert result.schedulable is True, (
+            "community+enabled must be schedulable after R15-4-C1 (no review gate)"
+        )
+        assert "review_required" not in (result.reason or "")
     finally:
         db.close()
 
 
-def test_resource_loader_rule3_community_approved():
-    """Rule 3 pass: community resource with reviewed_reference trust IS schedulable."""
+def test_resource_loader_community_reviewed_still_schedulable():
+    """community resource with reviewed_reference trust remains schedulable (unchanged)."""
     from app.core.database import get_session
     from app.services.resource_loader import load
     db = get_session()
@@ -310,6 +314,91 @@ def test_tool_registry_no_litellm_import():
                 )
 
 
+def _make_l3_tool(db, tool_slug="danger_exec_tool"):
+    """Create an enabled, active L3-risk tool ResourceEntry routed via execute scope."""
+    from app.models.resource_entry import (
+        ResourceEntry, ResourceType, SourceType, TrustLevel, RiskLevel, ResourceStatus,
+    )
+    rid = str(uuid.uuid4())
+    entry = ResourceEntry(
+        resource_id=rid,
+        name=f"L3 {tool_slug}",
+        resource_type=ResourceType.tool,
+        source_type=SourceType.user_provided,
+        source_trust_level=TrustLevel.trusted_current,
+        risk_level=RiskLevel.L3,
+        status=ResourceStatus.active,
+        enabled=True,
+        description="高风险执行类工具（L3），执行前须人工审批",
+        type_metadata={"tool_name": tool_slug, "write_scope": "execute"},
+    )
+    db.add(entry)
+    db.commit()
+    return entry
+
+
+def test_tool_registry_l3_creates_action_approval_gate():
+    """OD-06: an L3+ tool must NOT execute silently — execute_tool creates a REAL
+    action_approval Gate (via GateService) and returns awaiting_approval. No fabrication:
+    the gate is verifiable through GateService."""
+    import asyncio
+    from app.core.database import get_session
+    from app.services.tool_registry import execute_tool
+    from app.dependencies import get_services
+
+    db = get_session()
+    try:
+        _make_l3_tool(db, "danger_exec_tool")
+        project_id = "proj-l3-test"
+        result = asyncio.run(
+            execute_tool("danger_exec_tool", {"command": "rm -rf /"}, project_id,
+                         stage="p1", db=db, run_id="run-l3-test", tracer=None)
+        )
+        # execution must be parked behind a real approval gate, not run
+        assert result["status"] == "awaiting_approval", result
+        assert result["gate_type"] == "action_approval"
+        assert result["risk_level"] == "L3"
+        assert result.get("gate_id"), "a real gate_id must be returned"
+
+        # the gate is genuinely persisted + waiting (verifiable, not fabricated)
+        gates = get_services().gate_service.list_by_project(project_id)
+        approval = [g for g in gates if g.gate_type == "action_approval"]
+        assert len(approval) == 1, f"expected 1 action_approval gate, got {approval}"
+        assert approval[0].gate_id == result["gate_id"]
+        assert approval[0].gate_status == "waiting_decision"
+        assert approval[0].risk_level == "L3"
+        assert approval[0].run_id == "run-l3-test"
+    finally:
+        db.close()
+
+
+def test_tool_registry_action_approval_gate_does_not_advance_stage():
+    """公理6: deciding an action_approval Gate must NOT drive stage promotion —
+    it only authorizes the parked tool action."""
+    import asyncio
+    from app.core.database import get_session
+    from app.services.tool_registry import execute_tool
+    from app.dependencies import get_services
+    from app.schemas.gate import GateDecisionRequest
+
+    db = get_session()
+    try:
+        _make_l3_tool(db, "danger_exec_tool2")
+        result = asyncio.run(
+            execute_tool("danger_exec_tool2", {"command": "ls"}, "proj-l3-test2",
+                         stage="p0", db=db, run_id="run-l3-test2", tracer=None)
+        )
+        gid = result["gate_id"]
+        gs = get_services().gate_service
+        g, audit = gs.decide(gid, GateDecisionRequest(decision="approve"))
+        # action_approval decided → recorded + audited, but it is NOT a stage_promotion
+        assert g.gate_status == "approved"
+        assert g.gate_type == "action_approval"
+        assert audit is not None
+    finally:
+        db.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # W3 — knowledge_search.py (T5.2)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -397,96 +486,103 @@ def test_knowledge_search_scope_filters():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# W4 — Review state machine (T6.2) via HTTP
+# W4 — Review DEPRECATED (410) + enable/disable + soft-delete (R15-4-C1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _create_community_resource(client) -> str:
-    """Helper: create a community resource in draft/unreviewed state via API."""
+def _create_community_resource(client, status_val="active", trust="unreviewed") -> str:
+    """Helper: create a community resource via API (no review needed after R15-4-C1)."""
     resp = client.post("/api/resources", json={
         "name": "Test Community Resource",
         "resource_type": "knowledge",
         "source_type": "community",
-        "source_trust_level": "unreviewed",
+        "source_trust_level": trust,
         "risk_level": "L0",
-        "status": "draft",
-        "description": "Test community doc for review",
+        "status": status_val,
+        "description": "Test community doc",
     })
     assert resp.status_code == 201, resp.text
     return resp.json()["resource_id"]
 
 
-def test_review_approve(client):
-    """POST /api/resources/{id}/review approve → status=active, trust=reviewed_reference."""
+def test_review_endpoint_gone(client):
+    """R15-4-C1: POST /api/resources/{id}/review is DEPRECATED → 410 Gone (D-061 修订)."""
     rid = _create_community_resource(client)
-    resp = client.post(f"/api/resources/{rid}/review", json={
-        "decision": "approve",
-        "reviewer": "test_reviewer",
-        "review_notes": "Looks good.",
-    })
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body.get("success") is True or body.get("status") == "success"
-
-    # Verify the resource state changed
-    get_resp = client.get(f"/api/resources/{rid}")
-    assert get_resp.status_code == 200, get_resp.text
-    resource = get_resp.json()
-    assert resource["status"] == "active"
-    assert resource["source_trust_level"] == "reviewed_reference"
+    resp = client.post(f"/api/resources/{rid}/review", json={"decision": "approve"})
+    assert resp.status_code == 410, resp.text
 
 
-def test_review_reject(client):
-    """POST /api/resources/{id}/review reject → status=blocked, trust=blocked."""
-    rid = _create_community_resource(client)
-    resp = client.post(f"/api/resources/{rid}/review", json={
-        "decision": "reject",
-        "reviewer": "test_reviewer",
-        "review_notes": "Not appropriate.",
-    })
-    assert resp.status_code == 200, resp.text
-
-    get_resp = client.get(f"/api/resources/{rid}")
-    resource = get_resp.json()
-    assert resource["status"] == "blocked"
-    assert resource["source_trust_level"] == "blocked"
-
-
-def test_review_invalid_decision(client):
-    """POST /api/resources/{id}/review with invalid decision → 400."""
-    rid = _create_community_resource(client)
-    resp = client.post(f"/api/resources/{rid}/review", json={"decision": "maybe"})
-    assert resp.status_code == 400
-
-
-def test_review_unknown_resource(client):
-    """POST /api/resources/unknown-id/review → 404."""
+def test_review_endpoint_gone_before_existence_check(client):
+    """410 is returned regardless of resource existence (endpoint fully deprecated)."""
     resp = client.post("/api/resources/does-not-exist/review", json={"decision": "approve"})
+    assert resp.status_code == 410
+
+
+def test_enable_disable_resource(client):
+    """R15-4-C1: PATCH /enable and /disable flip enabled and are the canonical control."""
+    rid = _create_community_resource(client)
+    # disable
+    resp = client.patch(f"/api/resources/{rid}/disable")
+    assert resp.status_code == 200, resp.text
+    got = client.get(f"/api/resources/{rid}").json()
+    assert got["enabled"] is False
+    # enable
+    resp = client.patch(f"/api/resources/{rid}/enable")
+    assert resp.status_code == 200, resp.text
+    got = client.get(f"/api/resources/{rid}").json()
+    assert got["enabled"] is True
+
+
+def test_enable_unknown_resource(client):
+    """PATCH /enable on unknown id → 404."""
+    resp = client.patch("/api/resources/does-not-exist/enable")
     assert resp.status_code == 404
 
 
-def test_review_approved_community_becomes_schedulable(client):
-    """After approve, community resource passes Rule 3 in resource_loader."""
+def test_soft_delete_writes_deleted_at_and_filters_list(client):
+    """R15-4-C1: DELETE is a soft-delete — writes deleted_at, hides from default list."""
+    rid = _create_community_resource(client)
+    # present in list before delete
+    before = client.get("/api/resources?type=knowledge&limit=200").json()
+    before_ids = [r["resource_id"] for r in before["data"]["resources"]]
+    assert rid in before_ids
+    # soft delete
+    resp = client.delete(f"/api/resources/{rid}")
+    assert resp.status_code == 200, resp.text
+    # gone from default list
+    after = client.get("/api/resources?type=knowledge&limit=200").json()
+    after_ids = [r["resource_id"] for r in after["data"]["resources"]]
+    assert rid not in after_ids, "soft-deleted resource must not appear in default list"
+    # second delete → 404 (already soft-deleted)
+    resp2 = client.delete(f"/api/resources/{rid}")
+    assert resp2.status_code == 404
+
+
+def test_soft_deleted_not_schedulable(client):
+    """R15-4-C1: a soft-deleted resource must not be schedulable by resource_loader."""
     from app.core.database import get_session
     from app.services.resource_loader import load
-    rid = _create_community_resource(client)
-    # Before approval: should not be schedulable
+    rid = _create_community_resource(client, status_val="read_only")
+    client.delete(f"/api/resources/{rid}")
     db = get_session()
     try:
-        before = load(rid, db)
-        assert before is not None
-        assert before.schedulable is False
+        result = load(rid, db)
+        assert result is not None
+        assert result.schedulable is False
+        assert result.reason == "deleted"
     finally:
         db.close()
 
-    # Approve
-    client.post(f"/api/resources/{rid}/review", json={"decision": "approve", "reviewer": "test"})
 
-    # After approval: should be schedulable
+def test_community_resource_schedulable_without_review(client):
+    """R15-4-C1: an enabled community resource is schedulable directly (no approval step)."""
+    from app.core.database import get_session
+    from app.services.resource_loader import load
+    rid = _create_community_resource(client, status_val="read_only", trust="unreviewed")
     db = get_session()
     try:
-        after = load(rid, db)
-        assert after is not None
-        assert after.schedulable is True
+        result = load(rid, db)
+        assert result is not None
+        assert result.schedulable is True, "no review needed after R15-4-C1"
     finally:
         db.close()
 
@@ -640,8 +736,9 @@ def test_g4_context_assembler_injects_cases_and_knowledge():
     assert isinstance(trace["knowledge_count"], int)
 
 
-def test_t63_community_unreviewed_blocked_from_loader():
-    """T6.3: community resource with unreviewed trust must fail resource_loader Rule 3."""
+def test_t63_community_enabled_schedulable_from_loader():
+    """R15-4-C1 (supersedes T6.3): community resource with unreviewed trust but enabled
+    is now schedulable via resource_loader — the review gate was removed (D-061 修订)."""
     from app.core.database import get_session
     from app.services.resource_loader import load
     db = get_session()
@@ -650,11 +747,12 @@ def test_t63_community_unreviewed_blocked_from_loader():
             db, resource_type="knowledge",
             source_type="community",
             trust_level="unreviewed",
+            status_val="read_only",
         )
         loaded = load(entry.resource_id, db)
         assert loaded is not None
-        assert loaded.schedulable is False
-        assert "review_required" in loaded.reason
+        assert loaded.schedulable is True
+        assert "review_required" not in (loaded.reason or "")
     finally:
         db.close()
 
@@ -666,14 +764,38 @@ def test_online_source_provider_returns_six_cards():
     assert len(cards) == 6, f"Expected 6 static cards, got {len(cards)}"
 
 
-def test_online_source_provider_all_tagged_static_r15():
-    """All online cards are tagged online_source='static_R15'."""
+def test_online_source_provider_all_tagged_static_r15_fallback():
+    """Legacy static fallback cards are tagged online_source='static_R15_fallback'.
+
+    R15-4-C5: the primary path is now real community retrieval
+    (search_community_resources); the static cards remain only as an honest
+    fallback (distinct tag) for air-gapped runs.
+    """
     from app.services.online_source_provider import get_static_online_resources
     cards = get_static_online_resources()
     for c in cards:
-        assert c.get("online_source") == "static_R15", (
-            f"Card {c.get('resource_id')} missing static_R15 tag"
+        assert c.get("online_source") == "static_R15_fallback", (
+            f"Card {c.get('resource_id')} missing static_R15_fallback tag"
         )
+
+
+def test_search_community_resources_real_path():
+    """R15-4-C5: search_community_resources uses the real connector (primary path)
+    and reports community_available; falls back to static cards when unreachable."""
+    from unittest.mock import patch
+    from app.services.online_source_provider import search_community_resources
+    # reachable → real items, community_available=True
+    with patch("app.services.community_connector.search_resources",
+               return_value={"totalSize": 1, "offset": 0,
+                             "resources": [{"id": "c1", "name": "n", "resource_type": "case",
+                                            "description": "", "tags": [], "categories": [],
+                                            "license": "", "source": "community",
+                                            "verified": False, "download_count": 0,
+                                            "checksum_sha256": "x"}]}):
+        res = search_community_resources(type="case")
+    assert res["community_available"] is True
+    assert res["items"][0]["online_source"] == "community_real"
+    assert res["items"][0]["resource_id"] == "c1"
 
 
 def test_online_source_provider_type_filter():

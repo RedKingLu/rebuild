@@ -23,11 +23,18 @@ export interface ResourceCard {
 export interface ResourceListResponse { totalSize: number; offset: number; resources: ResourceCard[]; }
 export interface ResourceDetail extends ResourceCard { readme: string; versions: string[]; files: {name:string;size:number;download_url:string}[]; dependencies: unknown[]; manifest_ref: string; created_at: string | null; }
 export interface ManifestResponse { resource_id: string; version: string; type: string; files: {name:string;size:number;sha256:string}[]; checksum_sha256: string; dependencies: unknown[]; }
+// R16-B E3: version history (只读追溯)。历史版本 manifest 404，仅当前版本可导入。
+export interface CommunityResourceVersion { version: string; manifest_ref: string; deprecated: boolean; }
+export interface VersionListResponse { resource_id: string; versions: CommunityResourceVersion[]; current_version: string; note: string; }
 export interface NewsItem { id: string; title: string; summary: string; body: string; published_at: string | null; url: string | null; pinned: boolean; }
 export interface ModelEntry { model_id: string; display_name: string; provider_id: string; family: string; model_version: string; context_window: number | null; max_output_tokens: number | null; input_modalities: string[]; output_modalities: string[]; capability_tags: string[]; task_tags: string[]; license: string | null; official_icon_url: string | null; official_url: string | null; availability_status: string; source: string; updated_at: string | null; }
 export interface ModelListResponse { totalSize: number; offset: number; models: ModelEntry[]; }
 export interface EvaluationItem { eval_id: string; model_id: string; agent_type: string | null; task_type: string | null; scenario: string | null; metric: string | null; score: number | null; success_rate: number | null; cost_level: string | null; latency_level: string | null; sample_count: number | null; eval_method: string | null; eval_version: string | null; source: string | null; published_at: string | null; limitations: string | null; }
-export interface StatusResponse { status: string; version: string; resource_count: number; model_count: number; evaluation_count: number; }
+export interface StatusResponse { status: string; version: string; resource_count: number; model_count: number; evaluation_count: number; doc_count?: number; }
+// R16-E1: community online documentation
+export interface DocItem { slug: string; title: string; summary: string; category: string; tags: string[]; version: string; source: string; updated_at: string | null; created_at: string | null; }
+export interface DocDetail extends DocItem { body_markdown: string; }
+export interface DocListResponse { docs: DocItem[]; total: number; }
 
 export const api = {
   status: () => getJSON<StatusResponse>("/status"),
@@ -35,7 +42,11 @@ export const api = {
   resources: (p?: Record<string, string>) => getJSON<ResourceListResponse>("/resources", p),
   resource: (id: string) => getJSON<ResourceDetail>(`/resources/${id}`),
   manifest: (id: string) => getJSON<ManifestResponse>(`/resources/${id}/manifest`),
+  versions: (id: string) => getJSON<VersionListResponse>(`/resources/${id}/versions`),
   models: (p?: Record<string, string>) => getJSON<ModelListResponse>("/models", p),
   evaluations: (p?: Record<string, string>) => getJSON<{ evaluations: EvaluationItem[] }>("/evaluations", p),
+  // R16-E1: docs
+  docs: (category?: string) => getJSON<DocListResponse>("/docs", category ? { category } : undefined),
+  doc: (slug: string) => getJSON<DocDetail>(`/docs/${slug}`),
   downloadUrl: (id: string) => `${BASE_URL}/resources/${id}/download`,
 };

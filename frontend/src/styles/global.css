@@ -105,3 +105,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .step { flex: 1; text-align: center; padding: 8px; font-size: 12px; color: var(--ink-3); border-bottom: 2px solid var(--line); }
 .step.done { color: var(--green); border-color: var(--green); }
 .step.current { color: var(--accent-ink); border-color: var(--accent-ink); font-weight: 600; }
+
+/* R15-4-C10: model eval results (display-only) */
+.eval-disclaimer { background: var(--amber-bg, #fffbeb); border: 1px solid var(--amber, #fde68a); color: #92400e; padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
+.eval-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.eval-table { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 12px; }
+.eval-table th, .eval-table td { text-align: left; padding: 4px 8px; vertical-align: top; border-bottom: 1px dashed var(--line); }
+.eval-table th { width: 64px; color: var(--ink-3); font-weight: 600; }

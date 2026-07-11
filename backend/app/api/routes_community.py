@@ -76,21 +76,28 @@ def resource_detail(resource_id: str) -> dict:
 
 
 @community_router.post("/resources/{resource_id}/import", response_model=SuccessEnvelope)
-def import_resource(resource_id: str, svc: RegistryService = Depends(_svc)) -> SuccessEnvelope:
+def import_resource(resource_id: str, version: str | None = None,
+                    svc: RegistryService = Depends(_svc)) -> SuccessEnvelope:
     """Download + sha256 verify + persist as a community ResourceEntry.
+
+    version (R16-B E3): requested community version for traceability. 无论请求哪个版本，
+    当前实现始终下载校验 CURRENT 包；imported_version 记录请求的版本。请求历史版本会在
+    meta.warning 中标注（前端可展示）。
 
     P0: checksum mismatch → 409 (reject, no fallback success).
     Idempotency: if a ResourceEntry already exists for this community id, reuse it.
     Delegates to the shared community_introduction.import_resource (C4/C5).
     """
     try:
-        entry, checksum = import_resource(svc.db, resource_id)
+        entry, checksum, version_warning = import_resource(svc.db, resource_id, version=version)
     except CommunityUnavailableError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ChecksumMismatchError as e:
         raise HTTPException(status_code=409, detail=f"sha256 校验失败，拒绝导入：{e}")
-    return SuccessEnvelope(data=_to_response(svc, entry),
-                           meta={"detail": "imported", "checksum_sha256": checksum})
+    meta = {"detail": "imported", "checksum_sha256": checksum}
+    if version_warning:
+        meta["warning"] = version_warning
+    return SuccessEnvelope(data=_to_response(svc, entry), meta=meta)
 
 
 class IntroduceRequest(BaseModel):

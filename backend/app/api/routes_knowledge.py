@@ -1,11 +1,17 @@
-"""Knowledge package zip importer (R15-4-C7).
+"""Knowledge package zip importer + full-text search (R15-4-C7, R16-E2).
 
 Imports a knowledge zip (manifest.json + multiple .md docs) used to migrate the
 old static Docs/Help content into the Knowledge registry. Each .md doc becomes a
 Knowledge-type ResourceEntry with its Markdown body stored on disk (body_path).
 
-Endpoint:
+Also exposes full-text search over knowledge resources (T5.3/R9-5-4, R16-E2):
+the backend knowledge_search.search() runs a SQLite LIKE search across name +
+description + on-disk body_path, ranks by score, and returns snippets.
+
+Endpoints:
   POST /api/knowledge/import-package  (multipart: file=<zip>)
+  GET  /api/knowledge/search?q=&scope=&limit=
+  GET  /api/knowledge/packages
 """
 from __future__ import annotations
 
@@ -14,7 +20,7 @@ import json
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -136,6 +142,29 @@ async def import_knowledge_package(
             "resources": [ResourceResponse(**svc.to_response(e)).model_dump() for e in created],
         },
         meta={"source_status": "real", "scope": scope, "base_dir": str(base_dir)},
+    )
+
+
+@knowledge_router.get("/search")
+def search_knowledge(
+    q: str = "",
+    scope: str = "all",  # "all" | "platform" | "user" | "community"
+    limit: int = Query(default=20, le=50),
+    db: Session = Depends(get_db),
+):
+    """Full-text search over knowledge resources (T5.3/R9-5-4 + R16-E2).
+
+    SQLite LIKE search over name + description + on-disk body_path, ranked by
+    score, with snippet extraction. Replaces the old frontend-only static filter
+    (red line #4 remediation). retrieval_mode is always "fulltext_like" for now
+    (FTS5 is a future optional upgrade, not wired).
+    """
+    from app.services.knowledge_search import search
+    results = search(q.strip(), db, limit=limit, scope=scope)
+    return SuccessEnvelope(
+        data={"results": results, "query": q, "scope": scope, "count": len(results)},
+        meta={"source_status": "real",
+              "retrieval_mode": results[0]["retrieval_mode"] if results else "fulltext_like"},
     )
 
 

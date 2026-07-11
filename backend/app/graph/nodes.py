@@ -98,62 +98,6 @@ _DECISION_TO_STATUS = {
 }
 
 
-# ── B-PLAN-1: pre-execution plan review (D-025 / D-026) ─────────────────────
-def _write_stage_plan_report(project_id: str, stage: str, handler) -> str:
-    """Produce the stage's 起始计划报告 ({stage}_start_plan.json) BEFORE execution so
-    the user can审核 it at the plan_review Gate. Same content StageLoop would write —
-    from the handler's declared goal / acceptance_criteria / planned_actions."""
-    from app.graph.stage_reports import StageReports
-    reports = StageReports(project_id, stage)
-    return reports.start_plan(
-        goal=getattr(handler, "goal", f"{stage} stage"),
-        acceptance_criteria=getattr(handler, "acceptance_criteria", []),
-        planned_actions=getattr(handler, "planned_actions", []),
-    )
-
-
-async def _run_plan_review(stage: str, project_id: str, run_id: str, mode: str,
-                           handler) -> str:
-    """Run the pre-execution plan_review Gate for manual/plan mode and return the
-    user decision. Idempotent across the interrupt/resume re-run of the work node:
-    on resume the node re-executes from the top, so an already-created (or decided)
-    plan_review Gate is reused/short-circuited instead of duplicated (D-025/D-026)."""
-    existing = None
-    if _gate_backend is not None and hasattr(_gate_backend, "find_stage_gate"):
-        try:
-            existing = _gate_backend.find_stage_gate(
-                project_id=project_id, run_id=run_id, stage=stage,
-                gate_type="plan_review")
-        except Exception:
-            existing = None
-
-    if existing:
-        status = existing.get("gate_status")
-        if status == "approved":
-            return "approve"
-        if status == "rejected":
-            return "reject"
-        if status == "changes_requested":
-            return "request_changes"
-        gid = existing.get("gate_id", "")  # waiting_decision → reuse (no duplicate)
-    else:
-        # R17-3: plan_review gate 不挂 start_plan.json 作为审核材料（避免前端显示原始 JSON）。
-        # start_plan 仍写入工作区供后续 stage_promotion gate 使用，但 plan_review 仅作欢迎 + 确认。
-        plan_ref = _write_stage_plan_report(project_id, stage, handler)
-        gid = ""
-        if _gate_backend is not None:
-            gid = _gate_backend.create(
-                project_id=project_id, run_id=run_id, stage=stage,
-                artifact_refs=[], gate_type="plan_review",
-                metadata={"mode": mode, "plan_ref": plan_ref})
-
-    decision = interrupt({"gate_id": gid, "stage": stage, "type": "plan_review"})
-    decision = (decision or "").strip() if isinstance(decision, str) else decision
-    if _gate_backend is not None and gid and decision in _DECISION_TO_STATUS:
-        _gate_backend.decide(gate_id=gid, decision=decision)
-    return decision if decision in _DECISION_TO_STATUS else "approve"
-
-
 # ── Node factories ────────────────────────────────────────────────────────
 def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
     async def work(state: GraphState) -> dict:
@@ -170,28 +114,16 @@ def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
                                f"{stage} node is a future stub (business in later R-series)")],
             }
 
-        # R17-3 两阶段流程：
-        #   阶段 1（plan_review）: 欢迎 + 确认开始（不显示计划内容）
-        #   阶段 2（plan_presentation）: 展示生成的计划 → 用户/Agent 审核
-        #   阶段 3（stage_promotion）: 执行完成 → 审核结果
-        # Auto 模式跳过阶段 1 和 2，直接执行。
+        # R17-X 两阶段流程（已删除 per-stage plan_review 欢迎门，B-R17X-PLANREVIEW-1）：
+        #   阶段 1（plan_presentation）: plan_only 生成接入计划 → 用户/Agent 审核（D-025）
+        #   阶段 2（stage_promotion）: 执行完成 → 审核结果后晋级（D-023）
+        # Auto 模式跳过阶段 1，直接执行。
+        #（"欢迎 + 启动"改由前端一次性初始态页承担，不再逐阶段弹欢迎门。）
         mode = (state.get("execution_mode") or "").lower()
         plan_approved = state.get("plan_approved") or False
 
         if mode in ("manual", "plan") and not plan_approved:
-            # 阶段 1: plan_review（欢迎 + 确认）
-            plan_decision = await _run_plan_review(stage, project_id, run_id, mode, handler)
-            if plan_decision != "approve":
-                return {
-                    "current_stage": stage,
-                    "stage_status": {stage: "blocked"},
-                    "run_status": "blocked",
-                    "plan_halt": plan_decision,
-                    "events": [_ev(stage, "plan_not_approved",
-                                   f"{stage} 欢迎 Gate 未通过（{plan_decision}）：阶段动作未执行",
-                                   decision=plan_decision)],
-                }
-            # 阶段 2: plan_only 生成计划 → 创建 plan_presentation gate → 等待审核
+            # 阶段 1: plan_only 生成计划 → 创建 plan_presentation gate → 等待审核
             loop = StageLoop(project_id, stage, tracer=_tracer, auditor=_auditor, max_rounds=2)
             plan_res = await loop.run(
                 goal=getattr(handler, "goal", f"{stage} stage"),
@@ -303,21 +235,6 @@ def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
 
 def make_gate_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
     async def gate(state: GraphState) -> dict:
-        # B-PLAN-1: if the work node halted at an un-approved plan_review Gate, there
-        # is no promotion Gate to decide. Skip the interrupt and route to END (reject)
-        # so we neither hang on a nonexistent promotion decision nor loop.
-        if state.get("plan_halt"):
-            ph = state.get("plan_halt")
-            return {
-                "last_decision": "reject",
-                "plan_halt": None,
-                "pending_gate": None,
-                "stage_status": {stage: "blocked"},
-                "run_status": "blocked",
-                "events": [_ev(stage, "promotion_skipped_plan_halt",
-                               f"{stage} 计划未批准（{ph}），跳过晋级门")],
-            }
-
         pg = state.get("pending_gate") or {}
         gate_id = pg.get("gate_id", "")
         gate_type = pg.get("gate_type", "stage_promotion")

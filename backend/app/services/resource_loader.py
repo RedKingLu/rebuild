@@ -11,7 +11,10 @@ Dispatch logic:
   knowledge   → {"schedulable": True, "dispatch": "knowledge_context"}
   other       → {"schedulable": True, "dispatch": "registry_ref"} (metadata only)
   remote/external source → {"schedulable": False, "reason": "R14_remote_orchestration"}
-  blocked/unreviewed community → {"schedulable": False, "reason": "review_required"}
+  blocked trust level → {"schedulable": False, "reason": "blocked:trust_level_blocked"}
+
+注（R15-4-C1 / D-061 修订）：原「community unreviewed → review_required」审核门已移除。
+平台内不设资源审核状态机，统一 启用/禁用/软删除 + L1-L5 动作风险；enabled 的社区资源可被直接调度。
 """
 
 from __future__ import annotations
@@ -39,13 +42,6 @@ _SCHEDULABLE_STATUSES = {
 _REMOTE_SOURCE_TYPES = {
     SourceType.external_online,
     SourceType.third_party,
-}
-
-# Community resources require reviewed trust level
-_COMMUNITY_APPROVED_LEVELS = {
-    TrustLevel.trusted_current,
-    TrustLevel.reviewed_reference,
-    TrustLevel.read_only_reference,
 }
 
 
@@ -143,19 +139,23 @@ def _resolve(entry: ResourceEntry) -> LoadedResource:
         base.dispatch = "none"
         return base
 
+    # ── Rule 2b: soft-deleted → not schedulable (R15-4-C1)
+    if getattr(entry, "deleted_at", None) is not None:
+        base.schedulable = False
+        base.reason = "deleted"
+        base.dispatch = "none"
+        return base
+
     if entry.status not in _SCHEDULABLE_STATUSES:
         base.schedulable = False
         base.reason = f"status_not_schedulable:{entry.status.value}"
         base.dispatch = "none"
         return base
 
-    # ── Rule 3: community unreviewed → require review (D-061)
-    if entry.source_type == SourceType.community:
-        if entry.source_trust_level not in _COMMUNITY_APPROVED_LEVELS:
-            base.schedulable = False
-            base.reason = "review_required:community_not_approved"
-            base.dispatch = "none"
-            return base
+    # ── Rule 3 (REMOVED, R15-4-C1, D-061 修订执行注 2026-07-09):
+    # 原 community unreviewed → review_required 门已移除。社区资源合格性由发布侧保证；
+    # 平台内不设资源审核状态机，统一 启用/禁用/软删除（Rule 2/2b）+ L1-L5 动作风险（Rule 4 + tool_registry Gate）。
+    # enabled 的社区资源可被 Agent 直接读取；高危动作仍在动作层触发 L1-L5 Gate。
 
     # ── Rule 4: blocked trust level
     if entry.source_trust_level == TrustLevel.blocked:

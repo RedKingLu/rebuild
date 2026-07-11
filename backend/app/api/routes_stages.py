@@ -109,57 +109,17 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
             "transition_mode": "real_background",
         }
     else:
-        # Non-graph (or graph resume failed with partial side-effects): direct path.
-        # Guard: if graph side-effects already decided the stage gate (e.g. resume ran
-        # the graph but failed on checkpoint save AFTER the gate was decided), do NOT
-        # call stage_service.promote() again — just sync the project stage from the
-        # gate's implied next stage to avoid double-advancement.
-        stage_gate_already_decided = False
-        already_decided_gate = None
+        # Non-graph run (no active graph thread), OR the graph resume launch failed
+        # (graph_thread_active False, or _ensure_graph_task raised before the graph
+        # ran) → fall back to the direct single-decision path. There are no graph
+        # side-effects to reconcile, so promote() decides the gate and advances state.
         try:
-            for gx in svc.gate_service.list_by_project(project_id):
-                if (gx.stage or "").lower() == stage.lower() \
-                        and gx.gate_type == "stage_promotion" \
-                        and gx.gate_status != "waiting_decision" \
-                        and gx.run_id == run_id:
-                    stage_gate_already_decided = True
-                    already_decided_gate = gx
-                    break
-        except Exception as e:
-            logger.warning("gate already-decided check failed project=%s stage=%s: %s", project_id, stage, e)
-
-        if stage_gate_already_decided and already_decided_gate:
-            # Graph ran the gate decision but failed to save checkpoint; sync DB.
-            _dec = (already_decided_gate.decision or req.decision or "").lower()
-            from app.services.gate_service import STAGE_ORDER as _SO
-            try:
-                _cur = stage.lower()
-                if _dec == "approve":
-                    _nxt = _SO[_SO.index(_cur) + 1] if _cur in _SO else _cur
-                    svc.project_service.update(project_id, current_stage=_nxt, active_gate="")
-                    graph_driven = True  # signal that stage was advanced (idiomatic)
-                elif _dec in ("reject", "request_changes"):
-                    svc.project_service.update(project_id, active_gate="")
-                    graph_driven = True
-            except Exception as e:
-                logger.warning("DB sync after already-decided gate failed project=%s: %s", project_id, e)
-            result = {
-                "promotion_id": f"promo-{_uuid.uuid4().hex[:8]}",
-                "gate_id": already_decided_gate.gate_id,
-                "from_stage": stage,
-                "decision": _dec,
-                "gate_status": already_decided_gate.gate_status,
-                "audit_ref": already_decided_gate.audit_ref,
-                "transition_mode": "real",
-            }
-        else:
-            try:
-                result = svc.stage_service.promote(
-                    project_id, run_id, stage, req, drive_promotion=True)
-            except ValueError as e:
-                # R17-2 V-R17-1B-2: 无产物晋级拒绝统一 422（非法值仍 400）
-                code = 422 if "无真实产物" in str(e) else 400
-                raise HTTPException(code, str(e))
+            result = svc.stage_service.promote(
+                project_id, run_id, stage, req, drive_promotion=True)
+        except ValueError as e:
+            # R17-2 V-R17-1B-2: 无产物晋级拒绝统一 422（非法值仍 400）
+            code = 422 if "无真实产物" in str(e) else 400
+            raise HTTPException(code, str(e))
 
     result["graph_driven"] = graph_driven
 

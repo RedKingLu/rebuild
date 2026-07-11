@@ -4,10 +4,13 @@ import { ResourcesPage } from "./pages/ResourcesPage";
 import { ResourceDetailPage } from "./pages/ResourceDetailPage";
 import { ModelsPage } from "./pages/ModelsPage";
 import { EvaluationsPage } from "./pages/EvaluationsPage";
+import { DocsPage } from "./pages/DocsPage";
+import { DocDetailPage } from "./pages/DocDetailPage";
 
 const NAV = [
   { to: "/", label: "首页" },
   { to: "/resources", label: "资源" },
+  { to: "/docs", label: "文档" },
   { to: "/models", label: "模型" },
   { to: "/evaluations", label: "评测" },
 ];
@@ -22,19 +25,21 @@ export function App() {
             <NavLink key={n.to} to={n.to} end={n.to === "/"} className={({ isActive }) => "comm-navlink" + (isActive ? " active" : "")}>{n.label}</NavLink>
           ))}
         </nav>
-        <span className="comm-badge local">本地社区 · R15</span>
+        <span className="comm-badge local">本地社区 · R16</span>
       </header>
       <main className="comm-main">
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/resources" element={<ResourcesPage />} />
           <Route path="/resources/:id" element={<ResourceDetailPage />} />
+          <Route path="/docs" element={<DocsPage />} />
+          <Route path="/docs/:slug" element={<DocDetailPage />} />
           <Route path="/models" element={<ModelsPage />} />
           <Route path="/evaluations" element={<EvaluationsPage />} />
         </Routes>
       </main>
       <footer className="comm-footer">
-        <span>rebuild 社区 · 本地可运行骨架（R15）· 内容由发布侧 seed，非官方运营</span>
+        <span>rebuild 社区 · 本地可运行骨架（R16）· 内容由发布侧 seed，非官方运营</span>
       </footer>
     </div>
   );

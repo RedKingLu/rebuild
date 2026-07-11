@@ -49,7 +49,7 @@ interface Props {
   // runId fetches the active TaskGraph; if omitted, the bar shows task-context + live status.
   runId?: string | null;
   runStatus?: string;
-  // R17-3: 当前 active gate（plan_review 等待态 → TaskOverview 显示"计划审核中"）
+  // R17-X: 当前 active gate（plan_presentation 计划审核等待态 → TaskOverview 显示"计划审核中"；原 plan_review 欢迎门已删除）
   activeGate?: { gate_type: string; gate_status: string; stage: string } | null;
 }
 

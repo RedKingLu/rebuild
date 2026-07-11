@@ -2,11 +2,17 @@
 
 规则：
 - URL 导入：HTTPS URL，下载 JSON 或 zip
-- 文件导入：multipart UploadFile（md/txt/pdf/json/zip），draft+pending+unreviewed 入库
+- 文件导入：multipart UploadFile（md/txt/pdf/json/zip）
+- 用户主动导入即启用（D-061 修订）：资源落 status=active + enabled=True，可被 Agent 直接调度；
+  不写审核状态机业务值（review_status/source_trust_level 为兼容 deprecated 列，取中性默认，不作为门禁）
+- URL 导入尽力做完整性校验（A 方案）：若下载响应含 X-Checksum-SHA256 头则比对包体 sha256，
+  不匹配 → 409 拒绝；无该头则记录并放行（短期不强制）
 - zip 自动解压到 source/<type>/<name>/
 """
+import hashlib
 import io
 import json
+import logging
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -25,20 +31,58 @@ from app.services.skill_service import SkillService
 
 import_router = APIRouter(prefix="/import", tags=["import"])
 
+logger = logging.getLogger("rebuild.import")
+
 TIMEOUT = 30
 
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
 def _validate_url(url: str) -> str:
-    if not url or not url.startswith("https://"):
-        raise HTTPException(status_code=422, detail="导入地址必须为 HTTPS URL")
-    return url.strip()
+    if not url:
+        raise HTTPException(status_code=422, detail="导入地址不能为空")
+    u = url.strip()
+    if u.startswith("https://"):
+        return u
+    # 允许 http 仅限本机回环地址（本地社区 dev：http://localhost:8081/api/...）；
+    # 生产/外部一律要求 https，防止明文导入外部资源。
+    if u.startswith("http://"):
+        from urllib.parse import urlparse
+        host = (urlparse(u).hostname or "").lower()
+        if host in _LOCAL_HOSTS:
+            return u
+    raise HTTPException(
+        status_code=422,
+        detail="导入地址必须为 HTTPS URL（http 仅允许本机回环地址，用于本地社区）",
+    )
 
 
-async def _download(url: str) -> bytes:
+async def _download(url: str) -> tuple[bytes, dict]:
+    """下载 URL，返回 (包体字节, 响应头 dict)。响应头用于 A 方案 sha256 尽力校验。"""
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
         resp = await client.get(url)
         resp.raise_for_status()
-        return resp.content
+        return resp.content, dict(resp.headers)
+
+
+def _verify_checksum(raw: bytes, headers: dict) -> None:
+    """A 方案尽力完整性校验：若响应含 X-Checksum-SHA256 头则比对包体 sha256。
+
+    不匹配 → 409（诚实拒绝，不静默放行）；无该头 → 记录并放行（短期不强制）。
+    header 大小写不敏感（httpx headers 已规范化，这里再兜底一次）。
+    """
+    header_sha = headers.get("X-Checksum-SHA256") or headers.get("x-checksum-sha256") or ""
+    header_sha = header_sha.strip()
+    if not header_sha:
+        logger.info("import: no X-Checksum-SHA256 header, skipping integrity check (best-effort)")
+        return
+    actual = hashlib.sha256(raw).hexdigest()
+    if header_sha != actual:
+        raise HTTPException(
+            status_code=409,
+            detail=f"包体完整性校验失败：X-Checksum-SHA256 头 {header_sha} 与实际 {actual} 不匹配",
+        )
 
 
 def _unzip_to(data: bytes, dest: Path) -> None:
@@ -77,7 +121,7 @@ async def import_agent(
 ):
     """从官方社区 URL 导入 Agent（JSON）。"""
     url = _validate_url(community_url)
-    raw = await _download(url)
+    raw, _ = await _download(url)
     data = _load_json(raw)
 
     from app.schemas.agent import AgentCreate
@@ -107,7 +151,7 @@ async def import_skill(
 ):
     """从官方社区 URL 导入 Skill（zip 自动解压 或 JSON）。"""
     url = _validate_url(community_url)
-    raw = await _download(url)
+    raw, _ = await _download(url)
 
     svc = SkillService(db)
 
@@ -154,9 +198,10 @@ async def import_resource(
 ):
     """从社区 URL 或本地文件导入资源（JSON/zip/md/txt/pdf）。
 
-    - community_url: HTTPS URL 导入
-    - file: 本地文件上传（multipart），初始 draft/pending/unreviewed
+    - community_url: HTTPS URL 导入（含 A 方案 sha256 尽力校验）
+    - file: 本地文件上传（multipart）
     二者皆缺 → 422。
+    用户主动导入即启用：落 status=active + enabled=True（D-061 修订）。
     """
     if not community_url and not file:
         raise HTTPException(
@@ -165,10 +210,12 @@ async def import_resource(
         )
 
     svc = RegistryService(db)
+    imported_version: Optional[str] = None
 
     if community_url:
         url = _validate_url(community_url)
-        raw = await _download(url)
+        raw, headers = await _download(url)
+        _verify_checksum(raw, headers)
 
         if url.endswith(".zip") or raw[:2] == b"PK":
             tmp_dir = settings.source_path / "resources" / "community_import"
@@ -187,16 +234,19 @@ async def import_resource(
             data = _load_json(raw)
             source_path_or_ref = None
 
+        # E3 追溯：从 manifest/JSON 的 version 字段推断导入版本，否则诚实留 null
+        imported_version = data.get("version")
+
         from app.schemas.registry import ResourceCreate
         create_data = ResourceCreate(
             resource_type=data.get("resource_type", "tool"),
-            name=data.get("name", "Imported Resource"),
+            name=data.get("display_name") or data.get("name", "Imported Resource"),
             description=data.get("description", ""),
             source_type="community",
             risk_level=data.get("risk_level", "L1"),
-            status="draft",
-            review_status="pending",
-            source_trust_level="unreviewed",
+            status="active",
+            enabled=True,
+            source_trust_level="read_only_reference",
             capabilities=data.get("capabilities"),
             type_metadata=data.get("type_metadata"),
             source_path_or_ref=source_path_or_ref,
@@ -246,18 +296,22 @@ async def import_resource(
             description=meta.get("description") or description or "",
             source_type="user_provided",
             risk_level=meta.get("risk_level", "L0"),
-            status="draft",
-            review_status="pending",
-            source_trust_level="unreviewed",
+            status="active",
+            enabled=True,
+            source_trust_level="read_only_reference",
             capabilities=meta.get("capabilities"),
             type_metadata=type_metadata,
             source_path_or_ref=source_path,
         )
 
     entry = svc.create(create_data)
+    if imported_version:
+        entry.imported_version = imported_version
+        db.commit()
+        db.refresh(entry)
     return SuccessEnvelope(
         data=RegistryService.to_response(entry),
-        meta={"source_status": "real", "review_required": True}
+        meta={"source_status": "real"},
     )
 
 
@@ -270,7 +324,7 @@ async def import_mcp(
 ):
     """从官方社区 URL 导入 MCP 配置（JSON）。"""
     url = _validate_url(community_url)
-    raw = await _download(url)
+    raw, _ = await _download(url)
     data = _load_json(raw)
 
     svc = MCPService(db)
@@ -303,16 +357,18 @@ async def import_case(
 ):
     """从社区 URL 或本地文件导入案例（zip 或 JSON，resource_type=case）。
 
-    file 上传支持 json/zip/md/txt。初始 draft/pending/unreviewed (D-061)。
+    file 上传支持 json/zip/md/txt。用户主动导入即启用：落 status=active + enabled=True（D-061 修订）。
     """
     if not community_url and not file:
         raise HTTPException(status_code=422, detail="必须提供 community_url 或上传文件（file）")
 
     svc = RegistryService(db)
+    imported_version: Optional[str] = None
 
     if community_url:
         url = _validate_url(community_url)
-        raw = await _download(url)
+        raw, headers = await _download(url)
+        _verify_checksum(raw, headers)
 
         if url.endswith(".zip") or raw[:2] == b"PK":
             tmp_dir = settings.source_path / "cases" / "community_import"
@@ -331,16 +387,18 @@ async def import_case(
             data = _load_json(raw)
             source_path_or_ref = None
 
+        imported_version = data.get("version")
+
         from app.schemas.registry import ResourceCreate
         create_data = ResourceCreate(
             resource_type="case",
-            name=data.get("name", "Imported Case"),
+            name=data.get("display_name") or data.get("name", "Imported Case"),
             description=data.get("description", ""),
             source_type="community",
             risk_level=data.get("risk_level", "L0"),
-            status="draft",
-            review_status="pending",
-            source_trust_level="unreviewed",
+            status="active",
+            enabled=True,
+            source_trust_level="read_only_reference",
             capabilities=data.get("capabilities"),
             type_metadata=data.get("type_metadata"),
             source_path_or_ref=source_path_or_ref,
@@ -377,16 +435,20 @@ async def import_case(
             description=meta.get("description") or description or "",
             source_type="user_provided",
             risk_level="L0",
-            status="draft",
-            review_status="pending",
-            source_trust_level="unreviewed",
+            status="active",
+            enabled=True,
+            source_trust_level="read_only_reference",
             capabilities=meta.get("capabilities"),
             type_metadata=type_metadata,
             source_path_or_ref=str(dest_dir),
         )
 
     entry = svc.create(create_data)
+    if imported_version:
+        entry.imported_version = imported_version
+        db.commit()
+        db.refresh(entry)
     return SuccessEnvelope(
         data=RegistryService.to_response(entry),
-        meta={"source_status": "real", "never_execute": True, "review_required": True},
+        meta={"source_status": "real", "never_execute": True},
     )

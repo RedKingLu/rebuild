@@ -21,21 +21,30 @@ from sqlalchemy.orm import Session
 from app.db import PACKAGE_DIR, SessionLocal
 from app.models import (
     CommunityResource,
+    CommunityDoc,
     CommunityNews,
     CommunityModelEntry,
     CommunityEvaluation,
 )
 
-VERSION = "R15-community-0.1.0"
+VERSION = "R16-community-0.2.0"  # R16-E1: + community docs
 
 
-def _build_package(resource_id: str, files: dict[str, str]) -> tuple[str, str, list[dict]]:
+def _build_package(resource_id: str, files: dict[str, str], meta: dict | None = None) -> tuple[str, str, list[dict]]:
     """Write a real zip package + manifest.json to PACKAGE_DIR.
 
     Returns (package_path, checksum_sha256, file_entries).
+    manifest 自描述（R15-R16 返工）：含 resource_type/name/display_name/description/version，
+    供主平台粘贴链接导入时还原资源真实身份（否则落为默认 tool/Imported Resource）。
     """
+    meta = meta or {}
     manifest = {
         "resource_id": resource_id,
+        "resource_type": meta.get("resource_type"),
+        "name": meta.get("name"),
+        "display_name": meta.get("display_name"),
+        "description": meta.get("description"),
+        "version": meta.get("version"),
         "files": [{"name": n, "size": len(c.encode("utf-8"))} for n, c in files.items()],
     }
     buf = io.BytesIO()
@@ -174,6 +183,101 @@ _NEWS_DEFS = [
          summary="金融核心系统迁移案例已发布。", body="详见资源列表。", pinned=False),
 ]
 
+# R16-E1: community online documentation seed (trusted 发布侧 content).
+_DOC_DEFS = [
+    dict(
+        slug="xinchuang-overview",
+        title="信创迁移概述",
+        summary="信创（信息技术应用创新）迁移的背景、目标与总体路径。",
+        category="信创基础",
+        tags=["信创", "概述", "迁移"],
+        version="1.0.0", source="official",
+        body_markdown=(
+            "# 信创迁移概述\n\n"
+            "## 什么是信创\n\n"
+            "信创（信息技术应用创新）是指在核心基础设施领域采用自主可控的技术栈，"
+            "覆盖芯片、操作系统、数据库、中间件与应用软件。\n\n"
+            "## 迁移路径\n\n"
+            "1. **盘点**：梳理现有技术栈与依赖\n"
+            "2. **评估**：确定替换方案与风险\n"
+            "3. **改造**：语法适配与数据迁移\n"
+            "4. **验证**：一致性校验与回归测试\n\n"
+            "## 典型技术栈映射\n\n"
+            "| 原栈 | 目标栈 |\n"
+            "|---|---|\n"
+            "| Oracle | 达梦 DM8 / GaussDB |\n"
+            "| MySQL | GaussDB / 海量 |\n"
+            "| WebLogic | TongWeb |\n"
+            "| RedHat | 麒麟 Kylin / 统信 UOS |\n"
+        ),
+    ),
+    dict(
+        slug="dm-migration-guide",
+        title="达梦 DM8 迁移实战指南",
+        summary="从 Oracle 迁移到达梦 DM8 的常见问题与语法适配清单。",
+        category="数据库迁移",
+        tags=["达梦", "Oracle", "数据库", "迁移"],
+        version="1.0.0", source="community",
+        body_markdown=(
+            "# 达梦 DM8 迁移实战指南\n\n"
+            "## 语法差异清单\n\n"
+            "- `ROWNUM` → 使用 `LIMIT` / `ROWNUM`（达梦兼容但语义略异）\n"
+            "- `(+)` 外连接 → 改用 `LEFT/RIGHT JOIN`\n"
+            "- `DECODE` → 使用 `CASE WHEN`（推荐）\n"
+            "- `NVL` → `IFNULL` / `COALESCE`\n\n"
+            "## 数据类型\n\n"
+            "| Oracle | 达梦 |\n"
+            "|---|---|\n"
+            "| NUMBER | NUMERIC / DECIMAL |\n"
+            "| VARCHAR2 | VARCHAR |\n"
+            "| CLOB | TEXT |\n\n"
+            "## 数据校验\n\n"
+            "迁移完成后务必进行行数对比与关键业务查询的回归验证。\n"
+        ),
+    ),
+    dict(
+        slug="rebuild-platform-quickstart",
+        title="rebuild 平台快速上手",
+        summary="本地起栈、导入知识包与基础工作流。",
+        category="平台使用",
+        tags=["rebuild", "快速入门", "平台"],
+        version="1.0.0", source="official",
+        body_markdown=(
+            "# rebuild 平台快速上手\n\n"
+            "## 本地起栈\n\n"
+            "```bash\n"
+            "docker compose up -d            # 主平台（后端 8000 / 前端 8080）\n"
+            "docker compose --profile community up -d   # 社区门户（8001 / 8081）\n"
+            "```\n\n"
+            "## 基础工作流\n\n"
+            "1. 创建项目 → 2. 导入知识包 → 3. 启动迁移规划 → 4. 查看评测对比\n\n"
+            "## 知识包导入\n\n"
+            "平台支持导入 `.zip` 知识包（含 manifest.json + 多 .md 文档），"
+            "导入后可在知识库中按标题、摘要与正文全文检索。\n"
+        ),
+    ),
+    dict(
+        slug="eval-methodology",
+        title="评测方法学与局限性说明",
+        summary="社区评测结果的来源、方法与局限性，不代表模型全局能力。",
+        category="评测",
+        tags=["评测", "方法学", "局限性"],
+        version="1.0.0", source="official",
+        body_markdown=(
+            "# 评测方法学与局限性说明\n\n"
+            "## 数据来源\n\n"
+            "所有评测结果均为**导入数据**，由社区贡献或第三方评测机构提供，"
+            "**非平台自动评测**，也**不代表模型的全局能力**。\n\n"
+            "## 使用方法\n\n"
+            "- 每个评测均附带方法学（eval_method）与局限性（limitations）\n"
+            "- 分数仅在相同任务与场景下可比\n"
+            "- 样本量（sample_count）影响统计可信度\n\n"
+            "## 注意事项\n\n"
+            "请勿把评测排名写成模型全局能力结论；请结合具体场景判断。\n"
+        ),
+    ),
+]
+
 
 def seed_all(db: Session) -> dict:
     if db.query(CommunityResource).count() > 0:
@@ -183,7 +287,7 @@ def seed_all(db: Session) -> dict:
     for d in _RESOURCE_DEFS:
         d = dict(d)
         files = d.pop("files")
-        pkg_path, checksum, file_entries = _build_package(d["id"], files)
+        pkg_path, checksum, file_entries = _build_package(d["id"], files, meta=d)
         db.add(CommunityResource(
             **d, files=file_entries, checksum_sha256=checksum,
             package_path=pkg_path, updated_at=now,
@@ -194,8 +298,11 @@ def seed_all(db: Session) -> dict:
         db.add(CommunityEvaluation(**d, published_at=now))
     for d in _NEWS_DEFS:
         db.add(CommunityNews(**d, published_at=now))
+    for d in _DOC_DEFS:
+        db.add(CommunityDoc(**d, updated_at=now))
     db.commit()
-    return {"seeded": True, "resources": len(_RESOURCE_DEFS), "models": len(_MODEL_DEFS)}
+    return {"seeded": True, "resources": len(_RESOURCE_DEFS), "models": len(_MODEL_DEFS),
+            "docs": len(_DOC_DEFS)}
 
 
 def seed_on_startup() -> None:

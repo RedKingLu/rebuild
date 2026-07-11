@@ -40,8 +40,13 @@ def _find_local(db: Session, community_id: str) -> ResourceEntry | None:
     return db.execute(stmt).scalars().first()
 
 
-def import_resource(db: Session, community_id: str) -> tuple[ResourceEntry, str]:
+def import_resource(db: Session, community_id: str, version: str | None = None) -> tuple[ResourceEntry, str, str | None]:
     """Download + sha256 verify + persist a community resource (shared path).
+
+    version: R16-B E3 — requested community version. 诚实语义：无论请求哪个版本，
+    当前实现始终下载+校验 CURRENT 包（社区 seed 仅对最新版本落库有效），但把
+    imported_version 记录为用户请求的版本用于追溯。请求历史版本会在返回的
+    meta.warning 中标注（由 route 透传枚举展示）。
 
     Returns (entry, checksum). Raises CommunityUnavailableError /
     ChecksumMismatchError — callers MUST surface these (P0: no silent fallback).
@@ -54,6 +59,13 @@ def import_resource(db: Session, community_id: str) -> tuple[ResourceEntry, str]
     # sha256 verify (P0)
     data, checksum = download_package(community_id)
 
+    requested_version = version
+    current_version = meta.get("version") or "1.0.0"
+    version_warning: str | None = None
+    if requested_version and requested_version != current_version:
+        version_warning = (f"请求版本 v{requested_version} 与社区当前版本 v{current_version} 不同；已按当前版本落库校验，"
+                          f"imported_version 记为 v{requested_version} 用于追溯。")
+
     if existing is not None:
         # Refresh distribution fields, keep it enabled & usable.
         existing.package_url = package_url
@@ -61,9 +73,11 @@ def import_resource(db: Session, community_id: str) -> tuple[ResourceEntry, str]
         existing.download_count = meta.get("download_count", 0) or 0
         existing.icon_url = meta.get("icon_url")
         existing.enabled = True
+        if requested_version:
+            existing.imported_version = requested_version
         db.commit()
         db.refresh(existing)
-        return existing, checksum
+        return existing, checksum, version_warning
 
     manifest = meta.get("manifest")
     if isinstance(manifest, str):
@@ -90,11 +104,12 @@ def import_resource(db: Session, community_id: str) -> tuple[ResourceEntry, str]
         icon_url=meta.get("icon_url"),
         capabilities={"community_tags": meta.get("tags") or [],
                       "categories": meta.get("categories") or []},
+        imported_version=requested_version,
     )
     db.add(entry)
     db.commit()
     db.refresh(entry)
-    return entry, checksum
+    return entry, checksum, version_warning
 
 
 def introduce(

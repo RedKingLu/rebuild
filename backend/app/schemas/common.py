@@ -26,6 +26,7 @@ class Meta(BaseModel):
     not_connected_reason: str = ""
     generated_at: str = Field(default_factory=_now)
     persistence: str = "durable"
+    detail: str = ""
 
 
 class GraphPlaceholderFields(BaseModel):

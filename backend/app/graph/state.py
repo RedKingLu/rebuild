@@ -57,12 +57,8 @@ class GraphState(TypedDict, total=False):
     # --- interrupt / resume bookkeeping (scalar) ---
     pending_gate: Optional[Dict]  # {gate_id, stage} set when a stage interrupts
     last_decision: Optional[str]  # approve / reject / request_changes (resume payload)
-    # B-PLAN-1: set by a work node when a pre-execution plan_review Gate was NOT
-    # approved (manual/plan mode). Signals the following {stage}_gate node to skip
-    # its promotion interrupt (no stage actions ran → no promotion Gate to decide).
-    plan_halt: Optional[str]  # the non-approve plan decision (reject / request_changes)
-    # R17-3: plan_presentation 两阶段流程标记。True 表示 plan_review 已批准，
-    # work 节点应执行完整 StageLoop（而非 plan_only 模式）。
+    # R17-X: plan_presentation 两阶段流程标记。True 表示接入计划已在 plan_presentation
+    # gate 通过，work 节点应执行完整 StageLoop（而非 plan_only 模式）。
     plan_approved: Optional[bool]
 
     # --- capability / mode (scalar; real values, not placeholders) ---

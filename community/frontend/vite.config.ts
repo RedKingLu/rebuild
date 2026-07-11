@@ -11,6 +11,7 @@ export default defineConfig({
       "/api": {
         target: process.env.COMMUNITY_BACKEND_TARGET || "http://localhost:8001",
         changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/api/, ""),  // /api/docs → /docs (backend has no /api prefix)
       },
     },
   },

@@ -268,14 +268,15 @@ class TestGateSemantics:
         """T15: Auto mode must NOT bypass a stage_promotion Gate — it stays
         waiting_decision until an explicit user decision arrives."""
         pid = _make_project(client)
-        # T6b: /onboarding/complete drives the graph which creates the P0→P1
-        # stage_promotion Gate. Auto mode must NOT auto-resolve it.
-        d = client.post(f"/api/projects/{pid}/onboarding/complete",
-                        json={"execution_mode": "auto"}).json()["data"]
-        assert d.get("gate_id"), "complete should create the P0→P1 Gate (graph-driven)"
-        # Immediately read it back — Auto did not auto-approve it.
+        # R17-X: /onboarding/complete 不再驱动图；P0 图执行（含 P0→P1 stage_promotion Gate）
+        # 由用户点「开始」触发的 POST /onboarding/execute 创建。Auto mode 不得自动 resolve 它。
+        cd = client.post(f"/api/projects/{pid}/onboarding/complete",
+                         json={"execution_mode": "auto"}).json()["data"]
+        assert cd.get("gate_id") is None, "complete 不应创建 Gate（不自动执行）"
+        exec_resp = client.post(f"/api/projects/{pid}/onboarding/execute")
+        assert exec_resp.status_code == 200
+        # Read the gate created by the graph — Auto did not auto-approve it.
         fetched = client.get(f"/api/projects/{pid}/gates/active").json()["data"]
         assert fetched is not None
-        assert fetched["gate_id"] == d["gate_id"]
         assert fetched["gate_status"] == "waiting_decision"
         assert fetched["gate_type"] == "stage_promotion"
