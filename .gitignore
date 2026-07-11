@@ -52,3 +52,6 @@ backend/app/config/user_strategies.yaml
 backend/.data/project-sources/
 backend/.data/execution-sandbox/
 backend/.data/integration-repos/
+# 防误 cwd 运行把 .data 运行时库/检查点落到非后端目录（如 frontend/.data）产生游离物
+frontend/.data/
+/.data/
