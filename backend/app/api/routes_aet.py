@@ -25,7 +25,7 @@ async def list_artifacts(project_id: str, stage: str | None = None):
 @router.get("/artifacts/{artifact_id}")
 async def get_artifact(project_id: str, artifact_id: str):
     svc = _svc()
-    a = svc.aet_service.get_artifact(artifact_id)
+    a = svc.aet_service.get_artifact(artifact_id, project_id=project_id)
     if a is None:
         raise HTTPException(404, f"Artifact {artifact_id} not found")
     return SuccessEnvelope(data=a, meta=Meta())

@@ -27,6 +27,7 @@ work. Step 2 assembles context via context_assembler by default.
 from __future__ import annotations
 
 import inspect
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -34,6 +35,8 @@ from typing import Any, Awaitable, Callable, Optional
 from app.core.status import NODE_STATUSES
 from app.services.review_pass import ReviewPass, ReviewResult
 from app.services.acceptance_service import AcceptanceService
+
+logger = logging.getLogger("rebuild.node_loop")
 
 # 9-step markers (§2)
 STEP_RECEIVED = "task_received"
@@ -411,4 +414,5 @@ class NodeLoop:
                 run_id=(spec.run_id if spec else None),
                 stage=(spec.stage if spec else None), **extra)
         except Exception:
-            pass  # tracing advisory
+            # advisory：trace 仅用于可观测，NodeLoop 执行不受影响；记录以便定位偶发写失败。
+            logger.debug("node_loop trace 写入失败（advisory）", exc_info=True)

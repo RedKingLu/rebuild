@@ -277,9 +277,9 @@ def drain_graph_tasks(timeout: float = 30.0) -> None:
         try:
             f.result(timeout=timeout)
         except Exception:
-            # A background graph failure is logged/audited inside _run_graph_bg;
-            # here we only care that the thread has stopped touching globals.
-            pass
+            # advisory：后台图运行失败已在 _run_graph_bg 内部 logger.error + audit 记录（见下）；
+            # 此处仅需确认线程已停止触碰全局状态，重复发声无益。
+            logger.debug("drain_graph_tasks: 后台图 future 以异常结束（已在 _run_graph_bg 记录）", exc_info=True)
     with _graph_tasks_lock:
         _graph_tasks[:] = [f for f in _graph_tasks if not f.done()]
 
@@ -317,12 +317,15 @@ async def _run_graph_bg(run_id: str, decision: str, project_id: str, stage: str)
             try:
                 svc.project_service.update(project_id, current_stage=nxt, active_gate="")
             except Exception:
-                pass
+                # 发声：图已推进但 project.state 未同步会造成状态漂移（前端仍显示旧阶段）。
+                logger.warning("图完成后同步 project.current_stage 失败 run=%s stage=%s",
+                               run_id, nxt, exc_info=True)
         for st, status in (graph_state.get("stage_status") or {}).items():
             try:
                 svc.run_service.set_stage_status(run_id, st, status)
             except Exception:
-                pass
+                # 发声：stage_status 未持久化会造成状态漂移，须可见。
+                logger.warning("图完成后同步 stage_status 失败 run=%s stage=%s", run_id, st, exc_info=True)
     except Exception as e:
         logger.error("background graph run failed run=%s: %s", run_id, e, exc_info=True)
         try:
@@ -330,4 +333,5 @@ async def _run_graph_bg(run_id: str, decision: str, project_id: str, stage: str)
                                    summary=f"Graph background resume failed: {e}",
                                    project_id=project_id, run_id=run_id, stage=stage)
         except Exception:
-            pass
+            # advisory：主错误已在上方 logger.error 记录；此处仅是补写 trace，失败不影响主发声。
+            logger.debug("记录 graph_bg_failed trace 失败 run=%s", run_id, exc_info=True)

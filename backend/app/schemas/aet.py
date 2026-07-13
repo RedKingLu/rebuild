@@ -14,7 +14,7 @@ class ArtifactResponse(BaseModel):
     content_hash: str = ""
     bytes: int = 0
     path: str = ""
-    source_status: str = "mock"
+    source_status: str = "not_connected"
 
 
 class EvidenceResponse(BaseModel):
@@ -27,7 +27,7 @@ class EvidenceResponse(BaseModel):
     summary: str = ""
     gap_description: Optional[str] = None
     blocking: bool = False
-    source_status: str = "mock"
+    source_status: str = "not_connected"
 
 
 class TraceResponse(BaseModel):
@@ -39,7 +39,7 @@ class TraceResponse(BaseModel):
     action: str = ""
     summary: str = ""
     graph_status: str = "not_connected"
-    transition_mode: str = "mock"
+    transition_mode: str = "unknown"
     persistence: str = "volatile"
     created_at: str = ""
 
@@ -55,7 +55,7 @@ class AuditResponse(BaseModel):
     project_id: Optional[str] = None
     run_id: Optional[str] = None
     stage: Optional[str] = None
-    transition_mode: str = "mock"
+    transition_mode: str = "unknown"
     persistence: str = "volatile"
     created_at: str = ""
 
@@ -66,4 +66,4 @@ class EvidenceGapResponse(BaseModel):
     stage: str = ""
     description: str = ""
     blocking: bool = False
-    source_status: str = "mock"
+    source_status: str = "not_connected"

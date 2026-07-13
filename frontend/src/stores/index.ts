@@ -1,106 +1,9 @@
 import { create } from 'zustand';
-import { mockProjects, mockRuns, mockGates, mockArtifacts, mockEvidences, mockTraces, mockAudits, mockFileTree } from '../mock/data';
-import type { Project, Run, Gate, Artifact, Evidence, Trace, Audit, FileRoot } from '../types';
 
-// === Pre-computed stable lookups (created once, never change) ===
-const EMPTY_RUNS: Run[] = [];
-const EMPTY_GATES: Gate[] = [];
-const runsByProject = new Map<string, Run[]>();
-const gatesByProject = new Map<string, Gate[]>();
-const gapsList: Evidence[] = [];
-for (const r of mockRuns) {
-  const arr = runsByProject.get(r.project_id) || [];
-  arr.push(r);
-  runsByProject.set(r.project_id, arr);
-}
-for (const g of mockGates) {
-  const arr = gatesByProject.get(g.project_id) || [];
-  arr.push(g);
-  gatesByProject.set(g.project_id, arr);
-}
-for (const e of mockEvidences) {
-  if (e.blocking || e.evidence_status === 'insufficient') gapsList.push(e);
-}
-
-// === Project Store ===
-interface ProjectState {
-  projects: Project[];
-  getProject: (id: string) => Project | undefined;
-  createProject: (name: string) => Project;
-}
-export const useProjectStore = create<ProjectState>((set, get) => ({
-  projects: mockProjects,
-  getProject: (id) => get().projects.find(p => p.project_id === id),
-  createProject: (name) => {
-    const p: Project = {
-      project_id: 'proj-' + Date.now(),
-      name,
-      description: '',
-      project_status: 'created',
-      current_stage: null,
-      current_run_id: null,
-      active_gate: null,
-      evidence_gap_count: 0,
-      source_type: 'local_dir',
-      workspace_status: 'ready',
-      updated_at: new Date().toISOString(),
-      onboarding_done: false,
-      mock_level: 'mock',
-    };
-    set(s => ({ projects: [...s.projects, p] }));
-    return p;
-  },
-}));
-
-// === Run Store ===
-interface RunState {
-  runs: Run[];
-  /** Stable — same array reference for same projectId */
-  getRunsByProject: (projectId: string) => Run[];
-  getRun: (runId: string) => Run | undefined;
-}
-export const useRunStore = create<RunState>(() => ({
-  runs: mockRuns,
-  getRunsByProject: (pid) => runsByProject.get(pid) || EMPTY_RUNS,
-  getRun: (rid) => mockRuns.find(r => r.run_id === rid),
-}));
-
-// === Gate Store ===
-interface GateState {
-  gates: Gate[];
-  /** Stable — same array reference for same projectId */
-  getGatesByProject: (projectId: string) => Gate[];
-  /** Stable — returns same object ref for same projectId */
-  getActiveGate: (projectId: string) => Gate | undefined;
-}
-export const useGateStore = create<GateState>(() => ({
-  gates: mockGates,
-  getGatesByProject: (pid) => gatesByProject.get(pid) || EMPTY_GATES,
-  getActiveGate: (pid) => (gatesByProject.get(pid) || []).find(g => g.gate_status === 'waiting_decision'),
-}));
-
-// === Artifact Store ===
-interface ArtifactState { artifacts: Artifact[]; }
-export const useArtifactStore = create<ArtifactState>(() => ({ artifacts: mockArtifacts }));
-
-// === Evidence Store ===
-interface EvidenceState {
-  evidences: Evidence[];
-  /** Stable — pre-computed once */
-  gaps: Evidence[];
-}
-export const useEvidenceStore = create<EvidenceState>(() => ({
-  evidences: mockEvidences,
-  gaps: gapsList,
-}));
-
-// === Trace Store ===
-interface TraceState { traces: Trace[]; }
-export const useTraceStore = create<TraceState>(() => ({ traces: mockTraces }));
-
-// === Audit Store ===
-interface AuditState { audits: Audit[]; }
-export const useAuditStore = create<AuditState>(() => ({ audits: mockAudits }));
+// D-097：本文件不再引入任何 mock 数据。业务数据（Project / Run / Gate / Artifact /
+// Evidence / Trace / Audit / File）一律由各页面 / 组件直接调用真实 service（API）获取，
+// 不经此处的全局 mock store。以下仅保留纯前端 UI 状态 store（Workspace 布局、设置），
+// 它们不承载任何业务数据初值。
 
 // === Workspace UI Store ===
 export type ActivityType = 'stage' | 'files' | 'materials' | 'git' | 'remote' | 'search' | 'agent';
@@ -205,7 +108,3 @@ export const useSettingsStore = create<SettingsState>((set) => ({
 
 // 启动即应用已保存字号
 applyFontScale(readFontScale());
-
-// === File Store ===
-interface FileState { tree: FileRoot[]; }
-export const useFileStore = create<FileState>(() => ({ tree: mockFileTree }));

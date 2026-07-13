@@ -202,6 +202,8 @@ def _to_dict(obj: object | None) -> dict | None:
     try:
         return obj.model_dump()
     except AttributeError:
+        # 预期分支：obj 非 Pydantic 模型（无 model_dump），落到下方 __dict__ 分支。
+        # 属类型分派的正常控制流，非错误吞噬，无需发声。
         pass
     try:
         return dict(obj.__dict__)

@@ -832,7 +832,8 @@ async def execute_onboarding(project_id: str, db: Session = Depends(get_db)):
                     gate_type = _gt.gate_type
                     gate_reason = _gt.reason or ""
             except Exception:
-                pass
+                # 发声：Gate 查询失败会让 gate_type/reason 静默缺省，掩盖 Gate 查询故障。
+                logger.warning("resume: 查询 Gate 详情失败 gate=%s", gate_id, exc_info=True)
 
         # Update project state
         if gate_id:

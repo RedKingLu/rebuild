@@ -104,7 +104,8 @@ class RealP0Handler:
                 task_type="onboarding",
             )
         except Exception:
-            pass  # context assembly is advisory — domain work proceeds regardless
+            # advisory：上下文装配失败不阻断 P0 领域工作，主链路照常推进；记录以便定位。
+            logger.debug("P0 上下文装配失败（advisory，领域工作照常推进）", exc_info=True)
 
         materialized = {"materialization_status": "skipped", "file_count": 0}
         try:
@@ -188,7 +189,8 @@ class RealP1Handler:
                 task_type="profiling",
             )
         except Exception:
-            pass  # advisory — domain work proceeds regardless
+            # advisory：上下文装配失败不阻断 P1 领域工作，主链路照常推进；记录以便定位。
+            logger.debug("P1 上下文装配失败（advisory，领域工作照常推进）", exc_info=True)
 
         from app.services.full_stack_profiler import FullStackProfiler
         profiler = FullStackProfiler(trace_writer=self.tracer, audit_writer=self.auditor)
@@ -550,7 +552,7 @@ class RealP4Handler:
         from app.dependencies import get_services
         return get_services()
 
-    def _build_worker(self, project_id: str):
+    def _build_worker(self, project_id: str, reference_context: str = ""):
         from app.services.p4_execution_worker import P4ExecutionWorker
         gateway = self._gateway
         aet = self._aet
@@ -559,7 +561,8 @@ class RealP4Handler:
             gateway = gateway if gateway is not None else svc.model_gateway
             aet = aet if aet is not None else svc.aet_service
         return P4ExecutionWorker(project_id, tracer=self.tracer, auditor=self.auditor,
-                                 aet=aet, gateway=gateway)
+                                 aet=aet, gateway=gateway,
+                                 reference_context=reference_context)
 
     def _load_p3_task_graph(self, project_id: str) -> dict | None:
         """Load the latest P3 TaskGraph (definition) + its nodes for this project.
@@ -631,7 +634,14 @@ class RealP4Handler:
         # success/failure/retry/rework/gate 由 engine 路由；失败/阻塞/Gate 经 _finalize 诚实
         # 归类（绝不伪造 completed）。engine 由 handler 在 LangGraph p4_work 节点内调用（D-037）。
         run_id = state.get("run_id", "")
-        worker = self._build_worker(project_id)
+        # WP-B: pass C6 retrieved case/knowledge (already assembled in context_package)
+        # into the worker so P4 code generation is informed by migration case/knowledge
+        # reference. Empty retrieval → empty string (no reference block injected).
+        p4_ref_ctx = ""
+        _c6 = (context_package.get("layers") or {}).get("C6") or {}
+        if _c6.get("capability_status") == "active":
+            p4_ref_ctx = _c6.get("content", "")
+        worker = self._build_worker(project_id, reference_context=p4_ref_ctx)
 
         # P3 TaskNode 无 acceptance_criteria 列 → NodeLoop step1 会因"缺 acceptance_criteria"
         # 阻塞。为 execution 节点注入默认 P4 结构化验收标准（由真实产物落盘背书），worker 据此

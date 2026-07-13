@@ -21,7 +21,7 @@ from typing import Optional
 from app.services.context_layers import (
     ContextLayer, DEFAULT_CONTEXT_RECIPE,
     assemble_c0, assemble_c1, assemble_c2, assemble_c3,
-    assemble_c4, assemble_c5, assemble_c6_empty,
+    assemble_c4, assemble_c5, assemble_c6,
     build_system_prompt_from_layers,
 )
 from app.services.workspace_service import workspace_path
@@ -168,19 +168,20 @@ def assemble_context(
             acceptance_feedback=ns.get("acceptance_feedback"),
         )
 
-    if "C6" in active_layers:
-        layers["C6"] = assemble_c6_empty()
-
     ctx["layers"] = layers
 
     # ── T4/T5: Case + Knowledge retrieval and injection (R9-5-4) ──────────
+    # WP-B fix: retrieved case/knowledge bodies are injected into the C6 dynamic
+    # layer so they reach the model prompt via build_system_prompt_from_layers
+    # (previously ctx["cases"]/ctx["knowledge"] were computed but only used for
+    # assembly_trace stats — they never entered any system_prompt).
     cases: list[dict] = []
     knowledge: list[dict] = []
     try:
         cases = _retrieve_cases(project_id, current_stage)
         ctx["cases"] = cases
     except Exception as e:
-        logger.debug("case retrieval skipped: %s", e)
+        logger.warning("case retrieval failed (公理3, C6 案例层将标空): %s", e)
         ctx["cases"] = []
 
     try:
@@ -188,8 +189,12 @@ def assemble_context(
         knowledge = _retrieve_knowledge(current_stage, query)
         ctx["knowledge"] = knowledge
     except Exception as e:
-        logger.debug("knowledge retrieval skipped: %s", e)
+        logger.warning("knowledge retrieval failed (公理3, C6 知识层将标空): %s", e)
         ctx["knowledge"] = []
+
+    # Assemble C6 dynamic layer from the real retrieval results (empty → honest 标空).
+    if "C6" in active_layers:
+        layers["C6"] = assemble_c6(cases, knowledge)
 
     # Assembly trace stats (for Trace writing + Evidence)
     ctx["assembly_trace"] = {
@@ -277,7 +282,10 @@ def _retrieve_cases(project_id: str, stage: str, max_cases: int = 3) -> list[dic
                         from pathlib import Path
                         body_snippet = Path(body_path).read_text("utf-8", errors="replace")[:300]
                     except Exception:
-                        pass
+                        # advisory：案例正文片段仅为上下文增强，读取失败则退化为使用 description，
+                        # 不影响上下文装配主流程。
+                        logger.debug("读取案例正文片段失败，回退 description body_path=%s",
+                                     body_path, exc_info=True)
                 if not body_snippet:
                     body_snippet = (e.description or "")[:300]
                 results.append({

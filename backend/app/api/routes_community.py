@@ -101,6 +101,7 @@ def import_resource(resource_id: str, version: str | None = None,
 
 
 class IntroduceRequest(BaseModel):
+    project_id: str
     query: str | None = None
     resource_type: str | None = None
 
@@ -113,8 +114,14 @@ def introduce_ep(body: IntroduceRequest, svc: RegistryService = Depends(_svc)) -
     returns status=available directly (NO second gate). Otherwise creates a real
     community_resource_introduction Gate via the P121 kernel.
     """
-    # A representative project context; in graph-driven mode the agent_loop supplies it.
-    project_id = "proj-agent-autointro"
+    # project_id 必须来自请求的真实项目上下文，避免 Gate/审计错归属。
+    # graph 驱动路径由 agent_loop 传真实 id（见 tool_registry），不走本 REST 入口。
+    from app.models.project import Project
+    project_id = (body.project_id or "").strip()
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id 不能为空：社区资源引入需真实项目上下文")
+    if svc.db.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     result = introduce(svc.db, query=body.query, type=body.resource_type,
                        project_id=project_id, stage="p4")
     return SuccessEnvelope(data=result, meta={"detail": result["status"]})

@@ -10,6 +10,7 @@ thread_id convention: thread_id == run_id (one graph thread per Run, D-085 / Q-4
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,8 @@ import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.core.config import settings
+
+logger = logging.getLogger("rebuild.graph.checkpoint")
 
 _CKPT_FILENAME = "graph_checkpoints.sqlite"
 
@@ -93,7 +96,8 @@ async def close_checkpointer() -> None:
         try:
             await _conn.close()
         except Exception:
-            pass
+            # advisory：应用关闭/测试拆卸时关闭 checkpointer 连接，失败不影响后续（连接随即置空）。
+            logger.debug("关闭 checkpointer 连接失败（关闭/拆卸阶段，best-effort）", exc_info=True)
     _conn = None
     _saver = None
     _lock = None  # reset so next call creates a fresh lock on the current event loop

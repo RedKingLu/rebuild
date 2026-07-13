@@ -19,11 +19,130 @@ as seed-driven tools so capability is not lost when Registry is empty.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger("rebuild.tool_registry")
+
+# ── Minimal stdlib unified-diff engine (R17.2 apply_patch REC) ─────────────────
+# apply_patch previously wrote the draft's "diff" field verbatim as the whole file
+# content. If that field is an actual unified diff, writing it raw corrupts the
+# target. These helpers detect a unified diff and apply it hunk-by-hunk with strict
+# context matching, in pure stdlib (NO patch/whatthepatch/unidiff dependency).
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _looks_like_unified_diff(text: str) -> bool:
+    """Heuristic: is `text` a unified diff (vs. a whole-file new content)?
+
+    True when any line is a hunk header (@@ -a,b +c,d @@), a file header
+    (--- / +++), or a git diff header (diff --git). Empty/plain content → False
+    (so the full-content write path is preserved — backward compatible).
+    """
+    if not text:
+        return False
+    for line in text.splitlines():
+        if _HUNK_RE.match(line):
+            return True
+        if line.startswith("--- ") or line.startswith("+++ ") or line.startswith("diff --git"):
+            return True
+    return False
+
+
+def apply_unified_diff(base_text: str, diff_text: str) -> str:
+    """Apply a unified diff to base_text and return the new content (pure stdlib).
+
+    Locates each hunk by its @@ -a,b +c,d @@ header, copies intervening context
+    from the base, verifies every context/deleted line matches the base exactly,
+    then emits added lines. Raises ValueError on any mismatch or unappliable hunk
+    (D-097: never silently corrupt the target — the caller rejects instead of
+    writing garbage).
+    """
+    base_lines = base_text.splitlines()
+    diff_lines = diff_text.splitlines()
+    result: list[str] = []
+    base_idx = 0  # 0-based cursor into base_lines
+    i = 0
+    n = len(diff_lines)
+    applied_hunks = 0
+
+    while i < n:
+        m = _HUNK_RE.match(diff_lines[i])
+        if not m:
+            # File/metadata headers (---, +++, diff --git, index …) between hunks.
+            i += 1
+            continue
+        start_old = int(m.group(1))
+        hunk_start = (start_old - 1) if start_old > 0 else 0
+        if hunk_start < base_idx:
+            raise ValueError(
+                f"hunk 起始行 {start_old} 早于当前处理位置（{base_idx + 1}），diff 顺序异常"
+            )
+        if hunk_start > len(base_lines):
+            raise ValueError(
+                f"hunk 起始行 {start_old} 超出 base 文件行数（{len(base_lines)}）"
+            )
+        # Copy unchanged lines preceding this hunk.
+        result.extend(base_lines[base_idx:hunk_start])
+        base_idx = hunk_start
+        i += 1
+        applied_hunks += 1
+
+        # Consume the hunk body until the next hunk/file header.
+        while i < n:
+            hl = diff_lines[i]
+            if _HUNK_RE.match(hl):
+                break
+            if hl.startswith("--- ") or hl.startswith("+++ ") or hl.startswith("diff --git") or hl.startswith("index "):
+                break
+            if hl.startswith("\\"):  # "\ No newline at end of file"
+                i += 1
+                continue
+            tag = hl[:1]
+            content = hl[1:]
+            if tag == " " or hl == "":
+                # Context line (a bare empty line is an empty context line).
+                if base_idx >= len(base_lines) or base_lines[base_idx] != content:
+                    actual = base_lines[base_idx] if base_idx < len(base_lines) else "<EOF>"
+                    raise ValueError(
+                        f"上下文不匹配 @base行{base_idx + 1}: 期望 {content!r} 实际 {actual!r}"
+                    )
+                result.append(base_lines[base_idx])
+                base_idx += 1
+            elif tag == "-":
+                if base_idx >= len(base_lines) or base_lines[base_idx] != content:
+                    actual = base_lines[base_idx] if base_idx < len(base_lines) else "<EOF>"
+                    raise ValueError(
+                        f"删除行不匹配 @base行{base_idx + 1}: 期望删除 {content!r} 实际 {actual!r}"
+                    )
+                base_idx += 1
+            elif tag == "+":
+                result.append(content)
+            else:
+                raise ValueError(f"无法识别的 diff 行: {hl!r}")
+            i += 1
+
+    if applied_hunks == 0:
+        raise ValueError("未找到可应用的 hunk（@@ 段头缺失）")
+
+    # Append the remaining unchanged tail of the base file.
+    result.extend(base_lines[base_idx:])
+    new_text = "\n".join(result)
+    # Preserve a trailing newline when the base had one (or, for an empty base, when
+    # the diff content ends with one).
+    if base_text.endswith("\n") or (not base_text and diff_text.endswith("\n")):
+        new_text += "\n"
+    return new_text
+
+
+def _source_equivalent(out_rel: str) -> str:
+    """Map an output_code/ target back to its source/ original (read-only base)."""
+    norm = out_rel.replace("\\", "/")
+    if norm.startswith("output_code/"):
+        return "source/" + norm[len("output_code/"):]
+    return ""
 
 # ── Built-in tool fallback (seed-equivalent schemas) ────────────────────────
 # These match the hard-coded AGENT_TOOLS in agent_loop.py so the agent always
@@ -101,6 +220,14 @@ _BUILTIN_SCHEMAS = [
 # Risk levels that require gate review (T2.3 / S3 note: full HITL接线→R9-5-7)
 _GATE_RISK_THRESHOLD = "L3"
 _RISK_ORDER = ["L0", "L1", "L2", "L3", "L4", "L5"]
+
+
+def _rank(risk: str) -> int:
+    """Ordinal rank of a risk level string, tolerant of unknown values."""
+    try:
+        return _RISK_ORDER.index((risk or "L0").upper())
+    except ValueError:
+        return 0
 
 
 def load_schemas(
@@ -229,6 +356,7 @@ async def execute_tool(
     db: Optional[Session] = None,
     tracer=None,
     run_id: str = "",
+    confirmed: bool = False,
 ) -> dict:
     """Execute a tool by name, routing via write_scope / binds_via.
 
@@ -236,10 +364,24 @@ async def execute_tool(
     - builtin:*     → internal dispatch (get_project_info / read_artifact / run_profiling)
     - write_scope=mcp → MCP call_tool()
     - write_scope=none → local read (workspace/source)
-    - write_scope=workspace → workspace-confined write
-    - write_scope=execute → ExecutionProvider.execute()
-    - risk_level≥L3 → OD-06: create a real action_approval Gate (awaiting_approval);
-                      honest risk_flagged if no Gate backend is available.
+    - write_scope=workspace → workspace-confined write to output_code/ or artifacts/
+                      via WorkspaceMediator (source/ rejected — D-099①)
+    - write_scope=patch_draft → write a patch draft to patches/ via WorkspaceMediator
+                      (D-099③ / D-104)
+    - write_scope=output_code → apply a patch draft into output_code/ via WorkspaceMediator
+    - write_scope=execute/system OR run_safe_command → ExecutionProvider.execute()
+
+    HITL ownership (D-087, WP-C3 / B-R17.2-TOOL-DOUBLEGATE):
+    - An L3+ tool requires human approval. There is ONE action_approval Gate per
+      (project_id, run_id, tool_name); execute_tool is gate-aware:
+        * approved gate found (or caller passes confirmed=True) → re-dispatch = execute
+          for real.  This covers both (a) approval of a gate execute_tool created and
+          (b) approval of the gate the agent_loop authorization layer created — so
+          execute_tool never opens a SECOND gate for an already-approved action.
+        * a waiting gate found → return its awaiting_approval (no duplicate gate).
+        * no gate → create one, return awaiting_approval.
+      confirmed=True lets a caller that already owns the HITL decision (agent_loop /
+      REST after gate approval) thread the approved context through directly.
 
     Writes Trace on every call (公理3 / T2.3).
     """
@@ -261,7 +403,8 @@ async def execute_tool(
                     tool_entry = t
                     break
         except Exception:
-            pass
+            # 发声：工具查表的 DB 查询失败若静默会让工具"看似不存在"而非暴露 DB 故障。
+            logger.warning("tool_registry: 查询工具资源失败 tool=%s", tool_name, exc_info=True)
 
     # MCP dispatch
     if tool_name.startswith("mcp__"):
@@ -271,27 +414,76 @@ async def execute_tool(
     if tool_entry is None:
         return await _execute_builtin(tool_name, args, project_id, stage)
 
-    # Risk gate (T2.3 / OD-06): an L3+ tool must NOT execute silently — create a real
-    # action_approval Gate through the existing GateService kernel and return
-    # awaiting_approval. Honest degradation if no Gate backend (see _create_risk_gate).
+    # Risk gate (T2.3 / OD-06 / WP-C3): an L3+ tool must NOT execute silently. There is
+    # a SINGLE action_approval Gate per (project_id, run_id, tool_name). execute_tool is
+    # gate-aware so an approved action re-dispatches (executes for real) rather than being
+    # parked behind an endless second gate (B-R17.2-TOOL-DOUBLEGATE). Honest degradation if
+    # no Gate backend (see _create_risk_gate).
     risk = tool_entry.risk_level.value if hasattr(tool_entry.risk_level, "value") else "L0"
-    if _RISK_ORDER.index(risk) >= _RISK_ORDER.index(_GATE_RISK_THRESHOLD):
-        result = _create_risk_gate(project_id, run_id, stage, tool_name, risk)
-        _write_trace(tracer, project_id, tool_name, args, result)
-        return result
-
     meta = tool_entry.type_metadata or {}
     write_scope = meta.get("write_scope", "none")
+    approved_gate_id = ""  # set below iff a re-dispatched (gate-approved) call executes
 
-    # Execute by scope
-    if write_scope in ("none",):
+    if _rank(risk) >= _rank(_GATE_RISK_THRESHOLD):
+        gate_state, gate_id = _resolve_action_gate(project_id, run_id, tool_name)
+        approved = confirmed or gate_state == "approved"
+        if not approved:
+            if gate_state == "pending" and gate_id:
+                result = {
+                    "status": "awaiting_approval",
+                    "risk_level": risk,
+                    "tool_name": tool_name,
+                    "gate_id": gate_id,
+                    "gate_type": "action_approval",
+                    "message": (f"工具风险等级 {risk} ≥ {_GATE_RISK_THRESHOLD}，已有等待中的 "
+                                f"action_approval Gate（{gate_id}），审批通过后方可执行。"),
+                }
+            else:
+                result = _create_risk_gate(project_id, run_id, stage, tool_name, risk)
+            _write_trace(tracer, project_id, tool_name, args, result)
+            return result
+        # approved → fall through to real execution (re-dispatch). Remember the gate id
+        # so a successful high-risk write/execute consumes it (one-time approval, R18→R17.2).
+        # confirmed=True is a direct-thread with no gate_id → nothing to consume.
+        if not confirmed and gate_state == "approved":
+            approved_gate_id = gate_id
+
+    # Execute by scope. run_safe_command / execute-scope tools are checked first because
+    # run_safe_command carries no write_scope (defaults to "none") yet must run via provider.
+    if tool_name == "run_safe_command" or write_scope in ("execute", "system"):
+        result = await _execute_via_provider(tool_name, args, project_id, tool_entry)
+    elif write_scope in ("none",):
         result = await _execute_read(tool_name, args, project_id)
     elif write_scope in ("workspace",):
         result = await _execute_workspace_write(tool_name, args, project_id, tool_entry)
-    elif write_scope in ("execute", "system"):
+    elif write_scope in ("patch_draft",):
+        result = await _execute_generate_patch(tool_name, args, project_id, tool_entry)
+    elif write_scope in ("output_code",):
+        result = await _execute_apply_patch(tool_name, args, project_id, tool_entry)
+    elif args.get("command") or args.get("code"):
+        # A gate-approved exec tool without an explicit write scope → run via provider.
         result = await _execute_via_provider(tool_name, args, project_id, tool_entry)
     else:
         result = await _execute_builtin(tool_name, args, project_id, stage)
+
+    # One-time consumption of an approved action_approval Gate (R18→R17.2). Only after a
+    # gate-approved re-dispatch of a high-risk write/execute tool actually SUCCEEDS do we
+    # mark the gate consumed — so the same approval can never be reused for a second
+    # high-risk write. Failures (error/rejected/awaiting_approval) leave the gate approved
+    # so the caller can retry without re-approval. confirmed=True (no gate_id) is skipped.
+    if (
+        approved_gate_id
+        and write_scope in ("output_code", "execute", "system")
+        and not result.get("error")
+        and result.get("status") not in ("error", "rejected", "awaiting_approval")
+    ):
+        try:
+            from app.dependencies import get_services
+            get_services().gate_service.mark_consumed(approved_gate_id)
+        except Exception as e:
+            # 发声：消费失败若静默，该审批会被误当作可重复使用。
+            logger.warning("tool_registry: gate 一次性消费失败 gate=%s tool=%s: %s",
+                           approved_gate_id, tool_name, e)
 
     _write_trace(tracer, project_id, tool_name, args, result)
     return result
@@ -333,7 +525,10 @@ async def _execute_builtin(tool_name: str, args: dict, project_id: str, stage: s
     if tool_name == "introduce_community_resource":
         from app.services.community_introduction import introduce
         from app.core.database import get_session
-        project_id = project_id or "proj-agent-autointro"
+        if not project_id:
+            # 公理3：缺失真实 project 上下文时发声，不静默归到伪项目。
+            logger.warning("introduce_community_resource called without project_id; refusing to attribute to a fake project")
+            return {"error": "缺少 project_id：社区资源引入需真实项目上下文，拒绝执行以避免 Gate/审计错归属"}
         query = (args or {}).get("query")
         rtype = (args or {}).get("resource_type")
         db = get_session()
@@ -446,28 +641,287 @@ async def _execute_read(tool_name: str, args: dict, project_id: str) -> dict:
 
 
 async def _execute_workspace_write(tool_name: str, args: dict, project_id: str, entry) -> dict:
-    """Workspace-confined write operation."""
+    """Workspace-confined write (write_scope=workspace, e.g. fs_write_artifact).
+
+    WP-C1 (B-R17.2-TOOL-NODISPATCH): real write through WorkspaceMediator — the single
+    write gatekeeper (D-099 / D-104). source/ is rejected unconditionally; new code lands
+    in output_code/, reports in artifacts/, patch drafts in patches/. A bare filename or an
+    unrecognized top-level dir is canonicalized into output_code/ (the new-code write area).
+    Never returns a stub.
+    """
+    rel = (args.get("path") or args.get("file") or "").strip()
+    content = args.get("content")
+    if not rel:
+        return {"error": "fs_write_artifact 需要 path 参数（相对 workspace，建议置于 output_code/ 或 artifacts/）"}
+    if content is None:
+        return {"error": "fs_write_artifact 需要 content 参数（要写入的文件内容）"}
+
+    first = rel.replace("\\", "/").split("/", 1)[0]
+    if first not in ("output_code", "artifacts", "patches", "source"):
+        # Canonicalize bare/unknown paths into the new-code write area (source stays source/
+        # so the D-099① read-only rejection below still fires).
+        rel = f"output_code/{rel}"
+
+    try:
+        from app.services.workspace_mediator import _workspace_mediator_for
+        mediator = _workspace_mediator_for(project_id)
+        target, write_risk = mediator.check_write(rel)
+    except ValueError as e:
+        # D-099① source/ or boundary rejection — surface it, do not silently pass (公理3).
+        return {"status": "rejected", "tool_name": tool_name, "path": rel, "error": str(e)}
+    except Exception as e:
+        return {"error": f"workspace 写入解析失败: {e}"}
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = content if isinstance(content, str) else str(content)
+        target.write_text(data, encoding="utf-8")
+    except Exception as e:
+        return {"error": f"workspace 写入失败: {e}"}
+
+    from app.services.workspace_service import workspace_path
+    ws_root = workspace_path(project_id).resolve()
+    try:
+        rel_out = str(target.resolve().relative_to(ws_root))
+    except ValueError:
+        rel_out = rel
     return {
-        "status": "workspace_write_stub",
+        "status": "written",
         "tool_name": tool_name,
-        "note": "R9-5-4: workspace write routing stub — real execution via ExecutionProvider in R9-5-6",
+        "path": rel_out,
+        "bytes": len(data.encode("utf-8")),
+        "write_risk": write_risk,
+    }
+
+
+async def _execute_generate_patch(tool_name: str, args: dict, project_id: str, entry) -> dict:
+    """Write a patch draft into patches/ (write_scope=patch_draft).
+
+    WP-C2 (B-R17.2-TOOL-NODISPATCH): generate_patch previously fell through to
+    _execute_builtin → "未知内置工具" (mis-routed). It now produces a real draft under
+    patches/ via WorkspaceMediator (D-099③ / D-104 — platform-writable, user-read-only).
+    The draft is a self-describing envelope so apply_patch_with_confirm can resolve the
+    target + content later. It never touches source/ or output_code/.
+    """
+    target_path = (args.get("target_path") or args.get("path") or "").strip()
+    diff = args.get("diff") or args.get("content") or ""
+    if not target_path:
+        return {"error": "generate_patch 需要 target_path 参数（补丁针对的目标文件，相对 workspace）"}
+    if not diff:
+        return {"error": "generate_patch 需要 diff 参数（unified diff 文本或期望的新内容）"}
+
+    # Derive a stable, path-safe draft filename under patches/.
+    import hashlib
+    safe = target_path.replace("\\", "/").strip("/").replace("/", "__")
+    digest = hashlib.sha256(f"{target_path}".encode("utf-8")).hexdigest()[:8]
+    patch_rel = f"patches/{safe}.{digest}.patch"
+
+    try:
+        from app.services.workspace_mediator import _workspace_mediator_for
+        mediator = _workspace_mediator_for(project_id)
+        target, write_risk = mediator.check_write(patch_rel)
+    except ValueError as e:
+        return {"status": "rejected", "tool_name": tool_name, "path": patch_rel, "error": str(e)}
+    except Exception as e:
+        return {"error": f"patch 草案路径解析失败: {e}"}
+
+    import json as _json
+    envelope = {
+        "kind": "patch_draft",
+        "target_path": target_path,
+        "diff": diff,
+    }
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        return {"error": f"patch 草案写入失败: {e}"}
+
+    return {
+        "status": "patch_drafted",
+        "tool_name": tool_name,
+        "patch_ref": patch_rel,
+        "target_path": target_path,
+        "write_risk": write_risk,
+        "note": "补丁草案已写入 patches/（未落 source/ 或 output_code/）；需经 apply_patch_with_confirm + 用户 Gate 才应用到 output_code/。",
+    }
+
+
+async def _execute_apply_patch(tool_name: str, args: dict, project_id: str, entry) -> dict:
+    """Apply a patch draft into output_code/ (write_scope=output_code, L4, gate-approved).
+
+    WP-C3: reached only after the action_approval Gate is approved (re-dispatch). Reads the
+    patches/ draft through the Mediator's read guard, then writes the resulting content into
+    output_code/ through the Mediator's write check. source/ stays read-only (D-099①): a
+    target resolving under source/ is rejected by the Mediator.
+    """
+    patch_ref = (args.get("patch_ref") or "").strip()
+    target_path = (args.get("target_path") or "").strip()
+    if not patch_ref:
+        return {"error": "apply_patch_with_confirm 需要 patch_ref 参数（patches/ 下的补丁草案）"}
+
+    try:
+        from app.services.workspace_mediator import _workspace_mediator_for
+        mediator = _workspace_mediator_for(project_id)
+        draft_path = mediator.guard_read(patch_ref)
+    except ValueError as e:
+        return {"status": "rejected", "tool_name": tool_name, "error": str(e)}
+    except Exception as e:
+        return {"error": f"补丁草案读取解析失败: {e}"}
+    if not draft_path.exists() or not draft_path.is_file():
+        return {"error": f"补丁草案不存在: {patch_ref}"}
+
+    import json as _json
+    raw = draft_path.read_text("utf-8", errors="replace")
+    try:
+        env = _json.loads(raw)
+        drafted_target = env.get("target_path") or ""
+        new_content = env.get("diff") or ""
+    except Exception:
+        # Draft is not our envelope — treat the raw draft as the new content.
+        drafted_target = ""
+        new_content = raw
+
+    # Resolve the output target: explicit arg > draft's target_path; canonicalize into
+    # output_code/ (never source/ — that is rejected by the Mediator below).
+    out_rel = target_path or drafted_target
+    if not out_rel:
+        return {"error": "无法确定应用目标：请提供 target_path 或在补丁草案中记录 target_path"}
+    first = out_rel.replace("\\", "/").split("/", 1)[0]
+    if first not in ("output_code", "artifacts", "patches", "source"):
+        out_rel = f"output_code/{out_rel}"
+
+    try:
+        out_target, write_risk = mediator.check_write(out_rel)
+    except ValueError as e:
+        # D-099①: e.g. applying into source/ is rejected unconditionally.
+        return {"status": "rejected", "tool_name": tool_name, "path": out_rel, "error": str(e)}
+    except Exception as e:
+        return {"error": f"应用目标解析失败: {e}"}
+
+    # Decide apply mode from the drafted content. A unified diff is applied hunk by
+    # hunk against a real base; anything else is treated as whole-file new content
+    # (backward compatible with generate_patch drafts that store full content).
+    if _looks_like_unified_diff(new_content):
+        apply_mode = "unified_diff"
+        # Base content: existing output_code/ target first; else the source/ original
+        # (read-only, D-099① — via the Mediator read guard); else empty.
+        base_text = None
+        if out_target.exists() and out_target.is_file():
+            base_text = out_target.read_text("utf-8", errors="replace")
+        else:
+            src_rel = _source_equivalent(out_rel)
+            if src_rel:
+                try:
+                    src_path = mediator.guard_read(src_rel)
+                    if src_path.exists() and src_path.is_file():
+                        base_text = src_path.read_text("utf-8", errors="replace")
+                except ValueError:
+                    # source/ read boundary — leave base empty (no source original).
+                    base_text = None
+        if base_text is None:
+            base_text = ""
+        try:
+            final_content = apply_unified_diff(base_text, new_content)
+        except ValueError as e:
+            # D-097: context mismatch / unappliable hunk → reject WITHOUT writing, so the
+            # existing target file is never corrupted.
+            return {
+                "status": "rejected",
+                "tool_name": tool_name,
+                "patch_ref": patch_ref,
+                "path": out_rel,
+                "apply_mode": "unified_diff",
+                "error": f"unified diff 应用失败（上下文不匹配/hunk 无法定位），目标文件未改动: {e}",
+            }
+        note = ("unified diff 已按 hunk 应用到 output_code/ 目标（base=现有 output_code/ 目标或"
+                "source/ 只读原文，都无则空串；source/ 始终只读，D-099①）。")
+    else:
+        apply_mode = "full_content"
+        final_content = new_content
+        note = "补丁草案为整文件内容，已整体写入 output_code/（source/ 始终只读，D-099①）。"
+
+    try:
+        out_target.parent.mkdir(parents=True, exist_ok=True)
+        out_target.write_text(final_content, encoding="utf-8")
+    except Exception as e:
+        return {"error": f"补丁应用失败: {e}"}
+
+    from app.services.workspace_service import workspace_path
+    ws_root = workspace_path(project_id).resolve()
+    try:
+        rel_out = str(out_target.resolve().relative_to(ws_root))
+    except ValueError:
+        rel_out = out_rel
+    return {
+        "status": "patch_applied",
+        "tool_name": tool_name,
+        "patch_ref": patch_ref,
+        "path": rel_out,
+        "bytes": len(final_content.encode("utf-8")),
+        "apply_mode": apply_mode,
+        "write_risk": write_risk,
+        "note": note,
     }
 
 
 async def _execute_via_provider(tool_name: str, args: dict, project_id: str, entry) -> dict:
-    """Route through ExecutionProvider for execute-scope tools."""
+    """Route through ExecutionProvider for execute-scope tools (e.g. run_safe_command).
+
+    WP-C4: fixed to construct the provider via get_execution_provider() (honors
+    EXECUTION_MODE). The previous svc.execution_provider attribute never existed on Services
+    → the call always raised AttributeError, so this path never actually executed. The
+    provider still enforces DENY_SUBSTRINGS (L5 hard block) and, in the default "local"
+    mode, the ALLOWED_COMMANDS whitelist appropriate for "run_safe_command".
+    """
     code = args.get("code") or args.get("command", "")
     if not code:
         return {"error": "execute 类工具需要 code 或 command 参数"}
     try:
-        from app.dependencies import get_services
-        svc = get_services()
+        from app.services.execution_provider import get_execution_provider
         from app.services.workspace_service import workspace_path
         ws = str(workspace_path(project_id))
-        result = await svc.execution_provider.execute(code, language="bash", timeout=30, cwd=ws)
+        provider = get_execution_provider()
+        result = await provider.execute(code, language="bash", timeout=30, cwd=ws)
         return result
     except Exception as e:
         return {"error": f"ExecutionProvider failed: {e}"}
+
+
+def _resolve_action_gate(project_id: str, run_id: str, tool_name: str) -> tuple[str, str]:
+    """Resolve the single action_approval Gate for (project_id, run_id, tool_name).
+
+    WP-C3 / B-R17.2-TOOL-DOUBLEGATE: returns ("approved", gate_id) when an approved gate
+    for this action exists (either one execute_tool created, or one the agent_loop
+    authorization layer created — both put the tool name in the gate reason/summary), so a
+    re-dispatched call executes instead of opening a SECOND gate. Returns ("pending",
+    gate_id) when a waiting gate exists (reuse it, no duplicate). Returns ("none", "")
+    otherwise. Never fabricates a gate.
+    """
+    try:
+        from app.dependencies import get_services
+        gs = get_services().gate_service
+        gates = gs.list_by_project(project_id)
+    except Exception as e:
+        logger.warning("_resolve_action_gate: gate lookup failed for %s: %s", tool_name, e)
+        return ("none", "")
+
+    def _matches(g) -> bool:
+        if g.gate_type != "action_approval":
+            return False
+        if run_id and (g.run_id or "") != run_id:
+            return False
+        blob = f"{g.reason or ''} {g.summary or ''}"
+        return tool_name in blob
+
+    approved = [g for g in gates if _matches(g) and g.gate_status == "approved"]
+    if approved:
+        return ("approved", approved[-1].gate_id)
+    pending = [g for g in gates if _matches(g) and g.gate_status == "waiting_decision"]
+    if pending:
+        return ("pending", pending[-1].gate_id)
+    return ("none", "")
+
 
 
 def _create_risk_gate(project_id: str, run_id: str, stage: str,
@@ -532,4 +986,5 @@ def _write_trace(tracer, project_id: str, tool_name: str, args: dict, result: di
             detail={"tool_name": tool_name, "args_keys": list(args.keys()), "result_keys": list(result.keys())},
         )
     except Exception:
-        pass
+        # 发声：工具调用 trace 落库失败会让该次调用在可观测链路中缺失，须可见。
+        logger.warning("tool_registry: 写入 tool_call trace 失败 tool=%s", tool_name, exc_info=True)

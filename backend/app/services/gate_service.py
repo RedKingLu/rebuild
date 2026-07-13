@@ -179,6 +179,42 @@ class GateService:
         finally:
             db.close()
 
+    def mark_consumed(self, gate_id: str) -> bool:
+        """One-time consumption of an action_approval Gate (R18→R17.2).
+
+        Sets gate_status to "consumed" so a single approval cannot be reused for a
+        second high-risk tool execution. gate_status is a free-form String(32) column
+        (no schema Literal / migration needed). _resolve_action_gate only matches
+        "approved"/"waiting_decision", so a consumed gate no longer authorizes a
+        re-dispatch — the next call opens a fresh pending gate.
+
+        Writes a gate_decision Audit (action="gate_consumed", decision="consumed") so
+        consumption is visible, never silent. Returns True on success, False if the gate
+        does not exist.
+        """
+        db = self._db()
+        try:
+            g = db.get(Gate, gate_id)
+            if g is None:
+                _logger.warning("mark_consumed: gate %s 不存在，无法消费", gate_id)
+                return False
+            g.gate_status = "consumed"
+            db.commit()
+            db.refresh(g)
+            try:
+                self._svc.audit_writer.write(
+                    audit_type="gate_decision", gate_id=gate_id, risk_level=g.risk_level,
+                    action="gate_consumed", decision="consumed",
+                    reason="高风险工具审批通过并成功执行后，一次性消费该 action_approval Gate",
+                    project_id=g.project_id, run_id=g.run_id, stage=g.stage,
+                )
+            except Exception:
+                # 发声：消费审计写入失败必须可见（审计链完整性），但不回滚已生效的消费。
+                _logger.warning("mark_consumed: 消费审计写入失败 gate=%s", gate_id, exc_info=True)
+            return True
+        finally:
+            db.close()
+
     def _apply_promotion(self, g: Gate, decision: str) -> None:
         """Advance project/run state per a stage-promotion decision."""
         ps = self._svc.project_service

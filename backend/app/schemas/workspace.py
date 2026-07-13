@@ -11,7 +11,7 @@ from app.schemas.gate import GateResponse
 
 class GraphStatus(BaseModel):
     graph_capability_status: str = "not_connected"
-    transition_mode: str = "mock"
+    transition_mode: str = "unknown"
     checkpoint_ref: Optional[str] = None
 
 

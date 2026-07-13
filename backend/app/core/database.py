@@ -110,5 +110,91 @@ def _migrate_add_columns_on_engine(engine) -> None:
                     conn.execute(_sa.text(_idx_stmt))
                     conn.commit()
                 except Exception:
-                    pass  # already exists
+                    # 发声：索引用 IF NOT EXISTS，此处异常代表真实 DB 错误（如表缺失/锁），
+                    # 而非"已存在"；须可见以便定位。索引为附加性能项，故不抛出中断启动。
+                    import logging
+                    logging.getLogger("rebuild.database").warning(
+                        "call_log fusion 索引创建失败（非致命，索引为附加性能项）: %s",
+                        _idx_stmt, exc_info=True)
+
+
+def check_migration_drift(engine=None):
+    """Read-only: compare the SQLite DB's applied Alembic revision to the migration head.
+
+    Returns ``(in_sync: bool, db_revision: str | None, head_revision: str | None)``.
+
+    - SQLite only. On PostgreSQL, Alembic owns the migration flow authoritatively
+      (see ``_migrate_add_columns_on_engine`` which returns early for PG), so this
+      returns ``(True, None, None)`` and does not probe.
+    - NEVER mutates the DB and NEVER runs ``create_all`` — this is the honest drift
+      detector that ``create_all`` was masking (R16: ``resource_entry.package_url``).
+    - ``db_revision`` is ``None`` when the DB has no ``alembic_version`` table (a
+      ``create_all``-provisioned dev/test DB that Alembic never stamped).
+    - ``head_revision`` is read dynamically from the migration chain — no revision
+      string is hardcoded here.
+    """
+    if engine is None:
+        engine = get_engine()
+    if not str(engine.url).startswith("sqlite"):
+        return True, None, None  # PostgreSQL: Alembic is authoritative
+    import os
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    from alembic.runtime.migration import MigrationContext
+
+    backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    cfg = Config(os.path.join(backend_dir, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(backend_dir, "alembic"))
+    script = ScriptDirectory.from_config(cfg)
+    heads = script.get_heads()
+    head_revision = ",".join(sorted(heads)) if heads else None
+    with engine.connect() as conn:
+        db_revision = MigrationContext.configure(conn).get_current_revision()
+    in_sync = db_revision is not None and db_revision in set(heads)
+    return in_sync, db_revision, head_revision
+
+
+def verify_migration_head_on_startup(engine=None) -> None:
+    """Startup self-check (R17.2 WP-A): surface real-DB migration drift LOUDLY (公理3),
+    never mask it.
+
+    Root cause addressed: ``init_db()`` / ``get_engine()`` call ``create_all``, which
+    only creates MISSING tables — it never adds columns to EXISTING tables. A column
+    added by an Alembic migration but not applied to a persistent SQLite DB is therefore
+    silently absent until a query crashes with ``no such column`` (R16:
+    ``resource_entry.package_url``). Nothing verified, at startup, that the real DB was
+    at the migration head — this is that check.
+
+    Non-fatal by design: ``create_all`` has already run for dev self-heal, and hard-
+    crashing would also block brand-new / test DBs. But drift is NEVER silent — genuine
+    drift is logged at ERROR with the exact remediation (``alembic upgrade head``). This
+    is a detection/alarm only: it does NOT auto-migrate and does NOT ``create_all`` to
+    paper over the gap.
+    """
+    import logging
+    log = logging.getLogger("uvicorn")
+    try:
+        in_sync, db_rev, head_rev = check_migration_drift(engine)
+    except Exception:
+        log.warning("alembic head 启动自检执行失败（非致命）", exc_info=True)
+        return
+    if in_sync:
+        return
+    if db_rev is None:
+        # Not an Alembic-managed DB (create_all-provisioned dev/test). Informational only.
+        log.info(
+            "数据库未被 alembic 管理（create_all provisioned，开发/测试场景）；"
+            "持久化真实库应经 `alembic upgrade head` 建立版本记录。迁移链 head=%s",
+            head_rev,
+        )
+        return
+    # Genuine drift: an Alembic-managed DB sitting behind the migration head.
+    log.error(
+        "真实库落后于迁移 head：DB 当前 revision=%s，迁移链 head=%s。"
+        "create_all 只建缺表不补既有表缺列，缺失列将在查询时崩溃（no such column）。"
+        "请在 backend 目录执行 `alembic upgrade head` 后重启服务。"
+        "（本自检不自动迁移、不静默、不以 create_all 掩盖）",
+        db_rev,
+        head_rev,
+    )
 

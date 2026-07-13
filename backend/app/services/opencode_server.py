@@ -16,11 +16,14 @@ secrets.token_hex(16) and is never logged, stored, or returned in responses.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import secrets
 import shutil
 from pathlib import Path
+
+logger = logging.getLogger("rebuild.opencode_server")
 
 _READY_RE = re.compile(r"opencode server listening on (http://127\.0\.0\.1:\d+)")
 _STARTUP_TIMEOUT = 10  # seconds to wait for the URL line
@@ -54,7 +57,10 @@ def resolve_model_defaults(
             base_url = base_url or resolved["base_url"]
             api_key = resolved["api_key"]
         except Exception:
-            pass
+            # 发声：模型解析失败会让后续沿用未解析的默认值（可能为空），
+            # 导致下游"看似无关"的调用失败；须可见以便定位配置/策略问题。密钥不入日志。
+            logger.warning("opencode 模型解析失败 project=%s strategy=%s（回退到传入默认值）",
+                           project_id, strategy_id, exc_info=True)
     return {"model": model, "base_url": base_url, "api_key": api_key}
 
 
@@ -155,4 +161,5 @@ class OpenCodeServer:
                 try:
                     proc.kill()
                 except ProcessLookupError:
-                    pass
+                    # advisory：进程已退出（terminate 后自然结束），无可 kill 对象，属正常清理路径。
+                    logger.debug("opencode 进程已退出，kill 无对象（正常清理）")

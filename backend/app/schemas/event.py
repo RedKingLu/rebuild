@@ -13,7 +13,7 @@ class EventEnvelope(BaseModel):
     stage: Optional[str] = None
     task_graph_id: Optional[str] = None
     node_id: Optional[str] = None
-    source: str = "mock"
+    source: str = "unknown"
     severity: str = "info"
     sequence: int = 0
     cursor: Optional[str] = None
@@ -21,5 +21,5 @@ class EventEnvelope(BaseModel):
     trace_ref: Optional[str] = None
     audit_ref: Optional[str] = None
     graph_event_type: Optional[str] = None
-    source_status: str = "mock"
+    source_status: str = "not_connected"
     created_at: str = ""

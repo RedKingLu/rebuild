@@ -17,8 +17,11 @@ TaskGraph is persisted.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+logger = logging.getLogger("rebuild.task_graph_service")
 
 # ── §8.1 Edge types (10) ────────────────────────────────────────────────
 EDGE_TYPES = [
@@ -311,7 +314,8 @@ class TaskGraphEngine:
                     self.tracer.write("state_change", action="task_graph_engine",
                                       summary=kind, project_id=project_id, run_id=run_id, **extra)
                 except Exception:
-                    pass
+                    # advisory：trace 仅用于可观测，TaskGraph 调度不受影响；记录以便定位偶发写失败。
+                    logger.debug("task_graph_engine trace 写入失败（advisory）", exc_info=True)
 
         # entry nodes = no incoming edges
         entry = [nid for nid in nodes if not in_edges[nid]]

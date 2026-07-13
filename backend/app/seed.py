@@ -279,10 +279,11 @@ def seed_all(db: Session) -> dict:
             name="OpenCode (本地 CLI)",
             invoke_mode=CodingAgentInvokeMode.cli,
             config={
-                "model": "openai/deepseek-v4-flash",
-                "base_url": "http://maas.icompify.com:32788/v1",
+                # D-098：不预置 model/base_url——运行时经
+                # resolve_model_defaults → OpenCodeModelResolver → ModelGateway
+                # 按用户策略动态解析，避免硬编码 endpoint 绕过网关（单一事实源）。
                 "timeout_seconds": 180,
-                "note": "API Key 由平台 LLM_API_KEY 环境变量注入，不存储于此处",
+                "note": "model/base_url 由平台 ModelGateway 策略动态解析；API Key 由 LLM_API_KEY 环境变量注入，均不存储于此处",
             },
             status=CodingAgentStatus.connected if oc_available else CodingAgentStatus.not_configured,
             enabled=True,

@@ -24,7 +24,7 @@ class GateResponse(GraphPlaceholderFields):
     evidence_refs: list[str] = Field(default_factory=list)
     trace_refs: list[str] = Field(default_factory=list)
     audit_ref: Optional[str] = None
-    source_status: str = "mock"
+    source_status: str = "not_connected"
 
 
 class GateDecisionRequest(BaseModel):

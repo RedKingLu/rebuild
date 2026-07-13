@@ -6,11 +6,14 @@ R8: Adds file persistence — writes to project workspace .rebuild/traces.jsonl.
 """
 
 import json
+import logging
 import time
 import uuid
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional
+
+logger = logging.getLogger("rebuild.trace_writer")
 
 MAX_TRACES = 10000  # in-memory cap to prevent unbounded growth
 
@@ -30,7 +33,7 @@ class TraceWriter:
         action: str = "",
         summary: str = "",
         graph_status: str = "not_connected",
-        transition_mode: str = "mock",
+        transition_mode: str = "unknown",
         request_id: Optional[str] = None,
         project_id: Optional[str] = None,
         **extra,
@@ -67,7 +70,9 @@ class TraceWriter:
                     }, ensure_ascii=False) + "\n")
                 file_written = True
             except Exception:
-                pass  # file persistence failure is non-fatal to in-memory
+                # 发声：trace 文件持久化失败须可见；persistence 字段随后诚实降级为 "memory"，
+                # 故不抛出，但不得静默吞噬失败原因。
+                logger.warning("trace 文件持久化失败 project=%s type=%s", project_id, trace_type, exc_info=True)
 
         persistence = "file+memory" if file_written else "memory"
 
@@ -123,9 +128,11 @@ class TraceWriter:
                                     seen_ids.add(tid)
                                     results.append(t)
                             except json.JSONDecodeError:
-                                pass
+                                # 发声：trace jsonl 损坏行代表 trace 数据丢失，须可见。
+                                logger.warning("trace jsonl 存在损坏行，已跳过 project=%s", project_id)
             except Exception:
-                pass
+                # 发声：读取持久化 trace 失败会让查询静默返回不完整结果（看似完整）。
+                logger.warning("读取持久化 trace 失败 project=%s", project_id, exc_info=True)
 
         if project_id:
             results = [t for t in results if t.get("project_id") == project_id]

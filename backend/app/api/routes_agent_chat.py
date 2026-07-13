@@ -5,6 +5,7 @@ Returns text/event-stream with SSE chunks.
 """
 
 import json
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -15,6 +16,8 @@ from app.dependencies import get_services
 from app.services.agent_loop import AgentLoop
 from app.services.conversation_service import ConversationService, agent_role_for
 from app.services.workspace_service import workspace_path
+
+logger = logging.getLogger("rebuild.routes_agent_chat")
 
 agent_chat_router = APIRouter(prefix="/projects/{project_id}/agent", tags=["agent_chat"])
 
@@ -50,7 +53,9 @@ async def agent_chat(project_id: str, req: AgentChatRequest, request: Request):
         try:
             profiling_summary = summary_path.read_text(encoding="utf-8")
         except Exception:
-            pass
+            # advisory：profiling_summary 仅为对话上下文增强，读取失败则退化为无摘要，
+            # 不影响对话主链路；但记录以便定位偶发读失败。
+            logger.debug("读取 profiling_summary 失败（对话上下文增强，可降级）", exc_info=True)
 
     # Recent traces from workspace aggregate
     try:
@@ -126,7 +131,9 @@ async def agent_chat(project_id: str, req: AgentChatRequest, request: Request):
                             if d.get("token"):
                                 full_content.append(d["token"])
                 except Exception:
-                    pass
+                    # advisory：仅是从 SSE 帧旁路提取 tool_events/token 用于落库；
+                    # 解析失败不影响向客户端转发原始 frame（下方 yield），故可降级。
+                    logger.debug("解析 SSE 帧用于落库失败（原始帧仍转发）", exc_info=True)
                 yield frame
         finally:
             # UX-3: persist the agent reply + tool events. In `finally` so it runs even if

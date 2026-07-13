@@ -11,6 +11,7 @@ Platform-writable: artifacts/, evidence/, logs/, runs/, .rebuild/sessions/...
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,8 @@ from app.models.workspace_environment_binding import WorkspaceEnvironmentBinding
 from app.schemas.workspace import WorkspaceAggregateResponse, GraphStatus, FileIndex
 from app.schemas.project import ProjectResponse
 from app.schemas.common import Meta
+
+logger = logging.getLogger("rebuild.workspace_service")
 
 # Subdirectories created on project workspace init (architecture §3.2)
 WORKSPACE_SUBDIRS = [
@@ -133,7 +136,9 @@ def get_execution_mode(project_id: str) -> str:
         try:
             return json.loads(meta_file.read_text(encoding="utf-8")).get("execution_mode", "plan")
         except Exception:
-            pass
+            # 发声：workspace.json 是执行模式的唯一控制源，损坏时静默回退 "plan"
+            # 会让用户配置的模式（如 container）无声失效，须可见。
+            logger.warning("读取 execution_mode 失败，回退默认 plan project=%s", project_id, exc_info=True)
     return "plan"
 
 
@@ -266,7 +271,10 @@ def init_environment(project_id: str) -> dict:
         try:
             return json.loads(f.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            # 发声：environment.json 存在但损坏，静默会导致下方用默认 profile 覆盖，
+            # 造成用户环境配置无声丢失，须可见。
+            logger.warning("读取 environment.json 失败，将以默认 profile 重建 project=%s",
+                           project_id, exc_info=True)
     profile = {
         "project_id": project_id,
         "status": "unknown",          # unknown | declared | ready

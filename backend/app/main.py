@@ -37,8 +37,14 @@ async def lifespan(app: FastAPI):
     """Startup: init DB, seed data, warm services. Shutdown: clear cache."""
     settings = Settings()
     # Initialize database and seed
-    from app.core.database import get_session, init_db
+    from app.core.database import get_session, init_db, verify_migration_head_on_startup
     init_db()
+    # R17.2 WP-A: honest startup self-check — is the (SQLite) real DB at the Alembic
+    # migration head? create_all only builds missing tables, never adds columns to
+    # existing ones, so a persistent DB behind a migration silently lacks columns until
+    # a query crashes (R16: resource_entry.package_url). This surfaces drift LOUDLY at
+    # ERROR (公理3) without auto-migrating or masking with create_all. Non-fatal.
+    verify_migration_head_on_startup()
     db = get_session()
     try:
         from app.seed import seed_all, seed_model_catalog

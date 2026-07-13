@@ -207,7 +207,8 @@ class FusionExecutionEngine:
             try:
                 self.audit_writer.write("fusion_high_risk", action=action, **extra)
             except Exception:
-                pass
+                # 发声：高风险 Fusion 动作的审计写入失败关乎审计链完整性，须可见。
+                logger.warning("fusion 高风险审计写入失败 action=%s", action, exc_info=True)
 
     # ── Persistence helpers ───────────────────────────────────────────
 
@@ -786,5 +787,7 @@ def _safe_parse_judge_json(content: str) -> dict:
                 if isinstance(data, dict):
                     return data
             except Exception:
-                pass
+                # advisory：宽松解析 LLM 输出中的 JSON 子串，解析失败属正常（输出未必是 JSON），
+                # 最终返回 {} 表示无可解析结构，非隐藏故障。
+                logger.debug("LLM 输出 JSON 子串宽松解析失败（返回空 dict）", exc_info=True)
     return {}

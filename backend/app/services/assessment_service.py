@@ -319,4 +319,5 @@ class AssessmentService:
             self.tracer.write("model_call", action="p2_assessment", summary=summary,
                               project_id=project_id, run_id=run_id, stage=stage)
         except Exception:
-            pass  # tracing advisory
+            # advisory：trace 仅用于可观测，P2 评估结果不受影响；记录以便定位偶发写失败。
+            logger.debug("P2 assessment trace 写入失败（advisory）", exc_info=True)

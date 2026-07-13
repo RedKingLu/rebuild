@@ -75,7 +75,6 @@ class LiteLLMAdapter:
     """
 
     def __init__(self):
-        self._default_model = os.environ.get("LLM_MODEL_NAME", "deepseek-v4-flash")
         # Toggle litellm debug based on env
         litellm.suppress_debug_info = True
         if os.environ.get("LITELLM_LOG", "") == "DEBUG":

@@ -103,7 +103,10 @@ def load_skills_for_stage(
 
     # Disk fallback: scan source/skills/{common,stage}
     import os
-    skill_root = Path(os.environ.get("SKILL_SOURCE_ROOT", "/home/king/rebuild/source/skills"))
+    # 单一事实源：默认从 settings.source_path 派生（config.py source_dir），env 仍可覆盖。
+    from app.core.config import settings
+    default_root = str(settings.source_path / "skills")
+    skill_root = Path(os.environ.get("SKILL_SOURCE_ROOT", default_root))
     results = []
     for cat in ["common", stage]:
         cat_dir = skill_root / cat

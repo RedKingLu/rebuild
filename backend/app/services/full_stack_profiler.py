@@ -8,6 +8,7 @@ Uncertain items become Evidence Gaps, not guesses.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Optional
 
 from app.services.workspace_service import workspace_path, _guard
+
+logger = logging.getLogger("rebuild.full_stack_profiler")
 
 # Directories to skip during scan
 SKIP_DIRS = {
@@ -283,7 +286,8 @@ class FullStackProfiler:
                 elif "spring" in pom.lower():
                     frameworks.append({"framework": "Spring", "confidence": "medium"})
             except Exception:
-                pass
+                # 发声：pom.xml 存在却读取/解析失败，若静默会让框架识别"看似无框架"而掩盖读失败。
+                logger.warning("framework id: 读取 pom.xml 失败 src=%s", src, exc_info=True)
         # .NET frameworks
         if any(x.endswith(".csproj") for x in files_found):
             frameworks.append({"framework": ".NET", "confidence": "high"})
@@ -297,7 +301,8 @@ class FullStackProfiler:
                 elif "vue" in deps: frameworks.append({"framework": "Vue", "confidence": "high"})
                 elif "express" in deps: frameworks.append({"framework": "Express", "confidence": "medium"})
             except Exception:
-                pass
+                # 发声：package.json 存在却解析失败，静默会让 JS 框架识别假阴性。
+                logger.warning("framework id: 解析 package.json 失败 src=%s", src, exc_info=True)
         # Python
         if "requirements.txt" in file_set or "pyproject.toml" in file_set:
             try:
@@ -307,7 +312,8 @@ class FullStackProfiler:
                 elif "flask" in content.lower(): frameworks.append({"framework": "Flask", "confidence": "high"})
                 elif "fastapi" in content.lower(): frameworks.append({"framework": "FastAPI", "confidence": "high"})
             except Exception:
-                pass
+                # 发声：Python 依赖清单存在却读取失败，静默会让 Python 框架识别假阴性。
+                logger.warning("framework id: 读取 Python 依赖清单失败 src=%s", src, exc_info=True)
         if not frameworks:
             self.gaps.append({"item": 5, "type": "framework_unknown",
                             "detail": "No framework confidently identified from project files"})
@@ -338,7 +344,8 @@ class FullStackProfiler:
                 for name, ver in {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}.items():
                     deps.append({"name": name, "version": ver, "source": "package.json", "type": "npm"})
             except Exception:
-                pass
+                # 发声：package.json 解析失败会让依赖清单假性为空，掩盖真实依赖。
+                logger.warning("dependency id: 解析 package.json 失败 file=%s", pkg_json, exc_info=True)
         # Parse requirements.txt
         req_txt = src / "requirements.txt"
         if req_txt.exists():
@@ -349,7 +356,8 @@ class FullStackProfiler:
                         deps.append({"name": line.split("==")[0].split(">=")[0].strip(),
                                      "version": line, "source": "requirements.txt", "type": "pip"})
             except Exception:
-                pass
+                # 发声：requirements.txt 读取失败会让依赖清单假性为空，掩盖真实依赖。
+                logger.warning("dependency id: 读取 requirements.txt 失败 file=%s", req_txt, exc_info=True)
         return {"dependencies": deps[:500], "total": len(deps), "truncated": len(deps) > 500}
 
     def _item8_entry_point_id(self, src: Path, fi: dict, langs: dict) -> dict:
@@ -375,7 +383,8 @@ class FullStackProfiler:
                     if line.strip().upper().startswith(("ENTRYPOINT", "CMD")):
                         entries.append({"path": "Dockerfile", "pattern": line.strip(), "confidence": "high"})
             except Exception:
-                pass
+                # 发声：Dockerfile 读取失败会漏掉入口点线索，静默会掩盖读失败。
+                logger.warning("entry point id: 读取 Dockerfile 失败 file=%s", dockerfile, exc_info=True)
         return {"entry_points": entries[:20], "count": len(entries)}
 
     def _item9_test_inventory(self, src: Path, fi: dict) -> dict:
@@ -447,7 +456,8 @@ class FullStackProfiler:
                         clues.append({"file": f["path"], "infra_type": "connection_config_found",
                                     "confidence": "medium", "note": "Connection config detected — values REDACTED"})
                 except Exception:
-                    pass
+                    # 发声：配置文件读取失败会漏掉基础设施线索，静默会掩盖读失败。
+                    logger.warning("infra clues: 读取配置文件失败 file=%s", f.get("path"), exc_info=True)
         # Deduplicate
         seen = set()
         unique = []

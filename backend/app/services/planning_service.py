@@ -743,7 +743,9 @@ class PlanningService:
             if isinstance(data, dict):
                 return data, False
         except Exception:
-            pass
+            # advisory：LLM 输出未必是合法 JSON；解析失败在下方诚实标记 parse_error 返回
+            # （NodeLoop ReviewPass 会重试），故失败已被显式surfaced，非隐藏吞噬。
+            logger.debug("规划输出 JSON 解析失败，标记 parse_error 交由 ReviewPass 重试", exc_info=True)
         # unparseable → honest: keep raw, mark parse_error (NodeLoop ReviewPass retries)
         return {"objective": "", "raw": text[:2000]}, True
 

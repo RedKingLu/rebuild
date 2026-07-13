@@ -25,10 +25,13 @@ This module freezes the interface T2 (NodeLoop 9-step executor) calls at Step 8.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from app.core.status import ACCEPTANCE_RESULTS
+
+logger = logging.getLogger("rebuild.acceptance_service")
 
 
 # The 8 check items (§Step8), kept as stable identifiers for traceability.
@@ -272,4 +275,5 @@ class AcceptanceService:
             self.tracer.write("acceptance_event", action="acceptance",
                               summary=summary, **extra)
         except Exception:
-            pass  # tracing is advisory — acceptance verdict is unaffected
+            # advisory：trace 仅用于可观测，验收结论不受影响；记录以便定位偶发写失败。
+            logger.debug("acceptance trace 写入失败（advisory）", exc_info=True)

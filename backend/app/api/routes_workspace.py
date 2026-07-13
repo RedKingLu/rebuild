@@ -5,6 +5,7 @@ material tree, and terminal execution endpoint.
 """
 
 import asyncio
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -19,6 +20,8 @@ from app.services.workspace_service import (
     read_environment, update_environment,
 )
 from app.services.execution_provider import get_execution_provider
+
+logger = logging.getLogger("rebuild.routes_workspace")
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["workspace"])
 
@@ -505,7 +508,9 @@ async def execute_command(project_id: str, req: TerminalExecuteRequest):
             sdata["ended_at"] = _dt.now(_tz.utc).isoformat()
             session_file.write_text(_json.dumps(sdata, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
-        pass
+        # 发声：执行会话记录持久化失败会让该次运行在会话历史中"消失"（看似未执行）。
+        logger.warning("持久化执行会话记录失败 project=%s session=%s",
+                       project_id, session_id, exc_info=True)
 
     return SuccessEnvelope(data={
         "session_id": session_id,
@@ -530,7 +535,8 @@ async def list_sessions(project_id: str):
             try:
                 sessions.append(_json.loads(f.read_text(encoding="utf-8")))
             except Exception:
-                pass
+                # 发声：会话记录文件损坏被静默丢弃会让该会话从列表中"消失"，掩盖数据损坏。
+                logger.warning("读取执行会话记录失败，已跳过 file=%s", f, exc_info=True)
     return SuccessEnvelope(data={"sessions": sessions[:50]}, meta=Meta())
 
 

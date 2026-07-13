@@ -21,7 +21,7 @@ class StageResponse(GraphPlaceholderFields):
     audit_refs: list[str] = Field(default_factory=list)
     blocked_reason: Optional[str] = None
 
-    source_status: str = "mock"
+    source_status: str = "not_connected"
 
 
 class StagePlanRequest(BaseModel):

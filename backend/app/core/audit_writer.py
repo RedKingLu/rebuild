@@ -7,11 +7,14 @@ R8: Adds file persistence — writes to project workspace .rebuild/audits.jsonl.
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from collections import deque
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("rebuild.audit_writer")
 
 MAX_AUDITS = 10000  # in-memory cap
 
@@ -34,7 +37,7 @@ class AuditWriter:
         project_id: Optional[str] = None,
         run_id: Optional[str] = None,
         stage: Optional[str] = None,
-        transition_mode: str = "mock",
+        transition_mode: str = "unknown",
         **extra,
     ) -> dict:
         """Record an audit entry. Returns the audit dict.
@@ -69,7 +72,9 @@ class AuditWriter:
                 with open(audits_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(audit, ensure_ascii=False) + "\n")
             except Exception:
-                pass  # file persistence failure is non-fatal to in-memory
+                # 发声：审计文件持久化失败必须可见（审计链完整性关乎正确性）；
+                # 内存态仍保留，故不抛出，但不得静默吞噬。
+                logger.warning("audit 文件持久化失败 project=%s type=%s", project_id, audit_type, exc_info=True)
 
         return audit
 
@@ -105,9 +110,11 @@ class AuditWriter:
                                     seen_ids.add(aid)
                                     results.append(a)
                             except json.JSONDecodeError:
-                                pass
+                                # 发声：审计 jsonl 中出现损坏行代表审计数据丢失，须可见。
+                                logger.warning("audit jsonl 存在损坏行，已跳过 project=%s", project_id)
             except Exception:
-                pass
+                # 发声：读取持久化审计失败会让查询静默返回不完整结果（看似完整）。
+                logger.warning("读取持久化 audit 失败 project=%s", project_id, exc_info=True)
 
         if project_id:
             results = [a for a in results if a.get("project_id") == project_id]

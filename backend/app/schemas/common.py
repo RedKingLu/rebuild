@@ -35,7 +35,7 @@ class GraphPlaceholderFields(BaseModel):
     interrupt_ref: Optional[str] = None
     resume_ref: Optional[str] = None
     graph_capability_status: str = "not_connected"
-    transition_mode: str = "mock"
+    transition_mode: str = "unknown"
 
 
 class SuccessEnvelope(BaseModel):

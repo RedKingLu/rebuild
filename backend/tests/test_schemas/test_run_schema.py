@@ -17,5 +17,5 @@ def test_run_response_has_graph_fields():
         stage_status={"P0": "not_started"},
     )
     assert r.graph_capability_status == "not_connected"
-    assert r.transition_mode == "mock"
+    assert r.transition_mode == "unknown"
     assert r.checkpoint_ref is None

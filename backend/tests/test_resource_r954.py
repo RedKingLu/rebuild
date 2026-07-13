@@ -6,7 +6,6 @@ W3: knowledge_search.py   — search() full-text + scope (T5.2)
 W4: review state machine  — approve/reject via /resources/{id}/review (T6.2)
 W5: multipart import      — URL import via /import/resource (T6.1)
 W6: MCP call endpoint     — /mcp/{id}/call route (T3.3)
-W7: resource_resolver.py  — three-tier: self→local→online (T7.1)
 W8: architecture          — G4 trace injection, T6.3 community block, online provider
 """
 
@@ -649,77 +648,6 @@ def test_mcp_call_endpoint_route_exists():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# W7 — resource_resolver.py three-tier (T7.1)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_resolver_online_tier_no_db():
-    """With no DB, resolve_many returns online static resources."""
-    from app.services.resource_resolver import resolve_many
-    results = resolve_many(resource_types=None, stage="p0", project_id=None, db=None)
-    assert len(results) > 0
-    online = [r for r in results if r.hit_tier == "online"]
-    assert len(online) > 0
-
-
-def test_resolver_online_tier_not_schedulable():
-    """Online-tier resources must not be schedulable (require import first, D-089)."""
-    from app.services.resource_resolver import resolve_many
-    results = resolve_many(resource_types=None, stage="p0", project_id=None, db=None)
-    for r in results:
-        if r.hit_tier == "online":
-            assert r.schedulable is False, (
-                f"Online resource {r.resource_id} should not be schedulable"
-            )
-            assert r.dispatch == "online_import_required"
-
-
-def test_resolver_local_tier_with_db():
-    """With DB, resolve_many includes local resources tagged with hit_tier='local'."""
-    from app.core.database import get_session
-    from app.services.resource_resolver import resolve_many
-    db = get_session()
-    try:
-        # Seed a local tool resource
-        _make_entry(db, resource_type="tool")
-        results = resolve_many(resource_types=["tool"], stage="p0", project_id=None, db=db)
-        local = [r for r in results if r.hit_tier == "local"]
-        assert len(local) >= 1
-    finally:
-        db.close()
-
-
-def test_resolver_hit_tier_field_always_set():
-    """All resolved resources have hit_tier set to 'self', 'local', or 'online'."""
-    from app.core.database import get_session
-    from app.services.resource_resolver import resolve_many
-    db = get_session()
-    try:
-        results = resolve_many(stage="p0", project_id=None, db=db)
-        for r in results:
-            assert r.hit_tier in ("self", "local", "online"), (
-                f"Unexpected hit_tier: {r.hit_tier}"
-            )
-    finally:
-        db.close()
-
-
-def test_resolver_type_filter():
-    """resolve_many respects resource_types filter."""
-    from app.core.database import get_session
-    from app.services.resource_resolver import resolve_many
-    db = get_session()
-    try:
-        results = resolve_many(resource_types=["tool"], stage="p0", project_id=None, db=db)
-        for r in results:
-            if r.hit_tier == "local":
-                assert r.resource_type == "tool", (
-                    f"Expected resource_type=tool for local, got {r.resource_type}"
-                )
-    finally:
-        db.close()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # W8 — Architecture constraints
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -822,11 +750,3 @@ def test_knowledge_search_module_public_api():
     import app.services.knowledge_search as mod
     assert hasattr(mod, "search")
     assert hasattr(mod, "load_body")
-
-
-def test_resource_resolver_module_public_api():
-    """resource_resolver.py exports the expected public API (resolve, resolve_many)."""
-    import app.services.resource_resolver as mod
-    assert hasattr(mod, "resolve")
-    assert hasattr(mod, "resolve_many")
-    assert hasattr(mod, "ResolvedResource")

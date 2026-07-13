@@ -6,10 +6,13 @@ Traces and Audits come from TraceWriter/AuditWriter.
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
 from app.services.workspace_service import workspace_path
+
+logger = logging.getLogger("rebuild.aet_service")
 
 
 class AETService:
@@ -40,16 +43,63 @@ class AETService:
                         "bytes": st.st_size,
                         "path": f"artifacts/{f.name}",
                         "mock_level": "real",
+                        "source_status": "real",
                         "name": f.name,
                         "modified_at": st.st_mtime,
                     })
                 except Exception:
-                    pass
+                    # 发声：artifact 文件 stat 失败会让其从清单中消失，掩盖存在的产物。
+                    logger.warning("list_artifacts: 读取 artifact 失败 file=%s", f, exc_info=True)
         return results
 
-    def get_artifact(self, artifact_id: str):
-        # Simple lookup by name match (artifact_id encodes the stem)
-        # Real lookup is done via file read in routes
+    def get_artifact(self, artifact_id: str, project_id: Optional[str] = None):
+        """Resolve a single artifact by id via real file read.
+
+        artifact_id is encoded as "artifact-<stem>" (see list_artifacts). Locates
+        the matching file in workspace/{project_id}/artifacts by stem (stem may
+        itself contain "-", so only the fixed "artifact-" prefix is stripped) and
+        returns the same metadata structure as list_artifacts, with a real sha256
+        content_hash computed from the file bytes. Returns None when project_id is
+        missing, the id is malformed, or no file matches. stat/read errors are
+        surfaced via logger.warning (never silently swallowed).
+        """
+        import hashlib
+        if not project_id or not artifact_id:
+            return None
+        prefix = "artifact-"
+        if not artifact_id.startswith(prefix):
+            return None
+        stem = artifact_id[len(prefix):]
+        art_dir = workspace_path(project_id) / "artifacts"
+        if not art_dir.exists():
+            return None
+        for f in sorted(art_dir.iterdir()):
+            if f.is_file() and f.stem == stem:
+                try:
+                    st = f.stat()
+                    data = f.read_bytes()
+                    content_hash = hashlib.sha256(data).hexdigest()
+                    atype = f.suffix.lstrip(".")
+                    return {
+                        "artifact_id": f"artifact-{f.stem}",
+                        "artifact_type": atype,
+                        "title": f.stem.replace("_", " ").replace("-", " "),
+                        "stage": "",
+                        "artifact_status": "generated",
+                        "is_evidence_candidate": False,
+                        "content_hash": content_hash,
+                        "bytes": st.st_size,
+                        "path": f"artifacts/{f.name}",
+                        "mock_level": "real",
+                        "source_status": "real",
+                        "name": f.name,
+                        "modified_at": st.st_mtime,
+                    }
+                except Exception:
+                    # 发声：artifact 文件存在但 stat/read 失败，静默返回 None 会让
+                    # 已存在的产物"看似不存在"，掩盖读取故障。
+                    logger.warning("get_artifact: 读取 artifact 失败 file=%s", f, exc_info=True)
+                    return None
         return None
 
     # --- Evidence (WP-2: real filesystem storage under workspace/evidence/) ---
@@ -106,7 +156,8 @@ class AETService:
                         continue
                     results.append(ev)
                 except Exception:
-                    pass
+                    # 发声：Evidence 文件损坏被静默丢弃会让证据在列表中"消失"，掩盖数据损坏。
+                    logger.warning("list_evidence: 解析 Evidence 文件失败 file=%s", f, exc_info=True)
         return results
 
     def get_evidence(self, evidence_id: str, project_id: Optional[str] = None):
@@ -125,7 +176,8 @@ class AETService:
                 try:
                     return json.loads(ev_file.read_text(encoding="utf-8"))
                 except Exception:
-                    pass
+                    # 发声：Evidence 文件存在但解析失败，静默返回 None 会让其"看似不存在"。
+                    logger.warning("get_evidence: 解析 Evidence 失败 file=%s", ev_file, exc_info=True)
             return None
         # Scan all projects for this evidence_id
         if not os.path.isdir(projects_dir):
@@ -136,7 +188,8 @@ class AETService:
                 try:
                     return json.loads(ev_file.read_text(encoding="utf-8"))
                 except Exception:
-                    pass
+                    # 发声：Evidence 文件存在但解析失败，静默会让扫描"看似未命中"。
+                    logger.warning("get_evidence(scan): 解析 Evidence 失败 file=%s", ev_file, exc_info=True)
         return None
 
     def list_evidence_gaps(self, project_id: Optional[str] = None) -> list:

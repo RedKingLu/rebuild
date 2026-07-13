@@ -26,7 +26,7 @@ class RunResponse(GraphPlaceholderFields):
     can_resume: bool = False
     stage_status: dict[str, str] = Field(default_factory=dict)
 
-    source_status: str = "mock"
+    source_status: str = "not_connected"
     capability_status: str = "not_connected"
 
 

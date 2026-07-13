@@ -15,6 +15,8 @@ Validation design — intentionally does NOT require live LLM calls:
 from datetime import datetime, timezone
 from typing import Optional
 
+import logging
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -27,6 +29,8 @@ from app.schemas.fusion import (
     FusionRunResponse,
     FusionRunParticipantResponse,
 )
+
+logger = logging.getLogger("rebuild.fusion_profile_service")
 
 
 def _now_str() -> str:
@@ -119,7 +123,9 @@ class FusionProfileService:
                 name=fp.name,
             )
         except Exception:
-            pass
+            # 发声：Fusion 配置变更审计写入失败关乎审计链完整性，须可见。
+            logger.warning("fusion 配置变更审计写入失败 action=%s profile=%s",
+                           action, fp.fusion_profile_id, exc_info=True)
 
     # ── Provider lookups (cached per request) ──────────────────────────
 

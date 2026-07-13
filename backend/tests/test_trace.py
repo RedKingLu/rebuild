@@ -43,7 +43,7 @@ def test_trace_has_required_fields(client, project_id):
         assert "graph_status" in t
         assert "transition_mode" in t
         assert t["graph_status"] == "not_connected"
-        assert t["transition_mode"] == "mock"
+        assert t["transition_mode"] == "unknown"
         assert t["persistence"] == "file+memory"
 
 

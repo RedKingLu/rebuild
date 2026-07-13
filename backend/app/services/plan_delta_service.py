@@ -15,7 +15,10 @@ this service writes the PlanDelta audit and, optionally, applies the supersede.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
+
+logger = logging.getLogger("rebuild.plan_delta_service")
 
 # §5.2 nine trigger conditions → delta_type vocabulary
 DELTA_TYPES = [
@@ -131,4 +134,5 @@ class PlanDeltaService:
         try:
             self.tracer.write("plan_change", action="plan_delta", summary=summary, **extra)
         except Exception:
-            pass  # tracing advisory
+            # advisory：trace 仅用于可观测，PlanDelta 记录不受影响；记录以便定位偶发写失败。
+            logger.debug("plan_delta trace 写入失败（advisory）", exc_info=True)

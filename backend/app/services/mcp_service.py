@@ -171,13 +171,16 @@ class MCPService:
                     if tools:
                         break  # Got tools, done
             except asyncio.TimeoutError:
-                pass  # Partial response is OK
+                # advisory：探测阶段读取超时属可接受降级，已收集到的 tools 为部分结果即可；
+                # 连通性由下方 connected 标志独立判定，不受此超时影响。
+                logger.debug("MCP tools 探测读取超时（部分结果可接受）")
 
             # Kill process gracefully
             try:
                 proc.stdin.close()
             except Exception:
-                pass
+                # advisory：best-effort 关闭 stdin，进程随后被 wait/kill 回收，关闭失败不影响结果。
+                logger.debug("MCP 关闭 stdin 失败（best-effort 清理）", exc_info=True)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=3.0)
             except asyncio.TimeoutError:
@@ -312,7 +315,9 @@ class MCPService:
                             except json.JSONDecodeError:
                                 continue
                 except (asyncio.TimeoutError, Exception):
-                    pass
+                    # 发声：接收工具调用响应时的异常若静默会让 _recv 返回空 {}，
+                    # 使工具调用"看似无结果"（超时/IO/协议错误被掩盖为无响应）。
+                    logger.warning("MCP _recv 接收响应异常 expected_id=%s", expected_id, exc_info=True)
                 return {}
 
             # Handshake: initialize
@@ -335,7 +340,8 @@ class MCPService:
             try:
                 proc.stdin.close()
             except Exception:
-                pass
+                # advisory：best-effort 关闭 stdin，进程随后被 wait/kill 回收，关闭失败不影响结果。
+                logger.debug("MCP 关闭 stdin 失败（best-effort 清理）", exc_info=True)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=3.0)
             except asyncio.TimeoutError:

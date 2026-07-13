@@ -18,10 +18,13 @@ Modes (env `EXECUTION_MODE`, default "local"):
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import tempfile
 from pathlib import Path
 from typing import Protocol
+
+logger = logging.getLogger("rebuild.execution_provider")
 
 
 # ── Security boundaries (D-076: owned by ExecutionProvider, not opencode_adapter) ─
@@ -88,7 +91,20 @@ def _clean_env() -> dict:
     for key in list(env.keys()):
         if any(s in key.upper() for s in ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]):
             del env[key]
-    env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+    # WP-E (B-R17.2-P5-PATH): inherit the host PATH so installed toolchains
+    # (sdkman java, nvm node, dotnet, go, mvn, npm …) are visible to P5 build/verify
+    # commands. Previously PATH was pinned to /usr/local/bin:/usr/bin:/bin, which hid
+    #信创 toolchains → mvn/npm/go returned "command not found" (127) → false
+    # validation_failed. PATH is not a secret; sensitive KEY/TOKEN/SECRET/PASSWORD/
+    # CREDENTIAL vars are still stripped above. Standard system dirs are guaranteed to
+    # be present even if the host PATH is unusual/empty.
+    host_path = os.environ.get("PATH", "")
+    std_dirs = ["/usr/local/bin", "/usr/bin", "/bin"]
+    parts = [p for p in host_path.split(os.pathsep) if p]
+    for d in std_dirs:
+        if d not in parts:
+            parts.append(d)
+    env["PATH"] = os.pathsep.join(parts)
     return env
 
 
@@ -265,7 +281,8 @@ class ContainerExecutionProvider:
                 try:
                     container.remove(force=True)
                 except Exception:
-                    pass
+                    # advisory：best-effort 清理容器；执行结果已在上方捕获，清理失败不影响返回值。
+                    logger.debug("容器清理 remove 失败（best-effort）", exc_info=True)
         except Exception as e:
             exit_code = -1
             stdout = ""
@@ -275,7 +292,8 @@ class ContainerExecutionProvider:
             try:
                 shutil.rmtree(tmpdir)
             except Exception:
-                pass
+                # advisory：best-effort 清理临时目录；清理失败不影响执行结果，仅可能残留临时文件。
+                logger.debug("临时目录清理 rmtree 失败（best-effort）tmpdir=%s", tmpdir, exc_info=True)
 
         elapsed = int((time.time() - start) * 1000)
         risk = _classify_risk(code, language)
