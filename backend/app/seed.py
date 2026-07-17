@@ -204,7 +204,7 @@ RESOURCE_SEEDS = [
     {"resource_type": ResourceType.tool, "name": "run_safe_command", "description": "运行白名单内安全命令并采集 stdout/exit_code（测试白名单+审计）", "status": ResourceStatus.active, "risk_level": RiskLevel.L4, "permission_scope": "exec_with_gate", "type_metadata": {"dry_run_supported": False, "requires_gate": True, "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "要执行的命令（须在白名单内），经 ExecutionProvider 隔离执行"}}, "required": ["command"]}}},
 
     # Hook entries
-    {"resource_type": ResourceType.hook, "name": "pre-write Policy check", "description": "任何文件写操作前的 Policy 校验（PreToolUse，block 模式）", "status": ResourceStatus.active, "risk_level": RiskLevel.L2, "type_metadata": {"hook_point": "PreToolUse", "hook_mode": "block"}},
+    {"resource_type": ResourceType.hook, "name": "pre-write Policy check", "description": "任何文件写操作前的 Policy 校验（PreToolUse，block 模式）", "status": ResourceStatus.active, "risk_level": RiskLevel.L2, "type_metadata": {"hook_point": "PreToolUse", "hook_mode": "block", "hook_impl": "pre_write_policy"}},
     {"resource_type": ResourceType.hook, "name": "pre-commit quality check", "description": "提交前 lint/secret/console.log 扫描（ECC 分级 Hook 参考，warn 模式）", "status": ResourceStatus.planned, "risk_level": RiskLevel.L1, "type_metadata": {"hook_point": "PreToolUse", "hook_mode": "warn", "ref": "ECC hooks(MIT)"}, "source_type": SourceType.community, "source_trust_level": TrustLevel.read_only_reference},
 
     # Case entries (always read_only, never executable)

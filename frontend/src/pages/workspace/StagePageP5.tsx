@@ -100,9 +100,11 @@ export function StagePageP5({ projectId, runId = '', stageStatus: _stageStatus, 
   const evidenceGaps: any[] = p5Input?.evidence_gaps || [];
   const reworkItems: any[] = verifyResults.filter((vr: any) => !vr.passed);
   const canComplete = validationPlan?.can_be_completed || false;
-  const p4EvidenceRefs: string[] = p5Input?.p4_evidence_refs || [];
-  const p4OutputRefs: string[] = p5Input?.p4_output_code_refs || [];
-  const p4PatchRefs: string[] = p5Input?.p4_patch_refs || [];
+  // ISSUE-04 修复：/p5/input 序列化字段为 evidence_refs/output_code_refs/patch_refs（无 p4_ 前缀，
+  // 见 p5_input_service.p4_input_facts_to_dict），旧版读 p4_ 前缀致「P4 产物引用」整卡永不渲染。
+  const p4EvidenceRefs: string[] = p5Input?.evidence_refs || [];
+  const p4OutputRefs: string[] = p5Input?.output_code_refs || [];
+  const p4PatchRefs: string[] = p5Input?.patch_refs || [];
 
   const hardRequiredValidated = slots.filter(
     (s: any) => s.slot_type === 'hard_required' && s.status === 'validated').length;

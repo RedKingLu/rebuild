@@ -74,6 +74,19 @@ async def lifespan(app: FastAPI):
     except Exception:
         import logging
         logging.getLogger("uvicorn").warning("graph handler bootstrap failed", exc_info=True)
+    # R17.3-6 WP-8 (GAP-BG-1): restart recovery — scan DB for orphaned "running" runs and
+    # auto-resume them from their LangGraph checkpoint (process crash / restart resilience).
+    # Non-blocking: classification reads run here; heavy resume is offloaded to background
+    # threads. Non-fatal — a recovery failure must never block startup (公理3: 发声 not 崩溃).
+    try:
+        from app.graph.recovery import recover_interrupted_runs
+        _rec = await recover_interrupted_runs()
+        if _rec.get("scanned"):
+            import logging
+            logging.getLogger("uvicorn").info(f"R17.3-6 WP-8 run recovery: {_rec}")
+    except Exception:
+        import logging
+        logging.getLogger("uvicorn").warning("run recovery scan failed", exc_info=True)
     yield
     clear_services_cache()
     try:

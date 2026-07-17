@@ -154,6 +154,18 @@ class GateService:
                     f"非法 Gate 决策：{req.decision!r}（允许 {sorted(VALID_DECISIONS)}）"
                 )
 
+            # NEW-03: idempotency guard — one decision = one authoritative gate_decision
+            # Audit. A graph-driven gate is decided TWICE for a single user action: the
+            # REST route records it synchronously (drive_promotion=False), then the
+            # background LangGraph gate node re-applies the SAME decision on resume via
+            # _gate_backend.decide(). Without this guard both writes emit a gate_decision
+            # Audit (double-write). When the gate is already in the target decided status
+            # for this same decision, skip the re-write (no duplicate Audit, no state
+            # churn) and return the existing gate. Non-graph gates hit this only on a
+            # genuine double-submit, where skipping the duplicate is equally correct.
+            if g.decision == decision and g.gate_status == _DECISION_TO_STATUS[decision]:
+                return _gate_to_response(g), None
+
             g.gate_status = _DECISION_TO_STATUS[decision]
             g.decision = decision
             g.decided_at = datetime.now(timezone.utc)

@@ -53,9 +53,16 @@ class OpenCodeACPClient:
         password: OPENCODE_SERVER_PASSWORD for Basic auth
     """
 
-    def __init__(self, base_url: str, password: str) -> None:
+    def __init__(self, base_url: str, password: str, *,
+                 hitl_resolver=None, hitl_gate_timeout: float = 120.0) -> None:
         self._base = base_url.rstrip("/")
         self._headers = {**_auth_header(password), "Content-Type": "application/json"}
+        # GAP-HITL-1 (WP-4): interactive HITL for high-risk external-agent requests.
+        # `hitl_resolver(project_id, run_id, command, decision_obj) -> "once"|"reject"`
+        # drives the ACP reply from a real user Gate decision (replaces the blind reject
+        # bottom). Injectable for testing; defaults to the Gate-based resolver below.
+        self._hitl_resolver = hitl_resolver
+        self._hitl_gate_timeout = hitl_gate_timeout
 
     # ── Session ───────────────────────────────────────────────────────────
 
@@ -133,6 +140,7 @@ class OpenCodeACPClient:
         mode: str = "plan",
         project_id: Optional[str] = None,
         in_plan: bool = False,
+        run_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Stream SSE events until the session becomes idle or errors out.
 
@@ -146,7 +154,7 @@ class OpenCodeACPClient:
             result = await asyncio.wait_for(
                 self._stream_loop(
                     session_id, policy, workspace_path,
-                    mode=mode, project_id=project_id, in_plan=in_plan,
+                    mode=mode, project_id=project_id, in_plan=in_plan, run_id=run_id,
                 ),
                 timeout=timeout,
             )
@@ -167,6 +175,7 @@ class OpenCodeACPClient:
         mode: str = "plan",
         project_id: Optional[str] = None,
         in_plan: bool = False,
+        run_id: Optional[str] = None,
     ) -> dict[str, Any]:
         events_count = 0
         idle_reason = "unknown"
@@ -212,7 +221,7 @@ class OpenCodeACPClient:
                         target = props.get("path") or props.get("command") or ""
                         decision = self._evaluate_permission(
                             perm_kind, target, workspace_path, policy,
-                            mode=mode, project_id=project_id, in_plan=in_plan,
+                            mode=mode, project_id=project_id, in_plan=in_plan, run_id=run_id,
                         )
                         log.debug(
                             "perm_v1 %s target=%r decision=%s", perm_kind, target, decision
@@ -228,7 +237,7 @@ class OpenCodeACPClient:
                         target = props.get("path") or props.get("command") or ""
                         decision = self._evaluate_permission(
                             perm_kind, target, workspace_path, policy,
-                            mode=mode, project_id=project_id, in_plan=in_plan,
+                            mode=mode, project_id=project_id, in_plan=in_plan, run_id=run_id,
                         )
                         log.debug(
                             "perm_v2 %s target=%r decision=%s", perm_kind, target, decision
@@ -256,6 +265,7 @@ class OpenCodeACPClient:
         mode: str,
         project_id: Optional[str],
         in_plan: bool,
+        run_id: Optional[str] = None,
     ) -> str:
         """Route permission request through mediator/reviewer or fallback to policy.
 
@@ -292,7 +302,8 @@ class OpenCodeACPClient:
             if workspace_path:
                 try:
                     from app.services.external_command_reviewer import review
-                    decision_obj = review(target, mode=mode, in_plan=in_plan)
+                    decision_obj = review(target, mode=mode, in_plan=in_plan,
+                                          project_id=project_id, run_id=run_id)
                     acp_decision = "once" if decision_obj.is_allowed() else "reject"
 
                     if decision_obj.is_denied():
@@ -301,13 +312,12 @@ class OpenCodeACPClient:
                             decision_obj.reason, risk_level=decision_obj.risk_level,
                         )
                     elif decision_obj.requires_hitl():
-                        # HITL not yet wired here — default to reject (conservative, G8)
-                        # Full HITL integration is in ExternalPlatformDelegator (T3/T6.1)
-                        acp_decision = "reject"
-                        _audit_permission(
-                            project_id, pt, target, "hitl_required",
-                            decision_obj.reason, risk_level=decision_obj.risk_level,
-                        )
+                        # GAP-HITL-1 (WP-4): interactive HITL. A high-risk command no longer
+                        # gets a blind reject — the platform opens a real user Gate and drives
+                        # the ACP reply from the user's decision (approve → "once", reject /
+                        # timeout → "reject"). D-087/D-088: platform審核 Agent + HITL 拦截.
+                        acp_decision = self._resolve_hitl(
+                            project_id, run_id, target, decision_obj)
                     else:
                         _trace_permission(
                             project_id, pt, target, "once",
@@ -321,6 +331,78 @@ class OpenCodeACPClient:
             return policy.decide(perm_kind, target, workspace_path)
 
         # Unknown — safe default
+        return "reject"
+
+    # ── Interactive HITL (GAP-HITL-1) ──────────────────────────────────────
+
+    def _resolve_hitl(self, project_id, run_id, command: str, decision_obj) -> str:
+        """Drive the ACP reply from a real user Gate decision (interactive HITL).
+
+        Uses an injected resolver when provided (tests / custom wiring); otherwise the
+        default Gate-based resolver creates an action_approval Gate and waits (bounded) for
+        the user's decision. Never silently allows: on timeout / no-gate-backend it returns
+        "reject" AND records the reason (honest degradation, not a blind reject).
+        """
+        if self._hitl_resolver is not None:
+            try:
+                return self._hitl_resolver(project_id, run_id, command, decision_obj)
+            except Exception as exc:
+                log.warning("hitl_resolver error for %r: %s — reject", command[:80], exc)
+                _audit_permission(project_id, "command", command, "hitl_error",
+                                  f"HITL resolver 异常，保守拒绝: {exc}",
+                                  risk_level=decision_obj.risk_level)
+                return "reject"
+        return self._default_gate_hitl(project_id, run_id, command, decision_obj)
+
+    def _default_gate_hitl(self, project_id, run_id, command: str, decision_obj) -> str:
+        """Default interactive HITL: create a user Gate and poll (bounded) for its decision."""
+        import time
+        try:
+            from app.dependencies import get_services
+            gs = get_services().gate_service
+        except Exception as exc:
+            _audit_permission(project_id, "command", command, "hitl_required",
+                              f"HITL 需用户确认，但无 Gate 服务可用（{exc}）→ 保守拒绝",
+                              risk_level=decision_obj.risk_level)
+            return "reject"
+        try:
+            gate = gs.create(
+                project_id=project_id or "", run_id=run_id or "", stage="p4",
+                gate_type="action_approval", risk_level=decision_obj.risk_level,
+                reason=f"外部 Agent 高风险命令请求需用户确认：{command[:120]}",
+                summary=(f"外部编程 Agent 请求执行高风险命令（风险 {decision_obj.risk_level}）："
+                         f"{command[:120]}。请批准或拒绝。"),
+                options=["approve", "reject"],
+            )
+        except Exception as exc:
+            _audit_permission(project_id, "command", command, "hitl_required",
+                              f"创建 HITL Gate 失败（{exc}）→ 保守拒绝",
+                              risk_level=decision_obj.risk_level)
+            return "reject"
+
+        _trace_permission(project_id, "command", command, "hitl_gate_created",
+                          f"交互式 HITL Gate {gate.gate_id} 已创建，等待用户决策")
+        deadline = time.monotonic() + self._hitl_gate_timeout
+        while time.monotonic() < deadline:
+            try:
+                cur = gs.get(gate.gate_id)
+            except Exception:
+                cur = None
+            status = getattr(cur, "gate_status", "") if cur else ""
+            if status == "approved":
+                _audit_permission(project_id, "command", command, "hitl_approved",
+                                  f"用户经 Gate {gate.gate_id} 批准高风险命令",
+                                  risk_level=decision_obj.risk_level)
+                return "once"
+            if status in ("rejected", "changes_requested", "consumed"):
+                _audit_permission(project_id, "command", command, "hitl_rejected",
+                                  f"用户经 Gate {gate.gate_id} 拒绝高风险命令（{status}）",
+                                  risk_level=decision_obj.risk_level)
+                return "reject"
+            time.sleep(0.5)
+        _audit_permission(project_id, "command", command, "hitl_timeout",
+                          f"HITL Gate {gate.gate_id} 在 {self._hitl_gate_timeout}s 内未获用户决策 → 保守拒绝",
+                          risk_level=decision_obj.risk_level)
         return "reject"
 
 

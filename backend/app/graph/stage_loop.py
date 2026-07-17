@@ -45,12 +45,16 @@ class StageLoop:
     """
 
     def __init__(self, project_id: str, stage: str, *, tracer=None, auditor=None,
-                 max_rounds: int = 2):
+                 max_rounds: int = 2, run_id: str = ""):
         self.project_id = project_id
         self.stage = stage
         self.tracer = tracer
         self.auditor = auditor
         self.max_rounds = max_rounds
+        # NEW-04: carry run_id so the stage_loop Trace events + the inner ReviewPass
+        # Trace/Audit are scoped to the driving run (enables /trace?run_id= to return the
+        # full-stage timeline, not just handler-level events).
+        self.run_id = run_id
 
     async def run(
         self,
@@ -72,7 +76,8 @@ class StageLoop:
         if self.tracer:
             self.tracer.write("stage_loop", action="start_plan",
                               summary=f"{self.stage} start plan: {goal}",
-                              project_id=self.project_id)
+                              project_id=self.project_id, run_id=self.run_id or None,
+                              stage=self.stage)
 
         # R17-3: plan_only 模式 — 只生成计划，不执行。用于 plan_presentation gate 展示。
         if plan_only:
@@ -95,7 +100,8 @@ class StageLoop:
                                         reviewer=review.reviewer)
             return review
 
-        rp = ReviewPass(max_rounds=self.max_rounds, tracer=self.tracer, auditor=self.auditor)
+        rp = ReviewPass(max_rounds=self.max_rounds, tracer=self.tracer, auditor=self.auditor,
+                        run_id=self.run_id)
 
         # Wrap execute_fn in an async function so ReviewPass (_is_async) always awaits
         # it — execute_fn may be sync or return an awaitable (handler.execute).
@@ -114,12 +120,19 @@ class StageLoop:
         passed = bool(outcome.get("passed"))
         escalated = bool(outcome.get("escalated_to_gate"))
         rounds = outcome.get("rounds", [])
-        last_issues: List[str] = []
+        last_issues: List[dict] = []
         last_recs: List[str] = []
         for r in reversed(rounds):
             if r.get("issues") or r.get("recommendations"):
-                last_issues = [str(i) for i in r.get("issues", [])]
-                last_recs = [str(x) for x in r.get("recommendations", [])]
+                # FUP-3 (R17.3-6 WP-5): 保留结构化 issue 对象（{type/detail} 或
+                # {self_check}），不再 str() 成 Python dict 的 repr 字符串。旧实现使
+                # {stage}_acceptance.json 的 issues[0] 变成 "{'type': ..., 'detail': ...}"，
+                # 前端与下游无法结构化消费。ReviewResult.issues 契约即为 list[dict]
+                # （review_pass.py:20），非 dict 项才归一为 {"detail": str(i)}（诚实兜底）。
+                last_issues = [i if isinstance(i, dict) else {"detail": str(i)}
+                               for i in r.get("issues", [])]
+                last_recs = [x if isinstance(x, str) else str(x)
+                             for x in r.get("recommendations", [])]
                 break
 
         # ② 中间施工报告
@@ -137,7 +150,8 @@ class StageLoop:
         if self.tracer:
             self.tracer.write("stage_loop", action="acceptance",
                               summary=f"{self.stage} loop {'PASSED' if passed else ('ESCALATED' if escalated else 'FAILED')}",
-                              project_id=self.project_id)
+                              project_id=self.project_id, run_id=self.run_id or None,
+                              stage=self.stage)
 
         return StageLoopResult(
             stage=self.stage,

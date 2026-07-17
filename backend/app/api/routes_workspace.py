@@ -804,12 +804,15 @@ async def get_assessment_summary(project_id: str):
     blocker = _read("p2_blocker_list.json")
     gaps = _read("p2_validation_gaps.json")
     resources = _read("p2_resource_needs.json")
+    # WP-6 (Q-R17.3-6-2): 模型全失败强制中断的结构化报错（已尝试链路 + 原因 + 用户操作）。
+    model_error = _read("p2_model_error.json")
 
     # P2 not assessed yet → honest empty state (§4.10; no fabricated content)
     if report is None and risk is None and blocker is None:
         return SuccessEnvelope(data={
             "available": False,
             "reason": "P2 评估尚未执行。请先完成 P1 并批准 Gate 以触发 P2 评估。",
+            "model_unavailable": model_error if model_error and not model_error.get("_unreadable") else None,
         }, meta=Meta())
 
     # best-effort model identifier (analysis-only marker) from persisted Evidence
@@ -864,9 +867,19 @@ async def get_planning_summary(project_id: str):
               .order_by(StagePlan.version.desc(), StagePlan.created_at.desc())
               .first())
         if sp is None:
+            # WP-6: P3 尚未产出计划——若因模型全失败强制中断，透传结构化报错。
+            _p3_model_err = None
+            try:
+                import json as _json
+                _fp = workspace_path(project_id) / "artifacts" / "p3_model_error.json"
+                if _fp.exists():
+                    _p3_model_err = _json.loads(_fp.read_text(encoding="utf-8"))
+            except Exception:
+                _p3_model_err = None
             return SuccessEnvelope(data={
                 "available": False,
                 "reason": "P3 规划尚未执行。请先完成 P2 评估并批准 Gate 以触发 P3 规划。",
+                "model_unavailable": _p3_model_err,
             }, meta=Meta())
 
         detail = sp.plan_detail or {}
@@ -941,3 +954,34 @@ async def get_planning_summary(project_id: str):
         }, meta=Meta())
     finally:
         db.close()
+
+
+# ── P4 Model-Interruption Summary (R17.3-6 WP-6 EG-WP6-1) ──────────────────
+# Read-only view of the P4 model-interruption artifact written by WorkAgent
+# (_write_model_error_artifact → artifacts/p4_model_error.json). Surfaces the
+# structured `model_unavailable` payload so StagePageP4 renders
+# ModelUnavailableBanner (4-point explicit error: interrupted stage / failure
+# reason / error_category / attempted_chain + user_no-op=false guarantee).
+# Honest null when P4 model is available or P4 has not run yet. No LLM call.
+@router.get("/p4-summary")
+async def get_p4_summary(project_id: str):
+    import json as _json
+    from pathlib import Path as _Path
+    svc = get_services()
+    if svc.project_service.get(project_id) is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    art_dir: _Path = workspace_path(project_id) / "artifacts"
+    fp = art_dir / "p4_model_error.json"
+    model_error: dict | None = None
+    if fp.exists():
+        try:
+            model_error = _json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            # honest: unreadable/corrupt artifact surfaced as null, not fabricated
+            model_error = {"_unreadable": True}
+
+    return SuccessEnvelope(data={
+        "model_unavailable": model_error
+        if model_error and not model_error.get("_unreadable") else None,
+    }, meta=Meta())

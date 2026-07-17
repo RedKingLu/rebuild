@@ -33,6 +33,7 @@ from typing import Any, Optional
 
 from app.services.workspace_service import workspace_path
 from app.services.workspace_mediator import WorkspaceMediator
+from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -387,17 +388,25 @@ class P4ExecutionWorker:
         ]
         try:
             result = await self.gateway.call(messages=messages, max_tokens=4096,
-                                             temperature=0.2, source="api")
+                                             temperature=0.2, source="api",
+                                             project_id=self.project_id, stage="p4")
         except Exception as e:
             logger.warning("P4 model call failed", exc_info=True)  # 公理3
-            return {"status": "blocked", "reason": f"模型调用失败：{e}", "content": ""}
+            return {"status": "blocked", "reason": f"模型调用失败：{e}", "content": "",
+                    "attempted_chain": [], "model_error_category": "model_call_exception",
+                    "model_user_actions": _MODEL_USER_ACTIONS}
         content = result.get("content") or ""
         # B-P4-CODEFENCE: strip LLM markdown code fences so output_code is valid code body.
         content = _strip_code_fence(content)
         if result.get("status") != "completed" or not content.strip():
+            # WP-6: 模型全失败强制中断 → 携「已尝试模型链路」诚实 blocked（不静默降级）。
             return {"status": "blocked",
-                    "reason": result.get("error") or "模型未产出有效内容",
-                    "content": ""}
+                    "reason": (result.get("error_message") or result.get("error")
+                               or result.get("error_category") or "模型未产出有效内容"),
+                    "content": "",
+                    "attempted_chain": result.get("attempted_chain", []),
+                    "model_error_category": result.get("error_category", "model_unavailable"),
+                    "model_user_actions": _MODEL_USER_ACTIONS}
         return {"status": "completed", "content": content,
                 # B-P4-MODELUSED-NULL: ModelGateway.call returns the selected model under
                 # "model"; fall back to model_id/model_used for other callers/adapters.
@@ -475,6 +484,10 @@ class P4ExecutionWorker:
                     "node_status": "blocked", "reason": gen["reason"],
                     "criteria_met": False, "artifacts": [], "evidence_refs": [],
                     "output_code_refs": [], "patch_refs": [],
+                    # WP-6: 模型全失败中断的链路随节点上浮，供 handler 汇总到阶段级前端报错。
+                    "attempted_chain": gen.get("attempted_chain", []),
+                    "model_error_category": gen.get("model_error_category", ""),
+                    "model_user_actions": gen.get("model_user_actions", []),
                     "trace_refs": trace_refs, "audit_refs": audit_refs}
         output_code = gen["content"]
 

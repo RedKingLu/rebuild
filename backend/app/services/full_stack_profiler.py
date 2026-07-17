@@ -288,8 +288,12 @@ class FullStackProfiler:
             except Exception:
                 # 发声：pom.xml 存在却读取/解析失败，若静默会让框架识别"看似无框架"而掩盖读失败。
                 logger.warning("framework id: 读取 pom.xml 失败 src=%s", src, exc_info=True)
-        # .NET frameworks
-        if any(x.endswith(".csproj") for x in files_found):
+        # .NET frameworks — recognise solutions/projects generically via
+        # endswith (FUP-1): .sln solution files, .csproj/.vbproj/.fsproj project
+        # files. NOT hardcoded to any specific project name. Older .NET Framework
+        # solutions may ship only a .sln (+ packages.config) with NO .csproj, so
+        # the .sln marker is essential — a .csproj-only check misses them.
+        if any(x.endswith((".csproj", ".vbproj", ".fsproj", ".sln")) for x in files_found):
             frameworks.append({"framework": ".NET", "confidence": "high"})
         # Node.js
         if "package.json" in file_set:
@@ -326,7 +330,14 @@ class FullStackProfiler:
             fname = os.path.basename(f["path"])
             if fname in BUILD_FILES:
                 systems.append({"build_system": BUILD_FILES[fname], "file": f["path"], "confidence": "high"})
-            elif f["path"].endswith(".csproj"):
+            # FUP-1: .NET solution/project files matched generically via endswith.
+            # The BUILD_FILES wildcard keys ("*.csproj"/"*.sln"/"*.fsproj") can never
+            # match `fname in BUILD_FILES` (exact-key lookup), so .sln/.vbproj/.fsproj
+            # were silently missed — only .csproj was caught below. Recognise the
+            # full .NET family here (.sln → msbuild-sln, project files → msbuild).
+            elif f["path"].endswith(".sln"):
+                systems.append({"build_system": "msbuild-sln", "file": f["path"], "confidence": "high"})
+            elif f["path"].endswith((".csproj", ".vbproj", ".fsproj")):
                 systems.append({"build_system": "msbuild", "file": f["path"], "confidence": "high"})
         if not systems:
             self.gaps.append({"item": 6, "type": "build_system_unknown",

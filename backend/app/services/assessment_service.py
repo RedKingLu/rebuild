@@ -33,6 +33,9 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# WP-6 (Q-R17.3-6-2): 模型全失败中断时前端可采取操作（复用 gateway 单一事实源）。
+from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+
 # §4.5 six core assessment outputs
 ASSESSMENT_OUTPUTS = [
     "assessment_report", "risk_list", "blocker_list",
@@ -43,9 +46,12 @@ _SYSTEM_PROMPT = (
     "你是 rebuild 平台的 P2 评估 Agent。基于 P1 项目档案、Environment Profile 草案与 "
     "p2_input_manifest，评估软件重构/信创迁移的风险、阻塞项、不确定项、验证缺口与资源需求。"
     "严格输出 JSON，键为：assessment_report(对象), risk_list(数组，每项含 title/risk_level[L0-L5]/"
-    "source/basis), blocker_list(数组), uncertainty_list(数组), validation_gap_list(数组), "
-    "resource_needs(数组)。你的输出是【辅助分析，非事实】，不得替代 Evidence、不做代码修改、"
-    "不替代 P3 规划或 P5 验证。"
+    "source/basis/evidence_refs), blocker_list(数组，每项含 title/evidence_refs), uncertainty_list(数组), "
+    "validation_gap_list(数组，每项含 title/evidence_refs), resource_needs(数组)。"
+    "内联引用要求（硬约束）：每条 risk / blocker / validation_gap 必须在其 evidence_refs "
+    "字段内联列出所依据的上游产物 artifact ref——只能引用【可引用上游产物】清单中给出的 ref，"
+    "不得杜撰不存在的 id；确无可依据时给空数组（诚实，不编造）。"
+    "你的输出是【辅助分析，非事实】，不得替代 Evidence、不做代码修改、不替代 P3 规划或 P5 验证。"
 )
 
 
@@ -64,6 +70,11 @@ class AssessmentResult:
     evidence: list = field(default_factory=list)
     context_refs: list = field(default_factory=list)   # R10-5 P1-C: assembled C0-C6 layers
     skill_refs: list = field(default_factory=list)      # R10-5 P1-C: C3 skill refs (metadata)
+    # R17.3-6 WP-6 (Q-R17.3-6-2): 模型全失败强制中断时的「已尝试模型链路」+ 结构化错误分类
+    # + 用户可采取操作，透传前端显式报错（不静默降级）。
+    attempted_chain: list = field(default_factory=list)
+    model_error_category: str = ""
+    model_user_actions: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -80,6 +91,9 @@ class AssessmentResult:
             "evidence": self.evidence,
             "context_refs": self.context_refs,
             "skill_refs": self.skill_refs,
+            "attempted_chain": self.attempted_chain,
+            "model_error_category": self.model_error_category,
+            "model_user_actions": self.model_user_actions,
         }
 
 
@@ -122,15 +136,18 @@ class AssessmentService:
         """
         gw = self._get_gateway()
 
-        # Q-R10-2: no available model → blocked, no rule fallback.
-        status = gw.get_status()
-        overall = getattr(status, "overall_status", None) or (
-            status.get("overall_status") if isinstance(status, dict) else None)
-        if overall != "available":
+        # Q-R10-2 / WP-6: no available model → blocked, no rule fallback. 就绪度预检给出
+        # 「候选模型链路」，即便一次调用都未发生也能让前端显式看到考察过的模型链路。
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        if not readiness.get("available"):
             self._trace("P2 assessment blocked: no model", project_id, run_id, stage)
             return AssessmentResult(
                 status="blocked",
-                reason="no_model_key: 评估需要 LLM 支持，请配置有效 API Key（P2 不降级为规则评估）")
+                reason=("no_model_key: 评估需要 LLM 支持，请配置有效 API Key（P2 不降级为规则评估）"
+                        f"；{readiness.get('reason','')}"),
+                attempted_chain=readiness.get("attempted_chain", []),
+                model_error_category="model_unavailable",
+                model_user_actions=readiness.get("user_actions", []))
 
         context_refs, skill_refs = self._context_refs(context_package)
         inputs = self._gather_inputs(project_id, user_goal)
@@ -145,13 +162,18 @@ class AssessmentService:
         ]
 
         result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=4096, temperature=0.3, source="api")
+                               max_tokens=4096, temperature=0.3, source="api",
+                               project_id=project_id, run_id=run_id, stage=stage)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
             self._trace(f"P2 assessment model call not completed: {reason}", project_id, run_id, stage)
-            # a configured-but-failing model is a failure, not a silent success (公理3)
+            # a configured-but-failing model is a failure, not a silent success (公理3);
+            # WP-6: 携「已尝试模型链路」透传前端显式报错（不静默降级）。
             return AssessmentResult(status="failed", reason=str(reason),
-                                    model_used=result.get("model"))
+                                    model_used=result.get("model"),
+                                    attempted_chain=result.get("attempted_chain", []),
+                                    model_error_category=result.get("error_category", "model_unavailable"),
+                                    model_user_actions=_MODEL_USER_ACTIONS)
 
         parsed = self._parse(result.get("content", ""))
         model_used = result.get("model")
@@ -185,14 +207,20 @@ class AssessmentService:
         try:
             from app.services.workspace_service import workspace_path
             ws = workspace_path(project_id)
-            for name in ("p2_input_manifest.json", "profiling_summary.json",
+            # HDF-01 修复：P1 FullStackProfiler 写出的是 profiling_summary.md（Markdown），
+            # 旧版在此读 profiling_summary.json（不存在）→ 永远记入 missing，且即便存在也会被
+            # json.loads 判为 unreadable。改为按后缀区分：.md 读原文文本，其余按 JSON 解析。
+            for name in ("p2_input_manifest.json", "profiling_summary.md",
                          "intake_report.json", "environment.json"):
                 fp = ws / "artifacts" / name
                 if not fp.exists():
                     fp = ws / name if (ws / name).exists() else fp
                 if fp.exists():
                     try:
-                        inputs[name] = json.loads(fp.read_text(encoding="utf-8"))
+                        if name.endswith(".md"):
+                            inputs[name] = fp.read_text(encoding="utf-8")
+                        else:
+                            inputs[name] = json.loads(fp.read_text(encoding="utf-8"))
                         inputs["sources_read"].append(name)
                     except Exception:
                         inputs["missing"].append(f"{name}(unreadable)")
@@ -203,13 +231,17 @@ class AssessmentService:
         return inputs
 
     def _build_user_prompt(self, inputs: dict) -> str:
+        # 可引用上游产物清单：由本阶段真实读取到的输入产物构造（confirmed on disk），
+        # 供模型在 evidence_refs 内联引用，避免模型杜撰不存在的 artifact id（C1 真内联）。
+        citable = [f"artifacts/{n}" for n in inputs.get("sources_read", [])]
         return (
             f"项目 ID：{inputs.get('project_id')}\n"
             f"用户目标：{inputs.get('user_goal') or '（未提供）'}\n"
             f"已读取输入：{inputs.get('sources_read')}\n"
             f"缺失输入（登记为不确定项来源）：{inputs.get('missing')}\n"
+            f"【可引用上游产物】（evidence_refs 只能取自此清单，勿杜撰）：{citable}\n"
             f"P1 档案/清单摘要：{json.dumps({k: v for k, v in inputs.items() if k.endswith('.json')}, ensure_ascii=False)[:3000]}\n"
-            "请据此产出 6 类评估输出（JSON）。"
+            "请据此产出 6 类评估输出（JSON），并为每条 risk/blocker/validation_gap 内联填写 evidence_refs。"
         )
 
     # ── parse ──────────────────────────────────────────────────────────────

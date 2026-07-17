@@ -341,6 +341,97 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── SEC-01: P6 脱敏硬门禁（WP-4） ────────────────────────────────────────────
+# desensitization_ok=False（产物含 sk-/AKIA/api_key 等疑似密钥）时：默认硬 blocked 交付；
+# 唯一放行路径 = 一道强制显式用户 Gate（gate_type="desensitization_release"，L5 高风险，
+# 含风险说明），用户显式 approve 后方可交付。不再仅软提示。风险说明只含路径/模式名/计数，
+# 绝不含密钥明文（D-032：desensitization_issues 本身已只记 path/pattern/count）。
+
+_DESENS_GATE_TYPE = "desensitization_release"
+
+
+def desensitization_risk_explanation(pkg: "DeliveryPackage") -> dict:
+    """构造用户可读的脱敏风险说明（已脱敏：仅文件路径 + 模式名 + 计数，无密钥明文）。"""
+    return {
+        "reason": "交付包脱敏扫描发现疑似密钥/凭据；默认硬阻断交付，须用户显式确认风险后放行（SEC-01/D-032）。",
+        "issue_count": len(pkg.desensitization_issues),
+        "issues": [
+            {"path": i.get("path", ""), "pattern": i.get("pattern", ""), "count": i.get("count", 0)}
+            for i in (pkg.desensitization_issues or [])
+        ],
+        "release_path": "用户显式批准 desensitization_release Gate（L5 高风险，D-034）",
+    }
+
+
+def find_approved_desensitization_override(project_id: str, run_id: str) -> Optional[str]:
+    """查该 run 是否已有用户显式批准的脱敏放行 Gate（approved）。返回 gate_id 或 None。"""
+    try:
+        from app.dependencies import get_services
+        gates = get_services().gate_service.list_by_project(project_id)
+    except Exception:
+        logger.warning("SEC-01: 查询脱敏放行 Gate 失败 project=%s", project_id, exc_info=True)
+        return None
+    for g in gates:
+        if (g.gate_type == _DESENS_GATE_TYPE and (g.run_id or "") == (run_id or "")
+                and g.gate_status == "approved"):
+            return g.gate_id
+    return None
+
+
+def ensure_desensitization_gate(project_id: str, run_id: str, pkg: "DeliveryPackage",
+                                tracer=None, auditor=None) -> Optional[str]:
+    """确保存在一道强制脱敏放行 Gate（唯一放行路径）。已有 waiting/approved 则复用，
+    否则创建 L5 Gate + 写安全 Audit（含脱敏后的风险说明）。返回 gate_id。"""
+    try:
+        from app.dependencies import get_services
+        gs = get_services().gate_service
+        gates = gs.list_by_project(project_id)
+    except Exception:
+        logger.warning("SEC-01: 无法访问 Gate 服务，脱敏放行 Gate 未创建 project=%s", project_id, exc_info=True)
+        return None
+
+    for g in gates:
+        if (g.gate_type == _DESENS_GATE_TYPE and (g.run_id or "") == (run_id or "")
+                and g.gate_status in ("waiting_decision", "approved")):
+            return g.gate_id  # 复用（不重复建门）
+
+    risk = desensitization_risk_explanation(pkg)
+    paths = ", ".join(i["path"] for i in risk["issues"][:5]) or "(见风险清单)"
+    try:
+        gate = gs.create(
+            project_id=project_id, run_id=run_id or "", stage="p6",
+            gate_type=_DESENS_GATE_TYPE, risk_level="L5",
+            reason="P6 交付包脱敏扫描发现疑似密钥/凭据，默认硬阻断交付（SEC-01/D-032）",
+            summary=(f"⚠ 脱敏拦截：{risk['issue_count']} 处疑似密钥（{paths}）。"
+                     f"默认不交付；如确认非敏感或已处理，请显式批准放行。"),
+            options=["approve", "reject"],
+        )
+    except Exception:
+        logger.warning("SEC-01: 创建脱敏放行 Gate 失败 project=%s", project_id, exc_info=True)
+        return None
+
+    if auditor is not None:
+        try:
+            auditor.write(
+                audit_type="security_desensitization_block",
+                risk_level="L5", action="p6_delivery_desensitization",
+                decision="blocked",
+                reason=(f"脱敏扫描 {risk['issue_count']} 处疑似密钥，默认硬阻断交付；"
+                        f"须用户显式批准 Gate {gate.gate_id} 放行")[:300],
+                project_id=project_id, run_id=run_id, stage="p6",
+            )
+        except Exception:
+            logger.warning("SEC-01: 脱敏拦截审计写入失败", exc_info=True)
+    if tracer is not None:
+        try:
+            tracer.write("gate_event", action="create_desensitization_gate",
+                         summary=f"SEC-01 脱敏放行 Gate {gate.gate_id} 创建（默认阻断交付）",
+                         project_id=project_id, run_id=run_id, stage="p6")
+        except Exception:
+            logger.warning("SEC-01: 脱敏拦截 trace 写入失败", exc_info=True)
+    return gate.gate_id
+
+
 def delivery_package_to_dict(pkg: DeliveryPackage) -> dict:
     """序列化为 API 响应。"""
     return {

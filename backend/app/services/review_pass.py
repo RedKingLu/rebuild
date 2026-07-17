@@ -47,10 +47,13 @@ class ReviewPass:
         )
     """
 
-    def __init__(self, max_rounds: int = 2, tracer=None, auditor=None):
+    def __init__(self, max_rounds: int = 2, tracer=None, auditor=None, run_id: str = ""):
         self.max_rounds = max_rounds
         self.tracer = tracer
         self.auditor = auditor
+        # NEW-04: carry run_id so every review_pass Trace / review_escalation Audit
+        # written below is scoped to the driving run (enables /trace?run_id= filtering).
+        self.run_id = run_id
         self.rounds: list[dict] = []
 
     async def run(
@@ -78,7 +81,7 @@ class ReviewPass:
             if self.tracer:
                 self.tracer.write("review_pass", action="round_start",
                     summary=f"Review pass round {round_num}/{self.max_rounds} for {stage}",
-                    project_id=project_id)
+                    project_id=project_id, run_id=self.run_id or None, stage=stage)
 
             try:
                 result = await execute_fn() if hasattr(execute_fn, '__call__') and _is_async(execute_fn) else execute_fn()
@@ -98,7 +101,7 @@ class ReviewPass:
             if self.tracer:
                 self.tracer.write("review_pass", action="round_end",
                     summary=f"Round {round_num}: {'PASSED' if review.passed else 'RETRY'} ({len(review.issues)} issues)",
-                    project_id=project_id)
+                    project_id=project_id, run_id=self.run_id or None, stage=stage)
 
             if review.passed:
                 return {"final_result": result, "passed": True, "rounds": self.rounds, "escalated_to_gate": False}
@@ -121,7 +124,7 @@ class ReviewPass:
             self.auditor.write(
                 audit_type="review_escalation", action="escalate_to_gate",
                 decision="escalate", risk_level="L3",
-                project_id=project_id,
+                project_id=project_id, run_id=self.run_id or None, stage=stage,
                 reason=f"Review pass escalated after {self.max_rounds} rounds: {reason}",
             )
         return {

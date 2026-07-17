@@ -267,8 +267,10 @@ export function StagePageP6({ projectId, runId = '', stageStatus: _stageStatus, 
               </div>
             ) : (
               <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-                {pkg.p6_final_gate_id
-                  ? `最终 Gate ${pkg.p6_final_gate_id} 已创建（待用户批准）。`
+                {/* ISSUE-04 修复：交付包序列化字典（delivery_package_to_dict）不含 p6_final_gate_id，
+                    旧版读该幻影字段永远走 else 分支；改为依据交付包是否已生成给出诚实文案。 */}
+                {pkg
+                  ? '交付包已生成。P6 最终 Gate 若处于待决策态会在上方展示；当前无待决策 Gate（可能已授权或尚未创建）。'
                   : 'Gate 尚未创建（需 P5 先通过验证）。'}
               </div>
             )}

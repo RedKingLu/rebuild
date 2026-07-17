@@ -109,6 +109,12 @@ class RunService:
     def start(self, run_id: str) -> Optional[RunResponse]:
         return self._transition(run_id, "running")
 
+    def set_run_status(self, run_id: str, status: str) -> Optional[RunResponse]:
+        """NEW-01: explicit run_status setter used by the background graph runner to
+        keep the Run row in sync with the LangGraph checkpoint (running while resuming,
+        waiting_gate when a Gate is pending, completed/blocked on terminal states)."""
+        return self._transition(run_id, status)
+
     def pause(self, run_id: str) -> Optional[RunResponse]:
         return self._transition(run_id, "paused")
 

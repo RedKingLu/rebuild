@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from app.core.status import RISK_LEVELS
 from app.services.task_graph_service import EDGE_TYPES
+from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,9 @@ _STAGE_PLAN_SYSTEM_PROMPT = (
     "严格输出 JSON，键为：objective(字符串,阶段目标), scope(数组,范围内事项), out_of_scope(数组,明确不做), "
     "risk_level(L0-L5), permission_boundary(字符串,权限边界), expected_artifacts(数组), "
     "expected_evidence(数组), gate_policy(对象,哪些情况触发 Gate), completion_criteria(数组,计划覆盖完成条件), "
-    "validation_strategy(字符串,P5 验证策略)。要求：方案必须来源于 P2 评估；必须声明 out_of_scope；"
+    "validation_strategy(字符串,P5 验证策略), basis_refs(数组,本计划所依据的上游 P2 产物 artifact ref)。"
+    "要求：方案必须来源于 P2 评估；basis_refs 必须内联列出本计划实际依据的上游 P2 产物 artifact ref"
+    "（只能取自【可引用上游产物】清单，勿杜撰）；必须声明 out_of_scope；"
     "高风险动作必须在 risk_level/gate_policy 中显式标识。你生成的是待用户审核的计划草案，"
     "不得替代执行、不得越过 Gate。"
 )
@@ -75,8 +78,10 @@ _TASK_PLAN_SYSTEM_PROMPT = (
     "task_plans(数组，每项含 objective(字符串), scope(数组), inputs(数组), expected_outputs(数组), "
     "risk_level(L0-L5), permission_boundary(字符串), required_resources(数组), "
     "model_policy_override(字符串或null), validation_method(字符串), expected_artifacts(数组), "
-    "expected_evidence(数组), title(字符串))。硬约束：每个 Task Plan 不得超出 Stage Plan 的 scope；"
-    "高风险(L4/L5)任务必须在 risk_level 显式标识；任务必须可追溯到 Stage Plan。"
+    "expected_evidence(数组), title(字符串), basis_refs(数组,本任务所依据的上游 Stage Plan/P2 产物 artifact ref)))。"
+    "硬约束：每个 Task Plan 不得超出 Stage Plan 的 scope；basis_refs 必须内联列出本任务实际依据的上游"
+    "产物 artifact ref（只能取自【可引用上游产物】清单，勿杜撰）；高风险(L4/L5)任务必须在 risk_level "
+    "显式标识；任务必须可追溯到 Stage Plan。"
 )
 
 _TASK_GRAPH_SYSTEM_PROMPT = (
@@ -101,8 +106,13 @@ class StagePlanResult:
     expected_evidence: list = field(default_factory=list)
     gate_policy: dict = field(default_factory=dict)
     completion_criteria: list = field(default_factory=list)
+    basis_refs: list = field(default_factory=list)   # C1: 计划内联引用的上游 P2 产物 artifact ref
     model_used: Optional[str] = None
     parse_error: bool = False
+    # WP-6 (Q-R17.3-6-2): 模型全失败中断的已尝试链路 + 错误分类 + 用户可采取操作
+    attempted_chain: list = field(default_factory=list)
+    model_error_category: str = ""
+    model_user_actions: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -114,7 +124,11 @@ class StagePlanResult:
             "expected_evidence": self.expected_evidence,
             "gate_policy": self.gate_policy,
             "completion_criteria": self.completion_criteria,
+            "basis_refs": self.basis_refs,
             "model_used": self.model_used, "parse_error": self.parse_error,
+            "attempted_chain": self.attempted_chain,
+            "model_error_category": self.model_error_category,
+            "model_user_actions": self.model_user_actions,
         }
 
 
@@ -128,8 +142,12 @@ class TaskPlanBatchResult:
     batch_objective: str = ""
     batch_risk_level: str = "L0"
     gate_required: bool = False       # §4.2-4: high-risk task in batch → Gate
+    task_basis_refs: list = field(default_factory=list)  # C1: 任务内联引用的上游 artifact ref（并集）
     model_used: Optional[str] = None
     parse_error: bool = False
+    attempted_chain: list = field(default_factory=list)
+    model_error_category: str = ""
+    model_user_actions: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -137,7 +155,11 @@ class TaskPlanBatchResult:
             "batch_id": self.batch_id, "stage_plan_ref": self.stage_plan_ref,
             "task_plan_ids": self.task_plan_ids, "batch_objective": self.batch_objective,
             "batch_risk_level": self.batch_risk_level, "gate_required": self.gate_required,
+            "task_basis_refs": self.task_basis_refs,
             "model_used": self.model_used, "parse_error": self.parse_error,
+            "attempted_chain": self.attempted_chain,
+            "model_error_category": self.model_error_category,
+            "model_user_actions": self.model_user_actions,
         }
 
 
@@ -153,6 +175,9 @@ class TaskGraphResult:
     validation_errors: list = field(default_factory=list)
     model_used: Optional[str] = None
     parse_error: bool = False
+    attempted_chain: list = field(default_factory=list)
+    model_error_category: str = ""
+    model_user_actions: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -161,6 +186,9 @@ class TaskGraphResult:
             "node_count": self.node_count, "edge_count": self.edge_count,
             "degraded": self.degraded, "validation_errors": self.validation_errors,
             "model_used": self.model_used, "parse_error": self.parse_error,
+            "attempted_chain": self.attempted_chain,
+            "model_error_category": self.model_error_category,
+            "model_user_actions": self.model_user_actions,
         }
 
 
@@ -221,15 +249,17 @@ class PlanningService:
         """Generate a Stage Plan from the P2 assessment via LLM, persist as draft."""
         gw = self._get_gateway()
 
-        # Q-R10-2: no available model → blocked, no rule fallback.
-        status = gw.get_status()
-        overall = getattr(status, "overall_status", None) or (
-            status.get("overall_status") if isinstance(status, dict) else None)
-        if overall != "available":
+        # Q-R10-2 / WP-6: no available model → blocked, no rule fallback + 候选模型链路。
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        if not readiness.get("available"):
             self._trace("P3 stage-plan blocked: no model", project_id, run_id, stage)
             return StagePlanResult(
                 status="blocked",
-                reason="no_model_key: 规划需要 LLM 支持，请配置有效 API Key（P3 不降级为规则规划）")
+                reason=("no_model_key: 规划需要 LLM 支持，请配置有效 API Key（P3 不降级为规则规划）"
+                        f"；{readiness.get('reason','')}"),
+                attempted_chain=readiness.get("attempted_chain", []),
+                model_error_category="model_unavailable",
+                model_user_actions=readiness.get("user_actions", []))
 
         inputs = self._gather_p2_inputs(project_id, user_goal)
         messages = [
@@ -238,17 +268,26 @@ class PlanningService:
         ]
         result = await gw.call(messages=messages, strategy_id=strategy_id,
                                max_tokens=_PLANNING_MAX_TOKENS, temperature=0.3, source="api",
-                               timeout=_PLANNING_TIMEOUT)
+                               timeout=_PLANNING_TIMEOUT,
+                               project_id=project_id, run_id=run_id, stage=stage)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
             self._trace(f"P3 stage-plan model call not completed: {reason}", project_id, run_id, stage)
-            return StagePlanResult(status="failed", reason=str(reason), model_used=result.get("model"))
+            return StagePlanResult(status="failed", reason=str(reason), model_used=result.get("model"),
+                                   attempted_chain=result.get("attempted_chain", []),
+                                   model_error_category=result.get("error_category", "model_unavailable"),
+                                   model_user_actions=_MODEL_USER_ACTIONS)
 
         parsed, parse_error = self._parse(result.get("content", ""))
         model_used = result.get("model")
         sp_id = self._persist_stage_plan(project_id, run_id, stage, parsed, model_used, inputs)
         self._trace("P3 stage-plan generated (draft)", project_id, run_id, stage)
         risk = parsed.get("risk_level", "L0")
+        # C1: 内联 basis_refs——仅保留模型引用且真实存在于本阶段已读取上游产物中的 ref
+        # （校验被引 ref 真实存在，勿杜撰；杜撰的 ref 被过滤，不进入内联引用）。
+        citable = set(f"artifacts/{n}" for n in inputs.get("sources_read", []))
+        raw_basis = parsed.get("basis_refs", []) or []
+        basis_refs = [r for r in raw_basis if isinstance(r, str) and r in citable]
         return StagePlanResult(
             status="completed", stage_plan_id=sp_id,
             objective=parsed.get("objective", "") or "",
@@ -259,6 +298,7 @@ class PlanningService:
             expected_evidence=parsed.get("expected_evidence", []) or [],
             gate_policy=parsed.get("gate_policy", {}) or {},
             completion_criteria=parsed.get("completion_criteria", []) or [],
+            basis_refs=basis_refs,
             model_used=model_used, parse_error=parse_error,
         )
 
@@ -284,14 +324,16 @@ class PlanningService:
         from app.models.stage_plan import StagePlan
 
         gw = self._get_gateway()
-        status = gw.get_status()
-        overall = getattr(status, "overall_status", None) or (
-            status.get("overall_status") if isinstance(status, dict) else None)
-        if overall != "available":
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        if not readiness.get("available"):
             self._trace("P3 task-plan blocked: no model", project_id, run_id, stage)
             return TaskPlanBatchResult(
                 status="blocked", stage_plan_ref=stage_plan_id,
-                reason="no_model_key: 规划需要 LLM 支持，请配置有效 API Key（P3 不降级为规则规划）")
+                reason=("no_model_key: 规划需要 LLM 支持，请配置有效 API Key（P3 不降级为规则规划）"
+                        f"；{readiness.get('reason','')}"),
+                attempted_chain=readiness.get("attempted_chain", []),
+                model_error_category="model_unavailable",
+                model_user_actions=readiness.get("user_actions", []))
 
         # §3.2-1: load the owning Stage Plan; missing → failed (no fabrication)
         db = self._db()
@@ -303,43 +345,57 @@ class PlanningService:
                     reason=f"stage_plan_not_found: {stage_plan_id}（Task Plan 必须承接已存在的 Stage Plan）")
             sp_scope = sp.scope or {}
             sp_objective = sp.objective or ""
+            # C1: 可引用上游产物 = 生成 Stage Plan 时真实读取的 P2 产物（plan_detail.p2_sources）。
+            sp_p2_sources = (sp.plan_detail or {}).get("p2_sources", []) or []
         finally:
             db.close()
 
+        citable = [f"artifacts/{n}" for n in sp_p2_sources]
         messages = [
             {"role": "system", "content": self._combine_system(_TASK_PLAN_SYSTEM_PROMPT, system_prompt)},
-            {"role": "user", "content": self._build_task_plan_prompt(sp_objective, sp_scope, user_goal)},
+            {"role": "user", "content": self._build_task_plan_prompt(sp_objective, sp_scope, user_goal, citable)},
         ]
         result = await gw.call(messages=messages, strategy_id=strategy_id,
                                max_tokens=_PLANNING_MAX_TOKENS, temperature=0.3, source="api",
-                               timeout=_PLANNING_TIMEOUT)
+                               timeout=_PLANNING_TIMEOUT,
+                               project_id=project_id, run_id=run_id, stage=stage)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
             self._trace(f"P3 task-plan model call not completed: {reason}", project_id, run_id, stage)
             return TaskPlanBatchResult(status="failed", stage_plan_ref=stage_plan_id,
-                                       reason=str(reason), model_used=result.get("model"))
+                                       reason=str(reason), model_used=result.get("model"),
+                                       attempted_chain=result.get("attempted_chain", []),
+                                       model_error_category=result.get("error_category", "model_unavailable"),
+                                       model_user_actions=_MODEL_USER_ACTIONS)
 
         parsed, parse_error = self._parse(result.get("content", ""))
         model_used = result.get("model")
         task_specs = parsed.get("task_plans", []) if isinstance(parsed.get("task_plans"), list) else []
         return self._persist_task_batch(
-            project_id, run_id, stage, stage_plan_id, parsed, task_specs, model_used, parse_error)
+            project_id, run_id, stage, stage_plan_id, parsed, task_specs, model_used,
+            parse_error, set(citable))
 
-    def _build_task_plan_prompt(self, sp_objective: str, sp_scope: dict, user_goal: str) -> str:
+    def _build_task_plan_prompt(self, sp_objective: str, sp_scope: dict, user_goal: str,
+                                citable: Optional[list] = None) -> str:
         return (
             f"Stage Plan 目标：{sp_objective or '（未提供）'}\n"
             f"Stage Plan 范围（不得超出）：{json.dumps(sp_scope, ensure_ascii=False)}\n"
             f"用户目标/约束：{user_goal or '（未提供）'}\n"
-            "请据此拆解出 Task Plan Batch（JSON）。每个 Task Plan 必须落在上述范围内。"
+            f"【可引用上游产物】（basis_refs 只能取自此清单，勿杜撰）：{citable or []}\n"
+            "请据此拆解出 Task Plan Batch（JSON）。每个 Task Plan 必须落在上述范围内，"
+            "并在 basis_refs 内联填写本任务所依据的上游产物 ref。"
         )
 
     def _persist_task_batch(self, project_id: str, run_id: Optional[str], stage: str,
                             stage_plan_id: str, parsed: dict, task_specs: list,
-                            model_used: Optional[str], parse_error: bool) -> TaskPlanBatchResult:
+                            model_used: Optional[str], parse_error: bool,
+                            citable: Optional[set] = None) -> TaskPlanBatchResult:
         """Persist each Task Plan row (shared batch_id + stage_plan_ref) and record
         batch metadata on the owning StagePlan.plan_detail (T4: no separate batch table)."""
         from app.models.stage_plan import StagePlan, TaskPlan
 
+        citable = citable or set()
+        task_basis: list[str] = []   # C1: union of valid per-task inline basis_refs
         batch_id = f"tpb-{uuid.uuid4().hex[:8]}"
         db = self._db()
         try:
@@ -348,6 +404,11 @@ class PlanningService:
             for spec in task_specs:
                 if not isinstance(spec, dict):
                     continue
+                # C1: validate per-task basis_refs against the citable upstream list
+                # (真实存在校验，勿杜撰) — invalid refs are dropped, not fabricated.
+                for r in (spec.get("basis_refs") or []):
+                    if isinstance(r, str) and r in citable and r not in task_basis:
+                        task_basis.append(r)
                 risk = spec.get("risk_level", "L0")
                 risk = risk if risk in RISK_LEVELS else "L0"
                 risks.append(risk)
@@ -405,6 +466,7 @@ class PlanningService:
                 "batch_risk_level": batch_risk,
                 "gate_required": gate_required,
                 "task_plan_refs": task_ids,
+                "task_basis_refs": task_basis,
                 "model_used": model_used,
             }
             # record batch metadata on the owning Stage Plan (no separate batch table, T4)
@@ -418,6 +480,7 @@ class PlanningService:
                 status="completed", batch_id=batch_id, stage_plan_ref=stage_plan_id,
                 task_plan_ids=task_ids, batch_objective=batch_meta["batch_objective"],
                 batch_risk_level=batch_risk, gate_required=gate_required,
+                task_basis_refs=task_basis,
                 model_used=model_used, parse_error=parse_error)
         finally:
             db.close()
@@ -453,14 +516,16 @@ class PlanningService:
         from app.models.stage_plan import StagePlan, TaskPlan
 
         gw = self._get_gateway()
-        status = gw.get_status()
-        overall = getattr(status, "overall_status", None) or (
-            status.get("overall_status") if isinstance(status, dict) else None)
-        if overall != "available":
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        if not readiness.get("available"):
             self._trace("P3 task-graph blocked: no model", project_id, run_id, stage)
             return TaskGraphResult(
                 status="blocked", stage_plan_ref=stage_plan_id,
-                reason="no_model_key: 规划需要 LLM 支持，请配置有效 API Key（P3 不降级为规则规划）")
+                reason=("no_model_key: 规划需要 LLM 支持，请配置有效 API Key（P3 不降级为规则规划）"
+                        f"；{readiness.get('reason','')}"),
+                attempted_chain=readiness.get("attempted_chain", []),
+                model_error_category="model_unavailable",
+                model_user_actions=readiness.get("user_actions", []))
 
         db = self._db()
         try:
@@ -491,11 +556,14 @@ class PlanningService:
                 status="failed", stage_plan_ref=stage_plan_id,
                 reason="no_task_plans: TaskGraph 承接 Task Plan，无任务计划无法生成（先跑 T14）")
 
-        proposed, model_used, parse_error, call_status, reason = await self._propose_edges(
+        proposed, model_used, parse_error, call_status, reason, _pe_chain = await self._propose_edges(
             nodes, user_goal, strategy_id, system_prompt=system_prompt)
         if call_status == "failed":
             return TaskGraphResult(status="failed", stage_plan_ref=stage_plan_id,
-                                   reason=reason, model_used=model_used)
+                                   reason=reason, model_used=model_used,
+                                   attempted_chain=_pe_chain,
+                                   model_error_category="model_unavailable",
+                                   model_user_actions=_MODEL_USER_ACTIONS)
 
         edges, degraded, val_errors = self._build_validated_edges(nodes, proposed)
         graph_id = self._persist_task_graph(
@@ -527,10 +595,10 @@ class PlanningService:
                                timeout=_PLANNING_TIMEOUT)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
-            return [], result.get("model"), False, "failed", str(reason)
+            return [], result.get("model"), False, "failed", str(reason), result.get("attempted_chain", [])
         parsed, parse_error = self._parse(result.get("content", ""))
         edges = parsed.get("edges", []) if isinstance(parsed.get("edges"), list) else []
-        return edges, result.get("model"), parse_error, "completed", ""
+        return edges, result.get("model"), parse_error, "completed", "", []
 
     def _build_validated_edges(self, nodes: list, proposed: list):
         """Turn LLM index-edges into strategy edges, inject high-risk gate safety,
@@ -722,13 +790,17 @@ class PlanningService:
         return inputs
 
     def _build_user_prompt(self, inputs: dict) -> str:
+        # 可引用上游产物清单：由本阶段真实读取到的 P2 产物构造（confirmed on disk），
+        # 供模型在 basis_refs 内联引用，避免杜撰不存在的 artifact id（C1 真内联）。
+        citable = [f"artifacts/{n}" for n in inputs.get("sources_read", [])]
         return (
             f"项目 ID：{inputs.get('project_id')}\n"
             f"用户目标/范围：{inputs.get('user_goal') or '（未提供）'}\n"
             f"已读取 P2 评估输入：{inputs.get('sources_read')}\n"
             f"缺失输入（登记为不确定项来源，不得脑补）：{inputs.get('missing')}\n"
+            f"【可引用上游产物】（basis_refs 只能取自此清单，勿杜撰）：{citable}\n"
             f"P2 评估摘要：{json.dumps({k: v for k, v in inputs.items() if k.endswith('.json')}, ensure_ascii=False)[:3500]}\n"
-            "请据此生成 Stage Plan（JSON）。"
+            "请据此生成 Stage Plan（JSON），并在 basis_refs 内联填写本计划所依据的上游 P2 产物 ref。"
         )
 
     # ── parse ────────────────────────────────────────────────────────────────

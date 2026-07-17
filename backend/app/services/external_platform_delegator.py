@@ -160,6 +160,7 @@ class ExternalPlatformDelegator:
                     mode=self._mode,
                     project_id=project_id,
                     in_plan=self._in_plan,
+                    run_id=str(getattr(run, "run_id", "") or "") if run is not None else None,
                 )
                 messages = await client.get_messages(session_id)
         except DelegationError:

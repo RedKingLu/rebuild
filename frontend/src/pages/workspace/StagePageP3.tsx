@@ -6,6 +6,7 @@
  */
 import { useState, useEffect } from 'react';
 import { Icon } from '../../components/ui/Icon';
+import { ModelUnavailableBanner } from '../../components/ui/ModelUnavailableBanner';
 import { RISK_LABELS } from '../../services/resourceService';
 
 interface Props {
@@ -94,7 +95,11 @@ export function StagePageP3({ projectId, stageStatus, onReExecute }: Props) {
           {onReExecute && <button className="btn sm" style={{ background: 'var(--orange)', color: '#fff' }} onClick={onReExecute}>重新执行</button>}
         </div>
       )}
-      {isBlocked && (
+      {/* WP-6：模型全失败强制中断 → 显式报错 */}
+      {data?.model_unavailable && (
+        <ModelUnavailableBanner info={data.model_unavailable} onReExecute={onReExecute} />
+      )}
+      {isBlocked && !data?.model_unavailable && (
         <div style={{ padding: '10px 14px', marginBottom: 12, background: 'var(--red-bg)', border: '1px solid var(--red)', borderRadius: 6, fontSize: 12, color: 'var(--red)', display: 'flex', alignItems: 'center', gap: 10 }}>
           <Icon name="blocked" size={16} />
           <span>阶段已被阻塞。P3 规划依赖有效模型（无 Key 不降级为规则规划），请确认模型配置或查看 Gate 决策原因。</span>

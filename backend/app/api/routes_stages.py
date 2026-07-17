@@ -284,10 +284,19 @@ def drain_graph_tasks(timeout: float = 30.0) -> None:
         _graph_tasks[:] = [f for f in _graph_tasks if not f.done()]
 
 
-async def _run_graph_bg(run_id: str, decision: str, project_id: str, stage: str):
-    """Background graph resume: run to completion, log and audit on failure.
+async def _run_graph_bg(run_id: str, decision: str | None, project_id: str, stage: str):
+    """Background graph drive: run to completion, log and audit on failure.
     Mirrors the post-resume DB sync the sync path used to do, keeping
     project.state fresh once the graph actually completes.
+
+    decision semantics:
+      - str ("approve"/"reject"/"request_changes"): resume a graph paused at a Gate
+        interrupt with the user's decision (Command(resume=decision)). This is the
+        promotion-decision path.
+      - None: continue a graph that was interrupted mid-work (no pending user Gate) —
+        used by the WP-8 restart-recovery scheduler to resume an orphaned "running" run
+        from its last durable checkpoint (ainvoke(None) re-runs the pending work node).
+        Never fabricates a Gate decision.
 
     NOTE: This runs in a dedicated thread with its own event loop (see
     _ensure_graph_task). LangGraph's async SqliteSaver binds its internal
@@ -302,20 +311,39 @@ async def _run_graph_bg(run_id: str, decision: str, project_id: str, stage: str)
     """
     svc = get_services()
     try:
+        # NEW-01: the graph is resuming and will execute stage work → the Run is running.
+        # Sync the DB Run row immediately so status queries don't show a stale value while
+        # the background graph advances. Best-effort — a status write failure must not
+        # abort the resume, but it must be voiced (state drift is a correctness concern).
+        try:
+            svc.run_service.set_run_status(run_id, "running")
+        except Exception:
+            logger.warning("图 resume 前同步 run_status=running 失败 run=%s", run_id, exc_info=True)
+
         from app.graph.checkpoint import open_standalone_checkpointer, thread_config
         from app.graph.graph import build_graph
         from langgraph.types import Command
         conn, saver = await open_standalone_checkpointer()
         try:
             g = build_graph().compile(checkpointer=saver)
-            graph_state = await g.ainvoke(Command(resume=decision),
+            # decision=None → continue an orphaned mid-work checkpoint (WP-8 recovery);
+            # a str decision → resume a Gate interrupt with the user's decision.
+            payload = Command(resume=decision) if decision is not None else None
+            graph_state = await g.ainvoke(payload,
                                           config=thread_config(run_id))
         finally:
             await conn.close()
         nxt = graph_state.get("current_stage")
+        # NEW-02: reflect the REAL waiting Gate produced by the resumed graph. When a
+        # stage node interrupts on a fresh pending Gate, project.active_gate must point at
+        # that gate_id (was hardcoded "" here, so the frontend lost the active Gate after
+        # every promotion). Empty pending_gate → clear it (terminal / no gate waiting).
+        pending_gate = graph_state.get("pending_gate") or {}
+        active_gate_id = pending_gate.get("gate_id") or "" if isinstance(pending_gate, dict) else ""
         if nxt:
             try:
-                svc.project_service.update(project_id, current_stage=nxt, active_gate="")
+                svc.project_service.update(project_id, current_stage=nxt,
+                                           active_gate=active_gate_id)
             except Exception:
                 # 发声：图已推进但 project.state 未同步会造成状态漂移（前端仍显示旧阶段）。
                 logger.warning("图完成后同步 project.current_stage 失败 run=%s stage=%s",
@@ -326,8 +354,30 @@ async def _run_graph_bg(run_id: str, decision: str, project_id: str, stage: str)
             except Exception:
                 # 发声：stage_status 未持久化会造成状态漂移，须可见。
                 logger.warning("图完成后同步 stage_status 失败 run=%s stage=%s", run_id, st, exc_info=True)
+        # NEW-01: sync the terminal / waiting run_status from the resolved graph state.
+        # The gate node sets run_status=completed (final approve) or blocked (reject);
+        # otherwise a pending Gate means the run is waiting_gate; else it is still running.
+        graph_run_status = graph_state.get("run_status")
+        if graph_run_status in ("completed", "blocked"):
+            final_run_status = graph_run_status
+        elif active_gate_id:
+            final_run_status = "waiting_gate"
+        else:
+            final_run_status = "running"
+        try:
+            svc.run_service.set_run_status(run_id, final_run_status)
+        except Exception:
+            logger.warning("图完成后同步 run_status 失败 run=%s status=%s",
+                           run_id, final_run_status, exc_info=True)
     except Exception as e:
         logger.error("background graph run failed run=%s: %s", run_id, e, exc_info=True)
+        # NEW-01: a failed background resume must leave the Run in an explicit failed
+        # state (not silently stuck at "running") so the frontend can surface the failure
+        # honestly (D-097: failures must be visible, never masked as success/progress).
+        try:
+            svc.run_service.set_run_status(run_id, "failed")
+        except Exception:
+            logger.warning("图失败后同步 run_status=failed 失败 run=%s", run_id, exc_info=True)
         try:
             svc.trace_writer.write("graph_error", action="graph_bg_failed",
                                    summary=f"Graph background resume failed: {e}",

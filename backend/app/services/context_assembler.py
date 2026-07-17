@@ -256,22 +256,58 @@ def _resolve_recipe(agent: Optional[dict]) -> dict:
     return dict(DEFAULT_CONTEXT_RECIPE)
 
 
+def _case_relevance_score(entry, project_id: str, stage: str) -> int:
+    """GAP-CASE-1: score a case entry's relevance to (project_id, stage).
+
+    Generic (禁硬编码 MicroOA)：用 type_metadata 的 applicable_stages / project_id 显式绑定，
+    再退化到 stage/project token 在 name/description/tags 的文本匹配。
+    """
+    meta = entry.type_metadata or {}
+    score = 0
+    stage_l = (stage or "").lower()
+    # explicit stage binding
+    stages = meta.get("applicable_stages") or meta.get("stages") or []
+    if isinstance(stages, str):
+        stages = [stages]
+    if any(str(s).lower() == stage_l for s in stages):
+        score += 3
+    # explicit project binding
+    if project_id and str(meta.get("project_id") or "") == project_id:
+        score += 3
+    # textual match on stage token
+    text = f"{entry.name or ''} {entry.description or ''} {' '.join(str(t) for t in (meta.get('tags') or []))}".lower()
+    if stage_l and stage_l in text:
+        score += 1
+    return score
+
+
 def _retrieve_cases(project_id: str, stage: str, max_cases: int = 3) -> list[dict]:
-    """Retrieve relevant case references for injection (T4.1 / R9-5-4).
+    """Retrieve relevant case references for injection (T4.1 / R9-5-4 + GAP-CASE-1).
 
     Returns list of {resource_id, name, description, never_execute, body_snippet}.
-    never_execute=True always (D-061: cases are read-only reference).
+    never_execute=True always (D-061: cases are read-only reference). Candidates are
+    ranked by relevance to (project_id, stage); when any candidate is relevant, only
+    relevant ones are returned (irrelevant excluded). When no candidate carries
+    stage/project signals, falls back to the enabled pool (no regression).
     """
     try:
         from app.core.database import get_session
         from app.models.resource_entry import ResourceEntry, ResourceType, ResourceStatus
         db = get_session()
         try:
-            entries = db.query(ResourceEntry).filter(
+            pool = db.query(ResourceEntry).filter(
                 ResourceEntry.resource_type == ResourceType.case,
                 ResourceEntry.enabled == True,
                 ResourceEntry.status.in_([ResourceStatus.active, ResourceStatus.read_only]),
-            ).limit(max_cases).all()
+            ).limit(50).all()
+            # GAP-CASE-1: rank by relevance; keep relevant ones if any, else fall back.
+            scored = [(_case_relevance_score(e, project_id, stage), e) for e in pool]
+            relevant = [(s, e) for s, e in scored if s > 0]
+            if relevant:
+                relevant.sort(key=lambda x: -x[0])
+                entries = [e for _s, e in relevant[:max_cases]]
+            else:
+                entries = pool[:max_cases]
             results = []
             for e in entries:
                 meta = e.type_metadata or {}

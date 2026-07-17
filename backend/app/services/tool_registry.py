@@ -448,6 +448,41 @@ async def execute_tool(
         if not confirmed and gate_state == "approved":
             approved_gate_id = gate_id
 
+    # PreToolUse hooks (WP-4 / GAP-SEC-2): run the Registry-registered PreToolUse hooks
+    # before the real dispatch. A block-mode hook returning "block" (e.g. pre-write policy
+    # rejecting a source/ write or secret-bearing content) stops execution — the tool does
+    # NOT run. Fully data-driven from the Registry (no hardcoded tool list). Read-only/MCP
+    # tools are passed through by the hook impl itself.
+    try:
+        from app.services.hook_engine import run_hooks
+        _svc_wr = None
+        try:
+            from app.dependencies import get_services
+            _svc_wr = get_services()
+        except Exception:
+            _svc_wr = None
+        pre = run_hooks(
+            "PreToolUse",
+            {"project_id": project_id, "tool_name": tool_name,
+             "write_scope": write_scope, "args": args, "stage": stage},
+            db,
+            tracer=tracer or (getattr(_svc_wr, "trace_writer", None) if _svc_wr else None),
+            auditor=(getattr(_svc_wr, "audit_writer", None) if _svc_wr else None),
+        )
+        if pre.blocked:
+            result = {
+                "status": "blocked_by_hook",
+                "tool_name": tool_name,
+                "hook_point": "PreToolUse",
+                "reason": pre.block_reason,
+                "hooks_run": [r.hook_name for r in pre.results],
+            }
+            _write_trace(tracer, project_id, tool_name, args, result)
+            return result
+    except Exception:
+        # 发声：Hook 引擎异常必须可见，但不因引擎故障阻断已授权的合法工具（fail-open 仅限引擎自身故障）。
+        logger.warning("tool_registry: PreToolUse hook 引擎异常 tool=%s", tool_name, exc_info=True)
+
     # Execute by scope. run_safe_command / execute-scope tools are checked first because
     # run_safe_command carries no write_scope (defaults to "none") yet must run via provider.
     if tool_name == "run_safe_command" or write_scope in ("execute", "system"):
@@ -485,11 +520,21 @@ async def execute_tool(
             logger.warning("tool_registry: gate 一次性消费失败 gate=%s tool=%s: %s",
                            approved_gate_id, tool_name, e)
 
+    # PostToolUse hooks (WP-4 / GAP-SEC-2): advisory pass after a successful dispatch.
+    try:
+        from app.services.hook_engine import run_hooks
+        run_hooks(
+            "PostToolUse",
+            {"project_id": project_id, "tool_name": tool_name,
+             "write_scope": write_scope, "args": args, "stage": stage,
+             "result_status": result.get("status")},
+            db, tracer=tracer,
+        )
+    except Exception:
+        logger.warning("tool_registry: PostToolUse hook 引擎异常 tool=%s", tool_name, exc_info=True)
+
     _write_trace(tracer, project_id, tool_name, args, result)
     return result
-
-
-# ── Internal dispatch helpers ─────────────────────────────────────────────────
 
 async def _execute_builtin(tool_name: str, args: dict, project_id: str, stage: str) -> dict:
     """Handle the three built-in tool implementations."""

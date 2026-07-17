@@ -28,6 +28,35 @@ from app.core.audit_writer import AuditWriter
 logger = logging.getLogger("rebuild.model_gateway")
 
 
+# R17.3-6 WP-6 (Q-R17.3-6-2): 模型全失败强制中断时，前端可向用户呈现的可采取操作。
+# 结构化（action + 中文 label + 前端跳转 target），供 GatePanel / StagePage 显式报错渲染。
+MODEL_UNAVAILABLE_USER_ACTIONS: list[dict] = [
+    {"action": "configure", "label": "配置模型 / API Key", "target": "models"},
+    {"action": "switch", "label": "切换模型策略（默认 / 回退链）", "target": "models"},
+    {"action": "retry", "label": "重新执行本阶段", "target": "re_execute"},
+]
+
+
+def _attempt_entry(profile, provider, model: str, outcome: str, *,
+                   error_category: str = "", error_message: str = "",
+                   is_fallback: bool = False) -> dict:
+    """构造「已尝试模型链路」的一条记录（Q-R17.3-6-2 前端显式报错所需）。
+
+    仅含非敏感标识（profile_id/provider_id/model 名）与已脱敏的错误分类/消息
+    （error_message 由 LiteLLMAdapter._classify_litellm_error 预脱敏，不含 Key）。
+    outcome ∈ completed / failed / credential_missing / not_configured / skipped。
+    """
+    return {
+        "profile_id": getattr(profile, "profile_id", "") if profile else "",
+        "provider_id": getattr(provider, "provider_id", "") if provider else "",
+        "model": model or "",
+        "is_fallback": is_fallback,
+        "outcome": outcome,
+        "error_category": error_category,
+        "error_message": error_message,
+    }
+
+
 @dataclass
 class ModelGatewayStatus:
     """Aggregate status for GET /api/model/status."""
@@ -266,6 +295,126 @@ class ModelGateway:
 
     # ── Model call ────────────────────────────────────────────────────
 
+    def _build_profiles_to_try(self, profile, provider, reason: str,
+                               strategy_id: str, user_override: Optional[str]) -> list[tuple]:
+        """按策略构造顺位尝试链：主 profile + strategy.fallback_profile_refs（仅非显式
+        override 路径，D-098 策略化顺位回退）。每项 (profile, provider, reason, is_fallback)。
+        跳过未配置 / provider 缺失的 fallback（诚实：不把不可用项计入可尝试链）。"""
+        profiles_to_try: list[tuple] = [(profile, provider, reason, False)]
+        if user_override is not None:
+            return profiles_to_try  # 显式指定 → 不跨 provider 回退（D-036/D-098）
+        strategy = self._registry.get_strategy(strategy_id)
+        for fb_ref in (strategy.fallback_profile_refs if strategy else []):
+            if fb_ref == profile.profile_id:
+                continue
+            fb_p = self._registry.get_profile(fb_ref)
+            if not fb_p or fb_p.status != "configured":
+                continue
+            fb_prov = self._registry.get_provider(fb_p.provider_id)
+            if fb_prov:
+                profiles_to_try.append((fb_p, fb_prov, f"fallback:{fb_ref}", True))
+        return profiles_to_try
+
+    def stage_model_readiness(self, *, strategy_id: str = "system-default",
+                              user_override: Optional[str] = None,
+                              preferred_ref: Optional[str] = None,
+                              require_tool_calling: bool = False) -> dict:
+        """阶段模型就绪度预检（Q-R17.3-6-2）：在真正调用前判断「是否存在任一按策略
+        可用的模型」以及「阶段所需能力是否可满足」。返回结构化候选链，供阶段服务在
+        无模型可用时**诚实中断**并把「已尝试/候选模型链路」透传前端——即便一次网络调用
+        都未发生（纯未配置场景），前端仍能显式看到考察过的模型链路。
+
+        available=False → 阶段应彻底中断（禁止规则兜底冒充 LLM，D-097/公理3）。
+        探查为「configured + 具备凭据」（非实时网络可达；可达失败由运行期调用驱动回退
+        捕获，见 call()/call_stream 的 attempted_chain）。
+        """
+        profile, reason, provider = self._registry.resolve_model(
+            user_override=user_override, strategy_id=strategy_id, preferred_ref=preferred_ref)
+        candidates: list[dict] = []
+        capability_ok = False
+        available = False
+
+        if profile is not None and provider is not None:
+            chain = self._build_profiles_to_try(profile, provider, reason, strategy_id, user_override)
+        else:
+            # 无 resolved 主模型：仍从策略默认 + 回退链枚举候选，给前端可见的候选链路。
+            chain = []
+            strategy = self._registry.get_strategy(strategy_id)
+            for ref in ([strategy.default_profile_ref] + list(strategy.fallback_profile_refs)
+                        if strategy else []):
+                if not ref:
+                    continue
+                p = self._registry.get_profile(ref)
+                prov = self._registry.get_provider(p.provider_id) if p else None
+                if p and prov:
+                    chain.append((p, prov, f"candidate:{ref}", ref != (strategy.default_profile_ref if strategy else None)))
+
+        for cand_profile, cand_provider, cand_reason, is_fb in chain:
+            model_name = resolve_api_model_name(cand_profile, cand_provider.api_format)
+            if cand_profile.status != "configured":
+                candidates.append(_attempt_entry(cand_profile, cand_provider, model_name,
+                                                  "not_configured", error_category="not_configured",
+                                                  error_message="模型未配置", is_fallback=is_fb))
+                continue
+            key_val, _ = self._resolve_key(cand_provider, False)
+            if not key_val:
+                candidates.append(_attempt_entry(cand_profile, cand_provider, model_name,
+                                                  "credential_missing", error_category="credential_missing",
+                                                  error_message=f"{cand_provider.provider_id} 无可用凭据",
+                                                  is_fallback=is_fb))
+                continue
+            cap_ok = (not require_tool_calling) or bool(getattr(cand_profile, "supports_tool_calling", False))
+            candidates.append(_attempt_entry(cand_profile, cand_provider, model_name,
+                                             "candidate_ready" if cap_ok else "capability_unmet",
+                                             error_category="" if cap_ok else "capability_unmet",
+                                             error_message="" if cap_ok else "该模型不支持阶段所需的 tool_calling 能力",
+                                             is_fallback=is_fb))
+            if cap_ok:
+                available = True
+                capability_ok = True
+
+        if available:
+            rsn = ""
+        elif require_tool_calling and any(c["outcome"] == "capability_unmet" for c in candidates):
+            rsn = "阶段所需模型能力（tool_calling）不可满足：无任一已配置模型支持该能力"
+        else:
+            rsn = "无任一已配置且具备有效凭据的模型可用"
+        return {"available": available, "capability_ok": capability_ok,
+                "reason": rsn, "attempted_chain": candidates,
+                "user_actions": list(MODEL_UNAVAILABLE_USER_ACTIONS)}
+
+    def _emit_model_event(self, *, action: str, summary: str, project_id: Optional[str],
+                          run_id: Optional[str], stage: Optional[str],
+                          attempted_chain: Optional[list] = None,
+                          audit: bool = False, risk_level: str = "L2") -> None:
+        """回退 / 全失败中断的 Trace（每一步）+ Audit（中断）记录（Q-R17.3-6-2）。
+        best-effort：记录失败不影响主调用。链路仅含非敏感标识 + 已脱敏错误消息。"""
+        try:
+            from app.dependencies import get_services
+            services = get_services()
+        except Exception:
+            return
+        try:
+            tw = getattr(services, "trace_writer", None)
+            if tw is not None:
+                tw.write("model_gateway", action=action, summary=summary,
+                         project_id=project_id, run_id=run_id, stage=stage)
+        except Exception:
+            logger.debug("model_gateway trace(%s) 写入失败（advisory）", action, exc_info=True)
+        if audit:
+            try:
+                aw = getattr(services, "audit_writer", None)
+                if aw is not None:
+                    chain_txt = "; ".join(
+                        f"{c['profile_id']}={c['outcome']}({c['error_category']})"
+                        for c in (attempted_chain or []))
+                    aw.write(audit_type="model_unavailable", action=action,
+                             decision="blocked", risk_level=risk_level,
+                             project_id=project_id, run_id=run_id, stage=stage,
+                             reason=f"{summary}；已尝试模型链路：{chain_txt}")
+            except Exception:
+                logger.debug("model_gateway audit(%s) 写入失败（advisory）", action, exc_info=True)
+
     async def call(
         self,
         *,
@@ -277,6 +426,9 @@ class ModelGateway:
         stream: bool = False,
         timeout: Optional[float] = None,
         source: str = "api",  # "api" | "self_test" | "platform_assistant"
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        stage: Optional[str] = None,
     ) -> dict:
         """Execute a model call through the gateway.
 
@@ -308,76 +460,92 @@ class ModelGateway:
         )
 
         if not profile or not provider:
-            return _call_error("not_configured", "No configured model available", reason)
+            # 无任一按策略可用的模型 → 全失败强制中断（Q-R17.3-6-2）。给出候选链路供前端显式报错。
+            readiness = self.stage_model_readiness(strategy_id=strategy_id, user_override=user_override)
+            self._emit_model_event(
+                action="model_unavailable", summary="无任一按策略可用的模型（未配置 / 无凭据）",
+                project_id=project_id, run_id=run_id, stage=stage,
+                attempted_chain=readiness["attempted_chain"], audit=True, risk_level="L2")
+            return _call_error("model_unavailable", readiness["reason"] or "No configured model available",
+                               reason, attempted_chain=readiness["attempted_chain"])
 
         # R13-6: resolved 结果碰巧是一个 Fusion virtual_ref（防御性分派，罕见路径）
         fusion_fp = self._load_fusion_profile(profile.profile_id)
         if fusion_fp is not None:
             return await self._dispatch_fusion(fusion_fp, messages, source=source)
 
-        # 2. Get API key — try credential_ref first, then env fallback
+        # 2. 按策略构造顺位尝试链（主 + fallback），逐个尝试并记录「已尝试模型链路」
+        #    （D-098 策略化顺位回退；Q-R17.3-6-2 全失败强制中断 + attempted_chain）。
+        profiles_to_try = self._build_profiles_to_try(
+            profile, provider, reason, strategy_id, user_override)
+        attempted_chain: list[dict] = []
+        result: Optional[ModelCallResult] = None
+        sel_profile, sel_provider, sel_reason, sel_is_fb = profile, provider, reason, False
         explicit_provider = user_override is not None
-        key_val, key_source = self._resolve_key(provider, explicit_provider)
-        if not key_val:
-            return _call_error("credential_missing", f"No API key configured for {provider.provider_id}", reason)
 
-        # 3. Determine endpoint based on api_format
-        api_format = provider.api_format
-        if api_format == "anthropic" and provider.endpoint_anthropic:
-            api_base = provider.endpoint_anthropic
-        else:
-            api_base = provider.endpoint_openai or provider.endpoint_anthropic
+        for try_profile, try_provider, try_reason, is_fb in profiles_to_try:
+            model_name = resolve_api_model_name(try_profile, try_provider.api_format)
+            key_val, key_source = self._resolve_key(try_provider, explicit_provider)
+            if not key_val:
+                attempted_chain.append(_attempt_entry(
+                    try_profile, try_provider, model_name, "credential_missing",
+                    error_category="credential_missing",
+                    error_message=f"No API key configured for {try_provider.provider_id}",
+                    is_fallback=is_fb))
+                continue
 
-        # 4. Normalize model name
-        litellm_model = resolve_api_model_name(profile, api_format)
+            api_format = try_provider.api_format
+            if api_format == "anthropic" and try_provider.endpoint_anthropic:
+                api_base = try_provider.endpoint_anthropic
+            else:
+                api_base = try_provider.endpoint_openai or try_provider.endpoint_anthropic
 
-        # 5. Execute via adapter
-        result = await self._adapter.complete(
-            model=litellm_model,
-            messages=messages,
-            api_base=api_base,
-            api_key=key_val,
-            api_format=api_format,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stream=stream,
-            timeout=timeout,
-        )
+            r = await self._adapter.complete(
+                model=model_name, messages=messages, api_base=api_base, api_key=key_val,
+                api_format=api_format, max_tokens=max_tokens, temperature=temperature,
+                stream=stream, timeout=timeout,
+            )
+            if r.status == "completed":
+                attempted_chain.append(_attempt_entry(
+                    try_profile, try_provider, model_name, "completed", is_fallback=is_fb))
+                result = r
+                sel_profile, sel_provider, sel_reason, sel_is_fb = \
+                    try_profile, try_provider, (try_reason if is_fb else reason), is_fb
+                if is_fb:
+                    r.fallback_used = True
+                    r.fallback_from = profile.profile_id
+                    self._emit_model_event(
+                        action="model_fallback",
+                        summary=f"主模型 {profile.profile_id} 不可用，已按策略回退至 {try_profile.profile_id}",
+                        project_id=project_id, run_id=run_id, stage=stage,
+                        attempted_chain=attempted_chain)
+                break
+            # 失败 → 记录并继续尝试下一个 fallback（除非显式 override）
+            attempted_chain.append(_attempt_entry(
+                try_profile, try_provider, model_name, "failed",
+                error_category=r.error_category, error_message=r.error_message, is_fallback=is_fb))
+            result = r
+            sel_profile, sel_provider, sel_reason, sel_is_fb = try_profile, try_provider, try_reason, is_fb
 
-        # 5b. Runtime fallback: if call failed and no explicit override, try strategy fallback profiles
-        if result.status == "failed" and user_override is None:
-            strategy = self._registry.get_strategy(strategy_id)
-            for fb_ref in (strategy.fallback_profile_refs if strategy else []):
-                if fb_ref == profile.profile_id:
-                    continue
-                fb_profile = self._registry.get_profile(fb_ref)
-                if not fb_profile or fb_profile.status != "configured":
-                    continue
-                fb_provider = self._registry.get_provider(fb_profile.provider_id)
-                if not fb_provider:
-                    continue
-                fb_key, _ = self._resolve_key(fb_provider, False)
-                if not fb_key:
-                    continue
-                fb_format = fb_provider.api_format
-                fb_base = (fb_provider.endpoint_anthropic
-                           if fb_format == "anthropic" and fb_provider.endpoint_anthropic
-                           else fb_provider.endpoint_openai or fb_provider.endpoint_anthropic)
-                fb_model = resolve_api_model_name(fb_profile, fb_format)
-                fb_result = await self._adapter.complete(
-                    model=fb_model, messages=messages, api_base=fb_base, api_key=fb_key,
-                    api_format=fb_format, max_tokens=max_tokens, temperature=temperature,
-                    stream=stream, timeout=timeout,
-                )
-                if fb_result.status == "completed":
-                    fb_result.fallback_used = True
-                    fb_result.fallback_from = profile.profile_id
-                    result = fb_result
-                    profile = fb_profile
-                    provider = fb_provider
-                    reason = f"fallback:{fb_ref}"
-                    litellm_model = fb_model
-                    break
+        # 全失败强制中断：无任一 profile completed（禁止静默降级 / 假成功，D-097/公理3）。
+        if result is None or result.status != "completed":
+            if result is not None and result.status == "failed":
+                err_cat, err_msg, err_status = (result.error_category or "model_unavailable",
+                                                result.error_message or "所有可用模型均调用失败", "failed")
+            else:
+                err_cat, err_msg, err_status = ("credential_missing",
+                                                "无任一已配置且具备有效凭据的模型", "blocked")
+            self._emit_model_event(
+                action="model_unavailable",
+                summary=f"所有可用模型均不可用（{err_cat}），阶段模型调用强制中断",
+                project_id=project_id, run_id=run_id, stage=stage,
+                attempted_chain=attempted_chain, audit=True, risk_level="L2")
+            err = _call_error(err_cat, err_msg, sel_reason, attempted_chain=attempted_chain)
+            err["status"] = err_status
+            return err
+
+        litellm_model = resolve_api_model_name(sel_profile, sel_provider.api_format)
+        profile, provider, reason = sel_profile, sel_provider, sel_reason
 
         # 6. Record call log — persist to DB (FB-006) + in-memory
         latency = (time.monotonic() - t0) * 1000
@@ -416,6 +584,8 @@ class ModelGateway:
             "retry_count": result.retry_count,
             "fallback_used": result.fallback_used,
             "call_record": call_record,
+            "attempted_chain": attempted_chain,
+            "model_unavailable": False,
         }
 
     async def call_stream(
@@ -472,26 +642,22 @@ class ModelGateway:
         )
 
         if not profile or not provider:
+            readiness = self.stage_model_readiness(
+                strategy_id=strategy_id, user_override=user_override, preferred_ref=preferred_ref)
+            self._emit_model_event(
+                action="model_unavailable", summary="无任一按策略可用的模型（流式，未配置 / 无凭据）",
+                project_id=project_id, run_id=None, stage=None,
+                attempted_chain=readiness["attempted_chain"], audit=True)
             yield {
-                "type": "error", "error_category": "not_configured",
-                "error_message": "No configured model available",
+                "type": "error", "error_category": "model_unavailable",
+                "error_message": readiness["reason"] or "No configured model available",
+                "attempted_chain": readiness["attempted_chain"], "model_unavailable": True,
             }
             return
 
-        # 2. Build ordered profiles_to_try: primary + strategy fallbacks
-        strategy = self._registry.get_strategy(strategy_id)
-        fallback_refs: list[str] = list(strategy.fallback_profile_refs) if strategy else []
-        profiles_to_try: list[tuple] = [(profile, provider, reason, False)]
-        if user_override is None:
-            for fb_ref in fallback_refs:
-                if fb_ref == profile.profile_id:
-                    continue
-                fb_p = self._registry.get_profile(fb_ref)
-                if not fb_p or fb_p.status != "configured":
-                    continue
-                fb_prov = self._registry.get_provider(fb_p.provider_id)
-                if fb_prov:
-                    profiles_to_try.append((fb_p, fb_prov, f"fallback:{fb_ref}", True))
+        # 2. Build ordered profiles_to_try: primary + strategy fallbacks（D-098 策略化顺位回退）
+        profiles_to_try = self._build_profiles_to_try(
+            profile, provider, reason, strategy_id, user_override)
 
         # State for call log
         status = "failed"
@@ -506,6 +672,8 @@ class ModelGateway:
         selected_reason = reason
         tokens_committed = False
         stream_done = False
+        # Q-R17.3-6-2: 已尝试模型链路（流式），供全失败中断时前端显式报错。
+        attempted_chain: list[dict] = []
 
         # UX-1 FIX: the call-log write below MUST live in `finally`. Streaming consumers
         # (agent_loop and every SSE endpoint) `break` out of their `async for` on the
@@ -516,17 +684,22 @@ class ModelGateway:
         # platform_assistant calls (which persist inline in call()) were the only rows.
         try:
             for try_profile, try_provider, try_reason, is_fb in profiles_to_try:
+                _model_name = resolve_api_model_name(try_profile, try_provider.api_format)
                 key_val, _ = self._resolve_key(try_provider, user_override is not None)
                 if not key_val:
                     last_error_cat = "credential_missing"
                     last_error_msg = f"No API key for {try_provider.provider_id}"
+                    attempted_chain.append(_attempt_entry(
+                        try_profile, try_provider, _model_name, "credential_missing",
+                        error_category="credential_missing", error_message=last_error_msg,
+                        is_fallback=is_fb))
                     continue
 
                 api_format = try_provider.api_format
                 api_base = (try_provider.endpoint_anthropic
                             if api_format == "anthropic" and try_provider.endpoint_anthropic
                             else try_provider.endpoint_openai or try_provider.endpoint_anthropic)
-                litellm_model = resolve_api_model_name(try_profile, api_format)
+                litellm_model = _model_name
 
                 profile_failed_pre_token = False
 
@@ -543,6 +716,10 @@ class ModelGateway:
                             last_error_cat = frame.get("error_category", "stream_error")
                             last_error_msg = frame.get("error_message", "")
                             status = "failed"
+                            attempted_chain.append(_attempt_entry(
+                                try_profile, try_provider, litellm_model, "failed",
+                                error_category=last_error_cat, error_message=last_error_msg,
+                                is_fallback=is_fb))
                             yield frame
                             stream_done = True
                             break
@@ -552,6 +729,10 @@ class ModelGateway:
                             last_error_msg = frame.get("error_message", "")
                             call_id = frame.get("call_id", call_id)
                             profile_failed_pre_token = True
+                            attempted_chain.append(_attempt_entry(
+                                try_profile, try_provider, litellm_model, "failed",
+                                error_category=last_error_cat, error_message=last_error_msg,
+                                is_fallback=is_fb))
                             break
 
                     elif ftype == "done":
@@ -566,6 +747,9 @@ class ModelGateway:
                         status = "completed"
                         last_error_cat = ""
                         last_error_msg = ""
+                        attempted_chain.append(_attempt_entry(
+                            try_profile, try_provider, litellm_model, "completed",
+                            is_fallback=is_fb))
                         yield frame
                         stream_done = True
                         break
@@ -580,6 +764,12 @@ class ModelGateway:
                             if is_fb:
                                 fallback_used = True
                                 fallback_from = profiles_to_try[0][0].profile_id
+                                self._emit_model_event(
+                                    action="model_fallback",
+                                    summary=(f"主模型 {profiles_to_try[0][0].profile_id} 不可用，"
+                                             f"已按策略回退至 {try_profile.profile_id}（流式）"),
+                                    project_id=project_id, run_id=None, stage=None,
+                                    attempted_chain=attempted_chain)
                         yield frame
 
                 if stream_done:
@@ -592,11 +782,17 @@ class ModelGateway:
                     try_profile.profile_id, last_error_cat,
                 )
 
-            # If all profiles exhausted without any commit or done
+            # If all profiles exhausted without any commit or done → 全失败强制中断
             if not stream_done and not tokens_committed:
+                self._emit_model_event(
+                    action="model_unavailable",
+                    summary=f"所有可用模型均不可用（{last_error_cat}），流式阶段模型调用强制中断",
+                    project_id=project_id, run_id=None, stage=None,
+                    attempted_chain=attempted_chain, audit=True)
                 yield {
-                    "type": "error", "error_category": last_error_cat,
+                    "type": "error", "error_category": last_error_cat or "model_unavailable",
                     "error_message": last_error_msg, "call_id": call_id,
+                    "attempted_chain": attempted_chain, "model_unavailable": True,
                 }
         finally:
             # Write call log (always — 公理3; runs even when the consumer breaks early
@@ -1027,7 +1223,8 @@ def _strategy_to_dict(s: StrategyInfo) -> dict:
     }
 
 
-def _call_error(error_category: str, message: str, reason: str = "") -> dict:
+def _call_error(error_category: str, message: str, reason: str = "",
+                attempted_chain: Optional[list] = None) -> dict:
     return {
         "call_id": "",
         "status": "blocked",
@@ -1043,6 +1240,8 @@ def _call_error(error_category: str, message: str, reason: str = "") -> dict:
         "retry_count": 0,
         "fallback_used": False,
         "call_record": None,
+        "attempted_chain": attempted_chain or [],
+        "model_unavailable": True,
     }
 
 

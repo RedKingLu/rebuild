@@ -135,11 +135,17 @@ class RealP0Handler:
 
         assembly_trace = context_package.get("assembly_trace", {})
 
+        # NEW-05 (R17.3-6 WP-5): artifacts 真实反映实际写入的产物。P0 写 intake_report.json，
+        # 且 file_count>0 时 generate_source_index 写 source_index.json——旧实现硬编码只报
+        # intake_report.json，漏报 source_index.json（construction 欠报）。按盘上存在性汇集。
+        produced_artifacts = [f"artifacts/{n}" for n in ("intake_report.json", "source_index.json")
+                              if (art_dir / n).exists()]
+
         return {
             "file_count": file_count,
             "source_type": src_type,
             "materialized": materialized,
-            "artifacts": ["artifacts/intake_report.json"],
+            "artifacts": produced_artifacts,
             "assembly_trace": assembly_trace,
             "evidence_candidates": [
                 {"evidence_id": f"ev-p0-ws-{project_id[:8]}",
@@ -309,6 +315,10 @@ class RealP2Handler:
             "context_refs": result.context_refs,
             "skill_refs": result.skill_refs,
             "assembly_trace": context_package.get("assembly_trace", {}),
+            # WP-6 (Q-R17.3-6-2): 模型全失败中断的已尝试链路透传（WorkAgent → 前端显式报错）。
+            "attempted_chain": getattr(result, "attempted_chain", []),
+            "model_error_category": getattr(result, "model_error_category", ""),
+            "model_user_actions": getattr(result, "model_user_actions", []),
         }
 
     def _write_artifacts(self, project_id: str, result) -> List[str]:
@@ -430,20 +440,29 @@ class RealP3Handler:
                                            user_goal=user_goal, system_prompt=system_prompt)
         if sp.status != "completed":
             return {"status": sp.status, "reason": sp.reason,
-                    "stage_plan_ref": sp.stage_plan_id, "artifacts": [], "evidence_refs": []}
+                    "stage_plan_ref": sp.stage_plan_id, "artifacts": [], "evidence_refs": [],
+                    "attempted_chain": sp.attempted_chain,
+                    "model_error_category": sp.model_error_category,
+                    "model_user_actions": sp.model_user_actions}
         batch = await svc.generate_task_plans(project_id, sp.stage_plan_id,
                                               run_id=run_id, stage="p3", user_goal=user_goal,
                                               system_prompt=system_prompt)
         if batch.status != "completed":
             return {"status": batch.status, "reason": batch.reason,
-                    "stage_plan_ref": sp.stage_plan_id, "artifacts": [], "evidence_refs": []}
+                    "stage_plan_ref": sp.stage_plan_id, "artifacts": [], "evidence_refs": [],
+                    "attempted_chain": batch.attempted_chain,
+                    "model_error_category": batch.model_error_category,
+                    "model_user_actions": batch.model_user_actions}
         tg = await svc.generate_task_graph(project_id, sp.stage_plan_id,
                                            run_id=run_id, stage="p3", user_goal=user_goal,
                                            system_prompt=system_prompt)
         if tg.status != "completed":
             return {"status": tg.status, "reason": tg.reason,
                     "stage_plan_ref": sp.stage_plan_id, "task_graph_ref": tg.task_graph_id,
-                    "artifacts": [], "evidence_refs": []}
+                    "artifacts": [], "evidence_refs": [],
+                    "attempted_chain": tg.attempted_chain,
+                    "model_error_category": tg.model_error_category,
+                    "model_user_actions": tg.model_user_actions}
 
         # T16 Evidence + §5.6 Artifacts (only when all three completed)
         persisted = svc.persist_p3_evidence(project_id, sp, batch, tg, stage="p3",
@@ -456,6 +475,9 @@ class RealP3Handler:
             "task_plan_ids": batch.task_plan_ids, "degraded": tg.degraded,
             "batch_risk_level": batch.batch_risk_level, "gate_required": batch.gate_required,
             "artifacts": artifacts, "evidence_refs": evidence_refs, "model_used": sp.model_used,
+            # C1: 主输出内联携带的上游引用（供 WorkAgent 构造 claim-evidence，非二遍归因）。
+            "basis_refs": sp.basis_refs,
+            "task_basis_refs": batch.task_basis_refs,
             "context_refs": context_refs, "skill_refs": skill_refs,
             "assembly_trace": context_package.get("assembly_trace", {}),
         }
@@ -674,9 +696,14 @@ class RealP4Handler:
         evidence_refs = [e.get("evidence_id") for e in p4_ev if e.get("evidence_id")]
         artifacts: list[str] = []
         patch_refs: list[str] = []
+        # C1: 每个 output_code 派生自哪个源文件（真实迁移溯源，来自落盘 Evidence 的 source_ref）——
+        # 作为主输出内联引用供 WorkAgent 构造 claim-evidence（非第二遍 LLM 归因）。
+        code_source_map: dict[str, str] = {}
         for e in p4_ev:
             if e.get("output_code_ref"):
                 artifacts.append(e["output_code_ref"])
+                if e.get("source_ref"):
+                    code_source_map[e["output_code_ref"]] = e["source_ref"]
             if e.get("patch_ref"):
                 artifacts.append(e["patch_ref"]); patch_refs.append(e["patch_ref"])
         acceptance_results = [{"node_id": nid, **((r or {}).get("acceptance") or {})}
@@ -691,6 +718,18 @@ class RealP4Handler:
         # graph_status → handler status：completed→completed；其余（failed/waiting_gate/blocked/
         # rework_required）→ blocked（诚实非 completed，交 StageLoop 升级 Gate / 准备 P4→P5 Gate）。
         status = "completed" if eng.graph_status == "completed" else "blocked"
+
+        # WP-6 (Q-R17.3-6-2): 若有 execution 节点因模型全失败中断 → 汇总首个模型错误链路到
+        # 阶段级，供 WorkAgent/前端显式报错（不静默降级）。
+        _p4_chain: list = []
+        _p4_cat = ""
+        _p4_actions: list = []
+        for _nr in (eng.node_results.values() if hasattr(eng, "node_results") else []):
+            if isinstance(_nr, dict) and _nr.get("model_error_category"):
+                _p4_chain = _nr.get("attempted_chain", []) or []
+                _p4_cat = _nr.get("model_error_category", "")
+                _p4_actions = _nr.get("model_user_actions", []) or []
+                break
 
         return {
             "status": status,
@@ -710,9 +749,13 @@ class RealP4Handler:
             "edge_count": tg["edge_count"],
             "engine_events": eng.events,
             "acceptance_results": acceptance_results,
+            "attempted_chain": _p4_chain,
+            "model_error_category": _p4_cat,
+            "model_user_actions": _p4_actions,
             "artifacts": artifacts + ([summary_ref] if summary_ref else []),
             "evidence_refs": evidence_refs,
             "patch_refs": patch_refs,
+            "code_source_map": code_source_map,
             "assembly_trace": assembly_trace,
         }
 
@@ -1005,6 +1048,14 @@ class RealP5Handler:
         self._persist_p5_validation_report(project_id, run_id, plan_dict,
                                             verify_results, conditional_details)
 
+        # NEW-05 (R17.3-6 WP-5): artifacts 真实反映实际写入的产物。P5 handler 已把验证结果
+        # 持久化到 artifacts/p5_validation_report.json（⑦），旧实现却硬编码 artifacts:[]，
+        # 使 construction 报告 produced_artifacts 漏报该真实产物。按盘上存在性汇集。
+        p5_report_rel = "artifacts/p5_validation_report.json"
+        p5_produced = ([p5_report_rel]
+                       if (workspace_service.workspace_path(project_id) / p5_report_rel).exists()
+                       else [])
+
         # ⑧ Trace
         if self.tracer:
             self.tracer.write("stage_loop", action="p5_full_verification",
@@ -1028,7 +1079,7 @@ class RealP5Handler:
                                for vr in verify_results],
             "conditional_results": conditional_details,
             "evidence_gaps": p4_input.evidence_gaps,
-            "artifacts": [],
+            "artifacts": p5_produced,
             "evidence_refs": p4_input.evidence_refs,
         }
 
@@ -1269,8 +1320,37 @@ class RealP6Handler:
                     "reason": f"交付包生成阻断：{pkg.risk_manifest.get('error', '')}",
                     "artifacts": [], "evidence_refs": []}
 
+        # SEC-01（WP-4）：脱敏硬门禁。含疑似密钥/凭据的产物默认硬 blocked 交付；
+        # 唯一放行路径 = 用户显式批准 desensitization_release Gate（L5）。不再仅软提示。
+        if not pkg.desensitization_ok:
+            from app.services.p6_delivery_service import (
+                find_approved_desensitization_override, ensure_desensitization_gate,
+                desensitization_risk_explanation,
+            )
+            override = find_approved_desensitization_override(project_id, run_id)
+            if not override:
+                gate_id = ensure_desensitization_gate(project_id, run_id, pkg,
+                                                      tracer=self.tracer, auditor=self.auditor)
+                return {
+                    "status": "blocked",
+                    "reason": ("SEC-01 脱敏硬门禁：交付包含疑似密钥/凭据，默认阻断交付；"
+                               "须用户显式批准脱敏放行 Gate 后方可交付。"),
+                    "desensitization": {
+                        "ok": False,
+                        "risk_explanation": desensitization_risk_explanation(pkg),
+                    },
+                    "desensitization_gate_id": gate_id,
+                    "artifacts": [], "evidence_refs": [],
+                }
+            # override 已批准：用户已显式确认风险，允许继续交付（诚实标记放行来源）。
+
         # ③ 创建 P6 最终 Gate（用户最终授权，D-023）
         gate_id = self._create_p6_final_gate(project_id, run_id, pkg)
+
+        # NEW-05 (R17.3-6 WP-5): 持久化交付报告为可查询产物，使 artifacts 真实反映实际写入
+        # （P6DeliveryService 原仅在内存/按需重算，construction 报告 produced_artifacts 空）。
+        # 仅落交付元数据（清单/索引/脱敏结论），不含 source/ 与密钥明文（D-105③/AGENTS §8）。
+        delivery_report_ref = self._persist_p6_delivery_report(project_id, run_id, pkg)
 
         # ④ 组装输出
         return {
@@ -1290,9 +1370,42 @@ class RealP6Handler:
             },
             "p6_final_gate_id": gate_id,
             "p5_evidence_refs": p4_input.evidence_refs,
-            "artifacts": [],
+            "artifacts": [delivery_report_ref] if delivery_report_ref else [],
             "evidence_refs": p4_input.evidence_refs or [],
         }
+
+    def _persist_p6_delivery_report(self, project_id: str, run_id: str, pkg) -> str | None:
+        """NEW-05 (R17.3-6 WP-5): 持久化 P6 交付报告到 artifacts/p6_delivery_report.json。
+
+        参照 P5 `_persist_p5_validation_report` 范式，使 P6 handler 返回的 artifacts 真实
+        反映实际写入（construction 报告 produced_artifacts 不欠报）。仅落交付元数据
+        （delivery/risk/hash 清单 + AETA 索引 + 脱敏结论布尔），不含 source/ 与密钥明文。
+        """
+        try:
+            report = {
+                "project_id": project_id,
+                "run_id": run_id,
+                "stage": "p6",
+                "generated_at": _now(),
+                "delivery_manifest": pkg.delivery_manifest,
+                "risk_manifest": pkg.risk_manifest,
+                "hash_manifest": pkg.hash_manifest,
+                "p6_delivery_report": pkg.p6_delivery_report,
+                "indexes": pkg.indexes,
+                "desensitization_ok": pkg.desensitization_ok,
+            }
+            ref = _mediated_write(project_id, "artifacts/p6_delivery_report.json",
+                                  json.dumps(report, ensure_ascii=False, indent=2),
+                                  auditor=self.auditor, stage="p6",
+                                  action="write_p6_delivery_report")
+            if self.tracer:
+                self.tracer.write("evidence_event", action="p6_delivery_persisted",
+                                  summary=f"P6 交付报告持久化 {ref}",
+                                  project_id=project_id, run_id=run_id, stage="p6")
+            return ref
+        except Exception as e:
+            logger.warning("P6: persist delivery report failed: %s", e, exc_info=True)
+            return None
 
     def _create_p6_final_gate(self, project_id: str, run_id: str, pkg) -> str | None:
         """创建 P6 最终 Gate（用户最终授权，D-023）。"""

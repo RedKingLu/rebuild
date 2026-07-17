@@ -15,6 +15,22 @@ from app.schemas.gate import GateDecisionRequest
 logger = logging.getLogger("rebuild.gate_backend")
 
 
+def _read_gate_brief(project_id: str, artifact_refs: List[str]) -> Optional[dict]:
+    """Read the real Gate Brief report (if attached) so the promotion Gate summary
+    reflects real execution (R17.3-6 WP-2, D-101). Returns None when absent/unreadable."""
+    import json
+    from app.services.workspace_service import workspace_path
+    for ref in (artifact_refs or []):
+        if ref and ref.endswith("_gate_brief.json"):
+            try:
+                p = workspace_path(project_id) / ref
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                logger.warning("gate_backend: 读取 Gate Brief 失败 ref=%s", ref, exc_info=True)
+                return None
+    return None
+
+
 def _project_name(project_id: str) -> str:
     """取项目名（欢迎语用）。失败返 None。"""
     try:
@@ -57,8 +73,21 @@ class RealGateBackend:
             summary = f"{stage.upper()} 接入计划已生成，请审阅后决定是否执行。"
             retry_action = None
         else:
-            reason = f"{stage} 小循环通过，请求阶段晋级"
-            summary = f"{stage} 阶段已完成并产出三类审核报告，请审阅后决策。"
+            # R17.3-6 WP-2 (AGT-02/D-101): 若 artifact_refs 含真实 Gate Brief 落盘报告，
+            # 读其 what_happened / validation_verdict 合成真实 summary/reason（替换硬编码模板）。
+            brief = _read_gate_brief(project_id, artifact_refs)
+            if brief:
+                what = brief.get("what_happened") or f"{stage} 阶段已完成"
+                vv = brief.get("validation_verdict") or {}
+                verdict_txt = ""
+                if vv:
+                    verdict_txt = f"（独立验收：{vv.get('verdict','')}，{vv.get('issues_count',0)} 项问题）"
+                notes = brief.get("honest_notes") or ""
+                reason = f"{stage} 阶段已完成并通过独立验收，请求阶段晋级{verdict_txt}"
+                summary = what + (f" {notes}" if notes else "")
+            else:
+                reason = f"{stage} 小循环通过，请求阶段晋级"
+                summary = f"{stage} 阶段已完成并产出三类审核报告，请审阅后决策。"
             retry_action = None
         gate = gs.create(
             project_id=project_id, run_id=run_id or "", stage=stage,
@@ -93,6 +122,35 @@ class RealGateBackend:
         gs = get_services().gate_service
         # drive_promotion=False: the LangGraph gate node drives stage transitions.
         gs.decide(gate_id, GateDecisionRequest(decision=decision), drive_promotion=False)
+
+    def attach_artifact_refs(self, *, gate_id: str, refs: List[str]) -> None:
+        """GATE-02 (R17.3-6 WP-5): 向已存在的 Gate 合并补挂 artifact_refs（去重）。
+
+        用于 make_work_node 复用 P6 handler 创建的唯一权威最终 Gate（D-023，
+        _create_p6_final_gate）时，把三类审核报告 + Agent 侧材料补挂到同一 Gate，
+        使用户在唯一 Gate 上看到完整审核材料——从而消除 P6 重复建 Gate（原
+        handler p6_final_gate + make_work_node promotion gate 两个 stage_promotion）。
+        """
+        if not gate_id or not refs:
+            return
+        try:
+            from app.core.database import get_session
+            from app.models.gate import Gate
+            db = get_session()
+            try:
+                g = db.get(Gate, gate_id)
+                if g is None:
+                    return
+                existing = list(g.artifact_refs or [])
+                merged = existing + [r for r in refs if r and r not in existing]
+                if merged != existing:
+                    g.artifact_refs = merged
+                    db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("gate attach_artifact_refs failed gate_id=%s: %s", gate_id, e,
+                           exc_info=True)
 
     def find_stage_gate(self, *, project_id: str, run_id: str, stage: str,
                         gate_type: str) -> Optional[dict]:

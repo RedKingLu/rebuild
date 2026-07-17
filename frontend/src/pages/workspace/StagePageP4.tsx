@@ -8,6 +8,7 @@
  *  确认 / No Evidence No Completed。 */
 import { useState, useEffect } from 'react';
 import { Icon, type IconKey } from '../../components/ui/Icon';
+import { ModelUnavailableBanner, type ModelUnavailableInfo } from '../../components/ui/ModelUnavailableBanner';
 
 interface Props {
   projectId: string;
@@ -56,6 +57,7 @@ export function StagePageP4({ projectId, runId = '', stageStatus, onReExecute }:
   const [summary, setSummary] = useState<any>(null);
   const [gate, setGate] = useState<GateInfo>(null);
   const [preview, setPreview] = useState<{ path: string; content: string | null } | null>(null);
+  const [modelUnavailable, setModelUnavailable] = useState<ModelUnavailableInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -69,7 +71,9 @@ export function StagePageP4({ projectId, runId = '', stageStatus, onReExecute }:
         ? fetch(`/api/projects/${projectId}/runs/${runId || ''}/stages/p4/taskgraph`)
         : Promise.resolve(null);
       const gateReq = fetch(`/api/projects/${projectId}/gates/active`);
-      const [tgRes, gateRes] = await Promise.all([tgReq, gateReq]);
+      // WP-6 (EG-WP6-1): 拉取 P4 模型中断产物（artifacts/p4_model_error.json），驱动 ModelUnavailableBanner。
+      const modelReq = fetch(`/api/projects/${projectId}/p4-summary`);
+      const [tgRes, gateRes, modelRes] = await Promise.all([tgReq, gateReq, modelReq]);
       let tg = null;
       if (tgRes && tgRes.ok) tg = (await tgRes.json()).data || (await tgRes.json());
       setTg(tg);
@@ -84,6 +88,10 @@ export function StagePageP4({ projectId, runId = '', stageStatus, onReExecute }:
         const g = (await gateRes.json()).data || (await gateRes.json());
         setGate(g && g.gate_id ? g : null);
       }
+      if (modelRes.ok) {
+        const md = (await modelRes.json()).data || (await modelRes.json());
+        setModelUnavailable(md?.model_unavailable || null);
+      }
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -95,6 +103,9 @@ export function StagePageP4({ projectId, runId = '', stageStatus, onReExecute }:
 
   const isGateOpen = gate && gate.gate_status === 'waiting_decision';
   const nodes: any[] = tg?.nodes || summary?.nodes || [];
+  // ISSUE-04 修复：taskgraph 端点不返回 completed_node_count（见 routes_stages.get_taskgraph），
+  // 旧版读 tg.completed_node_count 恒为 0；改为从真实节点状态统计。
+  const completedNodeCount = nodes.filter((n: any) => n.status === 'completed').length;
   const changeManifest: any[] = summary?.change_manifest || [];
   const patchIndex: any[] = summary?.patch_index || [];
   const graphStatus = tg?.graph_status || summary?.graph_status;
@@ -122,7 +133,7 @@ export function StagePageP4({ projectId, runId = '', stageStatus, onReExecute }:
           <div style={{ fontWeight: 600, fontSize: 15 }}>P4 执行</div>
           <div style={{ ...muted, marginTop: 2 }}>
             图状态 <b style={{ color: statusColor }}>{graphStatus || stageStatus || '未开始'}</b>
-            {tg ? <> · {nodes.length} 节点 · 完成 {tg.completed_node_count ?? 0}</> : null}
+            {tg ? <> · {nodes.length} 节点 · 完成 {completedNodeCount}</> : null}
           </div>
         </div>
         {summary?.delegation || summary?.nodes?.some((n: any) => n.delegation) ? (
@@ -137,6 +148,11 @@ export function StagePageP4({ projectId, runId = '', stageStatus, onReExecute }:
       </div>
 
       {error && <div style={{ ...card, color: 'var(--red)' }}>加载失败: {error}</div>}
+
+      {/* WP-6 (EG-WP6-1)：模型全失败强制中断 → 显式报错横幅(模型不可用/中断阶段/原因/链路/操作) */}
+      {modelUnavailable && (
+        <ModelUnavailableBanner info={modelUnavailable} onReExecute={onReExecute} />
+      )}
 
       {/* P4→P5 Gate banner */}
       {isGateOpen && (

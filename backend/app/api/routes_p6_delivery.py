@@ -48,7 +48,29 @@ async def get_p6_package(project_id: str, run_id: str):
     if pkg.risk_manifest.get("blocking"):
         raise HTTPException(422, pkg.risk_manifest.get("error", "交付包生成阻断"))
 
-    return SuccessEnvelope(data=delivery_package_to_dict(pkg), meta=Meta())
+    # SEC-01（WP-4）：脱敏硬门禁。含疑似密钥/凭据时默认硬阻断交付；唯一放行路径 = 用户
+    # 显式批准 desensitization_release Gate。未放行 → 422 + 强制 Gate + 脱敏后风险说明。
+    if not pkg.desensitization_ok:
+        from app.services.p6_delivery_service import (
+            find_approved_desensitization_override, ensure_desensitization_gate,
+            desensitization_risk_explanation,
+        )
+        override = find_approved_desensitization_override(project_id, run_id)
+        if not override:
+            from app.dependencies import get_services
+            _svc2 = get_services()
+            gate_id = ensure_desensitization_gate(
+                project_id, run_id, pkg,
+                tracer=_svc2.trace_writer, auditor=_svc2.audit_writer)
+            raise HTTPException(422, {
+                "error": "SEC-01 脱敏硬门禁：交付包含疑似密钥/凭据，默认阻断交付",
+                "desensitization_gate_id": gate_id,
+                "risk_explanation": desensitization_risk_explanation(pkg),
+            })
+
+    data = delivery_package_to_dict(pkg)
+    data["desensitization_released"] = (not pkg.desensitization_ok)
+    return SuccessEnvelope(data=data, meta=Meta())
 
 
 @router.get("/download")
@@ -77,6 +99,19 @@ async def download_p6_file(project_id: str, run_id: str, path: str = ""):
         content = target.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         raise HTTPException(500, f"读取失败：{e}")
+
+    # SEC-01（WP-4）：单文件下载脱敏硬门禁。若该文件含疑似密钥且用户未显式批准脱敏放行
+    # Gate，则拒绝下载（防止绕过 package 门禁直接下载泄密文件）。
+    import re as _re
+    _secret_pats = [
+        _re.compile(r"sk-[a-z0-9]{20,}", _re.IGNORECASE),
+        _re.compile(r"AKIA[0-9A-Z]{16}"),
+        _re.compile(r"(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*[\"']?([^\s\"']{8,})"),
+    ]
+    if any(p.search(content) for p in _secret_pats):
+        from app.services.p6_delivery_service import find_approved_desensitization_override
+        if not find_approved_desensitization_override(project_id, run_id):
+            raise HTTPException(403, "SEC-01 脱敏硬门禁：该文件含疑似密钥/凭据，未经用户显式放行不得下载")
 
     return PlainTextResponse(content=content, media_type="text/plain",
                               headers={"Content-Disposition": f"attachment; filename={target.name}"})

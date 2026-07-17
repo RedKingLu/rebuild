@@ -24,6 +24,7 @@ class Services:
         self._run_service = None
         self._stage_service = None
         self._gate_service = None
+        self._security_authorization = None
         self._aet_service = None
         self._workspace_service = None
         self._event_service = None
@@ -84,6 +85,18 @@ class Services:
             from app.services.gate_service import GateService
             self._gate_service = GateService(self)
         return self._gate_service
+
+    @property
+    def security_authorization(self):
+        """Security/Authorization final-interception layer (WP-4 / GAP-SEC-1).
+
+        Policy is the authoritative floor (D-031); this service audits + explains every
+        allow/deny and reserves the Security/Authorization Agent extension slot.
+        """
+        if self._security_authorization is None:
+            from app.services.security_authorization import SecurityAuthorizationService
+            self._security_authorization = SecurityAuthorizationService(self)
+        return self._security_authorization
 
     @property
     def aet_service(self):

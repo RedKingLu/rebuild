@@ -98,8 +98,10 @@ export function StagePageP0({ projectId, project, run, traces, audits, fileIndex
             <div>文件数: {fileCount}</div>
             {sourceIndex && (
               <>
-                <div>索引状态: {sourceIndex.status || sourceIndex.index_status || '—'}</div>
-                {sourceIndex.summary && <div>摘要: {sourceIndex.summary}</div>}
+                <div>索引状态: {sourceIndex.materialization_status || '—'}</div>
+                {(sourceIndex.directory_count != null) && <div>目录数: {sourceIndex.directory_count}</div>}
+                {Array.isArray(sourceIndex.key_files) && sourceIndex.key_files.length > 0 &&
+                  <div>关键文件: {sourceIndex.key_files.length} 个</div>}
               </>
             )}
             {!sourceIndex && <div style={{ color: 'var(--color-text-muted)', fontStyle: 'italic' }}>source_index 尚未生成（需要完成 materialize）</div>}
