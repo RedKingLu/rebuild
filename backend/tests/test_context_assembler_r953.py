@@ -335,6 +335,7 @@ def test_context_assembler_single_source():
         "stage_handlers.py", "agent_loop.py", "routes_workspace.py",
         "external_context_builder.py",  # R9-5-5: external platform context injection
         "node_loop.py",  # R10 T2: NodeLoop Step 2 loads context via the canonical assembler
+        "work_agent.py",  # R17.3-6 WP-2: Stage WorkAgent 编排层经 canonical assembler 装配上下文
     }
     for name in caller_names:
         assert name in approved, (

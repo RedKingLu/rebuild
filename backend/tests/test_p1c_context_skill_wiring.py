@@ -43,6 +43,10 @@ class _CapturingGateway:
     def get_status(self):
         return SimpleNamespace(overall_status="available")
 
+    def stage_model_readiness(self, **kwargs):
+        return {"available": True, "capability_ok": True, "reason": "",
+                "attempted_chain": [], "user_actions": []}
+
     async def call(self, *, messages, **kwargs):
         sys = messages[0]["content"] if messages else ""
         self.system_prompts.append(sys)

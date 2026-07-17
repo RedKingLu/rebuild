@@ -24,6 +24,18 @@ class _FakeGateway:
     def get_status(self):
         return SimpleNamespace(overall_status=self._overall)
 
+    def stage_model_readiness(self, **kwargs):
+        # WP-6: emulate ModelGateway.stage_model_readiness.
+        available = self._overall == "available"
+        chain = [] if available else [{"profile_id": "fake/model", "provider_id": "fake",
+                                       "model": "fake", "is_fallback": False,
+                                       "outcome": "not_configured", "error_category": "not_configured",
+                                       "error_message": "模型未配置"}]
+        return {"available": available, "capability_ok": available,
+                "reason": "" if available else "无任一已配置且具备有效凭据的模型可用",
+                "attempted_chain": chain,
+                "user_actions": [{"action": "configure", "label": "配置模型 / API Key", "target": "models"}]}
+
     async def call(self, **kwargs):
         return self._call_result
 

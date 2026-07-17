@@ -28,11 +28,33 @@ class FakeHandler:
 
     async def execute(self, state):
         self.calls += 1
-        return {"artifacts": [f"{state.get('current_stage','x')}_out.json"],
+        # A completed stage must have a real domain artifact + Evidence (D-066); register
+        # them so the independent AcceptanceService gate (R17.3-6 WP-2 批B返工 C4) sees a
+        # legitimate completion rather than an evidence-less fake. Best-effort (advisory).
+        # Stage is the in_progress one (current_stage is only set on the node's return).
+        ss = state.get("stage_status") or {}
+        stage = next((k for k, v in ss.items() if v == "in_progress"),
+                     state.get("current_stage", "p0"))
+        pid = state.get("project_id", "")
+        try:
+            from app.services import workspace_service
+            art = workspace_service.workspace_path(pid) / "artifacts"
+            art.mkdir(parents=True, exist_ok=True)
+            (art / f"{stage}_domain.json").write_text('{"ok": true}', encoding="utf-8")
+            from app.services.aet_service import AETService
+            AETService(None).write_evidence(
+                pid, f"ev-fake-{stage}", evidence_type="fake_domain", status="candidate",
+                source="fake_handler", claim="fake completion evidence", stage=stage)
+        except Exception:
+            pass
+        return {"status": "completed" if not self.fail else "blocked",
+                "artifacts": [f"{state.get('current_stage','x')}_out.json"],
                 "ok": not self.fail}
 
     def review(self, result):
-        ok = bool(result.get("ok", True))
+        # 独立 ValidationAgent 从盘重读的 disk_view 只带控制信号（status）与域产物，不带
+        # 进程内 "ok"；失败经 status=blocked 传导（declared!=completed → 独立验收不通过）。
+        ok = result.get("status", "completed") == "completed" and bool(result.get("ok", True))
         return ReviewResult(passed=ok, issues=[] if ok else [{"e": "bad"}])
 
 

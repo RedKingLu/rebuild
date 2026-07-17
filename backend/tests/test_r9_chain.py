@@ -125,7 +125,16 @@ def test_gate_approve_advances_stage(client, project_id):
     _wait_for_stage(client, project_id, "p1")      # advanced in background thread
     proj = client.get(f"/api/projects/{project_id}").json()["data"]
     assert proj["current_stage"] == "p1"
-    assert proj.get("active_gate") in (None, "")
+    # WP-1 NEW-02: after advancing, the p1 work node produces a fresh pending Gate and
+    # project.active_gate must point at THAT real waiting gate (previously _run_graph_bg
+    # hardcoded active_gate="" here, so the frontend lost the active Gate after every
+    # promotion). Assert the corrected behavior: active_gate is a real waiting p1 gate.
+    active_gate_id = proj.get("active_gate")
+    assert active_gate_id, "active_gate must point at the new p1 waiting Gate (NEW-02)"
+    ag = client.get(f"/api/projects/{project_id}/gates/active").json()["data"]
+    assert ag is not None and ag["gate_id"] == active_gate_id
+    assert ag["stage"] == "p1"
+    assert ag["gate_status"] == "waiting_decision"
 
 
 def test_gate_request_changes_status(client, project_id):

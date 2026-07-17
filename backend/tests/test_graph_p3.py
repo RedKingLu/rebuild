@@ -27,6 +27,14 @@ class _SeqGateway:
     def get_status(self):
         return SimpleNamespace(overall_status=self._overall)
 
+    def stage_model_readiness(self, **kwargs):
+        ok = self._overall == "available"
+        return {"available": ok, "capability_ok": ok, "reason": "" if ok else "无可用模型",
+                "attempted_chain": [] if ok else [{"profile_id": "fake/m", "provider_id": "fake",
+                    "model": "m", "is_fallback": False, "outcome": "not_configured",
+                    "error_category": "not_configured", "error_message": "未配置"}],
+                "user_actions": [{"action": "configure", "label": "配置模型 / API Key", "target": "models"}]}
+
     async def call(self, **kwargs):
         r = self._results[min(self._i, len(self._results) - 1)] if self._results else {}
         self._i += 1
