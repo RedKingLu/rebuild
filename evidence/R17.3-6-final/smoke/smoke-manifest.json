@@ -1,0 +1,82 @@
+{
+  "results": [
+    {
+      "name": "00-workspace-overview",
+      "note": "Full workspace overview, P0-P6 sidebar visible",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/00-workspace-overview.png",
+      "ts": "2026-07-17T01:48:54.594Z"
+    },
+    {
+      "name": "stage-p0",
+      "note": "StagePage P0 via sidebar tab",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/stage-p0.png",
+      "ts": "2026-07-17T01:48:58.442Z"
+    },
+    {
+      "name": "stage-p1",
+      "note": "StagePage P1 via sidebar tab",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/stage-p1.png",
+      "ts": "2026-07-17T01:49:01.301Z"
+    },
+    {
+      "name": "stage-p2",
+      "note": "StagePage P2 via sidebar tab",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/stage-p2.png",
+      "ts": "2026-07-17T01:49:04.051Z"
+    },
+    {
+      "name": "stage-p3",
+      "note": "StagePage P3 via sidebar tab",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/stage-p3.png",
+      "ts": "2026-07-17T01:49:07.186Z"
+    },
+    {
+      "name": "stage-p4",
+      "note": "StagePage P4 via sidebar tab",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/stage-p4.png",
+      "ts": "2026-07-17T01:49:10.367Z"
+    },
+    {
+      "name": "stage-p5",
+      "note": "StagePage P5 via sidebar tab",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/stage-p5.png",
+      "ts": "2026-07-17T01:49:13.509Z"
+    },
+    {
+      "name": "stage-p6",
+      "note": "StagePage P6 via sidebar tab",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/stage-p6.png",
+      "ts": "2026-07-17T01:49:16.676Z"
+    },
+    {
+      "name": "10-gate-p3-overview",
+      "note": "Active P3 gate expanded (gate-3466e8 stage promotion)",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/10-gate-p3-overview.png",
+      "ts": "2026-07-17T01:49:20.900Z"
+    },
+    {
+      "name": "gate-tab-证据",
+      "note": "error locator.click: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for getByText('证据').first()\u001b[22m\n\u001b[2m    - locator resolved to <button class=\"\">证据</button>\u001b[22m\n\u001b[2m  - attempting click action\u001b[22m\n\u001b[2m    2 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div>…</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m    - retrying click action\u001b[22m\n\u001b[2m    - waiting 20ms\u001b[22m\n\u001b[2m    2 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div>…</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m    - retrying click action\u001b[22m\n\u001b[2m      - waiting 100ms\u001b[22m\n\u001b[2m    57 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m       - element is visible, enabled and stable\u001b[22m\n\u001b[2m       - scrolling into view if needed\u001b[22m\n\u001b[2m       - done scrolling\u001b[22m\n\u001b[2m       - <div>…</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m     - retrying click action\u001b[22m\n\u001b[2m       - waiting 500ms\u001b[22m\n",
+      "file": null
+    },
+    {
+      "name": "gate-tab-过程追踪",
+      "note": "error locator.click: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for getByText('过程追踪').first()\u001b[22m\n\u001b[2m    - locator resolved to <button class=\"active\">过程追踪</button>\u001b[22m\n\u001b[2m  - attempting click action\u001b[22m\n\u001b[2m    2 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div>…</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m    - retrying click action\u001b[22m\n\u001b[2m    - waiting 20ms\u001b[22m\n\u001b[2m    2 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div>…</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m    - retrying click action\u001b[22m\n\u001b[2m      - waiting 100ms\u001b[22m\n\u001b[2m    58 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m       - element is visible, enabled and stable\u001b[22m\n\u001b[2m       - scrolling into view if needed\u001b[22m\n\u001b[2m       - done scrolling\u001b[22m\n\u001b[2m       - <div>…</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m     - retrying click action\u001b[22m\n\u001b[2m       - waiting 500ms\u001b[22m\n",
+      "file": null
+    },
+    {
+      "name": "gate-tab-审计",
+      "note": "error locator.click: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for getByText('审计').first()\u001b[22m\n\u001b[2m    - locator resolved to <strong>待审计划草案</strong>\u001b[22m\n\u001b[2m  - attempting click action\u001b[22m\n\u001b[2m    2 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div>起始计划报告 (p3_start_plan)</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m    - retrying click action\u001b[22m\n\u001b[2m    - waiting 20ms\u001b[22m\n\u001b[2m    - waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m    - element is visible, enabled and stable\u001b[22m\n\u001b[2m    - scrolling into view if needed\u001b[22m\n\u001b[2m    - done scrolling\u001b[22m\n\u001b[2m    - <div>起始计划报告 (p3_start_plan)</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m  2 × retrying click action\u001b[22m\n\u001b[2m      - waiting 100ms\u001b[22m\n\u001b[2m      - waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div>请审阅下方阶段材料后决定（批准后进入下一阶段）。</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m  14 × retrying click action\u001b[22m\n\u001b[2m       - waiting 500ms\u001b[22m\n\u001b[2m       - waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m       - element is visible, enabled and stable\u001b[22m\n\u001b[2m       - scrolling into view if needed\u001b[22m\n\u001b[2m       - done scrolling\u001b[22m\n\u001b[2m       - <div>起始计划报告 (p3_start_plan)</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m     - retrying click action\u001b[22m\n\u001b[2m       - waiting 500ms\u001b[22m\n\u001b[2m       - waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m       - element is visible, enabled and stable\u001b[22m\n\u001b[2m       - scrolling into view if needed\u001b[22m\n\u001b[2m       - done scrolling\u001b[22m\n\u001b[2m       - <div>起始计划报告 (p3_start_plan)</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m     - retrying click action\u001b[22m\n\u001b[2m       - waiting 500ms\u001b[22m\n\u001b[2m       - waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m       - element is visible, enabled and stable\u001b[22m\n\u001b[2m       - scrolling into view if needed\u001b[22m\n\u001b[2m       - done scrolling\u001b[22m\n\u001b[2m       - <div>请审阅下方阶段材料后决定（批准后进入下一阶段）。</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m     - retrying click action\u001b[22m\n\u001b[2m       - waiting 500ms\u001b[22m\n\u001b[2m       - waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m       - element is visible, enabled and stable\u001b[22m\n\u001b[2m       - scrolling into view if needed\u001b[22m\n\u001b[2m       - done scrolling\u001b[22m\n\u001b[2m       - <div>请审阅下方阶段材料后决定（批准后进入下一阶段）。</div> from <div>…</div> subtree intercepts pointer events\u001b[22m\n\u001b[2m  - retrying click action\u001b[22m\n\u001b[2m    - waiting 500ms\u001b[22m\n",
+      "file": null
+    }
+  ],
+  "consoleErrors": [
+    "Failed to load resource: the server responded with a status of 404 (Not Found)",
+    "Failed to load resource: the server responded with a status of 404 (Not Found)",
+    "Failed to load resource: the server responded with a status of 423 (Locked)",
+    "Failed to load resource: the server responded with a status of 423 (Locked)",
+    "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)",
+    "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)"
+  ],
+  "url": "http://localhost:5173/projects/355d26e5-e22d-41c1-9a6c-4948ac7e2824/workspace"
+}

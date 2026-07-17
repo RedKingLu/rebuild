@@ -1,0 +1,21 @@
+{
+  "results": [
+    {
+      "name": "20-gate-before-approve",
+      "note": "Gate panel before approval attempt",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/20-gate-before-approve.png"
+    },
+    {
+      "name": "21-gate-after-approve",
+      "note": "State after approve attempt: clicked",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/21-gate-after-approve.png"
+    },
+    {
+      "name": "22-gate-final",
+      "note": "Final state after approve wait",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/22-gate-final.png"
+    }
+  ],
+  "approveResult": "clicked",
+  "apiFails": []
+}

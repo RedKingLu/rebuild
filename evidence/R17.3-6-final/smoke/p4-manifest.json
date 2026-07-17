@@ -1,0 +1,19 @@
+{
+  "results": [
+    {
+      "name": "30-p4-stage-current",
+      "note": "P4 stage after gate approval (current run state)",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/30-p4-stage-current.png"
+    },
+    {
+      "name": "31-p4-stage-selected",
+      "note": "P4 stage selected in sidebar",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/31-p4-stage-selected.png"
+    },
+    {
+      "name": "32-p4-gate-expanded",
+      "note": "P4 plan gate expanded (gate-eae3ac)",
+      "file": "/home/king/rebuild/evidence/R17.3-6-final/smoke/32-p4-gate-expanded.png"
+    }
+  ]
+}
