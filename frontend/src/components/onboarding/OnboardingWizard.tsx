@@ -38,6 +38,10 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
   const [envKind, setEnvKind] = useState<'local' | 'remote'>('local');
   const [languageHint, setLanguageHint] = useState('');
   const [frameworkHint, setFrameworkHint] = useState('');
+  // R17.5 WP-6 (Q-R17.4-3-2): 目标运行环境（迁移目标 CPU 架构 + 目标 OS）。
+  // 开放可扩展 / 允许自由输入（datalist 仅为常见建议，非封闭枚举）；平台可基于源环境推荐，用户点选为准。
+  const [targetCpuArch, setTargetCpuArch] = useState('');
+  const [targetOs, setTargetOs] = useState('');
 
   // Step 2 state — Submission method (R9-5-7 T1/T2: 本轮只接远端 Git)
   const [submissionKind, setSubmissionKind] = useState<'remote_git' | 'local_git'>('remote_git');
@@ -168,6 +172,11 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
           submission_kind: submissionKind,
           git_remote_url: submissionKind === 'remote_git' ? (selectedRepoUrl || null) : null,
           git_branch: submissionKind === 'remote_git' ? (gitBranch || null) : null,
+          // R17.5 WP-6 (Q-R17.4-3-2): 目标运行环境（用户点选/自由输入，非封闭枚举）。
+          target_cpu_arch: targetCpuArch.trim() || null,
+          target_cpu_arch_label: targetCpuArch.trim() || null,
+          target_os: targetOs.trim() || null,
+          target_os_label: targetOs.trim() || null,
         }),
       });
       if (!resp.ok) {
@@ -244,6 +253,45 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
               <label style={{ display: 'block', fontSize: 13, marginBottom: 4 }}>框架提示（可选）</label>
               <input value={frameworkHint} onChange={e => setFrameworkHint(e.target.value)}
                 placeholder="如 Spring Boot, .NET, Django..." style={{ width: '100%', padding: '8px', border: '1px solid var(--color-border)', borderRadius: 4, fontSize: 13 }} />
+            </div>
+            {/* R17.5 WP-6: 目标运行环境（迁移目标）。开放输入，下拉仅为常见建议，可自由填写。 */}
+            <div style={{ marginTop: 8, paddingTop: 12, borderTop: '1px dashed var(--color-border)' }}>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>目标运行环境（迁移目标）</div>
+              <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 10 }}>
+                指定本次迁移/重构的目标 CPU 架构与操作系统。可从建议中选择，也可自由填写（不限于列出选项）。留空则后续阶段再确认。
+              </div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                <div style={{ flex: 1 }}>
+                  <label style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>目标 CPU 架构</label>
+                  <input list="target-cpu-arch-options" value={targetCpuArch}
+                    onChange={e => setTargetCpuArch(e.target.value)}
+                    placeholder="如 x86_64 / ARM64 / 龙芯 LoongArch..."
+                    style={{ width: '100%', padding: '8px', border: '1px solid var(--color-border)', borderRadius: 4, fontSize: 13 }} />
+                  <datalist id="target-cpu-arch-options">
+                    <option value="x86_64" />
+                    <option value="ARM64 (aarch64)" />
+                    <option value="LoongArch (龙芯)" />
+                    <option value="鲲鹏 (Kunpeng ARM64)" />
+                    <option value="飞腾 (Phytium ARM64)" />
+                    <option value="兆芯 (Zhaoxin x86)" />
+                  </datalist>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>目标操作系统</label>
+                  <input list="target-os-options" value={targetOs}
+                    onChange={e => setTargetOs(e.target.value)}
+                    placeholder="如 统信 UOS / 麒麟 / openEuler / Linux..."
+                    style={{ width: '100%', padding: '8px', border: '1px solid var(--color-border)', borderRadius: 4, fontSize: 13 }} />
+                  <datalist id="target-os-options">
+                    <option value="统信 UOS" />
+                    <option value="麒麟 Kylin" />
+                    <option value="openEuler" />
+                    <option value="Ubuntu" />
+                    <option value="CentOS / RHEL" />
+                    <option value="Windows Server" />
+                  </datalist>
+                </div>
+              </div>
             </div>
             {envProfile && (
               <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
@@ -463,6 +511,9 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
                 {frameworkHint && <> · {frameworkHint}</>}
               </div>
               <div>✓ 来源：<b>{sourceType === 'local_dir' ? '本地目录' : sourceType === 'git' ? 'Git' : sourceType === 'github' ? 'GitHub' : sourceType === 'zip' ? 'ZIP' : '手动'}</b></div>
+              {(targetCpuArch.trim() || targetOs.trim()) && (
+                <div>✓ 目标环境：<b>{[targetCpuArch.trim(), targetOs.trim()].filter(Boolean).join(' · ')}</b></div>
+              )}
               <div>✓ 模型：<b>{gwStatus?.global_status === 'healthy' ? '全局默认' : '待配置'}</b></div>
               <div>✓ 模式：<b>{execMode === 'manual' ? '手动' : execMode === 'plan' ? '计划确认' : '自动'}</b></div>
             </div>

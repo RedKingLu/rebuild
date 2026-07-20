@@ -188,15 +188,12 @@ def _analyze_sql_file(path: Path, size_bytes: int) -> dict:
     return info
 
 
-# Generic application entry-point file names (bootstrap/handler entries across
-# stacks). Extension-based web endpoints (.aspx/.ashx/.asmx) are summarised as
-# counts in code_scale rather than listed one-by-one. NOT hardcoded to MicroOA.
-ENTRY_POINT_NAMES = {
-    "global.asax", "default.aspx", "index.aspx", "program.cs", "startup.cs",
-    "main.py", "app.py", "manage.py", "wsgi.py", "asgi.py",
-    "index.js", "app.js", "server.js", "main.js", "main.go", "index.php",
-    "application.java", "main.java",
-}
+# R17.5 WP-2/WP-3 (GAP-P0-10 / HC-04): entry-point IDENTIFICATION moved to the P0
+# LLM (Node Worker Agent). The collection layer no longer classifies entry points via
+# a hardcoded name whitelist (which false-positived on vendored index.js/main.js).
+# Collection surfaces the raw candidate signals — key_files / top_level_dirs /
+# code_scale.extension_counts — and the LLM judges the real entry points at P0.
+# NOTE: `ENTRY_POINT_NAMES` intentionally removed (no采集层 pattern/白名单, §2.3).
 
 
 class SourceMaterializer:
@@ -885,7 +882,10 @@ def generate_source_index(project_id: str, source_type: str | None = None) -> di
         "directory_count": 0,
         "top_level_dirs": [],
         "key_files": [],
+        # R17.5 WP-2/WP-3: entry-point identification is the P0 LLM's job now.
+        # Collection leaves this empty (candidates = key_files/top_level_dirs/code_scale).
         "entry_points": [],
+        "entry_points_note": "entry-point identification deferred to P0 LLM intake (采集不预判入口，LLM 据 key_files/结构/计数判定)",
         "database_files": [],
         "code_scale": {"extension_counts": {}, "total_code_files": 0},
         "skipped_dirs": [],
@@ -916,12 +916,9 @@ def generate_source_index(project_id: str, source_type: str | None = None) -> di
             elif item.is_file():
                 fc += 1
                 fname = parts[-1]
-                # Track key files
+                # Track key files (generic build/manifest/config candidates for the LLM).
                 if _is_key_file(fname):
                     index["key_files"].append(rel)
-                # WP-A: generic application entry points
-                if fname.lower() in ENTRY_POINT_NAMES:
-                    index["entry_points"].append(rel)
                 # WP-A: extension-count summary (code_scale)
                 ext = item.suffix.lower()
                 if ext:

@@ -25,7 +25,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
@@ -73,25 +72,16 @@ def _mediated_write(project_id: str, rel_path: str, content: str, *,
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# R17.4-2 WP-B: deterministic P0 intake enrichment
+# R17.5 WP-2/WP-3: P0 collection helpers (采集层，只产事实不产识别结论)
 # ════════════════════════════════════════════════════════════════════════════
-# All fields below are MEASURED from the real source (source_index) or RULE-derived.
-# Sample instance values (framework version, table count, dialect, OS) are NEVER
-# hardcoded — they flow from source_index / regex over the actual config files.
-# Deep semantic profiling (field-level DB schema, migration route, business
-# semantics) is deferred to P1/P2 and honestly marked NOT_DONE_IN_P0. Connection
-# string VALUES are never echoed (脱敏红线).
-
-# Generic technology keywords for README scanning (NOT hardcoded to any project).
-_TECH_KEYWORDS = [
-    ".NET", "ASP.NET", "WebForms", "MVC", "Blazor", "Entity Framework", "EF6",
-    "EF Core", "IIS", "C#", "VB.NET", "F#",
-    "SQL Server", "MySQL", "PostgreSQL", "Oracle", "SQLite", "MongoDB", "Redis",
-    "Java", "Spring", "Spring Boot", "Maven", "Gradle",
-    "Python", "Django", "Flask", "FastAPI",
-    "Node.js", "Express", "React", "Vue", "Angular", "TypeScript",
-    "Go", "Rust", "PHP", "Laravel", "Docker", "Kubernetes",
-]
+# 采集层【只读取/测量/脱敏】原始事实，喂给 P0 LLM（Node Worker Agent）推理识别。
+# 识别/解读/研判/规划/验收判定一律 LLM（AGENTS §2.3；R17.5 WP-1 IntakeService）。
+# 已删除（R17.5 WP-3）的确定性识别主线（改 LLM）：
+#   _TECH_KEYWORDS 关键词表(HC-01) / _extract_environment_clues 解读+Website GUID(HC-02/05)
+#   / _build_availability_classification A/B/C 规则(GAP-P0-06) / _build_p1_intake_tasks 固定
+#   10 类模板(HC-07) / _build_missing_information 规则研判(GAP-P0-08) / _build_database_entry
+#   方言/入口解读(GAP-P0-09) / _build_intake_enrichment 确定性组装(GAP-P0-02)。
+# 连接串等敏感值全程不回显（脱敏红线 D-032，intake_service.redact_config_text 二次防护）。
 
 
 def _read_source_text(project_id: str, rel_path: str, max_bytes: int = 200_000) -> str:
@@ -114,161 +104,25 @@ def _basename(rel: str) -> str:
     return rel.replace("\\", "/").split("/")[-1]
 
 
-def _extract_environment_clues(project_id: str, source_index: dict) -> dict:
-    """Clue-level regex extraction from Web.config / *.sln / packages.config / README.
+def _collect_key_file_contents(project_id: str, source_index: dict,
+                               *, max_files: int = 18, max_bytes: int = 8000) -> list:
+    """采集：读取 key_files 候选的【脱敏原文片段】喂给 LLM 识别（GAP-P0-05/HC-01/02）。
 
-    Only non-sensitive attributes are surfaced (targetFramework/auth mode/session
-    mode/providerName). Connection-string VALUES are NEVER read into the output —
-    only the boolean fact that connection strings exist. Deep semantic
-    interpretation (migration sensitivity analysis) is left to P1.
+    采集层不解读、不匹配关键词表/GUID——只读取原文并脱敏（连接串/密钥值一律 [REDACTED]，
+    D-032）。LLM 据原文推理 targetFramework/auth/框架/Website 等（泛化任意栈）。
     """
+    from app.services.intake_service import redact_config_text
     key_files = [k for k in (source_index.get("key_files") or []) if isinstance(k, str)]
-    clues: dict = {
-        "dotnet_web_config": {},
-        "solution": {},
-        "packages": {},
-        "readme_keywords": [],
-        "evidence_gaps": [],
-        "deep_environment_profiling": "NOT_DONE_IN_P0 (留 P1)",
-    }
-
-    # ── Web.config family (Web.config / Web.Debug.config / web.config) ──
-    # Prefer the base web.config (holds targetFramework/auth); transform variants
-    # (Web.Debug.config / Web.Release.config) are XDT overlays without those.
-    web_configs = sorted(
-        [r for r in key_files
-         if _basename(r).lower().startswith("web") and r.lower().endswith(".config")],
-        key=lambda r: (_basename(r).lower() != "web.config", r))
-    for rel in web_configs[:5]:
-        text = _read_source_text(project_id, rel)
+    # README 优先纳入（语义线索），其余按出现顺序；上限 max_files 防超长。
+    readmes = [k for k in key_files if _basename(k).lower().startswith("readme")]
+    ordered = readmes + [k for k in key_files if k not in readmes]
+    out: list = []
+    for rel in ordered[:max_files]:
+        text = _read_source_text(project_id, rel, max_bytes=max_bytes)
         if not text:
             continue
-        wc: dict = {"file": rel}
-        m = re.search(r'targetFramework\s*=\s*"([^"]+)"', text, re.IGNORECASE)
-        if m:
-            wc["target_framework"] = m.group(1)
-        m = re.search(r'<authentication[^>]*\bmode\s*=\s*"([^"]+)"', text, re.IGNORECASE)
-        if m:
-            wc["authentication_mode"] = m.group(1)
-        m = re.search(r'<sessionState[^>]*\bmode\s*=\s*"([^"]+)"', text, re.IGNORECASE)
-        if m:
-            wc["session_state_mode"] = m.group(1)
-        provs = sorted(set(re.findall(r'providerName\s*=\s*"([^"]+)"', text, re.IGNORECASE)))
-        if provs:
-            wc["provider_names"] = provs
-        # Presence of connection strings — value NEVER echoed (脱敏).
-        wc["has_connection_strings"] = bool(
-            re.search(r'<connectionStrings\b', text, re.IGNORECASE)
-            or re.search(r'connectionString\s*=', text, re.IGNORECASE))
-        # Keep the richest web.config (most extracted attributes); the base config
-        # (target_framework/auth present) wins over a transform overlay.
-        if len(wc) > len(clues["dotnet_web_config"]):
-            clues["dotnet_web_config"] = wc
-        if "target_framework" in wc:
-            break
-    if not clues["dotnet_web_config"] and web_configs:
-        clues["evidence_gaps"].append("web.config 存在但未提取到可识别的 targetFramework/auth 线索")
-
-    # ── *.sln solution: TargetFrameworkMoniker + Website Project detection ──
-    slns = [r for r in key_files if r.lower().endswith(".sln")]
-    for rel in slns[:3]:
-        text = _read_source_text(project_id, rel)
-        if not text:
-            continue
-        sol: dict = {"file": rel}
-        m = re.search(r'TargetFrameworkMoniker\s*=\s*"([^"]*)"', text)
-        if m and m.group(1).strip():
-            from urllib.parse import unquote
-            sol["target_framework_moniker"] = unquote(m.group(1).strip())
-        # Website project GUID (WebSite project type) or ASP.NET compiler section.
-        sol["is_website_project"] = bool(
-            "E24C65DC-7377-472B-9ABA-BC803B73C61A" in text.upper()
-            or re.search(r"Debug\.AspNetCompiler", text))
-        clues["solution"] = sol
-        break
-
-    # ── packages.config: count + net target framework distribution ──
-    pkg_files = [r for r in key_files if _basename(r).lower() == "packages.config"]
-    for rel in pkg_files[:1]:
-        text = _read_source_text(project_id, rel)
-        if not text:
-            continue
-        pkgs = re.findall(r"<package\b", text, re.IGNORECASE)
-        tfs = re.findall(r'targetFramework\s*=\s*"([^"]+)"', text, re.IGNORECASE)
-        tf_set = sorted(set(tfs))
-        clues["packages"] = {
-            "file": rel,
-            "package_count": len(pkgs),
-            "target_frameworks": tf_set,
-            "all_same_target": len(tf_set) == 1 and len(tfs) == len(pkgs) and len(pkgs) > 0,
-        }
-        break
-
-    # ── README: generic tech-keyword scan (case-insensitive) ──
-    readmes = [r for r in key_files if _basename(r).lower().startswith("readme")]
-    if not readmes:
-        # readme may not be a key_file entry name; scan top-level readme too
-        readmes = [r for r in key_files if _basename(r).lower() in ("readme.md", "readme.txt", "readme")]
-    for rel in readmes[:2]:
-        text = _read_source_text(project_id, rel)
-        if not text:
-            continue
-        low = text.lower()
-        found = [kw for kw in _TECH_KEYWORDS if kw.lower() in low]
-        clues["readme_keywords"] = sorted(set(found))
-        if not found:
-            clues["evidence_gaps"].append("README 未匹配到已知技术栈关键词（可能为业务描述文，语义解读留 P1）")
-        break
-
-    return clues
-
-
-def _build_database_entry(source_index: dict) -> dict:
-    """Primary database entry from source_index.database_files (measured). Field-level
-    schema建档 is deferred to P1 (already marked inside each database_files entry)."""
-    dbs = source_index.get("database_files") or []
-    if not dbs:
-        return {"present": False,
-                "note": "未在源码中发现 .sql 数据库脚本（database_files 为空）"}
-    primary = dbs[0]
-    return {
-        "present": True,
-        "primary": primary,
-        "total_sql_files": len(dbs),
-        "field_level_schema": "NOT_DONE_IN_P0 (留 P1，逐表字段建档)",
-    }
-
-
-def _build_availability_classification(source_index: dict, file_count: int,
-                                       materialized: dict) -> dict:
-    """Rule-based availability class (A/B/C) with an evidence reasoning chain.
-
-    A = source available AND verified running in its original environment (real run
-        evidence). B = source available + key files present (not verified running).
-    C = source missing / key files missing. Per red line, an inability to run in the
-    CURRENT environment does NOT downgrade to C.
-    """
-    key_files = source_index.get("key_files") or []
-    has_db = bool(source_index.get("database_files"))
-    reasoning: list[str] = []
-    if file_count <= 0:
-        cls = "C"
-        reasoning.append("源码目录为空或未物化 → 源码不可用（C）")
-    else:
-        reasoning.append(f"源码已物化（{file_count} 文件），源码可用")
-        if key_files:
-            reasoning.append(f"关键文件齐备（{len(key_files)} 项：构建/配置/DB 脚本等）")
-        else:
-            reasoning.append("未识别到关键构建/配置文件（信息量偏低）")
-        if has_db:
-            reasoning.append("发现数据库脚本，具备数据初始化入口")
-        cls = "B"
-        reasoning.append("无原环境实跑证据 → 判定为 B（源码可用，未验证可运行）；"
-                         "当前环境无法实跑不作为降级依据")
-    labels = {"A": "A 类（源码可用且原环境已验证运行）",
-              "B": "B 类（源码可用，未验证运行）",
-              "C": "C 类（源码/关键文件缺失）"}
-    return {"class": cls, "label": labels[cls], "reasoning": reasoning}
+        out.append({"path": rel, "content": redact_config_text(text)[:max_bytes]})
+    return out
 
 
 def _build_migration_intent(project_id: str, source_config: dict) -> dict:
@@ -302,92 +156,59 @@ def _build_migration_intent(project_id: str, source_config: dict) -> dict:
             "decision_status": "pending_p2_assessment"}
 
 
-def _build_p1_intake_tasks(source_index: dict) -> list:
-    """Ten-category P1 intake task template. Descriptions are generic; scope
-    references real measured structure values from source_index (counts/keys)."""
-    key_files = source_index.get("key_files") or []
-    entry_points = source_index.get("entry_points") or []
-    dbs = source_index.get("database_files") or []
-    code_scale = source_index.get("code_scale") or {}
-    ext_counts = code_scale.get("extension_counts") or {}
-    db_tables = None
-    if dbs:
-        db_tables = (dbs[0] or {}).get("create_table_count")
-    top_dirs = source_index.get("top_level_dirs") or []
-
-    def _task(cat, desc, scope):
-        return {"category": cat, "task": desc, "scope_ref": scope,
-                "status": "planned_for_p1"}
-
-    return [
-        _task("business_modules", "识别业务模块与领域边界",
-              f"顶层目录 {len(top_dirs)} 个：{', '.join(top_dirs[:12])}"),
-        _task("page_handlers", "枚举页面/请求处理器（入口点）",
-              f"入口文件 {len(entry_points)} 项 + 处理器扩展计数见 code_scale"),
-        _task("code_structure", "梳理代码结构与分层",
-              f"扩展分布：{dict(list(ext_counts.items())[:8])}"),
-        _task("db_objects", "识别数据库对象（表/视图/存储过程）",
-              (f"主脚本表数≈{db_tables}（P0 粗计）" if db_tables is not None
-               else "未发现 .sql 脚本")),
-        _task("configuration", "梳理配置项与环境依赖",
-              f"关键配置文件见 key_files（{len(key_files)} 项）"),
-        _task("dependencies", "解析第三方依赖清单", "packages/构建清单见 P1 profiler"),
-        _task("static_assets", "盘点静态资源与前端资产",
-              f"静态/资源扩展计数见 code_scale.extension_counts"),
-        _task("auth_workflow", "识别权限与鉴权工作流", "认证/会话线索见 source_environment_clues"),
-        _task("deployment_topology", "梳理部署拓扑与运行环境", "部署线索留 P1 深度识别"),
-        _task("migration_sensitive_points", "归纳迁移敏感点",
-              "深度语义归纳留 P1（FullStackProfiler + 评估）"),
-    ]
+def _build_p0_migration_target(project_id: str) -> dict | None:
+    """采集：读取 Project 级目标运行环境约束（用户引导点选，R17.5 WP-6）。
+    用户输入采集（非识别）；缺失则 None（诚实，不编造）。"""
+    try:
+        from app.core.database import get_session
+        from app.models.project import Project
+        db = get_session()
+        try:
+            proj = db.get(Project, project_id)
+            return getattr(proj, "migration_target", None) if proj else None
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("P0 读取 project.migration_target 失败（advisory）", exc_info=True)
+        return None
 
 
-def _build_missing_information(source_index: dict, migration_intent: dict) -> tuple[list, list]:
-    """Register gaps (missing LICENSE / target DB undefined / intent absent)."""
-    key_files = source_index.get("key_files") or []
-    top_dirs = source_index.get("top_level_dirs") or []
-    all_names = {_basename(k).lower() for k in key_files} | {_basename(d).lower() for d in top_dirs}
-    missing: list[str] = []
-    questions: list[str] = []
-    if not any(n.startswith("license") for n in all_names):
-        missing.append("未发现 LICENSE 文件（许可条款未知）")
-        questions.append("该源码的开源/使用许可为何？是否允许迁移与再分发？")
-    if migration_intent.get("text") is None:
-        missing.append("迁移意图未在 P0 提供（migration_intent=not_provided）")
-        questions.append("本次迁移/重构的目标与约束是什么（目标技术栈/目标数据库/信创要求）？")
-    questions.append("目标运行环境与目标数据库是否已确定？（P2 评估需要）")
-    return missing, questions
+def _build_intake_facts(project_id: str, source_index: dict, materialized: dict,
+                        *, src_type: str, source_config: dict) -> dict:
+    """采集：组装 P0 【事实包】喂给 LLM 识别（R17.5 WP-2）。
 
-
-def _build_intake_enrichment(project_id: str, source_index: dict, materialized: dict,
-                             *, src_type: str, source_config: dict) -> dict:
-    """Assemble the deterministic P0 intake enrichment block (WP-B).
-
-    Empty/absent source (manual or failed materialization) → honest minimal block
-    (availability C, intent registered, no fabricated clues)."""
+    只含【采集到的事实】——不含任何识别结论（关键性判定/A-B-C/方言/入口/任务清单等一律
+    由 LLM 产出，见 IntakeService）。连接串等敏感值不出（脱敏 D-032）。空源诚实标注。
+    """
     source_config = source_config or {}
-    file_count = source_index.get("file_count", 0) if source_index else 0
-
-    repository_metadata = (source_index.get("repository_metadata")
-                           or source_index.get("git_info")) if source_index else None
-    migration_intent = _build_migration_intent(project_id, source_config)
-    availability = _build_availability_classification(source_index or {}, file_count, materialized)
-    database_entry = _build_database_entry(source_index or {})
-    clues = _extract_environment_clues(project_id, source_index or {}) if file_count > 0 else {
-        "note": "源码为空/未物化，无法提取环境线索", "evidence_gaps": ["no_source_materialized"]}
-    p1_tasks = _build_p1_intake_tasks(source_index or {})
-    missing, questions = _build_missing_information(source_index or {}, migration_intent)
-
+    si = source_index or {}
+    file_count = si.get("file_count", 0)
+    repository_metadata = si.get("repository_metadata") or si.get("git_info")
+    # 迁移意图【原文登记】（采集读用户输入，不做归纳——归纳交 LLM）。
+    raw_intent = _build_migration_intent(project_id, source_config)
+    migration_target = _build_p0_migration_target(project_id)
+    key_file_contents = (_collect_key_file_contents(project_id, si) if file_count > 0 else [])
     return {
+        "source_type": src_type,
+        "materialization_status": materialized.get("materialization_status"),
+        "file_count": file_count,
         "repository_metadata": repository_metadata,
-        "source_environment_clues": clues,
-        "database_entry": database_entry,
-        "availability_classification": availability,
-        "migration_intent": migration_intent,
-        "p1_intake_tasks": p1_tasks,
-        "missing_information": missing,
-        "questions_for_user": questions,
-        "deep_profiling": "NOT_DONE_IN_P0 (业务语义/字段级DB schema/迁移路线留 P1/P2)",
+        "top_level_dirs": si.get("top_level_dirs") or [],
+        "directory_count": si.get("directory_count", 0),
+        # key_files 为采集候选（大小写不敏感、含 .NET/vendor），交 LLM 判哪些真正关键。
+        "key_files_candidates": si.get("key_files") or [],
+        "code_scale": si.get("code_scale") or {},
+        # database_files：采集给路径/规模/编码/计数；方言/入口解读交 LLM。
+        "database_files": si.get("database_files") or [],
+        "key_file_contents_redacted": key_file_contents,
+        "raw_migration_intent_text": raw_intent.get("text"),
+        "migration_intent_present": raw_intent.get("text") is not None,
+        "migration_target": migration_target,
+        "collection_note": ("源码为空/未物化，事实包仅含基础采集字段（诚实）"
+                            if file_count == 0 else
+                            "事实包为确定性采集事实（大小写不敏感/依赖入口全候选/已脱敏），识别交 LLM"),
     }
+
 
 
 class RealP0Handler:
@@ -404,35 +225,31 @@ class RealP0Handler:
         "写入接入报告（intake_report.json）",
     ]
 
-    def __init__(self, tracer=None, auditor=None):
+    def __init__(self, tracer=None, auditor=None, intake_service=None):
         self.tracer = tracer
         self.auditor = auditor
+        self._intake_service = intake_service      # R17.5 WP-1: LLM 识别服务（可注入以测试）
+
+    def _service(self):
+        if self._intake_service is not None:
+            return self._intake_service
+        from app.services.intake_service import IntakeService
+        return IntakeService(tracer=self.tracer, auditor=self.auditor)
 
     async def execute(self, state: GraphState) -> dict:
         project_id = state["project_id"]
         src_type = state.get("source_type", "manual")
         source_config = state.get("source_config", {}) or {}
+        run_id = state.get("run_id", "")
 
-        # R9-5-3 T-10: assemble context package at node entry (C0-C6 + SKILL.md bodies)
-        context_package: dict = {}
-        try:
-            from app.services.context_assembler import assemble_context
-            context_package = assemble_context(
-                project_id, "p0",
-                node_state={"node_task": "P0 接入：物化源码 + 登记材料"},
-                task_type="onboarding",
-            )
-        except Exception:
-            # advisory：上下文装配失败不阻断 P0 领域工作，主链路照常推进；记录以便定位。
-            logger.debug("P0 上下文装配失败（advisory，领域工作照常推进）", exc_info=True)
-
+        # ── 采集①：物化源码（clone/zip/local，确定性采集，KEEP） ────────────
         materialized = {"materialization_status": "skipped", "file_count": 0}
         source_index: dict = {}
         try:
             from app.services.source_materializer import SourceMaterializer, generate_source_index
             m = SourceMaterializer(trace_writer=self.tracer, audit_writer=self.auditor)
             materialized = m.materialize(project_id, src_type, source_config,
-                                         run_id=state.get("run_id"))
+                                         run_id=run_id)
             if materialized.get("file_count", 0) > 0:
                 source_index = generate_source_index(project_id)
         except Exception as e:  # honest: record, do not fake success (D-097/公理3)
@@ -440,11 +257,8 @@ class RealP0Handler:
                             "errors": [str(e)]}
 
         file_count = _source_file_count(project_id)
-
         art_dir = workspace_service.workspace_path(project_id) / "artifacts"
         art_dir.mkdir(parents=True, exist_ok=True)
-        # If source_index wasn't produced this run (e.g. reuse without re-index), read
-        # the on-disk one so intake enrichment references real measured values.
         if not source_index:
             try:
                 si_path = art_dir / "source_index.json"
@@ -453,45 +267,106 @@ class RealP0Handler:
             except Exception:
                 logger.debug("P0 读取既有 source_index.json 失败（advisory）", exc_info=True)
 
+        # ── 采集②：组装事实包（只产事实，不产识别结论） ─────────────────────
+        intake_facts = _build_intake_facts(
+            project_id, source_index, materialized,
+            src_type=src_type, source_config=source_config)
+        migration_target = intake_facts.get("migration_target")
+
+        # ── 上下文装配（C0-C6 + P-codebase-onboarding SKILL.md 正文 + 目标环境进上下文）──
+        context_package: dict = {}
+        skill_body = ""
+        system_prompt: str | None = None
+        node_state = {"node_task": "P0 接入：采集事实包 → LLM 识别（技术栈/环境/可用性/入口/DB/P1 任务）",
+                      "task": "P0 接入识别"}
+        if migration_target:  # WP-6: 目标运行环境进入 P0 上下文（C5 动态层）
+            node_state["upstream_output"] = {"migration_target": migration_target}
+        try:
+            from app.services.context_assembler import assemble_context, build_system_prompt
+            context_package = assemble_context(
+                project_id, "p0", node_state=node_state,
+                task_type="onboarding", include_body=True, skill_disclosure="full")
+            bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
+            skill_body = "\n\n".join(bodies)[:12000]
+            system_prompt = build_system_prompt(
+                project_id, "p0", node_state=node_state,
+                task_type="onboarding", skill_disclosure="metadata")
+        except Exception:
+            logger.warning("P0 上下文装配失败（advisory，识别照常以事实包推理）", exc_info=True)
+
+        # ── 识别（LLM，Node Worker Agent 经 ModelGateway；无 Key → 诚实 blocked，WP-5）──
+        svc = self._service()
+        intake_result = await svc.identify(
+            project_id, facts=intake_facts, run_id=run_id, stage="p0",
+            system_prompt=system_prompt, skill_body=skill_body,
+            context_package=context_package)
+
+        assembly_trace = context_package.get("assembly_trace", {})
+        # 基础采集字段（无论识别是否完成都真实反映采集事实）
         intake = {
             "artifact_id": f"artifact-intake-{project_id[:8]}",
             "project_id": project_id, "stage": "p0", "artifact_type": "intake_report",
             "source_type": src_type, "file_count": file_count,
             "materialization_status": materialized.get("materialization_status"),
+            "repository_metadata": intake_facts.get("repository_metadata"),
+            "migration_target": migration_target,
             "generated_at": _now(),
+            "produced_by": "llm_node_worker_agent",
+            "deep_profiling": "NOT_DONE_IN_P0 (业务语义/字段级DB schema/迁移路线留 P1/P2)",
         }
-        # R17.4-2 WP-B: deterministic P0 intake enrichment (repository_metadata /
-        # source_environment_clues / database_entry / availability_classification /
-        # migration_intent / p1_intake_tasks / missing_information). All fields are
-        # measured/rule-derived from the real source; deep semantic profiling is left
-        # to P1 (honestly marked). Never fabricates sample instance values.
-        try:
-            intake.update(_build_intake_enrichment(
-                project_id, source_index, materialized,
-                src_type=src_type, source_config=source_config))
-        except Exception:
-            # honest: enrichment failure must be visible, not silently hidden. The 8
-            # base fields are still written so P0 never regresses to nothing.
-            logger.warning("P0 intake 富化失败（advisory，基础字段仍写入）", exc_info=True)
-            intake["enrichment_status"] = "enrichment_failed_see_logs"
+
+        # WP-5：识别未完成（无 Key/模型失败）→ 诚实 blocked，不伪造 completed、不回退规则识别。
+        if intake_result.status != "completed":
+            intake["identification"] = {
+                "status": intake_result.status, "reason": intake_result.reason,
+                "note": "P0 识别需有效模型 Key，未降级为规则识别（D-097/公理3）"}
+            _mediated_write(project_id, "artifacts/intake_report.json",
+                            json.dumps(intake, ensure_ascii=False, indent=2),
+                            auditor=self.auditor, stage="p0", action="write_intake_report")
+            produced = [f"artifacts/{n}" for n in ("intake_report.json", "source_index.json")
+                        if (art_dir / n).exists()]
+            return {
+                "status": intake_result.status,
+                "reason": intake_result.reason,
+                "file_count": file_count, "source_type": src_type,
+                "materialized": materialized, "artifacts": produced,
+                "assembly_trace": assembly_trace,
+                "attempted_chain": intake_result.attempted_chain,
+                "model_error_category": intake_result.model_error_category,
+                "model_user_actions": intake_result.model_user_actions,
+            }
+
+        # 识别完成：合并 LLM 产出的识别字段（样本值 LLM 生成，通用锚点固定）。
+        identification = intake_result.identification or {}
+        intake["identification"] = identification
+        # 平铺常用识别字段到顶层（前端/下游沿用既有键名读取；单一事实源仍是 identification）。
+        for k in ("key_files", "source_environment_clues", "database_entry",
+                  "availability_classification", "migration_intent", "entry_points",
+                  "p1_intake_tasks", "missing_information", "questions_for_user",
+                  "uncertainty", "primary_language", "detected_stack"):
+            if k in identification:
+                intake[k] = identification[k]
+        intake["model_used"] = intake_result.model_used
         _mediated_write(project_id, "artifacts/intake_report.json",
                         json.dumps(intake, ensure_ascii=False, indent=2),
                         auditor=self.auditor, stage="p0", action="write_intake_report")
 
-        assembly_trace = context_package.get("assembly_trace", {})
-
-        # NEW-05 (R17.3-6 WP-5): artifacts 真实反映实际写入的产物。P0 写 intake_report.json，
-        # 且 file_count>0 时 generate_source_index 写 source_index.json——旧实现硬编码只报
-        # intake_report.json，漏报 source_index.json（construction 欠报）。按盘上存在性汇集。
         produced_artifacts = [f"artifacts/{n}" for n in ("intake_report.json", "source_index.json")
                               if (art_dir / n).exists()]
-
         return {
+            "status": "completed",
             "file_count": file_count,
             "source_type": src_type,
             "materialized": materialized,
+            "identification": identification,
+            "primary_language": identification.get("primary_language"),
+            "availability_class": (identification.get("availability_classification") or {}).get("class"),
+            "key_files_count": len(identification.get("key_files") or []),
+            "model_used": intake_result.model_used,
             "artifacts": produced_artifacts,
             "assembly_trace": assembly_trace,
+            "context_refs": intake_result.context_refs,
+            "skill_refs": intake_result.skill_refs,
             "evidence_candidates": [
                 {"evidence_id": f"ev-p0-ws-{project_id[:8]}",
                  "type": "workspace_initialized", "status": "candidate"},
@@ -502,9 +377,12 @@ class RealP0Handler:
 
     def review(self, result: dict) -> ReviewResult:
         issues = []
+        # 域规则（确定性）：非手动项目源码为空 → 应阻断引导补凭据。
         if result.get("source_type") not in ("manual",) and result.get("file_count", 0) == 0:
             issues.append({"type": "empty_source",
                            "detail": "非手动项目但源码目录为空（应阻断并引导补凭据）"})
+        # 识别质量语义判定由独立 LLM Acceptance Agent 承担（WP-4，validation_agent p0=llm）；
+        # 此处仅保留确定性域规则（存在性/空源），不做规则化识别质量判定。
         return ReviewResult(passed=not issues, issues=issues,
                             recommendations=["补充源码凭据后重新导入"] if issues else [],
                             reviewer="p0_review_skill")

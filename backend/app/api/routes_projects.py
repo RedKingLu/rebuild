@@ -460,6 +460,14 @@ class OnboardingCompleteRequest(_BaseModel):
     submission_kind: str | None = None
     git_remote_url: str | None = None
     git_branch: str | None = None
+    # R17.5 WP-6 (Q-R17.4-3-2): 目标运行环境（用户点选的目标 CPU 架构 + 目标 OS）。
+    # 开放可扩展/允许自由输入，非封闭枚举（§2.3）；平台可基于源环境推荐，用户点选为准。
+    # 这是用户输入采集（非识别逻辑）；持久化为 Project 级目标约束字段。
+    target_cpu_arch: str | None = None
+    target_cpu_arch_label: str | None = None
+    target_os: str | None = None
+    target_os_label: str | None = None
+    target_env_note: str | None = None
 
 
 @router.post("/{project_id}/onboarding/complete")
@@ -496,6 +504,19 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
         updates["model_strategy_mode"] = req.model_strategy_mode
     if req.global_model_ref is not None:
         updates["global_model_ref"] = req.global_model_ref
+    # R17.5 WP-6 (Q-R17.4-3-2): persist the target runtime environment chosen in the
+    # guide as a Project-level constraint (硬约束，可经用户 Gate 改). Stored as an open,
+    # extensible dict (non-enum); only recorded when the user actually selected/entered
+    # something (honest: absent → left null, not fabricated).
+    if req.target_cpu_arch or req.target_os or req.target_cpu_arch_label or req.target_os_label:
+        updates["migration_target"] = {
+            "cpu_arch": (req.target_cpu_arch or None),
+            "cpu_arch_label": (req.target_cpu_arch_label or req.target_cpu_arch or ""),
+            "os": (req.target_os or None),
+            "os_label": (req.target_os_label or req.target_os or ""),
+            "source": "user_onboarding",
+            "note": (req.target_env_note or ""),
+        }
     # R9-5-7 T1/T2: persist remote-Git submission choice into source_config so the
     # materializer (step 5b) clones the chosen repo. Honest deferred if no creds.
     if req.submission_kind == "remote_git" and req.git_remote_url:

@@ -142,6 +142,8 @@ class ProjectService:
             "external_platform_scope": getattr(p, "external_platform_scope", None) or "none",
             "model_strategy_mode": getattr(p, "model_strategy_mode", "global_unified") or "global_unified",
             "global_model_ref": getattr(p, "global_model_ref", None),
+            # R17.5 WP-6 (Q-R17.4-3-2): 目标运行环境约束（引导点选），前端展示 + 喂 P 阶段目标。
+            "migration_target": getattr(p, "migration_target", None),
             "created_at": p.created_at.isoformat() if p.created_at else "",
             "updated_at": p.updated_at.isoformat() if p.updated_at else "",
             "source_status": "real",

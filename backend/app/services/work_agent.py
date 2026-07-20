@@ -58,55 +58,17 @@ _STAGE_TASK_TYPE = {
     "p6": "delivery",
 }
 
-# LLM 主任务阶段（P2/P3/P4）：claim-evidence map（LLM 内联引用）+ LLM 语义 ValidationAgent。
-# 其余（P0/P1/P5/P6）为确定性主任务：fact-evidence map + 结构化 ValidationAgent。
-_LLM_STAGES = {"p2", "p3", "p4"}
+# LLM 主任务阶段：claim-evidence map（LLM 内联引用）+ LLM 语义 ValidationAgent。
+# R17.5 WP-1：P0 纳入 LLM 执行路径——识别/技术栈/环境解读/可用性研判/P1 任务规划/DB 入口
+# /入口点判定由 Node Worker Agent(经 ModelGateway, D-098) 对采集事实包推理产出（AGENTS §2.3）；
+# 确定性只做采集（materialize/index/git/SQL）。其余（P1/P5/P6）为确定性主任务：fact-evidence map。
+_LLM_STAGES = {"p0", "p2", "p3", "p4"}
 
-# R17.4-2 WP-C：语言检测排除项（与 FullStackProfiler._item4 口径一致——数据/文档
-# 扩展名不计入"主语言"）。避免 .json/.md 等被当成主语言。
+# R17.5 WP-3 (HC-06): 语言/主语言【识别】已下放给 P0 LLM（Node Worker Agent）。work_agent
+# 的 _scan_project_facts 仅做【采集】——原始扩展名计数 + 构建文件候选，用于合成"动态工作计划"
+# 的叙述（非权威识别）；不再做 .NET/框架加权主语言判定（旧 _framework_primary_language 已删，
+# 那是按栈枚举的样本值硬编码规则，§10-26）。数据/文档扩展不计入语言（采集口径，避免 .json 被当语言）。
 _NON_LANG_EXTS = {".json", ".yaml", ".yml", ".xml", ".md", ".txt", ".lock", ".rst"}
-
-# 供应商/示例目录：其中的语言文件不计入应用技术栈（B-R17.4-P0-STACK-PRIMARY 的
-# PHP 误报根因——第三方库 examples 目录下的 .php 示例文件被当成项目栈）。通用目录名，
-# 非硬编码 MicroOA。
-_VENDOR_EXAMPLE_DIRS = {"examples", "example", "samples", "sample", "demo", "demos"}
-
-
-def _framework_primary_language(build_files: list, lang_counts: dict) -> Optional[str]:
-    """基于构建/项目文件确定框架主语言（B-R17.4-P0-STACK-PRIMARY）。
-
-    存在框架工程文件（.sln/.csproj 等）时，框架栈语言优先于静态资源文件计数——
-    不因 .js/.ts 静态资源数量多而误判主语言。通用映射，非硬编码 MicroOA。
-    """
-    bl = [b.lower() for b in build_files]
-
-    def _suffix(*sfx):
-        return any(b.endswith(sfx) for b in bl)
-
-    def _name(*names):
-        return any(b in names for b in bl)
-
-    if _suffix(".sln", ".csproj", ".vbproj", ".fsproj"):
-        # .NET family — pick the most-present of C#/VB/F# (fallback C#).
-        cands = sorted(
-            [("C#", lang_counts.get("C#", 0)),
-             ("Visual Basic", lang_counts.get("Visual Basic", 0)),
-             ("F#", lang_counts.get("F#", 0))],
-            key=lambda x: -x[1])
-        return cands[0][0] if cands[0][1] > 0 else "C#"
-    if _name("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle"):
-        return "Kotlin" if lang_counts.get("Kotlin", 0) > lang_counts.get("Java", 0) else "Java"
-    if _name("requirements.txt", "setup.py", "pyproject.toml"):
-        return "Python"
-    if _name("go.mod", "go.sum"):
-        return "Go"
-    if _name("cargo.toml"):
-        return "Rust"
-    if _name("composer.json"):
-        return "PHP"
-    if _name("gemfile"):
-        return "Ruby"
-    return None
 
 # 各阶段上游产物（供 claim-evidence 绑定「引用了哪些上游证据」；§3.6 通用，非硬编码 MicroOA）。
 _STAGE_UPSTREAM_ARTIFACTS = {
@@ -285,18 +247,16 @@ class WorkAgent:
 
     # ── 轻量确定性事实扫描（用于动态工作计划，不重跑全量 profiler） ──────────
     def _scan_project_facts(self, state: dict) -> dict:
-        """基于真实 workspace 的轻量确定性扫描：source_type / file_count / 探测栈 /
-        构建文件。用于合成动态工作计划（Q-WP2-4：随项目变化，非静态模板）。
+        """基于真实 workspace 的轻量确定性【采集】：source_type / file_count / 原始扩展名
+        计数 / 构建文件候选。用于合成动态工作计划的叙述（Q-WP2-4：随项目变化，非静态模板）。
 
-        .NET/其它栈识别用通用 endswith（§3.6，禁硬编码 MicroOA）。
-
-        R17.4-2 WP-C：主语言判定加权——存在框架工程文件（.sln/.csproj 等）时框架栈
-        语言优先，不因静态资源（.js/.ts）数量多而误判为 JS 主；数据/文档扩展名不计入
-        语言；供应商 examples/samples 目录下的语言文件不计入应用栈（PHP 误报修复）。
+        R17.5 WP-3：仅采集——`detected_stack` 是按【原始文件计数】排序的候选栈（非权威识别），
+        权威技术栈/主语言【识别】由 P0 LLM（Node Worker Agent）对事实包推理产出。此处不做框架
+        加权主语言判定（旧规则已删）。数据/文档扩展不计入语言（采集口径）。
         """
         src = self._ws_root() / "source"
         source_type = state.get("source_type") or "manual"
-        ext_counts: Counter = Counter()      # 应用代码语言扩展计数（已排除供应商示例目录）
+        ext_counts: Counter = Counter()      # 语言扩展原始计数（采集）
         build_files: list[str] = []
         file_count = 0
         if src.exists():
@@ -308,10 +268,8 @@ class WorkAgent:
                     continue
                 file_count += 1
                 ext = p.suffix.lower()
-                # 语言计数排除：数据/文档扩展 + 供应商示例/样例目录（PHP 误报根因）。
-                lower_parts = {seg.lower() for seg in parts[:-1]}
-                in_vendor_example = bool(lower_parts & _VENDOR_EXAMPLE_DIRS)
-                if ext not in _NON_LANG_EXTS and not in_vendor_example:
+                # 语言计数排除数据/文档扩展（采集口径，避免 .json/.md 被当成语言）。
+                if ext not in _NON_LANG_EXTS:
                     ext_counts[ext] += 1
                 fname = p.name
                 if fname in BUILD_FILES:
@@ -324,23 +282,13 @@ class WorkAgent:
             lang = LANG_EXTENSIONS.get(ext)
             if lang:
                 lang_counts[lang] = lang_counts.get(lang, 0) + cnt
-        # 按计数排名（静态资源多的语言仍靠前，但下一步会被框架主语言加权覆盖）。
+        # 按原始计数排名的【候选】栈（非权威识别——权威识别交 P0 LLM）。
         detected_stack: list[str] = [lang for lang, _c in
-                                     sorted(lang_counts.items(), key=lambda kv: -kv[1])]
-        # 框架主语言加权：存在框架工程文件时，框架栈语言置顶（不因 .js 多标 JS 主）。
-        framework_primary = _framework_primary_language(build_files, lang_counts)
-        if framework_primary:
-            if framework_primary in detected_stack:
-                detected_stack.remove(framework_primary)
-            detected_stack.insert(0, framework_primary)
-        detected_stack = detected_stack[:6]
-        primary_language = detected_stack[0] if detected_stack else None
+                                     sorted(lang_counts.items(), key=lambda kv: -kv[1])][:6]
         return {
             "source_type": source_type,
             "file_count": file_count,
             "detected_stack": detected_stack,
-            "primary_language": primary_language,
-            "framework_primary": framework_primary,
             "build_files": sorted(set(build_files))[:20],
         }
 
@@ -363,7 +311,7 @@ class WorkAgent:
              "tool": "full_stack_profiler.profile",
              "rationale": "为下游 P2 评估提供可信输入清单"})
         goal = ("P1 建档：对"
-                + (f"以 {facts['detected_stack'][0]} 为主的项目" if facts["detected_stack"]
+                + (f"候选栈为 {facts['detected_stack'][0]} 的项目" if facts["detected_stack"]
                    else "该项目")
                 + f"（{facts['file_count']} 源文件）全量识别结构/技术栈/依赖/配置，产出项目档案与 P2 输入")
         criteria = [
@@ -383,7 +331,7 @@ class WorkAgent:
         handler = self._get_handler()
         base_goal = getattr(handler, "goal", f"{self.stage.upper()} 阶段主任务") if handler else \
             f"{self.stage.upper()} 阶段主任务"
-        stack_txt = (f"以 {facts['detected_stack'][0]} 为主" if facts["detected_stack"] else "结构待识别")
+        stack_txt = (f"候选栈 {facts['detected_stack'][0]}" if facts["detected_stack"] else "结构待识别")
         goal = f"{base_goal}（当前项目：{facts['file_count']} 源文件，{stack_txt}）"
         upstream_present = [r for r in _STAGE_UPSTREAM_ARTIFACTS.get(self.stage, [])
                             if self._exists_rel(r)]
@@ -864,16 +812,42 @@ class WorkAgent:
         st = self.stage
         out: list[dict] = []
         if st == "p0":
+            # R17.5 WP-1: P0 是 LLM 识别阶段——claim 为 LLM 产出的识别结论，内联引用其推理所据的
+            # 采集产物（source_index.json 为主，intake_report.json 承载最终识别）。materialization/
+            # source_type 为采集事实一并登记（引用 intake_report）。
+            ident = tool_result.get("identification") or {}
+            si_ref = "artifacts/source_index.json"
+            ir_ref = "artifacts/intake_report.json"
             m = tool_result.get("materialized") or {}
             out.append({"key": "materialization",
                         "statement": f"源码物化状态={m.get('materialization_status')}，文件数={tool_result.get('file_count',0)}",
-                        "artifact_ref": "artifacts/intake_report.json",
+                        "artifact_ref": ir_ref,
                         "detail": {"materialization_status": m.get("materialization_status"),
-                                   "file_count": tool_result.get("file_count", 0)}})
-            out.append({"key": "source_type",
-                        "statement": f"接入来源类型={tool_result.get('source_type')}",
-                        "artifact_ref": "artifacts/intake_report.json",
-                        "detail": {"source_type": tool_result.get("source_type")}})
+                                   "file_count": tool_result.get("file_count", 0)},
+                        "cited_refs": [si_ref]})
+            prim = ident.get("primary_language")
+            out.append({"key": "primary_language",
+                        "statement": f"LLM 识别主语言/主栈：{prim or '未确定（诚实标注）'}",
+                        "artifact_ref": ir_ref,
+                        "detail": {"primary_language": prim,
+                                   "detected_stack": ident.get("detected_stack")},
+                        "cited_refs": [si_ref]})
+            av = ident.get("availability_classification") or {}
+            out.append({"key": "availability",
+                        "statement": f"LLM 可用性研判：{av.get('class', '未判定')}（{av.get('label','')}）",
+                        "artifact_ref": ir_ref,
+                        "detail": {"availability_class": av.get("class")},
+                        "cited_refs": [si_ref]})
+            out.append({"key": "key_files",
+                        "statement": f"LLM 判定关键文件 {len(ident.get('key_files') or [])} 项",
+                        "artifact_ref": ir_ref,
+                        "detail": {"key_files_count": len(ident.get("key_files") or [])},
+                        "cited_refs": [si_ref]})
+            out.append({"key": "p1_tasks",
+                        "statement": f"LLM 生成 P1 建档任务 {len(ident.get('p1_intake_tasks') or [])} 项（防 P1 空转）",
+                        "artifact_ref": ir_ref,
+                        "detail": {"p1_task_count": len(ident.get("p1_intake_tasks") or [])},
+                        "cited_refs": [si_ref]})
         elif st == "p2":
             for i, r in enumerate((tool_result.get("risk_list") or [])[:8]):
                 out.append({"key": f"risk-{i}",

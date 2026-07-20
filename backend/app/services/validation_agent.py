@@ -242,7 +242,9 @@ class ValidationAgent:
         work_result = work_result or {}
         declared = work_result.get("status", "completed")
         cem_ref = work_result.get("claim_evidence_map_ref")
-        llm = self.stage in ("p2", "p3", "p4")
+        # R17.5 WP-4：P0 改 LLM 识别 → 纳入 LLM 验收路径（独立 Acceptance Agent LLM 判识别质量，
+        # 非仅存在性）；内联引用校验 + LLM 语义验收（无 Key → 诚实 evidence_gap，advisory）。
+        llm = self.stage in ("p0", "p2", "p3", "p4")
 
         checks: list = []
         issues: list = []

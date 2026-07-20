@@ -1,15 +1,14 @@
-"""R17.4-2 P0 确定性富化修复单测（WP-A/B/C/D）。
+"""R17.5 P0 目标驱动 Agent 重构单测（承接原 R17.4-2 P0 富化测试）。
 
-覆盖裁决 Q-R17.4-1-1「确定性→P0」补齐的确定性字段：
-  WP-A source_index 富化（key_files 大小写不敏感 / entry_points /
-        repository_metadata 全字段[remote 脱敏] / database_files 入口识别 / code_scale）
-  WP-B intake_report 富化（repository_metadata / source_environment_clues[连接串不回显] /
-        database_entry / availability_classification / migration_intent[缺则诚实标] /
-        p1_intake_tasks / missing_information）
-  WP-C work_agent 栈主语言加权（.sln→框架栈优先，不因 .js 多标 JS 主）+ PHP 误报修复
-  WP-D branch 不一致诚实发声 / trace run_id / 脱敏红线
+架构改动说明（R17.5，非"真 bug"）：P0 从"确定性识别富化"重构为"目标驱动 Node Worker
+Agent 循环"——确定性【只做采集】（clone/列文件/读/计数/编码/脱敏），识别/技术栈/环境解读/
+可用性研判/P1 任务规划/DB 入口/入口点判定【一律 LLM】（IntakeService 经 ModelGateway）。
+因此原 R17.4-2 的【确定性识别】单测（_build_intake_enrichment / _extract_environment_clues /
+_build_availability_classification / _build_p1_intake_tasks / _framework_primary_language 等）
+已随被测函数删除而失效——本文件保留【采集层】单测（编码/计数/key_file/git 元数据/脱敏/分支
+一致性），并新增【采集事实包】与【IntakeService 无 Key 诚实 blocked / 有 Key 识别】单测。
 
-真实读取/测量，无 mock；样本实例值来自真实构造的源树，不硬编码进被测代码。
+真实读取/测量，无 mock 生产路径（IntakeService gateway 注入仅为可测性，同 AssessmentService 范式）。
 """
 
 import subprocess
@@ -23,7 +22,8 @@ from app.services.source_materializer import (
     _detect_sql_encoding,
 )
 import app.graph.stage_handlers as sh
-from app.services.work_agent import WorkAgent, _framework_primary_language
+from app.services.work_agent import WorkAgent
+from app.services.intake_service import IntakeService, redact_config_text
 
 
 PID = "proj-r1742-test"
@@ -46,7 +46,7 @@ def _write(root, rel, content: str):
     return p
 
 
-# ── WP-A ─────────────────────────────────────────────────────────────────────
+# ── 采集层：key file / 编码 / 计数（保留，测采集测量） ──────────────────────────
 
 def test_r174_2_keyfile_case_insensitive():
     # .NET convention capitalises Web.config / Global.asax — must still match.
@@ -78,7 +78,9 @@ def test_r174_2_sql_encoding_and_analysis(tmp_path):
     assert info["deep_schema_profiling"].startswith("NOT_DONE_IN_P0")
 
 
-def test_r174_2_source_index_enrichment():
+def test_r174_2_source_index_collection():
+    """采集：source_index 列文件/计数/key_files（大小写不敏感）/database_files（编码/方言）/
+    code_scale。R17.5：entry_points 不再由采集预判（识别交 LLM）——应为空 + note。"""
     root = _src()
     _write(root, "Web.config", '<configuration><system.web>'
            '<compilation targetFramework="4.8"/></system.web></configuration>')
@@ -92,8 +94,9 @@ def test_r174_2_source_index_enrichment():
     idx = generate_source_index(PID, source_type="local_dir")
     bases = {k.replace("\\", "/").split("/")[-1] for k in idx["key_files"]}
     assert {"Web.config", "Global.asax"} <= bases       # case-insensitive hit
-    ep_bases = {e.split("/")[-1] for e in idx["entry_points"]}
-    assert {"Default.aspx", "Global.asax"} <= ep_bases
+    # R17.5 WP-2/WP-3: 采集不预判入口点（识别交 P0 LLM）。
+    assert idx["entry_points"] == []
+    assert idx.get("entry_points_note")
     assert idx["database_files"], "database_files must be identified"
     db0 = idx["database_files"][0]
     assert "UTF-16" in db0["encoding"]
@@ -137,7 +140,7 @@ def test_r174_2_sanitize_git_remote():
     assert _sanitize_git_remote(None) is None
 
 
-# ── WP-D branch mismatch ──────────────────────────────────────────────────────
+# ── WP-D branch mismatch（采集侧诚实发声） ─────────────────────────────────────
 
 def test_r174_2_branch_mismatch_voiced():
     result = {"warnings": [], "evidence_gaps": [], "git_info": {"branch": "master"}}
@@ -153,7 +156,7 @@ def test_r174_2_branch_match_no_gap():
     assert not [g for g in result["evidence_gaps"] if g.get("type") == "branch_mismatch"]
 
 
-# ── WP-B intake enrichment ────────────────────────────────────────────────────
+# ── R17.5 采集事实包 + 脱敏 ────────────────────────────────────────────────────
 
 def _build_dotnet_source(pid):
     root = _src(pid)
@@ -178,53 +181,41 @@ def _build_dotnet_source(pid):
     return root
 
 
-def test_r174_2_intake_enrichment_fields():
-    pid = "proj-r1742-intake"
+def test_r175_intake_facts_collection_only_and_redacted():
+    """采集事实包只含事实，不含识别结论；连接串/密钥值全程脱敏（D-032）。"""
+    pid = "proj-r175-facts"
     _build_dotnet_source(pid)
     idx = generate_source_index(pid, source_type="local_dir")
-    enr = sh._build_intake_enrichment(
+    facts = sh._build_intake_facts(
         pid, idx, {"materialization_status": "completed", "file_count": idx["file_count"]},
         src_type="local_dir", source_config={})
 
-    # availability B (source available, key files present) with reasoning chain
-    assert enr["availability_classification"]["class"] == "B"
-    assert enr["availability_classification"]["reasoning"]
+    # 采集字段存在（事实），且【无识别结论字段】（availability/primary_language 等交 LLM）。
+    assert facts["file_count"] == idx["file_count"]
+    assert facts["key_files_candidates"], "采集给关键文件候选（交 LLM 判）"
+    assert "availability_classification" not in facts
+    assert "source_environment_clues" not in facts
+    assert "p1_intake_tasks" not in facts
+    assert "primary_language" not in facts
 
-    # environment clues — real regex extraction; connection string VALUE not echoed
-    wc = enr["source_environment_clues"]["dotnet_web_config"]
-    assert wc["target_framework"] == "4.8"
-    assert wc["authentication_mode"] == "None"
-    assert wc["session_state_mode"] == "InProc"
-    assert wc["has_connection_strings"] is True
-    clues_blob = str(enr["source_environment_clues"])
-    assert "SUPERSECRET" not in clues_blob            # 脱敏红线：连接串值不回显
-    assert enr["source_environment_clues"]["solution"]["is_website_project"] is True
-    assert enr["source_environment_clues"]["packages"]["package_count"] == 2
-    assert ".NET" in enr["source_environment_clues"]["readme_keywords"]
-    assert enr["source_environment_clues"]["deep_environment_profiling"].startswith("NOT_DONE_IN_P0")
-
-    # database entry
-    assert enr["database_entry"]["present"] is True
-    assert enr["database_entry"]["primary"]["dialect"] == "SQL Server (T-SQL)"
-
-    # migration_intent honestly not_provided (no config/description)
-    assert enr["migration_intent"]["text"] is None
-    assert enr["migration_intent"]["note"] == "not_provided_at_p0"
-    assert enr["migration_intent"]["decision_status"] == "pending_p2_assessment"
-
-    # p1 intake tasks — ten categories
-    assert len(enr["p1_intake_tasks"]) == 10
-    cats = {t["category"] for t in enr["p1_intake_tasks"]}
-    assert "migration_sensitive_points" in cats and "db_objects" in cats
-
-    # missing information — no LICENSE + intent absent
-    assert any("LICENSE" in m for m in enr["missing_information"])
-    assert enr["questions_for_user"]
-    assert enr["repository_metadata"] == idx.get("repository_metadata")
+    # 关键文件原文已采集且脱敏——连接串密码值绝不出现。
+    blob = str(facts["key_file_contents_redacted"])
+    assert "SUPERSECRET" not in blob, "脱敏红线：连接串值不回显"
+    assert facts["migration_intent_present"] is False   # 无 config/description 意图
 
 
-def test_r174_2_migration_intent_from_config():
-    pid = "proj-r1742-intent"
+def test_r175_redact_config_text():
+    txt = ('<add connectionString="Server=.;Password=SUPERSECRET"/>'
+           '\napi_key = ABCD1234EFGH5678')
+    out = redact_config_text(txt)
+    assert "SUPERSECRET" not in out
+    assert "ABCD1234EFGH5678" not in out
+    assert "[REDACTED]" in out
+
+
+def test_r175_migration_intent_registration_from_config():
+    # 采集登记用户迁移意图原文（归纳交 LLM；此处仅测采集登记）。
+    pid = "proj-r175-intent"
     _src(pid)
     intent = sh._build_migration_intent(pid, {"migration_intent": "迁移到信创环境"})
     assert intent["text"] == "迁移到信创环境"
@@ -232,43 +223,63 @@ def test_r174_2_migration_intent_from_config():
     assert "note" not in intent
 
 
-def test_r174_2_availability_empty_source_is_C():
-    cls = sh._build_availability_classification({}, 0, {"materialization_status": "empty"})
-    assert cls["class"] == "C"
+# ── R17.5 IntakeService：无 Key 诚实 blocked / 有 Key（注入 gateway）识别 ─────────
+
+class _BlockedGateway:
+    """模拟无可用模型（无 Key）：readiness available=False。"""
+    def stage_model_readiness(self, **kw):
+        return {"available": False, "capability_ok": False,
+                "reason": "无任一已配置且具备有效凭据的模型可用",
+                "attempted_chain": [{"provider": "x", "outcome": "credential_missing"}],
+                "user_actions": [{"action": "configure_key"}]}
 
 
-# ── WP-C stack weighting + PHP fix ────────────────────────────────────────────
+class _KeyPresentGateway:
+    """模拟 Key-present LLM：readiness available=True，call 返回结构化识别 JSON。"""
+    def __init__(self, content):
+        self._content = content
 
-def test_r174_2_framework_primary_language():
-    assert _framework_primary_language(["App.sln"], {"C#": 10, "JavaScript": 200}) == "C#"
-    assert _framework_primary_language(["App.vbproj"], {"Visual Basic": 5, "C#": 0}) == "Visual Basic"
-    assert _framework_primary_language(["pom.xml"], {"Java": 20}) == "Java"
-    assert _framework_primary_language(["go.mod"], {"Go": 3}) == "Go"
-    assert _framework_primary_language(["package.json"], {"JavaScript": 5}) is None
+    def stage_model_readiness(self, **kw):
+        return {"available": True, "capability_ok": True, "reason": "",
+                "attempted_chain": [], "user_actions": []}
+
+    async def call(self, *, messages=None, **kw):
+        return {"status": "completed", "model": "fake-model", "content": self._content}
 
 
-def test_r174_2_scan_facts_dotnet_primary_no_php():
-    pid = "proj-r1742-stack"
-    root = _src(pid)
-    _write(root, "MicroOA.sln", "solution")
-    # many vendored JS/TS static assets (must NOT dominate primary language)
-    for i in range(30):
-        _write(root, f"Scripts/a{i}.js", "x")
-    for i in range(20):
-        _write(root, f"Resource/t{i}.ts", "x")
-    # real app code (.cs) — fewer files than JS but the framework language
-    for i in range(8):
-        _write(root, f"App_Code/C{i}.cs", "class C {}")
-    # vendored third-party PHP example files (PHP 误报根因) under examples/
-    _write(root, "Resource/fullcalendar/examples/php/a.php", "<?php ?>")
-    _write(root, "Resource/fullcalendar/examples/php/b.php", "<?php ?>")
-    # data/doc noise must not become a "language"
-    _write(root, "package.json", "{}")
-    _write(root, "README.md", "# doc")
+@pytest.mark.asyncio
+async def test_r175_intake_blocked_no_key():
+    svc = IntakeService(gateway=_BlockedGateway())
+    res = await svc.identify("pid-x", facts={"file_count": 3})
+    assert res.status == "blocked"
+    assert "no_model_key" in res.reason
+    assert res.model_error_category == "model_unavailable"
+    assert res.attempted_chain, "无 Key 须透传已尝试/候选模型链路（诚实）"
 
-    facts = WorkAgent("p0", pid, "run-x")._scan_project_facts({"source_type": "local_dir"})
-    assert facts["framework_primary"] == "C#"
-    assert facts["primary_language"] == "C#"          # not JavaScript despite 30 .js
-    assert "PHP" not in facts["detected_stack"]        # vendored examples excluded
-    assert "JSON" not in facts["detected_stack"]       # data ext not a language
-    assert "Markdown" not in facts["detected_stack"]
+
+@pytest.mark.asyncio
+async def test_r175_intake_completed_with_key():
+    import json
+    ident = {
+        "primary_language": "C#",
+        "detected_stack": ["C#", "JavaScript", "SQL"],
+        "key_files": [{"path": "Web.config", "why_key": "配置入口"}],
+        "availability_classification": {"class": "B", "label": "源码可用未验证运行",
+                                        "reasoning": ["源码已物化", "无实跑证据"]},
+        "database_entry": {"present": True, "dialect": "SQL Server (T-SQL)"},
+        "migration_intent": {"text": None, "source": "user_intent",
+                             "confidence": "unverified", "decision_status": "pending_p2_assessment"},
+        "entry_points": [{"path": "Global.asax", "kind": "asp_net_app"}],
+        "p1_intake_tasks": [{"category": "db_objects", "task": "识别表", "scope_ref": "Resource/DB"}],
+        "missing_information": ["未发现 LICENSE"],
+        "questions_for_user": ["目标数据库？"],
+        "uncertainty": [{"area": "运行环境", "detail": "未验证实跑"}],
+    }
+    svc = IntakeService(gateway=_KeyPresentGateway(json.dumps(ident, ensure_ascii=False)))
+    res = await svc.identify("pid-y", facts={"file_count": 10,
+                                             "migration_target": {"os": "openEuler"}})
+    assert res.status == "completed"
+    assert res.identification["primary_language"] == "C#"
+    assert res.identification["availability_classification"]["class"] == "B"
+    # 目标运行环境（用户输入采集）透传进 identification
+    assert res.identification["migration_target"]["os"] == "openEuler"

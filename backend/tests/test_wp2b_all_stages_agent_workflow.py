@@ -40,14 +40,63 @@ def test_all_stages_agent_workflow_enabled():
         assert nodes._agent_workflow_enabled(s)
 
 
-# ── P0 接入（确定性，无 Key 端到端） ─────────────────────────────────────
-async def test_p0_deterministic_workflow(isolated_data):
+# ── P0 接入（R17.5：LLM 识别阶段；有 Key=注入 gateway → 识别完成；无 Key → 诚实 blocked）──
+class _IntakeGateway:
+    """模拟 Key-present LLM（P0 识别）：readiness available=True；域调用返回结构化识别 JSON；
+    ValidationAgent LLM 语义验收调用返回 verdict JSON。同 P2/P3 handler 测试的 fake gateway 范式。"""
+
+    def __init__(self, ident_json):
+        self._ident = ident_json
+
+    def get_status(self):
+        return SimpleNamespace(overall_status="available")
+
+    def stage_model_readiness(self, **kwargs):
+        return {"available": True, "capability_ok": True, "reason": "",
+                "attempted_chain": [], "user_actions": []}
+
+    async def call(self, *, messages=None, **kw):
+        text = json.dumps(messages, ensure_ascii=False) if messages else ""
+        if "verdict" in text:   # ValidationAgent LLM 语义验收
+            return {"status": "completed", "model": "m",
+                    "content": json.dumps({"verdict": "accepted", "reason": "识别结构合理"})}
+        return {"status": "completed", "model": "fake-model", "content": self._ident}
+
+
+_P0_IDENT = json.dumps({
+    "primary_language": "Python",
+    "detected_stack": ["Python"],
+    "key_files": [{"path": "requirements.txt", "why_key": "依赖清单"},
+                  {"path": "app.py", "why_key": "应用入口"}],
+    "source_environment_clues": {"languages": ["Python"], "frameworks": ["Flask"],
+                                 "project_type": "web_app"},
+    "database_entry": {"present": False, "note": "未发现 .sql 脚本"},
+    "availability_classification": {"class": "B", "label": "源码可用未验证运行",
+                                    "reasoning": ["源码已物化", "无原环境实跑证据 → B"]},
+    "migration_intent": {"text": None, "source": "user_intent", "confidence": "unverified",
+                         "decision_status": "pending_p2_assessment", "note": "not_provided_at_p0"},
+    "entry_points": [{"path": "app.py", "kind": "python_entry"}],
+    "p1_intake_tasks": [{"category": "dependencies", "task": "解析 requirements.txt",
+                         "scope_ref": "requirements.txt"}],
+    "missing_information": ["未发现 LICENSE"],
+    "questions_for_user": ["目标运行环境？"],
+    "uncertainty": [{"area": "运行环境", "detail": "未验证实跑"}],
+}, ensure_ascii=False)
+
+
+async def test_p0_llm_intake_workflow_with_key(isolated_data):
+    """R17.5：P0 改 LLM 识别。注入 Key-present gateway → 采集事实包 → LLM 产识别字段 →
+    claim-evidence（produced_by=llm）绑定真实 intake_report.json；独立 LLM 验收通过。"""
     from app.graph.stage_handlers import RealP0Handler
+    from app.services.intake_service import IntakeService
+    from app.services.source_materializer import generate_source_index
     pid = "wp2b-p0"
     _seed(pid)
-    handler = RealP0Handler()
+    generate_source_index(pid, source_type="local_dir")  # 采集：源码索引落盘（供 LLM 引用）
+
+    gw = _IntakeGateway(_P0_IDENT)
+    handler = RealP0Handler(intake_service=IntakeService(gateway=gw))
     wa = WorkAgent("p0", pid, run_id="r1", handler=handler)
-    # 动态工作计划随真实事实
     plan_ref = wa.build_work_plan({"source_type": "manual"})
     plan = json.loads((workspace_service.workspace_path(pid) / plan_ref).read_text("utf-8"))
     assert plan["generated_by"] == "work_agent"
@@ -56,19 +105,52 @@ async def test_p0_deterministic_workflow(isolated_data):
     result = await wa.execute({"source_type": "manual", "project_id": pid})
     assert result["status"] == "completed"
     assert any(tc["tool"] == "p0_handler.execute" for tc in result["tool_calls"])
-    # fact-evidence map（确定性）绑定真实 intake_report.json
+    # intake 识别字段由 LLM 产出（非 deterministic_tool）
+    assert result["primary_language"] == "Python"
+    assert result["availability_class"] == "B"
+    # claim-evidence map（LLM claim）绑定真实 intake_report.json
     cem = json.loads((workspace_service.workspace_path(pid) /
                       result["claim_evidence_map_ref"]).read_text("utf-8"))
-    assert cem["map_type"] == "fact_evidence"
-    assert cem["entries"] and all(e["bindings"]["artifact_refs"] for e in cem["entries"])
+    assert cem["map_type"] == "claim_evidence"
+    assert cem["entries"] and all(e["produced_by"] == "llm" for e in cem["entries"])
+    assert all(e["bindings"]["artifact_refs"] for e in cem["entries"])
+    # intake_report.json 落盘且识别字段来自 LLM（produced_by 非 deterministic_tool）
+    intake = json.loads((workspace_service.workspace_path(pid) /
+                         "artifacts" / "intake_report.json").read_text("utf-8"))
+    assert intake["produced_by"] == "llm_node_worker_agent"
+    assert intake["identification"]["primary_language"] == "Python"
 
-    # 独立 ValidationAgent 通过（handler.review 域校验 + 磁盘反伪造 + AcceptanceService）
-    va = ValidationAgent("p0", pid, run_id="r1", handler=handler)
+    # 独立 ValidationAgent（LLM 验收路径）通过
+    va = ValidationAgent("p0", pid, run_id="r1", handler=handler, gateway=gw)
     rr = va.validate(result)
     assert rr.passed, f"P0 独立验收应通过 issues={rr.issues}"
     assert va.last_result.read_from_disk_only is True
-    # 独立验收产物落盘
     assert (workspace_service.workspace_path(pid) / "artifacts" / "p0_validation.json").exists()
+
+
+async def test_p0_llm_intake_blocked_no_key(isolated_data):
+    """R17.5 WP-5：P0 识别无有效 Key → 诚实 blocked（不回退规则识别冒充 completed，D-097）。"""
+    from app.graph.stage_handlers import RealP0Handler
+    from app.services.intake_service import IntakeService
+    pid = "wp2b-p0-nokey"
+    _seed(pid)
+
+    class _NoKeyGW:
+        def stage_model_readiness(self, **kw):
+            return {"available": False, "capability_ok": False,
+                    "reason": "无任一已配置且具备有效凭据的模型可用",
+                    "attempted_chain": [{"provider": "x", "outcome": "credential_missing"}],
+                    "user_actions": [{"action": "configure_key"}]}
+
+    handler = RealP0Handler(intake_service=IntakeService(gateway=_NoKeyGW()))
+    wa = WorkAgent("p0", pid, run_id="r1", handler=handler)
+    result = await wa.execute({"source_type": "manual", "project_id": pid})
+    assert result["status"] == "blocked", "无 Key 诚实 blocked，不伪造 completed"
+    assert result.get("attempted_chain"), "透传已尝试/候选模型链路"
+    va = ValidationAgent("p0", pid, run_id="r1", handler=handler)
+    rr = va.validate(result)
+    assert not rr.passed, "无 Key blocked → 独立验收不通过（诚实升级 Gate）"
+
 
 
 # ── P2 评估（LLM）：有 Key（fake gateway）→ claim-evidence + 内联引用 ─────

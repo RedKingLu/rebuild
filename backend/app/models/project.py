@@ -86,6 +86,13 @@ class Project(Base):
     # 默认 global_unified + null ref ⇒ 回落系统默认策略（动态 user_strategies.yaml override），不改现状。
     model_strategy_mode: Mapped[str] = mapped_column(String(32), default="global_unified", server_default="global_unified")
     global_model_ref: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
+    # R17.5 WP-6 (Q-R17.4-3-2): 目标运行环境约束（用户在引导中点选的目标 CPU 架构 + 目标 OS）。
+    # 硬约束（可经用户 Gate 改，非永久冻结）；作为 P0-P6 各阶段目标锚点输入之一。
+    # 结构（开放、可扩展、非封闭枚举，§2.3 反规则引擎）：
+    #   {"cpu_arch": str|null, "cpu_arch_label": str, "os": str|null, "os_label": str,
+    #    "source": "user_onboarding", "note": str}
+    # 这是【用户输入采集】而非识别逻辑（识别归 LLM）；样本值随项目由用户点选/输入，不硬编码枚举。
+    migration_target: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

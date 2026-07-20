@@ -126,8 +126,9 @@ class TestMigratedSchema:
         try:
             ver = c.execute("SELECT version_num FROM alembic_version").fetchone()[0]
             # R15-4 C1/C2 c4f1a9d7e2b8, C8 7c407d04e07b, C10 39528fb4d798;
-            # R16-B E3 e4f5a6b7c8d9 (imported_version). Alembic head must be R16-B.
-            assert ver == "e4f5a6b7c8d9", ver
+            # R16-B E3 e4f5a6b7c8d9; R17.5 WP-6 f8a1b2c3d4e5 (project.migration_target).
+            # Alembic head must be the R17.5 head.
+            assert ver == "f8a1b2c3d4e5", ver
         finally:
             c.close()
 
@@ -197,8 +198,8 @@ class TestR15Migration:
             # R16-B E3 must ALSO have added imported_version
             assert "imported_version" in cols, f"imported_version missing; cols={cols}"
             ver = c.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-            # R15-4 = 39528fb4d798; R16-B E3 = e4f5a6b7c8d9 (current head).
-            assert ver == "e4f5a6b7c8d9", ver
+            # R15-4 = 39528fb4d798; R16-B E3 = e4f5a6b7c8d9; R17.5 WP-6 = f8a1b2c3d4e5 (head).
+            assert ver == "f8a1b2c3d4e5", ver
         finally:
             c.close()
 

@@ -21,6 +21,56 @@ if backend_dir not in sys.path:
 # asyncio_mode=auto（pyproject）→ 无需模块级 mark；async 测试自动异步执行，同步测试不受影响。
 
 
+@pytest.fixture(autouse=True)
+def _isolate_credential_and_strategy_pollution():
+    """R17.5: 隔离本文件对【共享全局状态】的污染，防止跨测试泄漏。
+
+    根因：`_two_configured_registry()` 调用 `ProviderRegistry.set_credential()`（生产行为：
+    `os.environ[env_var]=key`，volatile，非 monkeypatch 托管）写入【假 Key】k-primary/k-fallback，
+    并调用 `update_strategy()` 把 system-default 覆盖写入【共享固定文件】 user_strategies.yaml
+    （非测试隔离路径）。这在 P0 为确定性阶段时无害；R17.5 P0 改 LLM 后，下游 P0 真实 LLM 调用
+    继承了这些假 Key（+被改写的策略）→ 调用失败 → P0 blocked，造成【测试顺序依赖】的全量套件
+    失败（test_w9w10 / test_wp2a / test_wp2b）。
+
+    修复：teardown 时把凭据环境变量【确定性复位为 .env 真值】（先删假 Key，再按 main.py 方式从
+    .env 重新载入 os.environ——真实 Key 从 backend/.env setdefault 回填），并还原策略/供应商共享
+    文件。不采用"快照-还原 os.environ"因真实 Key 是【惰性从 .env 载入】的，早于载入的快照会误删
+    真实 Key（那正是 blocked 的根因）。把污染消灭在污染源，其它测试的 .env 惰性加载不受影响。
+    """
+    from pathlib import Path
+    from app.providers.provider_registry import _USER_STRATEGY_PATH
+    _cred_vars = ("LLM_API_KEY", "DEEPSEEK_API_KEY", "MAAS_API_KEY", "OPENAI_API_KEY")
+    _strategy_path = Path(_USER_STRATEGY_PATH)
+    _strategy_before = _strategy_path.read_text(encoding="utf-8") if _strategy_path.exists() else None
+    _providers_path = _strategy_path.parent / "user_providers.yaml"
+    _providers_before = _providers_path.read_text(encoding="utf-8") if _providers_path.exists() else None
+    _env_path = Path(__file__).resolve().parents[1] / ".env"
+    try:
+        yield
+    finally:
+        # 凭据 env 确定性复位为 .env 真值：先删可能被 set_credential 写入的假 Key，再从 .env 回填。
+        for v in _cred_vars:
+            os.environ.pop(v, None)
+        if _env_path.exists():
+            for _line in _env_path.read_text(encoding="utf-8").splitlines():
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                _k, _, _val = _line.partition("=")
+                _k = _k.strip()
+                if _k in _cred_vars and _k not in os.environ:
+                    os.environ[_k] = _val.strip().strip('"').strip("'")
+        # 还原策略/供应商共享文件（原内容恢复，原不存在则删除）。
+        for _p, _before in ((_strategy_path, _strategy_before), (_providers_path, _providers_before)):
+            if _before is None:
+                if _p.exists():
+                    _p.unlink()
+            else:
+                _p.write_text(_before, encoding="utf-8")
+
+
+
+
 def _fresh_registry_no_keys(monkeypatch):
     """真实 ProviderRegistry，确保无任何可用凭据（删环境 Key，不设 credential）。"""
     for var in ("LLM_API_KEY", "DEEPSEEK_API_KEY", "MAAS_API_KEY", "OPENAI_API_KEY"):

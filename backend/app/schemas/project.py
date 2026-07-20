@@ -51,6 +51,7 @@ class ProjectResponse(BaseModel):
     external_platform_scope: str = "none"
     model_strategy_mode: str = "global_unified"
     global_model_ref: Optional[str] = None
+    migration_target: Optional[dict] = None  # R17.5 WP-6: 目标运行环境约束（引导点选）
     updated_at: str = ""
     created_at: str = ""
 
