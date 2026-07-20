@@ -35,6 +35,46 @@ def _seed_source(project_id: str) -> None:
     (src / "index.tsx").write_text("export default 1\n", encoding="utf-8")
 
 
+# R17.5：P1 改 LLM 建档 → 注入 fake gateway/exec 令 execute 确定性完成（不打真实 LLM，可测性）。
+def _fake_p1_handler():
+    import json as _json
+    from types import SimpleNamespace
+    from app.services.profiling_service import ProfilingService
+    from app.services.acceptance_baseline_service import AcceptanceBaselineService
+
+    _ident = _json.dumps({
+        "tech_stack": {"primary_language": "Python", "languages": [], "frameworks": [], "build_systems": []},
+        "dependency_draft": {"dependencies": [], "total": 0},
+        "entry_points": {"entry_points": [{"path": "app.py", "kind": "python_entry"}], "count": 1},
+        "config_inventory": {"configs": [], "count": 0},
+        "infra_clues": {"infra": [], "count": 0},
+        "test_inventory": {"has_tests": False, "note": "无测试"},
+        "module_structure": {"modules": [], "is_monorepo": False},
+        "uncertainty_manifest": {"evidence_gaps": [{"area": "测试", "detail": "无测试"}], "total_gaps": 1},
+    }, ensure_ascii=False)
+    _baseline = _json.dumps({
+        "test_assertions": [], "missing_test_paths": [], "characterization_specs": [{"target": "app.py"}],
+        "dynamic_golden_plan": {"runnable_on_platform": False, "needs_env": {"kind": "n/a"}, "reason": "单测跳过"},
+    }, ensure_ascii=False)
+
+    class _GW:
+        def get_status(self):
+            return SimpleNamespace(overall_status="available")
+        def stage_model_readiness(self, **kw):
+            return {"available": True, "capability_ok": True, "reason": "", "attempted_chain": [], "user_actions": []}
+        async def call(self, *, messages=None, **kw):
+            text = _json.dumps(messages, ensure_ascii=False) if messages else ""
+            if "verdict" in text:
+                return {"status": "completed", "model": "m", "content": _json.dumps({"verdict": "accepted", "reason": "ok"})}
+            if "验收基准" in text or "dynamic_golden_plan" in text:
+                return {"status": "completed", "model": "m", "content": _baseline}
+            return {"status": "completed", "model": "m", "content": _ident}
+
+    gw = _GW()
+    return RealP1Handler(profiling_service=ProfilingService(gateway=gw),
+                         baseline_service=AcceptanceBaselineService(gateway=gw))
+
+
 class _RecordingGate:
     def __init__(self):
         self.created = []
@@ -119,8 +159,9 @@ async def test_validation_agent_acceptance_exception_does_not_pass(isolated_data
     """
     pid = "wp2a-val-exc"
     _seed_source(pid)
-    wa = WorkAgent("p1", pid, run_id="r1")
-    result = await wa.execute({"source_type": "manual"})
+    handler = _fake_p1_handler()
+    wa = WorkAgent("p1", pid, run_id="r1", handler=handler)
+    result = await wa.execute({"source_type": "manual", "project_id": pid})
 
     # 令真实 AcceptanceService 在核验时抛异常（复现核验失败路径，非替身通过）
     import app.services.acceptance_service as acc_mod
@@ -134,14 +175,16 @@ async def test_validation_agent_acceptance_exception_does_not_pass(isolated_data
 
     monkeypatch.setattr(acc_mod, "AcceptanceService", _BoomAcceptance)
 
-    va = ValidationAgent("p1", pid, run_id="r1")
+    va = ValidationAgent("p1", pid, run_id="r1", handler=handler)
     rr = va.validate(result)
 
     assert not rr.passed, "AcceptanceService 异常时不得判为通过（不得静默 accepted）"
     vres = va.last_result
     assert vres.verdict == "rework_required", f"异常应显式降级为 rework_required, got {vres.verdict}"
-    # 4 项 hard_fail 结构检查未被放宽：全部仍为 passed（异常降级不等于放宽结构检查）
-    assert all(c["passed"] for c in vres.checks), "结构检查不得因核验异常而被放宽"
+    # 结构/域检查未被放宽：域校验与 evidence-map 检查仍为 passed（异常降级仅体现在独立结构核验门控）。
+    non_acc_checks = [c for c in vres.checks if "AcceptanceService" not in c["item"]]
+    assert non_acc_checks and all(c["passed"] for c in non_acc_checks), \
+        "域/结构检查不得因核验异常而被放宽（异常只影响独立结构核验门控）"
     # 异常以 issue 显式发声（脱敏：仅异常类型名，不含消息正文）
     exc_issues = [i for i in vres.issues if i.get("type") == "acceptance_check_error"]
     assert exc_issues, "核验异常须记录为 issue（失败发声）"
@@ -154,9 +197,10 @@ async def test_validation_agent_normal_pass_unaffected(isolated_data):
     """反向对照：AcceptanceService 正常时，结构全过仍正常通过（不因 REC-1 修复而回归）。"""
     pid = "wp2a-val-ok"
     _seed_source(pid)
-    wa = WorkAgent("p1", pid, run_id="r1")
-    result = await wa.execute({"source_type": "manual"})
-    va = ValidationAgent("p1", pid, run_id="r1")
+    handler = _fake_p1_handler()
+    wa = WorkAgent("p1", pid, run_id="r1", handler=handler)
+    result = await wa.execute({"source_type": "manual", "project_id": pid})
+    va = ValidationAgent("p1", pid, run_id="r1", handler=handler)
     rr = va.validate(result)
     assert rr.passed, f"正常路径应通过, issues={rr.issues}"
     assert va.last_result.verdict in ("accepted", "accepted_with_warning")

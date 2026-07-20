@@ -176,10 +176,14 @@ def test_issue03_non_dotnet_stacks_not_regressed(client, tmp_path):
         assert any(k.endswith(name) for k in idx["key_files"]), f"{name} 关键文件识别回退"
 
 
-# ── FUP-1 ───────────────────────────────────────────────────────────────
+# ── FUP-1（R17.5 P1 重构：框架/构建系统【识别】已下放 LLM；采集层只列 .NET 构建文件候选） ──
+# 架构改动说明（非"真 bug"）：R17.5 P1 把 FullStackProfiler 从"确定性识别主线"重构为"采集工具"
+# （AGENTS §2.3 / 禁止项 25/26）。原 FUP-1 断言 profile() 写 tech_stack.json 的 .NET/msbuild-sln
+# 【识别结论】——该识别现由 P1 LLM(ProfilingService) 对采集事实推理产出（见 test_wp2_p1_agent_workflow）。
+# 本处改为断言【采集层】大小写不敏感地把 .sln/.csproj 列为构建文件候选喂给 LLM（HC-P1-06 已删）。
 
-def test_fup1_dotnet_sln_only_solution_detected(client, tmp_path):
-    """仅含 .sln（无 .csproj）的 .NET 解决方案应识别出 .NET + msbuild-sln。"""
+def test_fup1_dotnet_sln_only_collected_as_build_candidate(client, tmp_path):
+    """仅含 .sln（无 .csproj）的 .NET 解决方案：采集层应把 .sln 列为构建文件候选（识别交 LLM）。"""
     ws = workspace_service.workspace_path("wp7-fup1")
     src = ws / "source"
     src.mkdir(parents=True, exist_ok=True)
@@ -188,23 +192,23 @@ def test_fup1_dotnet_sln_only_solution_detected(client, tmp_path):
     (src / "Default.aspx.cs").write_text("class D{}", encoding="utf-8")
 
     prof = FullStackProfiler()
-    prof.profile("wp7-fup1")
-    tech = json.loads((ws / "artifacts" / "tech_stack.json").read_text(encoding="utf-8"))
-    fw = [f["framework"] for f in tech["frameworks"]["frameworks"]]
-    bs = [b["build_system"] for b in tech["build_systems"]["build_systems"]]
-    assert ".NET" in fw, f".NET 未识别，frameworks={fw}"
-    assert "msbuild-sln" in bs, f"msbuild-sln 未识别，build_systems={bs}"
+    facts = prof.collect_facts("wp7-fup1")
+    build_paths = [c["path"] for c in facts["build_file_candidates"]]
+    assert "Legacy.sln" in build_paths, f"采集应列 .sln 构建文件候选，got={build_paths}"
+    # packages.config 作为依赖清单候选采集（大小写不敏感、任意栈，HC-P1-02 已删）
+    dep_paths = [d["path"] for d in facts["dependency_manifests"]]
+    assert "packages.config" in dep_paths, f"采集应列 packages.config 依赖候选，got={dep_paths}"
 
 
-def test_fup1_csproj_project_detected(client, tmp_path):
+def test_fup1_csproj_collected_as_build_candidate(client, tmp_path):
     ws = workspace_service.workspace_path("wp7-fup1b")
     src = ws / "source"
     src.mkdir(parents=True, exist_ok=True)
     (src / "Api.csproj").write_text("<Project/>", encoding="utf-8")
     prof = FullStackProfiler()
-    prof.profile("wp7-fup1b")
-    tech = json.loads((ws / "artifacts" / "tech_stack.json").read_text(encoding="utf-8"))
-    fw = [f["framework"] for f in tech["frameworks"]["frameworks"]]
-    bs = [b["build_system"] for b in tech["build_systems"]["build_systems"]]
-    assert ".NET" in fw
-    assert "msbuild" in bs
+    facts = prof.collect_facts("wp7-fup1b")
+    build_paths = [c["path"] for c in facts["build_file_candidates"]]
+    assert "Api.csproj" in build_paths, f"采集应列 .csproj 构建文件候选，got={build_paths}"
+    # .csproj 亦作为依赖清单候选（NuGet PackageReference），交 LLM 解析依赖
+    dep_paths = [d["path"] for d in facts["dependency_manifests"]]
+    assert "Api.csproj" in dep_paths

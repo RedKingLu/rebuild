@@ -1,0 +1,233 @@
+"""P1 original acceptance-baseline capture service (R17.5 P1 WP-B / D-106).
+
+D-106: at P1建档 the platform must capture the ORIGINAL acceptance baseline (regression
+baseline / characterization tests) so P5 can do行为等价/回归对比. Per AGENTS §2.3 the split is:
+  · STATIC baseline (LLM推理, 必产): test盘点+断言解读 / 缺测路径识别 / 特征化测试规格生成.
+  · DYNAMIC golden (确定性 verify, 用户裁决必须产=必须真跑真捕获): run the ORIGINAL tests /
+    key scenarios via ExecutionProvider and capture the golden output.
+      - 本地可跑栈 (Python/Node/Java/Go on Linux) → 直接跑捕获.
+      - 不可在本平台跑的栈 (信创/.NET/Windows/SQL Server) → 路由到可运行环境 (容器/R14);
+      - 真无可运行环境 → 诚实 needs_env / blocked，绝不伪造黄金 (D-097/公理3 红线不可破).
+
+Command/environment SELECTION is a sample-level decision → done by the LLM (which run
+command, which language, whether runnable here). EXECUTION+capture is deterministic
+(ExecutionProvider). This keeps §2.3 intact: 确定性只在采集与验证.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("rebuild.acceptance_baseline_service")
+
+_STATIC_SYSTEM_PROMPT = (
+    "你是 rebuild 平台的 P1 原始验收基准捕获 Agent（Node Worker Agent，D-106）。平台已采集了目标项目的"
+    "测试目录/框架候选与其脱敏原文、依赖清单、主语言/技术栈。你的职责是产出【原始验收基准】的静态部分，"
+    "并为动态黄金输出捕获规划【跑原始的命令】。严格输出 JSON，键为：\n"
+    "  test_assertions（数组，每项 {path, what_it_verifies}：读已有测试的断言，理解每个测试文件「验证了"
+    "什么」；无测试则空数组）；\n"
+    "  missing_test_paths（数组，每项 {path_or_module, why_critical}：据业务模块/入口/DB 识别关键但无测试"
+    "覆盖的路径）；\n"
+    "  characterization_specs（数组，每项 {target, input, expected_output_anchor, rationale}：为缺测关键"
+    "路径设计特征化/golden 测试规格——输入→期望输出锚点，供迁移后回归对比）；\n"
+    "  dynamic_golden_plan（对象 {runnable_on_platform: bool, language, run_command, working_subdir, "
+    "reason, needs_env: {kind, note}}：判断该项目的原始测试/关键场景能否在本 Linux 平台直接真跑（"
+    "Python/Node/Java/Go 通常可；.NET Framework/Windows/SQL Server 不可→runnable_on_platform=false 且 "
+    "needs_env 说明需何种环境如 windows/.net-framework/sqlserver，可经 R14 远程）。run_command 为在项目根"
+    "目录执行的单条 shell 命令（如 `python -m pytest -q` / `npm test` / `go test ./...`），working_subdir "
+    "为相对源码根的执行子目录（默认空=根）。禁止编造：不确定能否跑就 runnable_on_platform=false 并说明。"
+)
+
+
+@dataclass
+class BaselineResult:
+    status: str                        # completed / blocked / failed
+    reason: str = ""
+    baseline: dict = field(default_factory=dict)
+    model_used: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {"status": self.status, "reason": self.reason,
+                "baseline": self.baseline, "model_used": self.model_used}
+
+
+class AcceptanceBaselineService:
+    """Capture the original acceptance baseline. `gateway`/`execution_provider`
+    injectable for tests (no mock in the production path)."""
+
+    def __init__(self, *, gateway=None, execution_provider=None, tracer=None, auditor=None):
+        self._gateway = gateway
+        self._execution_provider = execution_provider
+        self.tracer = tracer
+        self.auditor = auditor
+
+    def _get_gateway(self):
+        if self._gateway is not None:
+            return self._gateway
+        from app.dependencies import get_services
+        return get_services().model_gateway
+
+    async def capture(
+        self,
+        project_id: str,
+        *,
+        facts: dict,
+        upstream: Optional[dict] = None,
+        run_id: Optional[str] = None,
+        stage: str = "p1",
+        strategy_id: str = "system-default",
+        source_path: Optional[str] = None,
+        run_dynamic: bool = True,
+    ) -> BaselineResult:
+        """Static baseline (LLM) + dynamic golden capture (ExecutionProvider真跑或诚实 needs_env)."""
+        gw = self._get_gateway()
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        if not readiness.get("available"):
+            # 静态基线需 LLM；无 Key → blocked（承 P0/P1，不伪造）。
+            return BaselineResult(status="blocked",
+                                  reason="no_model_key: 原始验收基准的静态部分需 LLM（D-106）")
+
+        messages = [
+            {"role": "system", "content": _STATIC_SYSTEM_PROMPT},
+            {"role": "user", "content": self._build_user_prompt(facts, upstream or {})},
+        ]
+        result = await gw.call(messages=messages, strategy_id=strategy_id,
+                               max_tokens=6144, temperature=0.3, source="api",
+                               project_id=project_id, run_id=run_id, stage=stage)
+        if result.get("status") != "completed":
+            reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
+            return BaselineResult(status="failed", reason=str(reason), model_used=result.get("model"))
+
+        static_baseline = self._parse(result.get("content", ""))
+        model_used = result.get("model")
+
+        # ── 动态黄金输出捕获（确定性 verify 层：真跑或诚实 needs_env） ──────────
+        plan = static_baseline.get("dynamic_golden_plan") or {}
+        dynamic_golden = await self._capture_dynamic_golden(
+            project_id, plan, source_path=source_path, run_id=run_id) if run_dynamic else \
+            {"captured": False, "reason": "dynamic capture skipped (run_dynamic=False)"}
+
+        baseline = {
+            "artifact_type": "acceptance_baseline",
+            "project_id": project_id,
+            "stage": stage,
+            "produced_by": "llm_node_worker_agent + execution_provider",
+            "static_baseline": {
+                "test_assertions": static_baseline.get("test_assertions", []),
+                "missing_test_paths": static_baseline.get("missing_test_paths", []),
+                "characterization_specs": static_baseline.get("characterization_specs", []),
+            },
+            "dynamic_golden": dynamic_golden,
+            "model_used": model_used,
+            "note": ("原始验收基准（D-106）：静态基线由 LLM 产出；动态黄金经 ExecutionProvider 真跑真捕获，"
+                     "不可运行环境诚实标 needs_env（不伪造，D-097/公理3），供 P5 行为等价/回归对比消费"),
+        }
+        if static_baseline.get("parse_error"):
+            baseline["static_parse_error"] = True
+        self._trace("P1 acceptance baseline captured", project_id, run_id, stage)
+        return BaselineResult(status="completed", baseline=baseline, model_used=model_used)
+
+    async def _capture_dynamic_golden(self, project_id: str, plan: dict, *,
+                                      source_path: Optional[str], run_id) -> dict:
+        """真跑原始测试/关键场景并捕获黄金输出；不可运行 → 诚实 needs_env（绝不伪造）。"""
+        if not isinstance(plan, dict) or not plan.get("runnable_on_platform"):
+            needs_env = (plan or {}).get("needs_env") or {}
+            return {
+                "captured": False,
+                "needs_env": needs_env or {"kind": "unknown",
+                                           "note": "LLM 判定本平台不可跑原始测试/场景"},
+                "reason": (plan or {}).get("reason", "本平台不可运行该栈，原始黄金输出待路由到可运行环境"
+                                                     "（容器/R14）——诚实 needs_env，不伪造黄金"),
+                "planned_command": (plan or {}).get("run_command"),
+            }
+        run_command = (plan.get("run_command") or "").strip()
+        if not run_command:
+            return {"captured": False, "reason": "runnable_on_platform=true 但 LLM 未给出 run_command",
+                    "needs_env": {"kind": "missing_command"}}
+
+        import os
+        from pathlib import Path
+        if source_path is None:
+            from app.services import workspace_service
+            source_path = str(workspace_service.workspace_path(project_id) / "source")
+        cwd = source_path
+        working_subdir = (plan.get("working_subdir") or "").strip().strip("/")
+        if working_subdir:
+            candidate = Path(source_path) / working_subdir
+            if candidate.exists():
+                cwd = str(candidate)
+
+        provider = self._execution_provider
+        if provider is None:
+            from app.services.execution_provider import get_execution_provider
+            provider = get_execution_provider("workspace_local")
+        try:
+            exec_result = await provider.execute(run_command, language="bash", timeout=180, cwd=cwd)
+        except Exception as e:
+            return {"captured": False, "reason": f"执行捕获异常：{type(e).__name__}",
+                    "command": run_command, "needs_env": {"kind": "execution_error"}}
+
+        if exec_result.get("blocked"):
+            return {"captured": False, "reason": f"命令被安全策略阻断：{exec_result.get('stderr','')}",
+                    "command": run_command, "provider": exec_result.get("provider"),
+                    "needs_env": {"kind": "blocked_by_policy"}}
+
+        return {
+            "captured": True,
+            "command": run_command,
+            "language": plan.get("language"),
+            "cwd_subdir": working_subdir or ".",
+            "exit_code": exec_result.get("exit_code"),
+            "stdout": (exec_result.get("stdout") or "")[:20000],
+            "stderr": (exec_result.get("stderr") or "")[:8000],
+            "provider": exec_result.get("provider"),
+            "execution_mode": exec_result.get("execution_mode"),
+            "elapsed_ms": exec_result.get("elapsed_ms"),
+            "note": ("原始黄金输出真捕获（未做迁移前的基准）；exit_code/stdout 即回归对比锚点。"
+                     "注意：若原始测试因缺依赖/环境未就绪而非零退出，此为诚实的原始状态，不代表迁移能力"),
+        }
+
+    def _build_user_prompt(self, facts: dict, upstream: dict) -> str:
+        blob = json.dumps({
+            "primary_language_from_p0": (upstream or {}).get("primary_language"),
+            "detected_stack_from_p0": (upstream or {}).get("detected_stack"),
+            "test_candidates": facts.get("test_candidates"),
+            "dependency_manifests": [{"path": d.get("path")} for d in (facts.get("dependency_manifests") or [])],
+            "build_file_candidates": facts.get("build_file_candidates"),
+            "ext_language_counts": facts.get("ext_language_counts"),
+            "migration_target": (upstream or {}).get("migration_target"),
+        }, ensure_ascii=False, default=str)
+        if len(blob) > 18000:
+            blob = blob[:18000] + "\n…[截断]"
+        return ("以下是采集的测试/依赖/技术栈事实（含测试文件脱敏原文候选）与上游 P0 结论。请产出原始验收基准的"
+                "静态部分并规划动态黄金捕获命令。严格输出上述 JSON。\n\n" + blob)
+
+    def _parse(self, content: str) -> dict:
+        text = (content or "").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lstrip().lower().startswith("json"):
+                text = text.lstrip()[4:]
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            logger.warning("P1 baseline: LLM 输出无法解析为 JSON", exc_info=True)
+        return {"parse_error": True, "raw": text[:2000],
+                "test_assertions": [], "missing_test_paths": [], "characterization_specs": [],
+                "dynamic_golden_plan": {"runnable_on_platform": False,
+                                        "needs_env": {"kind": "parse_error"},
+                                        "reason": "静态基线解析失败，动态捕获跳过"}}
+
+    def _trace(self, summary: str, project_id, run_id, stage) -> None:
+        if self.tracer is None:
+            return
+        try:
+            self.tracer.write("model_call", action="p1_acceptance_baseline", summary=summary,
+                              project_id=project_id, run_id=run_id, stage=stage)
+        except Exception:
+            logger.debug("P1 baseline trace 写入失败（advisory）", exc_info=True)

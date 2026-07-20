@@ -38,15 +38,6 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# P1 阶段验收标准（与 WorkAgent 动态计划 acceptance_criteria 对齐）。
-_P1_CRITERIA = [
-    "至少产出 1 项识别产物",
-    "profiling_summary.md 已生成",
-    "p2_input_manifest.json 已生成",
-    "每条 fact 绑定可解析 artifact/evidence（fact-evidence map）",
-]
-
-
 @dataclass
 class ValidationResult:
     stage: str
@@ -116,116 +107,9 @@ class ValidationAgent:
 
     # ── main entry（review_fn） ─────────────────────────────────────────
     def validate(self, work_result: dict) -> ReviewResult:
-        """StageLoop.review_fn：独立验收 WorkAgent 产出。P1 走结构化路径；
-        P0/P2/P3/P4/P5/P6 走通用路径（批 B）。r3 约束 3：只消费落盘 ref + 磁盘重读。"""
-        if self.stage == "p1":
-            return self._validate_p1(work_result)
+        """StageLoop.review_fn：独立验收 WorkAgent 产出。R17.5：P0/P1 与 P2/P3/P4 一致，走
+        通用 LLM 语义验收路径；P5/P6 亦经此路径。r3 约束 3：只消费落盘 ref + 磁盘重读。"""
         return self._validate_generic(work_result)
-
-    def _validate_p1(self, work_result: dict) -> ReviewResult:
-        """StageLoop.review_fn：独立验收 P1 WorkAgent 产出（批 A 结构化路径）。
-
-        r3 约束 3：只消费 work_result 中的落盘 ref，从磁盘重新读取内容再验，
-        不使用 WorkAgent 进程内未落盘推理。
-        """
-        work_result = work_result or {}
-        # 只取落盘 refs（不取 work_result 的推理字段）
-        cem_ref = work_result.get("claim_evidence_map_ref")
-
-        # ① 独立结构检查（全部从磁盘重新读取）
-        art_dir = self._ws_root() / "artifacts"
-        disk_json_refs: list[str] = []
-        identified_items: list[str] = []
-        if art_dir.exists():
-            for p in sorted(art_dir.glob("*.json")):
-                disk_json_refs.append(f"artifacts/{p.name}")
-                if p.name != "p2_input_manifest.json" and not p.name.startswith("p0_") \
-                        and not p.name.startswith("p1_") and p.name != "intake_report.json":
-                    identified_items.append(p.stem)
-
-        summary_ok = self._exists("artifacts/profiling_summary.md")
-        manifest_ok = self._exists("artifacts/p2_input_manifest.json")
-        ident_ok = len(identified_items) >= 1
-
-        # ② fact-evidence map 落盘可解析 + sha256 校验（独立读盘）
-        cem_ok, cem_verify, cem_issues = self._verify_fact_evidence_map(cem_ref)
-
-        checks = [
-            {"item": _P1_CRITERIA[0], "passed": ident_ok,
-             "reason": f"识别产物数={len(identified_items)}", "evidence_ref": None},
-            {"item": _P1_CRITERIA[1], "passed": summary_ok,
-             "reason": "profiling_summary.md 存在" if summary_ok else "缺 profiling_summary.md",
-             "evidence_ref": "artifacts/profiling_summary.md" if summary_ok else None},
-            {"item": _P1_CRITERIA[2], "passed": manifest_ok,
-             "reason": "p2_input_manifest.json 存在" if manifest_ok else "缺 p2_input_manifest.json",
-             "evidence_ref": "artifacts/p2_input_manifest.json" if manifest_ok else None},
-            {"item": _P1_CRITERIA[3], "passed": cem_ok,
-             "reason": (f"fact-evidence {cem_verify.get('resolved',0)}/{cem_verify.get('total',0)} 可解析"
-                        if cem_ok else "fact-evidence map 存在未解析/ sha256 不匹配项"),
-             "evidence_ref": cem_ref},
-        ]
-        criteria_met = {c["item"]: c["passed"] for c in checks}
-
-        # ③ 复用 AcceptanceService（独立身份 + 结构检查族）做二次结构核验
-        acc_result = self._acceptance_check(disk_json_refs, criteria_met)
-
-        # ④ 汇总 issues / verdict
-        issues: list = []
-        recs: list = []
-        for c in checks:
-            if not c["passed"]:
-                issues.append({"type": "criterion_unmet", "detail": c["item"],
-                               "missing_ref": c.get("evidence_ref")})
-        issues += cem_issues
-
-        hard_fail = not (ident_ok and summary_ok and manifest_ok and cem_ok)
-        if hard_fail:
-            verdict = "rework_required"
-            passed = False
-            if not manifest_ok:
-                recs.append("重新执行全量识别，补齐 p2_input_manifest.json 后重跑")
-            if not summary_ok:
-                recs.append("补齐 profiling_summary.md 后重跑")
-            if not ident_ok:
-                recs.append("确认 profiler 产出识别产物后重跑")
-            if not cem_ok:
-                recs.append("修正 fact-evidence map，确保每条 fact 绑定可解析且 sha256 匹配")
-        else:
-            # 结构检查全过：verdict 采纳 AcceptanceService 路由（可能 accepted_with_warning）。
-            # REC-1：若独立结构核验异常（error 标记），不得静默按 accepted 处理——显式记录
-            # issue 并降级为不通过（rework），保留脱敏异常原因让失败发声（D-097/公理3）。
-            acc_error = acc_result.get("error")
-            if acc_error:
-                verdict = "rework_required"
-                passed = False
-                issues.append({"type": "acceptance_check_error",
-                               "detail": f"独立结构核验（AcceptanceService）异常（{acc_error}），已降级为不通过"})
-                recs += acc_result.get("recommendations", [])
-            else:
-                verdict = acc_result.get("result", "accepted")
-                passed = verdict in ("accepted", "accepted_with_warning")
-                recs += acc_result.get("recommendations", [])
-
-        result = ValidationResult(
-            stage=self.stage, passed=passed, verdict=verdict,
-            agent_id=acc_result.get("agent_id"),
-            checks=checks, issues=issues, recommendations=recs,
-            claim_evidence_verification=cem_verify,
-            read_from_disk_only=True,
-        )
-        self.last_result = result
-        self._persist(result)
-        if self.tracer:
-            try:
-                self.tracer.write("validation_agent", action="validate",
-                                  summary=f"{self.stage} 独立验收 verdict={verdict} passed={passed}",
-                                  project_id=self.project_id, run_id=self.run_id or None,
-                                  stage=self.stage)
-            except Exception:
-                logger.debug("validation_agent trace 写入失败（advisory）", exc_info=True)
-        return result.to_review_result()
-
-    # ── 批 B：通用阶段验收（P0/P2/P3/P4/P5/P6） ─────────────────────────
     def _validate_generic(self, work_result: dict) -> ReviewResult:
         """独立验收（通用路径）。独立性（r3 约束 3）：独立 agent_id + 独立 DB 会话 +
         磁盘重读 artifacts/evidence/claim-evidence map。
@@ -242,9 +126,9 @@ class ValidationAgent:
         work_result = work_result or {}
         declared = work_result.get("status", "completed")
         cem_ref = work_result.get("claim_evidence_map_ref")
-        # R17.5 WP-4：P0 改 LLM 识别 → 纳入 LLM 验收路径（独立 Acceptance Agent LLM 判识别质量，
+        # R17.5 WP-4：P0/P1 改 LLM 识别 → 纳入 LLM 验收路径（独立 Acceptance Agent LLM 判识别质量，
         # 非仅存在性）；内联引用校验 + LLM 语义验收（无 Key → 诚实 evidence_gap，advisory）。
-        llm = self.stage in ("p0", "p2", "p3", "p4")
+        llm = self.stage in ("p0", "p1", "p2", "p3", "p4")
 
         checks: list = []
         issues: list = []
@@ -436,6 +320,10 @@ class ValidationAgent:
             intake = self._read_json("artifacts/intake_report.json") or {}
             view["source_type"] = intake.get("source_type")
             view["file_count"] = intake.get("file_count", 0)
+        elif self.stage == "p1":
+            # P1 域校验（RealP1Handler.review）判定建档识别产物 + 原始验收基准存在性；
+            # 从盘重读 artifacts 已在 view["artifacts"]。status 反映是否 completed。
+            view["file_count"] = (self._read_json("artifacts/source_index.json") or {}).get("file_count", 0)
         elif self.stage == "p2":
             rep = self._read_json("artifacts/p2_assessment_report.json") or {}
             view["assessment_report"] = rep.get("report", rep.get("assessment_report", {}))
@@ -534,37 +422,6 @@ class ValidationAgent:
             return {"status": "evidence_gap",
                     "detail": f"LLM 语义验收未完成（{cat}）：需有效模型 Key 端到端验证"}
         return {"status": "completed", "raw": (resp.get("content", "") or "")[:200]}
-
-    # ── fact-evidence map 校验 ──────────────────────────────────────────
-    def _verify_fact_evidence_map(self, cem_ref: Optional[str]) -> tuple[bool, dict, list]:
-        if not cem_ref:
-            return False, {"total": 0, "resolved": 0, "unresolved": ["<map 缺失>"]}, \
-                [{"type": "no_fact_evidence_map", "detail": "缺 fact-evidence map"}]
-        data = self._read_json(cem_ref)
-        if not data:
-            return False, {"total": 0, "resolved": 0, "unresolved": ["<map 不可解析>"]}, \
-                [{"type": "unparseable_fact_evidence_map", "detail": cem_ref}]
-        entries = data.get("entries") or []
-        total = len(entries)
-        resolved = 0
-        unresolved: list = []
-        for e in entries:
-            bindings = e.get("bindings") or {}
-            art_refs = bindings.get("artifact_refs") or []
-            recorded_sha = bindings.get("sha256") or ""
-            ok = bool(art_refs) and all(self._exists(r.split("#")[0]) for r in art_refs)
-            # sha256 校验：至少首个 artifact 的当前 sha256 与登记一致
-            if ok and recorded_sha:
-                ok = self._sha256(art_refs[0].split("#")[0]) == recorded_sha
-            if ok:
-                resolved += 1
-            else:
-                unresolved.append(e.get("id"))
-        verify = {"total": total, "resolved": resolved, "unresolved": unresolved}
-        cem_ok = total > 0 and resolved == total
-        issues = ([] if cem_ok else
-                  [{"type": "fact_evidence_unresolved", "detail": f"未解析: {unresolved}"}])
-        return cem_ok, verify, issues
 
     # ── AcceptanceService 结构核验（独立身份 + 独立 DB 会话） ────────────
     def _acceptance_check(self, disk_refs: list, criteria_met: dict) -> dict:

@@ -1,8 +1,22 @@
-"""Full-Stack Profiler — P1 全量项目识别基线 (R9-3C).
+"""Full-Stack Profiler — P1 建档【采集】工具 (R9-3C; R17.5 P1 重构为采集层).
 
-14 identification items performed on workspace/source/, generating
-structured Artifacts for P2-P6 reuse. All config/env values redacted.
-Uncertain items become Evidence Gaps, not guesses.
+R17.5 P1 (AGENTS §2.3 / 禁止项 25/26): identification is done by the LLM (Node Worker
+Agent) via ProfilingService — this module is now the deterministic **collection** tool.
+It ONLY gathers raw facts (list files / structure / case-insensitive candidates /
+dependency-manifest & config & test raw contents — redacted / ext counts) and produces
+NO identification verdict. 主语言/框架/依赖判定/入口点/配置解读/infra 解读/盲区发声 都由 LLM
+在 RealP1Handler 里对 collect_facts() 的事实包推理产出。
+
+已删除（R17.5 P1 WP-3，均为按栈枚举的样本值硬编码规则，改 LLM）：
+  HC-P1-01 "扩展名多=主语言" + .gif 当语言（_item4_language_id primary 判定）
+  HC-P1-02 依赖清单文件名白名单（_item7_dependency_id 只认 package.json/requirements.txt）
+  HC-P1-03 入口 pattern endswith("index.js")（_item8_entry_point_id）
+  HC-P1-04 config 文件名大小写敏感精确匹配（_item12 CONFIG_FILES exact）
+  HC-P1-05 TEST_DIR_NAMES 全小写敏感（_item9）
+  HC-P1-06 framework/infra 关键词/pattern 表（_item5_framework_id / _item11 infra_patterns）
+
+collect_facts() 是图 P1 handler 的采集入口；profile() 保留为遗留 /profile 路由与
+run_profiling 工具的采集通道（只产采集产物，不产 LLM 识别）。All config/secret values redacted.
 """
 
 from __future__ import annotations
@@ -10,12 +24,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
-from app.services.workspace_service import workspace_path, _guard
+from app.services.workspace_service import workspace_path
 
 logger = logging.getLogger("rebuild.full_stack_profiler")
 
@@ -26,12 +38,12 @@ SKIP_DIRS = {
     ".next", ".nuxt", ".rebuild",
 }
 
-# R9-5-8 T2: authoritative P1 identification item list — SINGLE SOURCE OF TRUTH.
-# These are the 12 artifact keys actually produced by profile() (see the
-# `artifacts` dict in profile()); the frontend StagePageP1 MUST read this list
-# from the backend instead of hardcoding its own (formerly a drifted 14-item
-# array). Each entry: (artifact_key, human label). uncertainty_manifest backs
-# the Evidence Gaps card (T3).
+# Authoritative P1 建档 artifact key list — SINGLE SOURCE OF TRUTH (R9-5-8 T2).
+# The frontend StagePageP1 / profiling-summary endpoint read this list instead of
+# hardcoding their own. In the graph P1 flow the collection layer writes file_index/
+# source_structure/cicd_inventory/doc_inventory and the LLM (ProfilingService) writes
+# tech_stack/dependency_draft/entry_points/config_inventory/infra_clues/test_inventory/
+# module_structure/uncertainty_manifest.
 PROFILING_ITEMS: list[tuple[str, str]] = [
     ("file_index", "文件索引"),
     ("source_structure", "源码结构"),
@@ -47,7 +59,7 @@ PROFILING_ITEMS: list[tuple[str, str]] = [
     ("uncertainty_manifest", "不确定性清单"),
 ]
 
-# Key files for identification
+# Build/manifest file NAMES (kept as reference candidates for the LLM; NOT a verdict).
 BUILD_FILES = {
     "pom.xml": "maven", "build.gradle": "gradle", "build.gradle.kts": "gradle-kts",
     "settings.gradle": "gradle", "Makefile": "make", "CMakeLists.txt": "cmake",
@@ -55,25 +67,32 @@ BUILD_FILES = {
     "requirements.txt": "pip", "setup.py": "setuptools", "pyproject.toml": "python-build",
     "Cargo.toml": "cargo", "go.mod": "go-mod", "go.sum": "go",
     "Gemfile": "bundler", "composer.json": "composer",
-    "*.csproj": "msbuild", "*.sln": "msbuild-sln", "*.fsproj": "msbuild",
     "Android.bp": "soong", "BUILD": "bazel", "WORKSPACE": "bazel",
 }
+_BUILD_SUFFIXES = (".csproj", ".vbproj", ".fsproj", ".sln")
 
-CONFIG_FILES = {
-    ".env": "dotenv", ".env.example": "dotenv-example",
-    "appsettings.json": "dotnet-appsettings", "web.config": "iis-webconfig",
-    "application.yml": "spring-yml", "application.yaml": "spring-yaml",
-    "application.properties": "spring-props",
-    "tsconfig.json": "tsconfig", "jsconfig.json": "jsconfig",
-    "Dockerfile": "docker", "docker-compose.yml": "docker-compose",
-    "docker-compose.yaml": "docker-compose", ".dockerignore": "docker-ignore",
-    ".gitignore": "gitignore", ".gitlab-ci.yml": "gitlab-ci",
-    ".github/": "github-actions", "Jenkinsfile": "jenkins",
-    ".travis.yml": "travis-ci", "Makefile": "make",
+# Dependency manifest candidate names (case-insensitive) + suffixes — collection lists
+# ALL of them across stacks; the LLM parses/judges dependencies (no whitelist verdict).
+_DEP_MANIFEST_NAMES = {
+    "package.json", "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+    "pipfile", "pom.xml", "build.gradle", "build.gradle.kts", "go.mod", "cargo.toml",
+    "gemfile", "composer.json", "packages.config", "paket.dependencies",
 }
+_DEP_MANIFEST_SUFFIXES = (".csproj", ".vbproj", ".fsproj")
 
+# Config file candidate names (case-insensitive) + suffixes / dir prefixes.
+_CONFIG_NAMES = {
+    ".env", ".env.example", "appsettings.json", "web.config", "app.config",
+    "application.yml", "application.yaml", "application.properties",
+    "tsconfig.json", "jsconfig.json", "dockerfile", "docker-compose.yml",
+    "docker-compose.yaml", ".gitlab-ci.yml", "jenkinsfile", ".travis.yml", "makefile",
+}
+_CONFIG_SUFFIXES = (".config",)
+
+# Test directory candidate names (matched case-INsensitively — HC-P1-05 fix).
 TEST_DIR_NAMES = {"test", "tests", "spec", "specs", "__tests__", "e2e", "integration"}
 
+# Extension → language hint map (reference labels only; NOT a primary-language verdict).
 LANG_EXTENSIONS = {
     ".java": "Java", ".kt": "Kotlin", ".scala": "Scala", ".groovy": "Groovy",
     ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript", ".jsx": "React JSX",
@@ -82,19 +101,24 @@ LANG_EXTENSIONS = {
     ".c": "C", ".cpp": "C++", ".h": "C/C++ Header", ".hpp": "C++ Header",
     ".rb": "Ruby", ".php": "PHP", ".swift": "Swift", ".m": "Objective-C",
     ".r": "R", ".sql": "SQL", ".sh": "Shell", ".bash": "Bash",
-    ".yaml": "YAML", ".yml": "YAML", ".json": "JSON", ".xml": "XML",
-    ".md": "Markdown", ".rst": "reStructuredText",
-    ".toml": "TOML", ".ini": "INI", ".cfg": "Config",
     ".tf": "Terraform", ".proto": "Protobuf", ".graphql": "GraphQL",
 }
 
-# Sensitive config keys whose VALUES must never appear in output
-SENSITIVE_KEYS = {
-    "password", "passwd", "secret", "key", "token", "apikey", "api_key",
-    "connectionstring", "connection_string", "connstr", "credential",
-    "private_key", "privatekey", "access_key", "accesskey", "auth",
-    "authorization", "jwt_secret", "jwtsecret", "encryption_key",
-}
+CICD_PATTERNS = [
+    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    ".gitlab-ci.yml", ".github/workflows/", "Jenkinsfile",
+    ".travis.yml", "deploy/", "k8s/", "helm/", "terraform/",
+    ".drone.yml", "bitbucket-pipelines.yml",
+]
+
+DOC_PATTERNS = {"readme.md", "readme", "changelog.md", "changelog", "contributing.md",
+                "license", "license.md", "notice", "authors", "code_of_conduct.md"}
+
+# DB/connection indicators to surface (redacted) — collection reports presence, the LLM
+# interprets the actual infra type (no keyword→label verdict table, HC-P1-06 fix).
+_CONN_INDICATORS = ["jdbc:", "connectionstring", "connection_string", "datasource",
+                    "database_url", "db_url", "redis_url", "kafka_broker", "mongodb://",
+                    "server=", "data source="]
 
 
 def _now() -> str:
@@ -102,12 +126,16 @@ def _now() -> str:
 
 
 def _redact(text: str) -> str:
-    """Return '[REDACTED]' for any text. Never log actual values."""
-    return "[REDACTED]"
+    """采集层脱敏（连接串/密钥值 → [REDACTED]），复用 intake_service 单一事实源。"""
+    try:
+        from app.services.intake_service import redact_config_text
+        return redact_config_text(text)
+    except Exception:
+        return text
 
 
 class FullStackProfiler:
-    """Performs P1 full-stack identification on a project workspace."""
+    """P1 建档【采集】工具：collect_facts() 产事实包喂 LLM；profile() 为遗留采集通道。"""
 
     def __init__(self, trace_writer=None, audit_writer=None):
         self.trace = trace_writer
@@ -115,483 +143,324 @@ class FullStackProfiler:
         self.gaps: list[dict] = []
         self.warnings: list[str] = []
 
-    def profile(self, project_id: str) -> dict:
-        """Main entry point. Returns profiling_result dict with all 14 items."""
-        src = workspace_path(project_id) / "source"
-        art_dir = workspace_path(project_id) / "artifacts"
-        art_dir.mkdir(parents=True, exist_ok=True)
-
-        result = {
-            "project_id": project_id,
-            "profiled_at": _now(),
-            "source_path": str(src),
-            "items_completed": 0,
-            "items_not_applicable": 0,
-            "gaps_count": 0,
-        }
-
-        # Phase 1: Structure (items 1-3)
-        file_index = self._item1_file_index(project_id, src)
-        src_structure = self._item2_source_structure(src)
-        modules = self._item3_module_structure(src, file_index)
-
-        # Phase 2: Technology (items 4-6)
-        languages = self._item4_language_id(file_index)
-        frameworks = self._item5_framework_id(src, file_index)
-        build_systems = self._item6_build_system_id(src, file_index)
-
-        # Phase 3: Dependencies & Entry (items 7-8)
-        dependencies = self._item7_dependency_id(src, file_index)
-        entry_points = self._item8_entry_point_id(src, file_index, languages)
-
-        # Phase 4: Quality Infrastructure (items 9-10)
-        test_inventory = self._item9_test_inventory(src, file_index)
-        cicd_inventory = self._item10_cicd_inventory(src, file_index)
-
-        # Phase 5: Infrastructure & Config (items 11-12)
-        infra_clues = self._item11_infra_clues(src, file_index)
-        config_inventory = self._item12_config_inventory(src, file_index)
-
-        # Phase 6: Docs & Uncertainty (items 13-14)
-        doc_inventory = self._item13_doc_inventory(src, file_index)
-        uncertainty = self._item14_uncertainty_manifest()
-
-        # Write all artifacts
-        artifacts = {
-            "file_index": file_index,
-            "source_structure": src_structure,
-            "module_structure": modules,
-            "tech_stack": {"languages": languages, "frameworks": frameworks, "build_systems": build_systems},
-            "dependency_draft": dependencies,
-            "entry_points": entry_points,
-            "test_inventory": test_inventory,
-            "cicd_inventory": cicd_inventory,
-            "infra_clues": infra_clues,
-            "config_inventory": config_inventory,
-            "doc_inventory": doc_inventory,
-            "uncertainty_manifest": uncertainty,
-        }
-
-        for name, data in artifacts.items():
-            try:
-                (art_dir / f"{name}.json").write_text(
-                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-                result["items_completed"] += 1
-            except Exception as e:
-                self.warnings.append(f"Failed to write {name}.json: {e}")
-
-        # Count not applicable
-        for name, data in artifacts.items():
-            if isinstance(data, dict) and data.get("not_applicable"):
-                result["items_not_applicable"] += 1
-
-        result["gaps_count"] = len(self.gaps)
-        result["warnings"] = self.warnings
-
-        # Write profiling summary
-        summary = self._build_summary(project_id, result, artifacts)
-        (art_dir / "profiling_summary.md").write_text(summary, encoding="utf-8")
-
-        # Write P2 input manifest
-        p2_manifest = self._build_p2_manifest(project_id, artifacts)
-        (art_dir / "p2_input_manifest.json").write_text(
-            json.dumps(p2_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        # Trace
-        if self.trace:
-            self.trace.write("profiling_complete", action="full_stack_profile",
-                summary=f"P1 profiling: {result['items_completed']} items, {result['gaps_count']} gaps",
-                project_id=project_id)
-
-        return result
-
-    # ── Item implementations ────────────────────────────────────────────
-
-    def _item1_file_index(self, pid: str, src: Path) -> dict:
-        """Full file/directory index."""
+    # ── 低层扫描（采集） ────────────────────────────────────────────────
+    def _scan(self, src: Path) -> list[dict]:
+        files: list[dict] = []
         if not src.exists():
-            return {"not_applicable": True, "reason": "source/ is empty", "files": [], "total_files": 0}
-        files = []
+            return files
         for f in sorted(src.rglob("*")):
             parts = f.relative_to(src).parts
             if any(p in SKIP_DIRS for p in parts):
                 continue
             if f.is_file():
                 try:
-                    st = f.stat()
-                    files.append({"path": str(f.relative_to(src)), "size": st.st_size, "ext": f.suffix.lower()})
+                    size = f.stat().st_size
                 except Exception:
-                    files.append({"path": str(f.relative_to(src)), "size": 0, "ext": f.suffix.lower()})
-        return {"total_files": len(files), "files": files[:2000], "truncated": len(files) > 2000}
+                    size = 0
+                files.append({"path": str(f.relative_to(src)), "size": size,
+                              "ext": f.suffix.lower()})
+        return files
 
-    def _item2_source_structure(self, src: Path) -> dict:
-        """Top-level source directory structure."""
+    @staticmethod
+    def _read_text(src: Path, rel: str, max_bytes: int = 6000) -> str:
+        try:
+            raw = (src / rel).read_bytes()[:max_bytes]
+            if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+                return raw.decode("utf-16", errors="replace")
+            if raw.startswith(b"\xef\xbb\xbf"):
+                return raw.decode("utf-8-sig", errors="replace")
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    # ── 采集产物构造（无识别结论） ──────────────────────────────────────
+    def _file_index(self, files: list[dict]) -> dict:
+        return {"total_files": len(files), "files": files[:2000],
+                "truncated": len(files) > 2000}
+
+    def _source_structure(self, src: Path) -> dict:
         if not src.exists():
-            return {"not_applicable": True, "reason": "source/ is empty"}
+            return {"not_applicable": True, "reason": "source/ is empty", "top_level": []}
         top = []
         for d in sorted(src.iterdir()):
             if d.name in SKIP_DIRS:
                 continue
             if d.is_dir():
-                sub_count = sum(1 for _ in d.rglob("*") if _.is_file() and not any(p in SKIP_DIRS for p in _.relative_to(src).parts))
-                top.append({"name": d.name, "type": "dir", "file_count": sub_count})
+                sub = sum(1 for x in d.rglob("*") if x.is_file()
+                          and not any(p in SKIP_DIRS for p in x.relative_to(src).parts))
+                top.append({"name": d.name, "type": "dir", "file_count": sub})
             else:
-                top.append({"name": d.name, "type": "file", "size": d.stat().st_size})
+                try:
+                    top.append({"name": d.name, "type": "file", "size": d.stat().st_size})
+                except Exception:
+                    top.append({"name": d.name, "type": "file", "size": 0})
         return {"top_level": top, "total_top_level": len(top)}
 
-    def _item3_module_structure(self, src: Path, fi: dict) -> dict:
-        """Module/package structure identification."""
-        if fi.get("not_applicable"):
-            return {"not_applicable": True, "reason": "No source files"}
-        modules = []
-        # Detect multi-module: look for nested build files
-        build_locations = [f["path"] for f in fi.get("files", []) if os.path.basename(f["path"]) in BUILD_FILES or f["path"].endswith(tuple(f".{e}" for e in ["csproj", "sln"]))]
-        for bl in build_locations:
-            mod_dir = str(Path(bl).parent) if Path(bl).parent != Path(".") else "root"
-            modules.append({"path": mod_dir, "build_file": bl})
-        is_monorepo = len(set(m["path"] for m in modules)) > 1
-        return {"modules": modules, "is_monorepo": is_monorepo, "module_count": len(modules)}
-
-    def _item4_language_id(self, fi: dict) -> dict:
-        """Primary language identification by extension stats."""
-        if fi.get("not_applicable"):
-            return {"not_applicable": True, "reason": "No source files"}
+    def _ext_language_counts(self, files: list[dict]) -> dict:
+        """采集：原始扩展名计数 + 语言 hint（LANG_EXTENSIONS 仅作标签，未知扩展 language=None）。
+        不判 primary_language（交 LLM，HC-P1-01 已删）。"""
         ext_counts: dict[str, int] = {}
-        for f in fi.get("files", []):
+        for f in files:
             ext = f.get("ext", "")
-            if ext and ext not in {".json", ".yaml", ".yml", ".xml", ".md", ".txt", ".lock"}:
+            if ext:
                 ext_counts[ext] = ext_counts.get(ext, 0) + 1
-        sorted_exts = sorted(ext_counts.items(), key=lambda x: -x[1])
-        languages = []
-        for ext, count in sorted_exts[:10]:
-            lang = LANG_EXTENSIONS.get(ext, f"Unknown({ext})")
-            languages.append({"language": lang, "extension": ext, "file_count": count,
-                            "confidence": "high" if count > 5 else "medium" if count > 1 else "low"})
-        primary = languages[0]["language"] if languages else "unknown"
-        return {"primary_language": primary, "languages": languages, "total_lang_files": sum(ext_counts.values())}
+        by_ext = [{"extension": ext, "file_count": cnt,
+                   "language_hint": LANG_EXTENSIONS.get(ext)}
+                  for ext, cnt in sorted(ext_counts.items(), key=lambda kv: -kv[1])[:20]]
+        return {"extension_counts": dict(sorted(ext_counts.items(), key=lambda kv: -kv[1])[:30]),
+                "languages_by_extension": by_ext,
+                "note": "primary_language / 语言判定交 LLM（采集只给原始计数与 hint 标签）"}
 
-    def _item5_framework_id(self, src: Path, fi: dict) -> dict:
-        """Framework identification from project files."""
-        frameworks = []
-        files_found = [f["path"] for f in fi.get("files", [])]
-        file_set = set(files_found)
-
-        # Java frameworks
-        if any("pom.xml" in x for x in files_found):
-            # Check for Spring Boot starters
-            try:
-                pom = (src / "pom.xml").read_text(encoding="utf-8", errors="replace")[:10000]
-                if "spring-boot" in pom:
-                    frameworks.append({"framework": "Spring Boot", "confidence": "high"})
-                elif "spring" in pom.lower():
-                    frameworks.append({"framework": "Spring", "confidence": "medium"})
-            except Exception:
-                # 发声：pom.xml 存在却读取/解析失败，若静默会让框架识别"看似无框架"而掩盖读失败。
-                logger.warning("framework id: 读取 pom.xml 失败 src=%s", src, exc_info=True)
-        # .NET frameworks — recognise solutions/projects generically via
-        # endswith (FUP-1): .sln solution files, .csproj/.vbproj/.fsproj project
-        # files. NOT hardcoded to any specific project name. Older .NET Framework
-        # solutions may ship only a .sln (+ packages.config) with NO .csproj, so
-        # the .sln marker is essential — a .csproj-only check misses them.
-        if any(x.endswith((".csproj", ".vbproj", ".fsproj", ".sln")) for x in files_found):
-            frameworks.append({"framework": ".NET", "confidence": "high"})
-        # Node.js
-        if "package.json" in file_set:
-            try:
-                pkg = json.loads((src / "package.json").read_text(encoding="utf-8", errors="replace"))
-                deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
-                if "next" in deps: frameworks.append({"framework": "Next.js", "confidence": "high"})
-                elif "react" in deps: frameworks.append({"framework": "React", "confidence": "high"})
-                elif "vue" in deps: frameworks.append({"framework": "Vue", "confidence": "high"})
-                elif "express" in deps: frameworks.append({"framework": "Express", "confidence": "medium"})
-            except Exception:
-                # 发声：package.json 存在却解析失败，静默会让 JS 框架识别假阴性。
-                logger.warning("framework id: 解析 package.json 失败 src=%s", src, exc_info=True)
-        # Python
-        if "requirements.txt" in file_set or "pyproject.toml" in file_set:
-            try:
-                req_file = src / "requirements.txt" if "requirements.txt" in file_set else src / "pyproject.toml"
-                content = req_file.read_text(encoding="utf-8", errors="replace")[:5000]
-                if "django" in content.lower(): frameworks.append({"framework": "Django", "confidence": "high"})
-                elif "flask" in content.lower(): frameworks.append({"framework": "Flask", "confidence": "high"})
-                elif "fastapi" in content.lower(): frameworks.append({"framework": "FastAPI", "confidence": "high"})
-            except Exception:
-                # 发声：Python 依赖清单存在却读取失败，静默会让 Python 框架识别假阴性。
-                logger.warning("framework id: 读取 Python 依赖清单失败 src=%s", src, exc_info=True)
-        if not frameworks:
-            self.gaps.append({"item": 5, "type": "framework_unknown",
-                            "detail": "No framework confidently identified from project files"})
-        return {"frameworks": frameworks, "count": len(frameworks)}
-
-    def _item6_build_system_id(self, src: Path, fi: dict) -> dict:
-        """Build system identification."""
-        systems = []
-        for f in fi.get("files", []):
+    def _build_candidates(self, files: list[dict]) -> list[dict]:
+        out = []
+        for f in files:
             fname = os.path.basename(f["path"])
             if fname in BUILD_FILES:
-                systems.append({"build_system": BUILD_FILES[fname], "file": f["path"], "confidence": "high"})
-            # FUP-1: .NET solution/project files matched generically via endswith.
-            # The BUILD_FILES wildcard keys ("*.csproj"/"*.sln"/"*.fsproj") can never
-            # match `fname in BUILD_FILES` (exact-key lookup), so .sln/.vbproj/.fsproj
-            # were silently missed — only .csproj was caught below. Recognise the
-            # full .NET family here (.sln → msbuild-sln, project files → msbuild).
-            elif f["path"].endswith(".sln"):
-                systems.append({"build_system": "msbuild-sln", "file": f["path"], "confidence": "high"})
-            elif f["path"].endswith((".csproj", ".vbproj", ".fsproj")):
-                systems.append({"build_system": "msbuild", "file": f["path"], "confidence": "high"})
-        if not systems:
-            self.gaps.append({"item": 6, "type": "build_system_unknown",
-                            "detail": "No build file detected"})
-        return {"build_systems": systems, "count": len(systems)}
+                out.append({"path": f["path"], "build_hint": BUILD_FILES[fname]})
+            elif f["path"].lower().endswith(_BUILD_SUFFIXES):
+                out.append({"path": f["path"], "build_hint": "msbuild(.NET)"})
+        return out
 
-    def _item7_dependency_id(self, src: Path, fi: dict) -> dict:
-        """Dependency inventory draft."""
-        deps = []
-        # Parse package.json
-        pkg_json = src / "package.json"
-        if pkg_json.exists():
-            try:
-                pkg = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
-                for name, ver in {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}.items():
-                    deps.append({"name": name, "version": ver, "source": "package.json", "type": "npm"})
-            except Exception:
-                # 发声：package.json 解析失败会让依赖清单假性为空，掩盖真实依赖。
-                logger.warning("dependency id: 解析 package.json 失败 file=%s", pkg_json, exc_info=True)
-        # Parse requirements.txt
-        req_txt = src / "requirements.txt"
-        if req_txt.exists():
-            try:
-                for line in req_txt.read_text(encoding="utf-8", errors="replace").splitlines()[:500]:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        deps.append({"name": line.split("==")[0].split(">=")[0].strip(),
-                                     "version": line, "source": "requirements.txt", "type": "pip"})
-            except Exception:
-                # 发声：requirements.txt 读取失败会让依赖清单假性为空，掩盖真实依赖。
-                logger.warning("dependency id: 读取 requirements.txt 失败 file=%s", req_txt, exc_info=True)
-        return {"dependencies": deps[:500], "total": len(deps), "truncated": len(deps) > 500}
+    def _dependency_manifests(self, src: Path, files: list[dict]) -> list[dict]:
+        """采集：列全依赖清单候选（大小写不敏感、任意栈）+ 脱敏原文。不解析依赖（交 LLM，HC-P1-02 已删）。"""
+        out = []
+        for f in files:
+            fname = os.path.basename(f["path"]).lower()
+            if fname in _DEP_MANIFEST_NAMES or fname.endswith(_DEP_MANIFEST_SUFFIXES):
+                content = self._read_text(src, f["path"], max_bytes=6000)
+                out.append({"path": f["path"],
+                            "content_redacted": _redact(content)[:6000] if content else ""})
+            if len(out) >= 30:
+                break
+        return out
 
-    def _item8_entry_point_id(self, src: Path, fi: dict, langs: dict) -> dict:
-        """Entry point / startup method candidates."""
-        entries = []
-        # Common entry patterns
-        patterns = [
-            "Program.cs", "Main.cs", "main.go", "main.rs", "index.js", "index.ts",
-            "app.py", "main.py", "manage.py", "server.js", "server.ts",
-            "App.tsx", "App.jsx", "Application.java",
-        ]
-        file_set = {f["path"] for f in fi.get("files", [])}
-        for pat in patterns:
-            for fp in file_set:
-                if fp.endswith(pat) or fp == pat:
-                    entries.append({"path": fp, "pattern": pat, "confidence": "medium"})
-        # Dockerfile ENTRYPOINT/CMD
-        dockerfile = src / "Dockerfile"
-        if dockerfile.exists():
-            try:
-                content = dockerfile.read_text(encoding="utf-8", errors="replace")
+    def _config_candidates(self, src: Path, files: list[dict]) -> list[dict]:
+        """采集：大小写不敏感 config 候选 + 脱敏键（值不出，HC-P1-04 已删）。用途解读交 LLM。"""
+        out = []
+        for f in files:
+            fname = os.path.basename(f["path"]).lower()
+            is_cfg = (fname in _CONFIG_NAMES or fname.endswith(_CONFIG_SUFFIXES)
+                      or f["path"].startswith(".github/"))
+            if not is_cfg:
+                continue
+            content = self._read_text(src, f["path"], max_bytes=8000)
+            keys = self._extract_keys(f["path"], content)
+            out.append({"path": f["path"], "keys_redacted": keys[:50], "keys_count": len(keys)})
+            if len(out) >= 40:
+                break
+        return out
+
+    @staticmethod
+    def _extract_keys(rel: str, content: str) -> list[str]:
+        if not content:
+            return []
+        keys: list[str] = []
+        low = rel.lower()
+        try:
+            if low.endswith(".env"):
                 for line in content.splitlines():
-                    if line.strip().upper().startswith(("ENTRYPOINT", "CMD")):
-                        entries.append({"path": "Dockerfile", "pattern": line.strip(), "confidence": "high"})
-            except Exception:
-                # 发声：Dockerfile 读取失败会漏掉入口点线索，静默会掩盖读失败。
-                logger.warning("entry point id: 读取 Dockerfile 失败 file=%s", dockerfile, exc_info=True)
-        return {"entry_points": entries[:20], "count": len(entries)}
+                    if line.strip() and not line.startswith("#") and "=" in line:
+                        keys.append("[ENV_KEY]_" + line.split("=")[0].strip())
+            elif low.endswith((".json", ".yaml", ".yml", ".properties")):
+                for line in content.splitlines():
+                    s = line.strip()
+                    if ":" in s and not s.startswith("#"):
+                        k = s.split(":")[0].strip().strip('"').strip("'")
+                        if 0 < len(k) < 80:
+                            keys.append(k)
+                    elif "=" in s and not s.startswith("#") and low.endswith(".properties"):
+                        keys.append(s.split("=")[0].strip())
+            else:
+                keys.append("[non-parseable-config]")
+        except Exception:
+            keys.append("[read_error]")
+        return keys
 
-    def _item9_test_inventory(self, src: Path, fi: dict) -> dict:
-        """Test directories and test framework clues."""
-        test_dirs = []
-        test_frameworks = set()
-        for f in fi.get("files", []):
+    def _test_candidates(self, src: Path, files: list[dict]) -> dict:
+        """采集：大小写不敏感测试目录/文件候选 + 脱敏原文（供 LLM 读断言，HC-P1-05 已删）。"""
+        dirs: set[str] = set()
+        test_files: list[dict] = []
+        for f in files:
             parts = Path(f["path"]).parts
-            if any(d in TEST_DIR_NAMES for d in parts):
-                test_dir = next(d for d in parts if d in TEST_DIR_NAMES)
-                if test_dir not in [t["dir"] for t in test_dirs]:
-                    test_dirs.append({"dir": test_dir, "path": f["path"]})
-            # Detect test frameworks by file patterns
-            if "pytest" in f["path"] or "conftest.py" in f["path"]:
-                test_frameworks.add("pytest")
-            if any(x in f["path"] for x in ["jest.config", ".test.", ".spec."]):
-                test_frameworks.add("jest")
-            if any(x in f["path"] for x in ["JUnit", "Test.java", "Tests.java"]):
-                test_frameworks.add("JUnit")
-            if any(x in f["path"] for x in ["NUnit", "xUnit", "Test.cs", "Tests.cs"]):
-                test_frameworks.add("NUnit/xUnit")
-        return {"test_directories": test_dirs, "test_frameworks": list(test_frameworks),
-                "has_tests": len(test_dirs) > 0 or len(test_frameworks) > 0}
+            lower_parts = [p.lower() for p in parts]
+            fname = parts[-1].lower()
+            hit_dir = next((p for p, lp in zip(parts, lower_parts) if lp in TEST_DIR_NAMES), None)
+            is_test_file = ("test" in fname or "spec" in fname or fname == "conftest.py"
+                            or ".test." in fname or ".spec." in fname)
+            if hit_dir:
+                dirs.add(hit_dir)
+            if (hit_dir or is_test_file) and len(test_files) < 15:
+                content = self._read_text(src, f["path"], max_bytes=4000)
+                test_files.append({"path": f["path"],
+                                   "content_redacted": _redact(content)[:4000] if content else ""})
+        return {"test_directories": sorted(dirs), "test_files": test_files,
+                "note": "测试识别/断言解读/框架判定交 LLM（采集只列候选与原文）"}
 
-    def _item10_cicd_inventory(self, src: Path, fi: dict) -> dict:
-        """CI/CD, container, deployment file inventory."""
-        items = []
-        cicd_patterns = [
-            "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
-            ".gitlab-ci.yml", ".github/workflows/", "Jenkinsfile",
-            ".travis.yml", "deploy/", "k8s/", "helm/", "terraform/",
-            ".drone.yml", "bitbucket-pipelines.yml",
-        ]
-        for f in fi.get("files", []):
-            for pat in cicd_patterns:
+    def _cicd_candidates(self, files: list[dict]) -> list[dict]:
+        out = []
+        for f in files:
+            for pat in CICD_PATTERNS:
                 if pat in f["path"] or f["path"].startswith(pat.rstrip("/")):
-                    items.append({"path": f["path"], "type": pat.rstrip("/"), "confidence": "high"})
+                    out.append({"path": f["path"], "matched_pattern": pat.rstrip("/")})
                     break
-        return {"cicd_items": items, "count": len(items), "has_docker": any("Dockerfile" in i["path"] for i in items)}
+        return out
 
-    def _item11_infra_clues(self, src: Path, fi: dict) -> dict:
-        """Database, middleware, external service configuration clues. REDACTED."""
-        clues = []
-        # Common DB/middleware indicators in file names
-        infra_patterns = {
-            "mysql": "MySQL", "postgres": "PostgreSQL", "postgresql": "PostgreSQL",
-            "oracle": "Oracle", "mssql": "SQL Server", "sqlserver": "SQL Server",
-            "mongodb": "MongoDB", "redis": "Redis", "kafka": "Kafka",
-            "rabbitmq": "RabbitMQ", "elasticsearch": "Elasticsearch",
-            "nginx": "Nginx", "apache": "Apache", "tomcat": "Tomcat",
-            "weblogic": "WebLogic", "websphere": "WebSphere",
-            "dameng": "达梦DM", "opengauss": "openGauss", "gaussdb": "GaussDB",
+    def _doc_candidates(self, files: list[dict]) -> list[dict]:
+        out = []
+        for f in files:
+            fname = os.path.basename(f["path"]).lower()
+            if fname in DOC_PATTERNS or f["path"].startswith("docs/") or "/doc/" in f["path"]:
+                out.append({"path": f["path"]})
+        return out
+
+    def _infra_indicators(self, src: Path, files: list[dict]) -> list[dict]:
+        """采集：报告哪些 config 文件含连接/DB 指示（脱敏）；不判 infra 类型（交 LLM，HC-P1-06 已删）。"""
+        out = []
+        for f in files:
+            if not any(f["path"].endswith(ext) for ext in
+                       (".json", ".yml", ".yaml", ".xml", ".properties", ".env", ".config")):
+                continue
+            content = self._read_text(src, f["path"], max_bytes=5000).lower()
+            if any(kw in content for kw in _CONN_INDICATORS):
+                out.append({"path": f["path"], "indicator": "connection_config_present",
+                            "note": "含连接/数据源配置（值已脱敏）— infra 类型解读交 LLM"})
+            if len(out) >= 50:
+                break
+        return out
+
+    # ── 采集入口（图 P1 handler 用） ────────────────────────────────────
+    def collect_facts(self, project_id: str) -> dict:
+        """采集事实包 + 写盘 4 个纯采集产物（file_index/source_structure/cicd/doc）。
+        返回喂给 ProfilingService(LLM) 的事实包（无识别结论）。"""
+        src = workspace_path(project_id) / "source"
+        art_dir = workspace_path(project_id) / "artifacts"
+        art_dir.mkdir(parents=True, exist_ok=True)
+
+        files = self._scan(src)
+        file_index = self._file_index(files)
+        source_structure = self._source_structure(src)
+        cicd = self._cicd_candidates(files)
+        docs = self._doc_candidates(files)
+
+        # 纯采集产物落盘（file listing，无 LLM 识别）
+        for name, data in (("file_index", file_index), ("source_structure", source_structure),
+                           ("cicd_inventory", {"cicd_items": cicd, "count": len(cicd)}),
+                           ("doc_inventory", {"documents": docs, "count": len(docs)})):
+            try:
+                (art_dir / f"{name}.json").write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as e:
+                self.warnings.append(f"Failed to write {name}.json: {e}")
+
+        facts = {
+            "source_path": str(src),
+            "file_count": len(files),
+            "file_index_truncated": file_index["truncated"],
+            "top_level_dirs": [t["name"] for t in source_structure.get("top_level", [])
+                               if t.get("type") == "dir"],
+            "source_structure": source_structure,
+            "ext_language_counts": self._ext_language_counts(files),
+            "build_file_candidates": self._build_candidates(files),
+            "dependency_manifests": self._dependency_manifests(src, files),
+            "config_candidates": self._config_candidates(src, files),
+            "test_candidates": self._test_candidates(src, files),
+            "cicd_candidates": cicd,
+            "doc_candidates": docs,
+            "infra_config_indicators": self._infra_indicators(src, files),
+            "collection_note": ("源码为空/未物化，事实包仅含基础采集字段（诚实）" if not files else
+                                "确定性采集事实（大小写不敏感/依赖配置测试全候选/已脱敏）；识别交 LLM"),
         }
-        for f in fi.get("files", []):
-            fname = f["path"].lower()
-            for key, label in infra_patterns.items():
-                if key in fname:
-                    clues.append({"file": f["path"], "infra_type": label, "confidence": "low",
-                                "note": "File name match only — needs config content verification"})
-        # Also scan for connection strings in config files (REDACTED output)
-        for f in fi.get("files", []):
-            if any(f["path"].endswith(ext) for ext in [".json", ".yml", ".yaml", ".xml", ".properties", ".env"]):
-                try:
-                    content = (src / f["path"]).read_text(encoding="utf-8", errors="replace")[:5000]
-                    # Check for DB connection indicators without outputting values
-                    if any(kw in content.lower() for kw in ["jdbc:", "connectionstring", "connection_string",
-                                                              "datasource", "database_url", "db_url",
-                                                              "redis_url", "kafka_broker"]):
-                        clues.append({"file": f["path"], "infra_type": "connection_config_found",
-                                    "confidence": "medium", "note": "Connection config detected — values REDACTED"})
-                except Exception:
-                    # 发声：配置文件读取失败会漏掉基础设施线索，静默会掩盖读失败。
-                    logger.warning("infra clues: 读取配置文件失败 file=%s", f.get("path"), exc_info=True)
-        # Deduplicate
-        seen = set()
-        unique = []
-        for c in clues:
-            key = (c["file"], c["infra_type"])
-            if key not in seen:
-                seen.add(key)
-                unique.append(c)
-        return {"infra_clues": unique[:50], "count": len(unique)}
+        if self.trace:
+            try:
+                self.trace.write("collection_complete", action="full_stack_collect",
+                                 summary=f"P1 采集：{len(files)} 文件，{len(facts['dependency_manifests'])} 依赖清单候选",
+                                 project_id=project_id)
+            except Exception:
+                logger.debug("collect_facts trace 写入失败（advisory）", exc_info=True)
+        return facts
 
-    def _item12_config_inventory(self, src: Path, fi: dict) -> dict:
-        """Config file inventory — keys only, values REDACTED."""
-        configs = []
-        for f in fi.get("files", []):
-            fname = os.path.basename(f["path"])
-            matched = None
-            for pat, ctype in CONFIG_FILES.items():
-                if fname == pat or (pat.endswith("/") and f["path"].startswith(pat)):
-                    matched = ctype
-                    break
-            if matched:
-                # Extract keys only, never values
-                keys_found = []
-                try:
-                    content = (src / f["path"]).read_text(encoding="utf-8", errors="replace")[:10000]
-                    if f["path"].endswith((".json", ".yaml", ".yml")):
-                        # Simple key extraction (not a full parser)
-                        for line in content.splitlines():
-                            for sk in SENSITIVE_KEYS:
-                                if sk in line.lower():
-                                    keys_found.append(f"[REDACTED]_{sk}")
-                                    break
-                            else:
-                                # Extract non-sensitive top-level keys
-                                stripped = line.strip()
-                                if ":" in stripped and not stripped.startswith("#"):
-                                    key = stripped.split(":")[0].strip().strip('"').strip("'")
-                                    if len(key) < 80:
-                                        keys_found.append(key)
-                    elif f["path"].endswith(".env"):
-                        keys_found = [line.split("=")[0].strip() for line in content.splitlines()
-                                     if line.strip() and not line.startswith("#") and "=" in line]
-                        # ALL .env keys are potentially sensitive → mark as REDACTED
-                        keys_found = [f"[ENV_KEY]_{k}" for k in keys_found]
-                    else:
-                        keys_found = ["[binary/non-parseable]"]
-                except Exception:
-                    keys_found = ["[read_error]"]
-                configs.append({"path": f["path"], "config_type": matched,
-                              "keys_found": keys_found[:50], "keys_count": len(keys_found)})
-        return {"configs": configs, "count": len(configs),
-                "redaction_note": "ALL config values REDACTED. Only keys are listed."}
+    # ── 遗留采集通道（/profile 路由 + run_profiling 工具） ────────────────
+    def profile(self, project_id: str) -> dict:
+        """遗留采集通道：写采集产物 + p2_input_manifest + summary（不产 LLM 识别）。
+        图 P1 建档识别走 RealP1Handler → ProfilingService(LLM)；本方法只做采集。"""
+        src = workspace_path(project_id) / "source"
+        art_dir = workspace_path(project_id) / "artifacts"
+        facts = self.collect_facts(project_id)  # 写 file_index/source_structure/cicd/doc
+        files = facts["file_count"]
 
-    def _item13_doc_inventory(self, src: Path, fi: dict) -> dict:
-        """Documentation and README identification."""
-        docs = []
-        doc_patterns = {"README.md", "README", "CHANGELOG.md", "CHANGELOG", "CONTRIBUTING.md",
-                       "LICENSE", "LICENSE.md", "NOTICE", "AUTHORS", "CODE_OF_CONDUCT.md"}
-        for f in fi.get("files", []):
-            fname = os.path.basename(f["path"])
-            if fname in doc_patterns or f["path"].startswith("docs/") or "/doc/" in f["path"]:
-                docs.append({"path": f["path"], "type": "documentation"})
-        return {"documents": docs, "count": len(docs), "has_readme": any("README" in d["path"] for d in docs)}
+        # 采集版（无识别结论）的其余产物落盘。
+        collection_artifacts = {
+            "module_structure": {"build_file_candidates": facts["build_file_candidates"],
+                                 "note": "模块业务角色识别交 LLM（采集只列构建文件位置）"},
+            "dependency_draft": {"dependency_manifests": facts["dependency_manifests"],
+                                 "note": "依赖解析交 LLM（采集只列清单原文候选）",
+                                 "identification_deferred": True},
+            "test_inventory": {**facts["test_candidates"], "identification_deferred": True},
+            "config_inventory": {"configs": facts["config_candidates"],
+                                 "count": len(facts["config_candidates"]),
+                                 "redaction_note": "ALL config values REDACTED. Only keys listed.",
+                                 "identification_deferred": True},
+            "infra_clues": {"infra_config_indicators": facts["infra_config_indicators"],
+                            "count": len(facts["infra_config_indicators"]),
+                            "identification_deferred": True},
+            "uncertainty_manifest": {"evidence_gaps": self.gaps, "total_gaps": len(self.gaps),
+                                     "note": "识别盲区由 P1 LLM 建档主动发声（采集层只登记采集警告）"},
+        }
+        items_completed = 4  # 已由 collect_facts 写盘的 4 个采集产物
+        for name, data in collection_artifacts.items():
+            try:
+                (art_dir / f"{name}.json").write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                items_completed += 1
+            except Exception as e:
+                self.warnings.append(f"Failed to write {name}.json: {e}")
 
-    def _item14_uncertainty_manifest(self) -> dict:
-        """Uncertainties, conflicts, missing items → Evidence Gaps."""
-        return {"evidence_gaps": self.gaps, "total_gaps": len(self.gaps),
-                "note": "All uncertain/conflicting/missing items explicitly registered. No guesswork."}
-
-    def _build_summary(self, pid: str, result: dict, artifacts: dict) -> str:
-        """Generate Markdown profiling summary."""
-        tech = artifacts.get("tech_stack", {})
-        langs = tech.get("languages", {}).get("languages", [])
-        primary = tech.get("languages", {}).get("primary_language", "unknown")
-        fws = tech.get("frameworks", {}).get("frameworks", [])
-        bss = tech.get("build_systems", {}).get("build_systems", [])
-        deps = artifacts.get("dependency_draft", {})
-        ci = artifacts.get("cicd_inventory", {})
-        ti = artifacts.get("test_inventory", {})
-        fi = artifacts.get("file_index", {})
-
-        lang_dist = ", ".join("{0}({1})".format(l["language"], l["file_count"]) for l in langs[:5])
-        framework_str = ", ".join(f["framework"] for f in fws) if fws else "未识别"
-        build_str = ", ".join(b["build_system"] for b in bss) if bss else "未识别"
-
-        lines = [
-            f"# P1 建档摘要：{pid}",
-            f"建档时间：{result['profiled_at']}",
-            "",
-            "## 技术栈",
-            f"- 主要语言：{primary}",
-            f"- 语言分布：{lang_dist}",
-            f"- 框架：{framework_str}",
-            f"- 构建系统：{build_str}",
-            "",
-            "## 规模",
-            f"- 文件总数：{fi.get('total_files', 0)}",
-            f"- 依赖项：{deps.get('total', 0)}",
-            f"- 入口点候选：{artifacts.get('entry_points', {}).get('count', 0)}",
-            "",
-            "## 质量基础设施",
-            f"- 测试：{'有' if ti.get('has_tests') else '无'} (框架：{', '.join(ti.get('test_frameworks', []))})",
-            f"- CI/CD：{ci.get('count', 0)} 项",
-            f"- Docker：{'有' if ci.get('has_docker') else '无'}",
-            "",
-            "## 不确定性",
-            f"- Evidence Gap 总数：{result['gaps_count']}",
-            f"- 警告：{len(result.get('warnings', []))}",
-            "",
-            "> 深度兼容性评估归 P2。本档案为 P1 全量识别基线。",
-        ]
-        return "\n".join(lines)
-
-    def _build_p2_manifest(self, pid: str, artifacts: dict) -> dict:
-        """Build P2 input package manifest."""
-        return {
-            "project_id": pid,
-            "p1_completed_at": _now(),
-            "p1_stage": "completed",
-            "input_artifacts": [
-                {"ref": f"artifacts/{name}.json", "type": name}
-                for name in artifacts.keys()
-            ],
+        result = {
+            "project_id": project_id, "profiled_at": _now(), "source_path": str(src),
+            "items_completed": items_completed, "items_not_applicable": 0,
+            "gaps_count": len(self.gaps), "warnings": self.warnings,
+            "collection_only": True,
+            "note": "profile() 为采集通道；LLM 识别在图 P1 RealP1Handler（AGENTS §2.3）",
+        }
+        # summary + p2 manifest（采集口径）
+        (art_dir / "profiling_summary.md").write_text(
+            self._build_summary(project_id, result, facts), encoding="utf-8")
+        p2_manifest = {
+            "project_id": project_id, "p1_completed_at": _now(),
+            "p1_stage": "collection_only",
+            "input_artifacts": [{"ref": f"artifacts/{p.name}", "type": p.stem}
+                                for p in sorted(art_dir.glob("*.json"))],
             "pending_evidence_gaps": self.gaps,
             "environment_profile_ref": ".rebuild/environment.json",
         }
+        (art_dir / "p2_input_manifest.json").write_text(
+            json.dumps(p2_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if self.trace:
+            try:
+                self.trace.write("profiling_complete", action="full_stack_profile",
+                    summary=f"P1 采集通道：{items_completed} 采集产物，{len(self.gaps)} gaps",
+                    project_id=project_id)
+            except Exception:
+                logger.debug("profile trace 写入失败（advisory）", exc_info=True)
+        return result
+
+    def _build_summary(self, pid: str, result: dict, facts: dict) -> str:
+        exts = facts.get("ext_language_counts", {}).get("languages_by_extension", [])
+        ext_dist = ", ".join(f"{e.get('language_hint') or e['extension']}({e['file_count']})"
+                             for e in exts[:5])
+        deps = facts.get("dependency_manifests", [])
+        return "\n".join([
+            f"# P1 采集摘要：{pid}",
+            f"采集时间：{result['profiled_at']}",
+            "",
+            "## 采集事实（识别交 LLM P1 建档）",
+            f"- 文件总数：{facts.get('file_count', 0)}",
+            f"- 扩展名分布（hint）：{ext_dist or '无'}",
+            f"- 构建文件候选：{len(facts.get('build_file_candidates', []))}",
+            f"- 依赖清单候选：{len(deps)}",
+            f"- 配置候选：{len(facts.get('config_candidates', []))}",
+            f"- 测试目录候选：{', '.join(facts.get('test_candidates', {}).get('test_directories', [])) or '无'}",
+            "",
+            "> 主语言/框架/依赖/入口/infra 的【识别】由 P1 LLM 建档 Agent 对采集事实推理产出（AGENTS §2.3）。",
+        ])

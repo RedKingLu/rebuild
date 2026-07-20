@@ -59,10 +59,11 @@ _STAGE_TASK_TYPE = {
 }
 
 # LLM 主任务阶段：claim-evidence map（LLM 内联引用）+ LLM 语义 ValidationAgent。
-# R17.5 WP-1：P0 纳入 LLM 执行路径——识别/技术栈/环境解读/可用性研判/P1 任务规划/DB 入口
-# /入口点判定由 Node Worker Agent(经 ModelGateway, D-098) 对采集事实包推理产出（AGENTS §2.3）；
-# 确定性只做采集（materialize/index/git/SQL）。其余（P1/P5/P6）为确定性主任务：fact-evidence map。
-_LLM_STAGES = {"p0", "p2", "p3", "p4"}
+# R17.5 WP-1：P0/P1 纳入 LLM 执行路径——P0 接入识别 + P1 建档识别（技术栈/依赖/入口/配置/infra/
+# 测试断言/盲区）由 Node Worker Agent(经 ModelGateway, D-098) 对采集事实包 + 上游产物推理产出
+# （AGENTS §2.3）；确定性只做采集（materialize/index/collect_facts）与验证（原始黄金真跑捕获，
+# D-106）。其余（P5/P6）为确定性主任务：fact-evidence map。
+_LLM_STAGES = {"p0", "p1", "p2", "p3", "p4"}
 
 # R17.5 WP-3 (HC-06): 语言/主语言【识别】已下放给 P0 LLM（Node Worker Agent）。work_agent
 # 的 _scan_project_facts 仅做【采集】——原始扩展名计数 + 构建文件候选，用于合成"动态工作计划"
@@ -125,19 +126,19 @@ class WorkAgentResult:
 
 
 class WorkAgent:
-    """阶段主任务编排主体（确定性阶段路径，P1 样例）。
+    """阶段主任务编排主体（handler-Tool 编排路径）。
 
     Args:
       stage / project_id / run_id
       tracer / auditor          — 进程单例（可 None）
       db                        — 复用会话（可 None；AET/上下文各自取会话）
       aet                       — AETService（可注入，默认 AETService(None)）
-      profiler                  — P1 确定性 Tool（可注入以便测试注入退化场景，默认真实
-                                  FullStackProfiler）。DI 仅为可测性，不引入 mock 生产路径。
+      handler                   — 阶段 handler（重定位为 WorkAgent 可调用的确定性/LLM Tool）；
+                                  可注入以便测试注入 gateway；默认从图 registry 取。
     """
 
     def __init__(self, stage: str, project_id: str, run_id: str = "", *,
-                 tracer=None, auditor=None, db=None, aet=None, profiler=None,
+                 tracer=None, auditor=None, db=None, aet=None,
                  handler=None):
         self.stage = stage
         self.project_id = project_id
@@ -146,8 +147,7 @@ class WorkAgent:
         self.auditor = auditor
         self.db = db
         self._aet = aet
-        self._profiler = profiler
-        self._handler = handler          # 批 B：非 P1 阶段编排的确定性/LLM Tool（handler 重定位）
+        self._handler = handler          # 阶段编排的确定性/LLM Tool（handler 重定位）
         self._rework_feedback: Optional[dict] = None
         self.last_result: Optional[WorkAgentResult] = None
 
@@ -161,12 +161,6 @@ class WorkAgent:
             return self._aet
         from app.services.aet_service import AETService
         return AETService(None)
-
-    def _profiler_tool(self):
-        if self._profiler is not None:
-            return self._profiler
-        from app.services.full_stack_profiler import FullStackProfiler
-        return FullStackProfiler(trace_writer=self.tracer, audit_writer=self.auditor)
 
     def _get_handler(self):
         """批 B：非 P1 阶段的确定性/LLM Tool（handler 重定位为 WorkAgent 可调用 Tool，
@@ -294,34 +288,38 @@ class WorkAgent:
 
     # ── 动态工作计划（确定性合成，Q-WP2-4） ─────────────────────────────
     def _plan_body_p1(self, facts: dict) -> tuple[str, list, list, list]:
-        """P1 建档动态计划体（保持批 A 输出契约）。"""
+        """P1 建档动态计划体（R17.5：采集→LLM 识别→原始验收基准捕获）。"""
         planned_actions = [
-            {"action": "全量识别项目结构/技术栈/依赖/配置",
-             "tool": "full_stack_profiler.profile",
-             "rationale": (f"检测到 {facts['file_count']} 个源文件"
-                           + (f"，探测栈 {', '.join(facts['detected_stack'])}" if facts["detected_stack"] else "，源码待物化/为空"))},
+            {"action": "采集项目事实包（结构/依赖/配置/测试原文，大小写不敏感、脱敏）",
+             "tool": "full_stack_profiler.collect_facts",
+             "rationale": (f"采集到 {facts['file_count']} 个源文件"
+                           + (f"，候选栈 {', '.join(facts['detected_stack'])}" if facts["detected_stack"] else "，源码待物化/为空"))},
+            {"action": "复用 P0 接入识别（primary_language/环境/DB）+ LLM 深化建档识别",
+             "tool": "p1_handler.execute→profiling_service(LLM)",
+             "rationale": "识别归 LLM（AGENTS §2.3），复用 P0 结论不重算（解 P1-ARCH-1）"},
         ]
         if facts["build_files"]:
             planned_actions.append(
-                {"action": "解析构建系统与依赖清单",
-                 "tool": "full_stack_profiler.profile",
-                 "rationale": f"检测到构建文件 {', '.join(facts['build_files'])}"})
+                {"action": "LLM 解析构建系统与依赖清单",
+                 "tool": "p1_handler.execute→profiling_service(LLM)",
+                 "rationale": f"采集到构建文件候选 {', '.join(facts['build_files'])}"})
         planned_actions.append(
-            {"action": "生成 profiling_summary.md 摘要 + p2_input_manifest.json（P2 输入）",
-             "tool": "full_stack_profiler.profile",
-             "rationale": "为下游 P2 评估提供可信输入清单"})
+            {"action": "捕获原始验收基准 acceptance_baseline.json（静态 LLM + 动态黄金真跑，D-106）",
+             "tool": "acceptance_baseline_service",
+             "rationale": "为下游 P5 行为等价/回归对比提供原始基准（不可跑栈诚实 needs_env）"})
         goal = ("P1 建档：对"
                 + (f"候选栈为 {facts['detected_stack'][0]} 的项目" if facts["detected_stack"]
                    else "该项目")
-                + f"（{facts['file_count']} 源文件）全量识别结构/技术栈/依赖/配置，产出项目档案与 P2 输入")
+                + f"（{facts['file_count']} 源文件）复用 P0 识别深化建档 + 捕获原始验收基准")
         criteria = [
-            "至少产出 1 项识别产物",
-            "profiling_summary.md 已生成",
-            "p2_input_manifest.json 已生成",
-            "每条 fact 绑定可解析 artifact/evidence（fact-evidence map）",
+            "复用 P0 上游识别（不重算/推翻）",
+            "产出建档识别产物（LLM）",
+            "原始验收基准 acceptance_baseline.json 已产出",
+            "盲区主动发声（uncertainty 非 0-gap）",
         ]
-        risks = (["源码目录为空或未物化，识别产物将标记 not_applicable"]
-                 if facts["file_count"] == 0 else [])
+        risks = ["LLM 主任务：无有效模型 Key 时本阶段将诚实 blocked（不伪造，D-097）"]
+        if facts["file_count"] == 0:
+            risks.append("源码目录为空或未物化，识别将受限")
         return goal, planned_actions, criteria, risks
 
     def _plan_body_generic(self, facts: dict) -> tuple[str, list, list, list]:
@@ -427,93 +425,12 @@ class WorkAgent:
 
     # ── 主执行（execute_fn） ─────────────────────────────────────────────
     async def execute(self, state: dict) -> dict:
-        """StageLoop.execute_fn：阶段主任务闭环。P1 走确定性 profiler 路径；
-        P0/P2/P3/P4/P5/P6 走 handler-Tool 编排路径（批 B）。返回 WorkAgentResult.to_dict()。"""
-        if self.stage == "p1":
-            return await self._execute_p1(state)
+        """StageLoop.execute_fn：阶段主任务闭环。R17.5：P0/P1 与 P2/P3/P4 一致，走
+        handler-Tool 编排路径（handler 内部采集事实 + LLM 识别）；P5/P6 亦经此路径。
+        返回 WorkAgentResult.to_dict()。"""
         return await self._execute_generic(state)
 
-    async def _execute_p1(self, state: dict) -> dict:
-        """P1 确定性主任务闭环（批 A 范式，保持契约）。"""
-        rework = self._rework_feedback
-        self._rework_feedback = None  # 消费一次
-
-        ctx = self._assemble(state)
-        skill_loaded = self._skill_loaded_info(ctx)
-        assembly_trace = ctx.get("assembly_trace", {})
-        tool_calls: list = []
-
-        # 动态工作计划（若 plan_only 阶段未生成则此处补齐；rework 时重新合成）
-        try:
-            work_plan_ref = self.build_work_plan(state)
-        except Exception:
-            logger.warning("WorkAgent[%s] work_plan 合成失败（advisory）", self.stage, exc_info=True)
-            work_plan_ref = None
-
-        # ③ 调用确定性 Tool：FullStackProfiler.profile
-        profiler = self._profiler_tool()
-        try:
-            prof = profiler.profile(self.project_id)
-            tool_calls.append({"tool": "full_stack_profiler.profile", "status": "ok",
-                               "items_completed": prof.get("items_completed", 0)})
-        except Exception as e:  # 诚实：失败不伪造 completed（D-097/公理3）
-            tool_calls.append({"tool": "full_stack_profiler.profile", "status": "error",
-                               "error": str(e)})
-            res = WorkAgentResult(stage=self.stage, status="failed",
-                                  agent_id=self._agent_id(),
-                                  work_plan_ref=work_plan_ref,
-                                  skill_loaded=skill_loaded, tool_calls=tool_calls,
-                                  reason=f"FullStackProfiler 执行异常：{type(e).__name__}")
-            self.last_result = res
-            return res.to_dict()
-
-        # ④ 汇总真实落盘产物（单一事实源 = artifacts/*.json，DOC-2 范式）
-        refs, identified_items = self._collect_artifacts()
-
-        # ⑦ fact-evidence map：每条 fact 绑定 artifact/sha256/evidence/trace
-        cem_ref, evidence_refs, facts_entries = self._build_fact_evidence_map(prof)
-
-        # ⑥ Gate Brief（WorkAgent 侧：做了什么/关键产物/风险）
-        gate_brief_partial, gate_brief_ref = self._build_gate_brief_partial(
-            prof, refs, facts_entries, rework)
-
-        res = WorkAgentResult(
-            stage=self.stage,
-            status="completed",
-            agent_id=self._agent_id(),
-            work_plan_ref=work_plan_ref,
-            artifacts=refs,
-            evidence_refs=evidence_refs,
-            claim_evidence_map_ref=cem_ref,
-            gate_brief_ref=gate_brief_ref,
-            gate_brief_partial=gate_brief_partial,
-            skill_loaded=skill_loaded,
-            context_trace={
-                "layers": assembly_trace.get("layers_assembled", []),
-                "case_count": assembly_trace.get("case_count", 0),
-                "knowledge_count": assembly_trace.get("knowledge_count", 0),
-            },
-            tool_calls=tool_calls,
-            items_completed=prof.get("items_completed", 0),
-            reason=("rework 重跑：已按验收反馈补齐产物" if rework else ""),
-        )
-        # identified_items 供前端/审核参考（DOC-2 单一事实源）
-        result_dict = res.to_dict()
-        result_dict["identified_items"] = identified_items
-        result_dict["assembly_trace"] = assembly_trace
-        self.last_result = res
-        if self.tracer:
-            try:
-                self.tracer.write("work_agent", action="execute",
-                                  summary=(f"{self.stage} WorkAgent 完成：{prof.get('items_completed',0)} 识别项，"
-                                           f"{len(facts_entries)} facts→evidence"),
-                                  project_id=self.project_id, run_id=self.run_id or None,
-                                  stage=self.stage)
-            except Exception:
-                logger.debug("work_agent trace(execute) 写入失败（advisory）", exc_info=True)
-        return result_dict
-
-    # ── 批 B：P0/P2/P3/P4/P5/P6 handler-Tool 编排路径 ────────────────────
+    # ── 批 B：P0/P1/P2/P3/P4/P5/P6 handler-Tool 编排路径 ─────────────────
     async def _execute_generic(self, state: dict) -> dict:
         """WorkAgent 编排：上下文装配（Skill 正文）→ 动态计划 → 调 handler（重定位为
         确定性/LLM Tool）→ 汇总产物 → evidence map（fact/claim）→ Gate Brief。
@@ -621,139 +538,13 @@ class WorkAgent:
                 logger.debug("work_agent trace(execute-generic) 写入失败（advisory）", exc_info=True)
         return result_dict
 
-    # ── 产物汇总（P1） ──────────────────────────────────────────────────
-    def _collect_artifacts(self) -> tuple[list, list]:
-        art_dir = self._artifacts_dir()
-        refs: list[str] = []
-        identified_items: list[str] = []
-        if art_dir.exists():
-            for p in sorted(art_dir.glob("*.json")):
-                refs.append(f"artifacts/{p.name}")
-                if p.name != "p2_input_manifest.json" and not p.name.startswith("p0_") \
-                        and not p.name.startswith("p1_") and p.name != "intake_report.json":
-                    identified_items.append(p.stem)
-            if (art_dir / "profiling_summary.md").exists():
-                refs.append("artifacts/profiling_summary.md")
-        return refs, identified_items
-
-    # ── fact-evidence map（契约 4，确定性阶段） ──────────────────────────
+    # ── sha256 校验（通用 evidence map / gate brief 用） ─────────────────
     def _sha256(self, rel_path: str) -> str:
         try:
             raw = (self._ws_root() / rel_path).read_bytes()
             return hashlib.sha256(raw).hexdigest()
         except Exception:
             return ""
-
-    def _read_artifact(self, name: str) -> dict:
-        try:
-            return json.loads((self._artifacts_dir() / name).read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-    def _build_fact_evidence_map(self, prof: dict) -> tuple[Optional[str], list, list]:
-        """构造 fact-evidence map：每条 fact 绑定真实 artifact/sha256/trace，
-        并经 AETService.write_evidence(claim=) 登记为可查询 Evidence（EVI-01 折入）。"""
-        aet = self._aet_service()
-        pid8 = self.project_id[:8]
-        entries: list[dict] = []
-        evidence_refs: list[str] = []
-
-        tech = self._read_artifact("tech_stack.json")
-        fi = self._read_artifact("file_index.json")
-        deps = self._read_artifact("dependency_draft.json")
-
-        tech_ref = "artifacts/tech_stack.json"
-        fi_ref = "artifacts/file_index.json"
-        dep_ref = "artifacts/dependency_draft.json"
-
-        primary = (tech.get("languages") or {}).get("primary_language", "unknown")
-        frameworks = [f.get("framework") for f in (tech.get("frameworks") or {}).get("frameworks", [])]
-        builds = [b.get("build_system") for b in (tech.get("build_systems") or {}).get("build_systems", [])]
-        total_files = fi.get("total_files", 0)
-        dep_total = deps.get("total", 0)
-
-        candidate_facts = [
-            ("lang", f"项目主要语言为 {primary}", tech_ref,
-             {"primary_language": primary}),
-            ("frameworks", f"识别到框架：{', '.join([x for x in frameworks if x]) or '未识别'}", tech_ref,
-             {"frameworks": frameworks}),
-            ("build", f"识别到构建系统：{', '.join([x for x in builds if x]) or '未识别'}", tech_ref,
-             {"build_systems": builds}),
-            ("files", f"源码文件总数 {total_files}", fi_ref,
-             {"total_files": total_files}),
-            ("deps", f"依赖项总数 {dep_total}", dep_ref,
-             {"dependency_total": dep_total}),
-        ]
-
-        for key, statement, art_ref, detail in candidate_facts:
-            sha = self._sha256(art_ref)
-            bindings = {
-                "artifact_refs": [art_ref],
-                "sha256": sha,
-                "evidence_refs": [],
-                "trace_refs": ([f"run:{self.run_id}"] if self.run_id else []),
-                "audit_refs": [],
-                **detail,
-            }
-            ev_id = f"ev-p1-fact-{key}-{pid8}"
-            try:
-                aet.write_evidence(
-                    self.project_id, ev_id, evidence_type="p1_fact",
-                    status="candidate", source="p1_work_agent",
-                    claim=statement, stage=self.stage, extra={"bindings": bindings})
-                bindings["evidence_refs"] = [ev_id]
-                evidence_refs.append(ev_id)
-            except Exception:
-                logger.warning("WorkAgent fact-evidence 登记失败 key=%s（advisory）", key, exc_info=True)
-            entries.append({
-                "id": f"fact-p1-{key}",
-                "kind": "fact",
-                "statement": statement,
-                "produced_by": "deterministic_tool",
-                "bindings": bindings,
-                "inline_citation": False,  # 确定性阶段无 LLM 内联引用
-                "verified_on_disk": bool(sha),
-            })
-
-        from app.graph.stage_reports import StageReports
-        reports = StageReports(self.project_id, self.stage)
-        cem_ref = reports.claim_evidence_map(map_type="fact_evidence", entries=entries)
-        return cem_ref, evidence_refs, entries
-
-    # ── Gate Brief（契约 3，WorkAgent 侧） ──────────────────────────────
-    def _build_gate_brief_partial(self, prof: dict, refs: list,
-                                  facts_entries: list, rework: Optional[dict]) -> tuple[dict, str]:
-        summary_md = "artifacts/profiling_summary.md"
-        key_artifacts = []
-        for r in refs:
-            if r.endswith("profiling_summary.md") or r.endswith("tech_stack.json") \
-                    or r.endswith("p2_input_manifest.json"):
-                key_artifacts.append({"ref": r, "kind": "profiling",
-                                      "sha256": self._sha256(r)})
-        gaps = self._read_artifact("uncertainty_manifest.json").get("evidence_gaps", [])
-        risks = [{"level": "info", "desc": g.get("detail", ""), "source_ref": "artifacts/uncertainty_manifest.json"}
-                 for g in gaps[:10]]
-
-        what = (f"P1 建档完成：FullStackProfiler 全量识别 {prof.get('items_completed',0)} 项，"
-                f"产出项目档案 + profiling_summary.md + p2_input_manifest.json；"
-                f"登记 {len(facts_entries)} 条 fact-evidence。")
-        if rework:
-            what += "（本轮为验收打回后的重跑，已按反馈补齐产物）"
-
-        partial = {
-            "stage": self.stage,
-            "what_happened": what,
-            "key_artifacts": key_artifacts,
-            "risks": risks,
-            "honest_notes": ("源码为空/未物化，部分识别项标记 not_applicable"
-                             if prof.get("items_not_applicable", 0) else ""),
-        }
-        from app.graph.stage_reports import StageReports
-        reports = StageReports(self.project_id, self.stage)
-        # 落盘 partial（validation_verdict/claim_evidence_summary 由 finalize 阶段补齐）
-        ref = reports.gate_brief(**partial, validation_verdict=None,
-                                 claim_evidence_summary={"total": len(facts_entries)})
-        return partial, ref
 
     # ── 批 B：通用 evidence map（fact/claim）+ LLM 内联引用合成 ────────────
     def _build_generic_gate_brief(self, tool_result: dict, refs: list, entries: list,
@@ -848,6 +639,44 @@ class WorkAgent:
                         "artifact_ref": ir_ref,
                         "detail": {"p1_task_count": len(ident.get("p1_intake_tasks") or [])},
                         "cited_refs": [si_ref]})
+        elif st == "p1":
+            # R17.5 P1 WP-1: P1 是 LLM 建档识别阶段——claim 为 LLM 深化建档结论，内联引用其推理所据的
+            # 上游 P0 产物（intake_report.json 承载 P0 识别、source_index.json 承载采集）。样本值 LLM 生成。
+            ident = tool_result.get("identification") or {}
+            ir_ref = "artifacts/intake_report.json"          # P0 上游识别（复用基线）
+            si_ref = "artifacts/source_index.json"           # P0 采集
+            tech = ident.get("tech_stack") or {}
+            deps = ident.get("dependency_draft") or {}
+            dep_total = deps.get("total", len(deps.get("dependencies", []) or []))
+            gaps = (ident.get("uncertainty_manifest") or {}).get("evidence_gaps", [])
+            out.append({"key": "primary_language",
+                        "statement": (f"P1 建档主语言：{tech.get('primary_language') or tool_result.get('primary_language') or '未确定'}"
+                                      f"（复用 P0 识别：{tool_result.get('reused_p0_primary_language')}）"),
+                        "artifact_ref": "artifacts/tech_stack.json",
+                        "detail": {"primary_language": tech.get("primary_language"),
+                                   "reused_p0": tool_result.get("reused_p0_primary_language")},
+                        "cited_refs": [ir_ref, si_ref]})
+            out.append({"key": "dependencies",
+                        "statement": f"LLM 建档依赖项 {dep_total} 项",
+                        "artifact_ref": "artifacts/dependency_draft.json",
+                        "detail": {"dependency_total": dep_total},
+                        "cited_refs": [si_ref]})
+            out.append({"key": "entry_points",
+                        "statement": f"LLM 判定应用入口 {len(ident.get('entry_points') or [])} 项",
+                        "artifact_ref": "artifacts/entry_points.json",
+                        "detail": {"entry_point_count": len(ident.get("entry_points") or [])},
+                        "cited_refs": [ir_ref]})
+            out.append({"key": "acceptance_baseline",
+                        "statement": (f"原始验收基准已捕获（status={tool_result.get('acceptance_baseline_status')}；"
+                                      f"D-106 静态基线+动态黄金/needs_env）"),
+                        "artifact_ref": "artifacts/acceptance_baseline.json",
+                        "detail": {"baseline_status": tool_result.get("acceptance_baseline_status")},
+                        "cited_refs": [si_ref]})
+            out.append({"key": "uncertainty",
+                        "statement": f"LLM 主动发声识别盲区 {len(gaps)} 项（防 0-gap 掩盖，公理3）",
+                        "artifact_ref": "artifacts/uncertainty_manifest.json",
+                        "detail": {"gap_count": len(gaps)},
+                        "cited_refs": [ir_ref]})
         elif st == "p2":
             for i, r in enumerate((tool_result.get("risk_list") or [])[:8]):
                 out.append({"key": f"risk-{i}",

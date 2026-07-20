@@ -389,64 +389,255 @@ class RealP0Handler:
 
 
 class RealP1Handler:
-    """P1 建档: FullStackProfiler.profile → real identification artifacts + summary + p2 manifest."""
+    """P1 建档 (R17.5): 采集事实包 (FullStackProfiler.collect_facts) + 复用 P0 上游识别
+    (intake_report/source_index) → Node Worker Agent(LLM, ProfilingService) 深化建档识别
+    → 原始验收基准捕获 (AcceptanceBaselineService, D-106)。采集确定性/识别 LLM (AGENTS §2.3)；
+    无 Key → 诚实 blocked (承 P0，不回退规则识别)。"""
 
-    goal = "P1 建档：全量识别项目结构/技术栈/依赖/配置，产出项目档案与 P2 输入"
+    goal = "P1 建档：复用 P0 识别、深化项目档案（技术栈/依赖/入口/配置/infra/测试）并捕获原始验收基准"
     acceptance_criteria = [
-        "至少产出 1 项识别产物", "profiling_summary.md 已生成", "p2_input_manifest.json 已生成",
+        "复用 P0 上游识别（不重算/推翻）", "产出建档识别产物（LLM）",
+        "原始验收基准 acceptance_baseline.json 已产出", "盲区主动发声（uncertainty 非 0-gap）",
     ]
     planned_actions = [
-        "全量识别项目结构/技术栈/依赖/配置",
-        "生成 profiling_summary.md 摘要",
-        "构建 P2 输入清单（p2_input_manifest.json）",
+        "采集项目事实包（结构/依赖/配置/测试原文，大小写不敏感、脱敏）",
+        "复用 P0 接入识别（primary_language/环境/DB）作为建档基线",
+        "LLM 深化建档识别 + 捕获原始验收基准（静态+动态黄金）",
     ]
 
-    def __init__(self, tracer=None, auditor=None):
+    # LLM 建档识别字段 → 落盘产物 key 映射（通用锚点固定，样本值 LLM 生成）。
+    _LLM_ARTIFACT_KEYS = ["tech_stack", "dependency_draft", "entry_points",
+                          "config_inventory", "infra_clues", "test_inventory",
+                          "module_structure", "uncertainty_manifest"]
+
+    def __init__(self, tracer=None, auditor=None, profiling_service=None, baseline_service=None):
         self.tracer = tracer
         self.auditor = auditor
+        self._profiling_service = profiling_service      # R17.5: 可注入以测试 LLM/blocked 路径
+        self._baseline_service = baseline_service
+
+    def _profiler_svc(self):
+        if self._profiling_service is not None:
+            return self._profiling_service
+        from app.services.profiling_service import ProfilingService
+        return ProfilingService(tracer=self.tracer, auditor=self.auditor)
+
+    def _baseline_svc(self):
+        if self._baseline_service is not None:
+            return self._baseline_service
+        from app.services.acceptance_baseline_service import AcceptanceBaselineService
+        return AcceptanceBaselineService(tracer=self.tracer, auditor=self.auditor)
+
+    def _read_upstream(self, project_id: str) -> dict:
+        """WP-2: 读 P0 已 LLM 产出的接入识别结论 + source_index 摘要（复用基线，解 P1-ARCH-1）。"""
+        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
+        intake = {}
+        source_index = {}
+        try:
+            p = art_dir / "intake_report.json"
+            if p.exists():
+                intake = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug("P1 读取 intake_report.json 失败（advisory）", exc_info=True)
+        try:
+            p = art_dir / "source_index.json"
+            if p.exists():
+                si = json.loads(p.read_text(encoding="utf-8"))
+                source_index = {"file_count": si.get("file_count"),
+                                "top_level_dirs": si.get("top_level_dirs"),
+                                "code_scale": si.get("code_scale"),
+                                "database_files": si.get("database_files")}
+        except Exception:
+            logger.debug("P1 读取 source_index.json 失败（advisory）", exc_info=True)
+        ident = intake.get("identification") or {}
+        return {
+            "p0_primary_language": intake.get("primary_language") or ident.get("primary_language"),
+            "primary_language": intake.get("primary_language") or ident.get("primary_language"),
+            "detected_stack": ident.get("detected_stack"),
+            "source_environment_clues": ident.get("source_environment_clues"),
+            "database_entry": ident.get("database_entry"),
+            "availability_classification": ident.get("availability_classification"),
+            "key_files": ident.get("key_files"),
+            "p1_intake_tasks": ident.get("p1_intake_tasks"),
+            "migration_target": intake.get("migration_target"),
+            "source_index_summary": source_index,
+            "p0_produced_by": intake.get("produced_by"),
+        }
 
     async def execute(self, state: GraphState) -> dict:
         project_id = state["project_id"]
+        run_id = state.get("run_id", "")
+        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
+        art_dir.mkdir(parents=True, exist_ok=True)
 
-        # R9-5-3 T-10: context assembly hook (advisory)
-        context_package: dict = {}
-        try:
-            from app.services.context_assembler import assemble_context
-            context_package = assemble_context(
-                project_id, "p1",
-                node_state={"node_task": "P1 建档：全量识别项目结构/技术栈/依赖/配置"},
-                task_type="profiling",
-            )
-        except Exception:
-            # advisory：上下文装配失败不阻断 P1 领域工作，主链路照常推进；记录以便定位。
-            logger.debug("P1 上下文装配失败（advisory，领域工作照常推进）", exc_info=True)
-
+        # ── 采集①：事实包 + 写盘纯采集产物（file_index/source_structure/cicd/doc） ──
         from app.services.full_stack_profiler import FullStackProfiler
         profiler = FullStackProfiler(trace_writer=self.tracer, audit_writer=self.auditor)
-        result = profiler.profile(project_id)
+        facts = profiler.collect_facts(project_id)
 
-        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
-        # real produced artifact refs (single source of truth, DOC-2)
+        # ── 采集②：复用 P0 上游识别结论（WP-2，深化不重算） ──────────────────
+        upstream = self._read_upstream(project_id)
+
+        # ── 上下文装配（C0-C6 + P-profiling SKILL.md 正文；目标环境进上下文） ──
+        context_package: dict = {}
+        skill_body = ""
+        system_prompt = None
+        node_state = {"node_task": "P1 建档：复用 P0 识别 + 采集事实 → LLM 深化建档 + 捕获原始验收基准",
+                      "task": "P1 建档识别"}
+        if upstream.get("migration_target"):
+            node_state["upstream_output"] = {"migration_target": upstream["migration_target"]}
+        try:
+            from app.services.context_assembler import assemble_context, build_system_prompt
+            context_package = assemble_context(
+                project_id, "p1", node_state=node_state, task_type="profiling",
+                include_body=True, skill_disclosure="full")
+            bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
+            skill_body = "\n\n".join(bodies)[:12000]
+            system_prompt = build_system_prompt(
+                project_id, "p1", node_state=node_state, task_type="profiling",
+                skill_disclosure="metadata")
+        except Exception:
+            logger.warning("P1 上下文装配失败（advisory，识别照常以事实包推理）", exc_info=True)
+
+        # ── 识别（LLM，Node Worker Agent 经 ModelGateway；无 Key → 诚实 blocked） ──
+        svc = self._profiler_svc()
+        prof_result = await svc.profile(
+            project_id, facts=facts, upstream=upstream, run_id=run_id, stage="p1",
+            system_prompt=system_prompt, skill_body=skill_body, context_package=context_package)
+        assembly_trace = context_package.get("assembly_trace", {})
+
+        if prof_result.status != "completed":
+            # 诚实 blocked：不伪造 completed、不回退规则识别（D-097/公理3）。
+            self._write_json(project_id, "profiling_summary.md",
+                             self._blocked_summary(project_id, prof_result), raw_text=True)
+            produced = [f"artifacts/{p.name}" for p in sorted(art_dir.glob("*.json"))]
+            return {
+                "status": prof_result.status, "reason": prof_result.reason,
+                "file_count": facts.get("file_count", 0), "artifacts": produced,
+                "assembly_trace": assembly_trace,
+                "attempted_chain": prof_result.attempted_chain,
+                "model_error_category": prof_result.model_error_category,
+                "model_user_actions": prof_result.model_user_actions,
+            }
+
+        # ── 落盘 LLM 建档识别产物（通用锚点固定，样本值 LLM 生成） ────────────
+        identification = prof_result.identification or {}
+        for key in self._LLM_ARTIFACT_KEYS:
+            data = identification.get(key)
+            if data is None:
+                data = {"identification_note": f"LLM 未产出 {key}（诚实标注，未伪造）"}
+            self._write_json(project_id, f"{key}.json", data)
+
+        # ── WP-B (D-106)：原始验收基准捕获（静态 LLM + 动态黄金真跑/needs_env） ──
+        baseline_svc = self._baseline_svc()
+        baseline_result = await baseline_svc.capture(
+            project_id, facts=facts, upstream=upstream, run_id=run_id, stage="p1",
+            source_path=str(workspace_service.workspace_path(project_id) / "source"))
+        if baseline_result.status == "completed":
+            self._write_json(project_id, "acceptance_baseline.json", baseline_result.baseline)
+        else:
+            # 静态基线需 LLM；若基线子步骤未完成，诚实登记（不伪造黄金）。
+            self._write_json(project_id, "acceptance_baseline.json", {
+                "artifact_type": "acceptance_baseline", "project_id": project_id, "stage": "p1",
+                "status": baseline_result.status, "reason": baseline_result.reason,
+                "note": "原始验收基准未完成（诚实标注，未伪造黄金 D-097/公理3）"})
+
+        # ── 建档摘要 + P2 输入清单（复用 P0 + LLM 识别口径） ──────────────────
+        self._write_json(project_id, "profiling_summary.md",
+                         self._build_summary(project_id, identification, upstream, facts,
+                                             baseline_result), raw_text=True)
+        self._write_p2_manifest(project_id)
+
         refs: List[str] = []
         identified_items: List[str] = []
-        if art_dir.exists():
-            for p in sorted(art_dir.glob("*.json")):
-                refs.append(f"artifacts/{p.name}")
-                if p.name not in ("p2_input_manifest.json",) and not p.name.startswith("p0_") \
-                        and not p.name.startswith("p1_") and p.name != "intake_report.json":
-                    identified_items.append(p.stem)
-            if (art_dir / "profiling_summary.md").exists():
-                refs.append("artifacts/profiling_summary.md")
+        for p in sorted(art_dir.glob("*.json")):
+            refs.append(f"artifacts/{p.name}")
+            if p.name != "p2_input_manifest.json" and not p.name.startswith("p0_") \
+                    and not p.name.startswith("p1_") and p.name != "intake_report.json" \
+                    and p.name != "source_index.json":
+                identified_items.append(p.stem)
+        if (art_dir / "profiling_summary.md").exists():
+            refs.append("artifacts/profiling_summary.md")
 
-        return {**result, "artifacts": refs, "identified_items": identified_items,
-                "assembly_trace": context_package.get("assembly_trace", {})}
+        tech = identification.get("tech_stack") or {}
+        return {
+            "status": "completed",
+            "file_count": facts.get("file_count", 0),
+            "identification": identification,
+            "primary_language": tech.get("primary_language") or upstream.get("primary_language"),
+            "reused_p0_primary_language": upstream.get("primary_language"),
+            "acceptance_baseline_status": baseline_result.status,
+            "model_used": prof_result.model_used,
+            "artifacts": refs, "identified_items": identified_items,
+            "assembly_trace": assembly_trace,
+            "context_refs": prof_result.context_refs, "skill_refs": prof_result.skill_refs,
+        }
+
+    def _write_json(self, project_id: str, name: str, data, *, raw_text: bool = False) -> None:
+        content = data if raw_text else json.dumps(data, ensure_ascii=False, indent=2)
+        _mediated_write(project_id, f"artifacts/{name}", content,
+                        auditor=self.auditor, stage="p1", action=f"write_{name.split('.')[0]}")
+
+    def _write_p2_manifest(self, project_id: str) -> None:
+        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
+        manifest = {
+            "project_id": project_id, "p1_completed_at": _now(), "p1_stage": "completed",
+            "input_artifacts": [{"ref": f"artifacts/{p.name}", "type": p.stem}
+                                for p in sorted(art_dir.glob("*.json"))],
+            "environment_profile_ref": ".rebuild/environment.json",
+        }
+        self._write_json(project_id, "p2_input_manifest.json", manifest)
+
+    @staticmethod
+    def _blocked_summary(project_id: str, r) -> str:
+        return "\n".join([f"# P1 建档摘要：{project_id}", "",
+                          f"状态：{r.status}", f"原因：{r.reason}", "",
+                          "> P1 建档识别需有效模型 Key，未降级为规则识别（D-097/公理3）。"])
+
+    def _build_summary(self, pid: str, ident: dict, upstream: dict, facts: dict, baseline) -> str:
+        tech = ident.get("tech_stack") or {}
+        primary = tech.get("primary_language") or upstream.get("primary_language") or "未确定"
+        deps = ident.get("dependency_draft") or {}
+        dep_total = deps.get("total", len(deps.get("dependencies", []) or []))
+        gaps = (ident.get("uncertainty_manifest") or {}).get("evidence_gaps", [])
+        golden = (baseline.baseline or {}).get("dynamic_golden", {}) if baseline else {}
+        return "\n".join([
+            f"# P1 建档摘要：{pid}", f"建档时间：{_now()}", "",
+            "## 技术栈（LLM 识别，复用 P0）",
+            f"- 主语言：{primary}（P0 识别：{upstream.get('primary_language')}）",
+            f"- 框架：{', '.join(f.get('framework','') for f in (tech.get('frameworks') or [])) or '见 tech_stack.json'}",
+            f"- 依赖项：{dep_total}", "",
+            "## 原始验收基准（D-106）",
+            f"- 静态基线：已产出（测试断言/缺测/特征化规格，见 acceptance_baseline.json）",
+            f"- 动态黄金：{'已真跑捕获' if golden.get('captured') else 'needs_env（诚实，未伪造）'}",
+            "", "## 不确定性",
+            f"- 识别盲区：{len(gaps)} 项（LLM 主动发声）", "",
+            f"- 文件总数：{facts.get('file_count', 0)}", "",
+            "> 深度业务语义/字段级 schema 归 P2。本档案在 P0 识别之上深化建档（复用不重算）。",
+        ])
 
     def review(self, result: dict) -> ReviewResult:
+        """确定性域规则（存在性）：建档识别产物 + 原始验收基准存在。识别质量语义由独立 LLM
+        Acceptance Agent 判定（WP-4，validation_agent p1=llm）。r3 约束 3：从盘重读的 artifacts。"""
         issues = []
-        if result.get("items_completed", 0) < 1:
-            issues.append({"type": "no_artifacts", "detail": "profiler 未产出识别产物"})
+        if result.get("status") not in ("completed", None):
+            issues.append({"type": "not_completed",
+                           "detail": f"P1 未完成（status={result.get('status')}）"})
+            return ReviewResult(passed=False, issues=issues,
+                                recommendations=["配置有效模型 Key 后重跑 P1 建档识别"],
+                                reviewer="p1_review_skill")
+        disk_artifacts = [r for r in (result.get("artifacts") or []) if isinstance(r, str)]
+        has_ident = any(any(k in r for k in ("tech_stack", "dependency_draft", "entry_points"))
+                        for r in disk_artifacts)
+        has_baseline = any("acceptance_baseline" in r for r in disk_artifacts)
+        if not has_ident:
+            issues.append({"type": "no_identification_artifact", "detail": "缺建档识别产物（LLM）"})
+        if not has_baseline:
+            issues.append({"type": "no_acceptance_baseline",
+                           "detail": "缺 acceptance_baseline.json（D-106 原始验收基准）"})
         return ReviewResult(passed=not issues, issues=issues,
-                            recommendations=["重新执行全量识别并确认产物写入"] if issues else [],
+                            recommendations=(["重跑 P1 建档并确认识别产物 + 原始验收基准写入"]
+                                             if issues else []),
                             reviewer="p1_review_skill")
 
 
