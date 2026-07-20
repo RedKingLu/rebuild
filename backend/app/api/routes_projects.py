@@ -839,6 +839,15 @@ async def execute_onboarding(project_id: str, db: Session = Depends(get_db)):
         if gate_id:
             svc.update(project_id, active_gate=gate_id)
 
+        # REC-R17.4-2 (WP-D): backfill the Run row's own run_status after the initial
+        # P0 graph run. A run created with status="created" that then pauses at a Gate
+        # must not stay stale — surface waiting_gate (Gate pending) / running honestly.
+        try:
+            svc_deps.run_service.set_run_status(
+                run_id, "waiting_gate" if gate_id else "running")
+        except Exception:
+            logger.warning("P0 图执行后回填 run_status 失败 run=%s（advisory）", run_id, exc_info=True)
+
         # Re-read project to get real state
         proj_now = svc.get(project_id)
         final_stage = (proj_now.current_stage if proj_now else "p0") or "p0"

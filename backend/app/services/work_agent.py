@@ -62,6 +62,52 @@ _STAGE_TASK_TYPE = {
 # 其余（P0/P1/P5/P6）为确定性主任务：fact-evidence map + 结构化 ValidationAgent。
 _LLM_STAGES = {"p2", "p3", "p4"}
 
+# R17.4-2 WP-C：语言检测排除项（与 FullStackProfiler._item4 口径一致——数据/文档
+# 扩展名不计入"主语言"）。避免 .json/.md 等被当成主语言。
+_NON_LANG_EXTS = {".json", ".yaml", ".yml", ".xml", ".md", ".txt", ".lock", ".rst"}
+
+# 供应商/示例目录：其中的语言文件不计入应用技术栈（B-R17.4-P0-STACK-PRIMARY 的
+# PHP 误报根因——第三方库 examples 目录下的 .php 示例文件被当成项目栈）。通用目录名，
+# 非硬编码 MicroOA。
+_VENDOR_EXAMPLE_DIRS = {"examples", "example", "samples", "sample", "demo", "demos"}
+
+
+def _framework_primary_language(build_files: list, lang_counts: dict) -> Optional[str]:
+    """基于构建/项目文件确定框架主语言（B-R17.4-P0-STACK-PRIMARY）。
+
+    存在框架工程文件（.sln/.csproj 等）时，框架栈语言优先于静态资源文件计数——
+    不因 .js/.ts 静态资源数量多而误判主语言。通用映射，非硬编码 MicroOA。
+    """
+    bl = [b.lower() for b in build_files]
+
+    def _suffix(*sfx):
+        return any(b.endswith(sfx) for b in bl)
+
+    def _name(*names):
+        return any(b in names for b in bl)
+
+    if _suffix(".sln", ".csproj", ".vbproj", ".fsproj"):
+        # .NET family — pick the most-present of C#/VB/F# (fallback C#).
+        cands = sorted(
+            [("C#", lang_counts.get("C#", 0)),
+             ("Visual Basic", lang_counts.get("Visual Basic", 0)),
+             ("F#", lang_counts.get("F#", 0))],
+            key=lambda x: -x[1])
+        return cands[0][0] if cands[0][1] > 0 else "C#"
+    if _name("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle"):
+        return "Kotlin" if lang_counts.get("Kotlin", 0) > lang_counts.get("Java", 0) else "Java"
+    if _name("requirements.txt", "setup.py", "pyproject.toml"):
+        return "Python"
+    if _name("go.mod", "go.sum"):
+        return "Go"
+    if _name("cargo.toml"):
+        return "Rust"
+    if _name("composer.json"):
+        return "PHP"
+    if _name("gemfile"):
+        return "Ruby"
+    return None
+
 # 各阶段上游产物（供 claim-evidence 绑定「引用了哪些上游证据」；§3.6 通用，非硬编码 MicroOA）。
 _STAGE_UPSTREAM_ARTIFACTS = {
     "p2": ["artifacts/tech_stack.json", "artifacts/p2_input_manifest.json",
@@ -243,10 +289,14 @@ class WorkAgent:
         构建文件。用于合成动态工作计划（Q-WP2-4：随项目变化，非静态模板）。
 
         .NET/其它栈识别用通用 endswith（§3.6，禁硬编码 MicroOA）。
+
+        R17.4-2 WP-C：主语言判定加权——存在框架工程文件（.sln/.csproj 等）时框架栈
+        语言优先，不因静态资源（.js/.ts）数量多而误判为 JS 主；数据/文档扩展名不计入
+        语言；供应商 examples/samples 目录下的语言文件不计入应用栈（PHP 误报修复）。
         """
         src = self._ws_root() / "source"
         source_type = state.get("source_type") or "manual"
-        ext_counts: Counter = Counter()
+        ext_counts: Counter = Counter()      # 应用代码语言扩展计数（已排除供应商示例目录）
         build_files: list[str] = []
         file_count = 0
         if src.exists():
@@ -257,23 +307,40 @@ class WorkAgent:
                 if not p.is_file():
                     continue
                 file_count += 1
-                ext_counts[p.suffix.lower()] += 1
+                ext = p.suffix.lower()
+                # 语言计数排除：数据/文档扩展 + 供应商示例/样例目录（PHP 误报根因）。
+                lower_parts = {seg.lower() for seg in parts[:-1]}
+                in_vendor_example = bool(lower_parts & _VENDOR_EXAMPLE_DIRS)
+                if ext not in _NON_LANG_EXTS and not in_vendor_example:
+                    ext_counts[ext] += 1
                 fname = p.name
                 if fname in BUILD_FILES:
                     build_files.append(fname)
-                elif p.suffix.lower() in (".csproj", ".sln", ".fsproj", ".vbproj"):
+                elif ext in (".csproj", ".sln", ".fsproj", ".vbproj"):
                     build_files.append(fname)
-        detected_stack: list[str] = []
-        for ext, _cnt in ext_counts.most_common():
+        # 语言计数（扩展 → 语言）。
+        lang_counts: dict[str, int] = {}
+        for ext, cnt in ext_counts.items():
             lang = LANG_EXTENSIONS.get(ext)
-            if lang and lang not in detected_stack:
-                detected_stack.append(lang)
-            if len(detected_stack) >= 6:
-                break
+            if lang:
+                lang_counts[lang] = lang_counts.get(lang, 0) + cnt
+        # 按计数排名（静态资源多的语言仍靠前，但下一步会被框架主语言加权覆盖）。
+        detected_stack: list[str] = [lang for lang, _c in
+                                     sorted(lang_counts.items(), key=lambda kv: -kv[1])]
+        # 框架主语言加权：存在框架工程文件时，框架栈语言置顶（不因 .js 多标 JS 主）。
+        framework_primary = _framework_primary_language(build_files, lang_counts)
+        if framework_primary:
+            if framework_primary in detected_stack:
+                detected_stack.remove(framework_primary)
+            detected_stack.insert(0, framework_primary)
+        detected_stack = detected_stack[:6]
+        primary_language = detected_stack[0] if detected_stack else None
         return {
             "source_type": source_type,
             "file_count": file_count,
             "detected_stack": detected_stack,
+            "primary_language": primary_language,
+            "framework_primary": framework_primary,
             "build_files": sorted(set(build_files))[:20],
         }
 

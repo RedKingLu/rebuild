@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
+import subprocess
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +46,159 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── R17.4-2 WP-A/WP-D: deterministic git / repository metadata helpers ───────
+# The clone may carry an injected auth token in the remote URL (see _with_git_auth
+# → x-access-token:...@github.com). We NEVER surface that token: remote URLs are
+# credential-stripped before they enter any artifact/trace (公理3 脱敏红线).
+
+def _sanitize_git_remote(url: str | None) -> str | None:
+    """Strip embedded credentials (userinfo) from a git remote URL.
+
+    ``https://x-access-token:<token>@github.com/o/r.git`` → ``https://github.com/o/r.git``.
+    scp-like ``git@host:path`` (no secret) is returned unchanged.
+    """
+    if not url:
+        return url
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*://)([^/@]*@)?(.*)$", url)
+    if m:
+        return f"{m.group(1)}{m.group(3)}"
+    return url
+
+
+def _git_str(target: Path, *args: str, timeout: int = 15) -> str | None:
+    """Run a read-only git command, return stripped stdout or None (never raises)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(target), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except Exception:
+        _logger.debug("git %s failed for %s (non-fatal)", args, target, exc_info=True)
+    return None
+
+
+def _capture_repository_metadata(target: Path) -> dict | None:
+    """Deterministic repository metadata for source_index / intake.
+
+    Returns {commit, short_commit, branch, remote(sanitized), working_tree_status,
+    shallow, repo_size_bytes}. Missing values are set to None (evidence honesty —
+    never fabricated). Returns None when the source is not a git checkout.
+    """
+    if not (target / ".git").exists():
+        return None
+    commit = _git_str(target, "rev-parse", "HEAD")
+    if not commit:
+        return None
+    branch = _git_str(target, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = branch if (branch and branch != "HEAD") else None
+    remote_raw = _git_str(target, "remote", "get-url", "origin")
+    remote = _sanitize_git_remote(remote_raw) if remote_raw else None
+    status = _git_str(target, "status", "--short")
+    working_tree_status = (
+        "clean" if status == "" else ("dirty" if status is not None else None)
+    )
+    shallow_raw = _git_str(target, "rev-parse", "--is-shallow-repository")
+    shallow = {"true": True, "false": False}.get(shallow_raw) if shallow_raw is not None else None
+    repo_size_bytes = None
+    try:
+        du = subprocess.run(["du", "-sb", str(target)], capture_output=True,
+                            text=True, timeout=20)
+        if du.returncode == 0:
+            repo_size_bytes = int(du.stdout.split()[0])
+    except Exception:
+        _logger.debug("repo size (du) failed for %s (non-fatal)", target, exc_info=True)
+    return {
+        "commit": commit,
+        "short_commit": commit[:8],
+        "branch": branch,
+        "remote": remote,
+        "working_tree_status": working_tree_status,
+        "shallow": shallow,
+        "repo_size_bytes": repo_size_bytes,
+    }
+
+
+# SQL dialect markers (generic, extension/pattern based — NOT hardcoded to any project).
+_SQL_DIALECT_MARKERS = [
+    ("SQL Server (T-SQL)", (r"\[dbo\]", r"\bIDENTITY\s*\(", r"SET\s+ANSI_NULLS",
+                            r"\bGETDATE\s*\(", r"\bNVARCHAR\b", r"\bGO\b")),
+    ("MySQL", (r"\bAUTO_INCREMENT\b", r"\bENGINE\s*=", r"`\w+`")),
+    ("Oracle", (r"\bVARCHAR2\b", r"\bNUMBER\s*\(", r"\bNVL\s*\(")),
+    ("PostgreSQL", (r"\bSERIAL\b", r"\bnextval\s*\(", r"\bBYTEA\b")),
+]
+
+
+def _detect_sql_encoding(raw: bytes) -> tuple[str, bytes]:
+    """Detect encoding from a BOM and return (encoding_label, decode_encoding)."""
+    if raw.startswith(b"\xff\xfe"):
+        return "UTF-16LE (BOM)", "utf-16"
+    if raw.startswith(b"\xfe\xff"):
+        return "UTF-16BE (BOM)", "utf-16"
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "UTF-8 (BOM)", "utf-8-sig"
+    return "UTF-8", "utf-8"
+
+
+def _analyze_sql_file(path: Path, size_bytes: int) -> dict:
+    """Deterministic SQL entry analysis: encoding / dialect / table & insert counts.
+
+    Field-level schema profiling (per-table columns/types) is explicitly deferred
+    to P1 (deep_schema_profiling). Values are measured, never guessed.
+    """
+    info: dict = {
+        "size_bytes": size_bytes,
+        "encoding": None,
+        "dialect": None,
+        "create_table_count": None,
+        "insert_count": None,
+        "deep_schema_profiling": "NOT_DONE_IN_P0 (留 P1)",
+    }
+    if size_bytes > MAX_FILE_BYTES:
+        info["analysis_gap"] = f"file exceeds {MAX_FILE_BYTES} bytes; counts skipped"
+        # still detect encoding from the head bytes only
+        try:
+            head = path.open("rb").read(4)
+            info["encoding"], _ = _detect_sql_encoding(head)
+        except Exception:
+            _logger.debug("sql head read failed for %s (non-fatal)", path, exc_info=True)
+        return info
+    try:
+        raw = path.read_bytes()
+    except Exception:
+        _logger.warning("SQL 文件读取失败 %s（analysis_gap）", path, exc_info=True)
+        info["analysis_gap"] = "read_failed"
+        return info
+    enc_label, dec = _detect_sql_encoding(raw)
+    info["encoding"] = enc_label
+    try:
+        text = raw.decode(dec, errors="replace")
+    except Exception:
+        text = raw.decode("utf-8", errors="replace")
+    # create_table_count / insert_count — occurrence counts (not line counts; the
+    # dump packs many statements per very-long line). INSERT is matched without a
+    # mandatory INTO because T-SQL emits ``INSERT [dbo].[t]``.
+    info["create_table_count"] = len(re.findall(r"CREATE\s+TABLE", text, re.IGNORECASE))
+    info["insert_count"] = len(re.findall(r"\bINSERT\b", text, re.IGNORECASE))
+    for dialect, markers in _SQL_DIALECT_MARKERS:
+        if any(re.search(mk, text, re.IGNORECASE) for mk in markers):
+            info["dialect"] = dialect
+            break
+    return info
+
+
+# Generic application entry-point file names (bootstrap/handler entries across
+# stacks). Extension-based web endpoints (.aspx/.ashx/.asmx) are summarised as
+# counts in code_scale rather than listed one-by-one. NOT hardcoded to MicroOA.
+ENTRY_POINT_NAMES = {
+    "global.asax", "default.aspx", "index.aspx", "program.cs", "startup.cs",
+    "main.py", "app.py", "manage.py", "wsgi.py", "asgi.py",
+    "index.js", "app.js", "server.js", "main.js", "main.go", "index.php",
+    "application.java", "main.java",
+}
+
+
 class SourceMaterializer:
     """Handles source code import into workspace/source/ for all source types."""
 
@@ -53,7 +208,7 @@ class SourceMaterializer:
 
     def materialize(self, project_id: str, source_type: str,
                     source_config: dict | None = None,
-                    force_refresh: bool = False) -> dict:
+                    force_refresh: bool = False, run_id: str | None = None) -> dict:
         """Main entry point. Returns import_result dict.
 
         Result keys: success, source_type, file_count, dir_count,
@@ -130,7 +285,7 @@ class SourceMaterializer:
         if result["materialization_status"] != "failed":
             self._write_materialization_meta(project_id, source_type, source_config, result)
 
-        self._write_trace(project_id, source_type, result)
+        self._write_trace(project_id, source_type, result, run_id=run_id)
         return result
 
     # ── per-type materializers ──────────────────────────────────────────
@@ -208,6 +363,7 @@ class SourceMaterializer:
                 result["materialization_status"] = "completed"
                 result["materialization_mode"] = "clone"
                 result["git_info"] = self._capture_git_info(target)
+                self._voice_branch_mismatch(branch, result, _log)
                 break
             else:
                 # Non-branch errors on first URL — try fallback URL before giving up
@@ -253,6 +409,7 @@ class SourceMaterializer:
             result["materialization_status"] = "completed"
             result["materialization_mode"] = "clone"
             result["git_info"] = self._capture_git_info(target)
+            self._voice_branch_mismatch(branch, result, None)
         else:
             result["warnings"].append(f"GitHub clone failed: {detail}")
             result["evidence_gaps"].append({
@@ -369,15 +526,32 @@ class SourceMaterializer:
         return None
 
     def _capture_git_info(self, target: Path) -> dict | None:
-        """Capture {commit, short_commit, branch} for the index/meta. No url/token."""
-        commit = self._git_head_commit(target)
-        if not commit:
-            return None
-        return {
-            "commit": commit,
-            "short_commit": commit[:8],
-            "branch": self._git_current_branch(target),
-        }
+        """Capture repository metadata for the index/meta. No token ever surfaced.
+
+        R17.4-2 WP-A: enriched beyond {commit,short_commit,branch} to also carry
+        remote(credential-stripped)/working_tree_status/shallow/repo_size_bytes.
+        """
+        return _capture_repository_metadata(target)
+
+    @staticmethod
+    def _voice_branch_mismatch(requested_branch: str, result: dict, log=None) -> None:
+        """R17.4-2 WP-D (B-R17.4-P0-BRANCH-MISMATCH): when the configured branch
+        differs from the branch actually checked out (a silent fallback to
+        master/default), voice it explicitly (warning + branch_mismatch evidence_gap)
+        instead of silently landing on the default branch (公理3)."""
+        actual = (result.get("git_info") or {}).get("branch")
+        if requested_branch and actual and requested_branch != actual:
+            msg = (f"配置分支 branch='{requested_branch}' 与实际检出分支 '{actual}' 不一致"
+                   f"（clone 回退到 '{actual}'）——未静默落默认分支，显式发声")
+            result["warnings"].append(msg)
+            result["evidence_gaps"].append({
+                "type": "branch_mismatch",
+                "detail": msg,
+                "requested_branch": requested_branch,
+                "actual_branch": actual,
+            })
+            if log is not None:
+                log.warning("Git materialize: %s", msg)
 
     @staticmethod
     def _git_fetch_reset(target: Path, branch: str) -> tuple[bool, str]:
@@ -617,8 +791,13 @@ class SourceMaterializer:
                 dc += 1
         return fc, dc
 
-    def _write_trace(self, project_id: str, source_type: str, result: dict):
-        """Write Trace (and Audit for L2+) for materialization action."""
+    def _write_trace(self, project_id: str, source_type: str, result: dict,
+                     run_id: str | None = None):
+        """Write Trace (and Audit for L2+) for materialization action.
+
+        R17.4-2 WP-D (REC-R17.4-1): run_id is threaded through so the
+        source_materialization trace/audit carry the run context (was None).
+        """
         if self.trace_writer:
             self.trace_writer.write(
                 "source_materialization",
@@ -627,6 +806,7 @@ class SourceMaterializer:
                         f"({source_type}, {result['file_count']} files, "
                         f"{len(result['errors'])} errors)",
                 project_id=project_id,
+                run_id=run_id,
                 extras={
                     "source_type": source_type,
                     "status": result["materialization_status"],
@@ -644,6 +824,7 @@ class SourceMaterializer:
                 decision="executed",
                 risk_level="L2" if source_type in ("git", "github") else "L1",
                 project_id=project_id,
+                run_id=run_id,
                 reason=f"Source materialized: {source_type} → "
                        f"{result['materialization_status']}",
                 extras={"source_type": source_type, "status": result["materialization_status"]},
@@ -662,6 +843,12 @@ def generate_source_index(project_id: str, source_type: str | None = None) -> di
     (.sln/.csproj/.vbproj/.fsproj/.config/packages.config/*.sql/appsettings.json)
     — NOT hardcoded to any specific project's filenames; git_info (commit/branch)
     is surfaced when the source is a git clone.
+
+    R17.4-2 WP-A: enriched with deterministic, measured fields —
+    entry_points (generic app-entry files), repository_metadata (git remote
+    [credential-stripped]/status/shallow/size), database_files (per-.sql
+    encoding/dialect/table & insert counts; field-level schema deferred to P1),
+    and code_scale (extension count summary). All values measured, never guessed.
     """
     ws_source = workspace_path(project_id) / "source"
     artifacts_dir = workspace_path(project_id) / "artifacts"
@@ -683,16 +870,24 @@ def generate_source_index(project_id: str, source_type: str | None = None) -> di
             # 发声：meta 损坏时不静默伪造 source_type，保留 unknown 并记录。
             _logger.warning("generate_source_index: materialization.json 损坏 project=%s", project_id, exc_info=True)
 
+    # WP-A: prefer live on-disk repository metadata (fresh + full: remote/status/
+    # shallow/size) when the source is a git checkout; fall back to the meta record.
+    repository_metadata = _capture_repository_metadata(ws_source) or git_info
+
     index = {
         "project_id": project_id,
         "generated_at": _now(),
         "source_type": resolved_source_type,
         "materialization_status": materialization_status,
-        "git_info": git_info,
+        "git_info": repository_metadata,
+        "repository_metadata": repository_metadata,
         "file_count": 0,
         "directory_count": 0,
         "top_level_dirs": [],
         "key_files": [],
+        "entry_points": [],
+        "database_files": [],
+        "code_scale": {"extension_counts": {}, "total_code_files": 0},
         "skipped_dirs": [],
         "binary_files_count": 0,
         "too_large_files_count": 0,
@@ -702,6 +897,8 @@ def generate_source_index(project_id: str, source_type: str | None = None) -> di
         index["materialization_status"] = "empty"
     else:
         fc, dc = 0, 0
+        ext_counts: dict[str, int] = {}
+        sql_paths: list[tuple[str, int]] = []
         for item in sorted(ws_source.rglob("*")):
             rel = str(item.relative_to(ws_source))
             parts = item.relative_to(ws_source).parts
@@ -718,19 +915,39 @@ def generate_source_index(project_id: str, source_type: str | None = None) -> di
                     index["top_level_dirs"].append(rel)
             elif item.is_file():
                 fc += 1
+                fname = parts[-1]
                 # Track key files
-                if _is_key_file(parts[-1]):
+                if _is_key_file(fname):
                     index["key_files"].append(rel)
-                # Track large/binary
+                # WP-A: generic application entry points
+                if fname.lower() in ENTRY_POINT_NAMES:
+                    index["entry_points"].append(rel)
+                # WP-A: extension-count summary (code_scale)
+                ext = item.suffix.lower()
+                if ext:
+                    ext_counts[ext] = ext_counts.get(ext, 0) + 1
+                # Track large/binary + collect .sql for DB entry analysis
                 try:
                     size = item.stat().st_size
                     if size > MAX_FILE_BYTES:
                         index["too_large_files_count"] += 1
+                    if ext == ".sql":
+                        sql_paths.append((rel, size))
                 except Exception:
                     _logger.debug("generate_source_index: stat failed for %s (skipping)", item, exc_info=True)
 
         index["file_count"] = fc
         index["directory_count"] = dc
+        # WP-A: code_scale summary — top extensions by count (generic).
+        index["code_scale"] = {
+            "extension_counts": dict(sorted(ext_counts.items(), key=lambda kv: -kv[1])[:30]),
+            "total_code_files": fc,
+        }
+        # WP-A: database_files entry-level analysis (cap at 20 .sql files).
+        for rel, size in sql_paths[:20]:
+            entry = {"path": rel}
+            entry.update(_analyze_sql_file(ws_source / rel, size))
+            index["database_files"].append(entry)
         if index["materialization_status"] == "unknown":
             index["materialization_status"] = "indexed"
 
@@ -755,11 +972,16 @@ KEY_FILE_NAMES = {
 KEY_FILE_SUFFIXES = (
     ".sln", ".csproj", ".vbproj", ".fsproj",  # .NET project/solution files
     ".sql",                                     # database scripts
+    ".config",                                  # .NET config (Web.Debug.config etc.)
 )
+# Case-insensitive lookup set (B-R17.4-P0-KEYFILE-CASE): .NET convention capitalises
+# Web.config / Global.asax, which an exact-case match missed.
+KEY_FILE_NAMES_LOWER = {n.lower() for n in KEY_FILE_NAMES}
 
 
 def _is_key_file(filename: str) -> bool:
-    """Return True for build/manifest/.NET/SQL key files (generic matching)."""
-    if filename in KEY_FILE_NAMES:
+    """Return True for build/manifest/.NET/SQL key files (case-insensitive, generic)."""
+    fl = filename.lower()
+    if fl in KEY_FILE_NAMES_LOWER:
         return True
-    return filename.endswith(KEY_FILE_SUFFIXES)
+    return fl.endswith(KEY_FILE_SUFFIXES)

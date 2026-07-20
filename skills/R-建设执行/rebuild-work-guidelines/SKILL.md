@@ -77,6 +77,7 @@ AGENTS.md（硬规则） > 交接/当前/（任务入口） > 本 Skill（执行
 | 代码施工 | [references/workflows.md] §4 | 三步法：自有方案→历史吸收→完善施工 |
 | 文档审核 | [references/workflows.md] §1 | 对照检查维度表逐项审核 |
 | 测试与验收 | [references/workflows.md] §4 | 必须有证据、结论区分四档 |
+| **P 阶段执行链路（P0-P6 设计/施工/验收）** | **[references/stage-agent-loop.md]** | **目标驱动 Agent 循环；确定性只限采集与验证；通用 vs 样本分层；吸收本地/在线参考轨（AGENTS §2.3）** |
 | **前端施工** | **§4.4（本 Skill）** | **必读 06-UX 章节；中文优先；能力标记/脱敏/mock 区分** |
 
 ---
@@ -429,6 +430,7 @@ LangGraph 是主编排底座（D-037）。变更技术栈须按 C4 级别提交�
 |------|------|---------|
 | [references/workflows.md](references/workflows.md) | 完整工作流（文档正式化/交接材料/历史参考/施工前计划/安全） | 执行具体任务时 |
 | [references/templates.md](references/templates.md) | 全部输出模板 | 需要模板格式时 |
+| [references/stage-agent-loop.md](references/stage-agent-loop.md) | 参考轨吸收 + 目标驱动阶段循环（P0-P6：目标固定/Agent 自主/确定性只在采集与验证；通用 vs 样本分层；任务拆分与子循环） | 设计/施工/验收任一 P 阶段执行链路时；复核参考轨时（AGENTS §2.3 配套） |
 
 ---
 

@@ -38,7 +38,9 @@ async def get_active_gate(project_id: str):
     svc = _svc()
     gate = svc.gate_service.get_active(project_id)
     svc.trace_writer.write("gate_event", action="get_active_gate",
-                           summary=f"Active gate: {gate.gate_id if gate else 'none'}", project_id=project_id)
+                           summary=f"Active gate: {gate.gate_id if gate else 'none'}",
+                           project_id=project_id,
+                           run_id=(gate.run_id if gate else None))
     return SuccessEnvelope(data=gate, meta=Meta())
 
 
@@ -56,7 +58,8 @@ async def create_gate(project_id: str, gate_data: dict):
         options=gate_data.get("options"),
     )
     svc.trace_writer.write("gate_event", action="create_gate",
-                           summary=f"Created gate {gate.gate_id}", project_id=project_id)
+                           summary=f"Created gate {gate.gate_id}", project_id=project_id,
+                           run_id=(gate.run_id or None))
     return SuccessEnvelope(data=gate, meta=Meta())
 
 
