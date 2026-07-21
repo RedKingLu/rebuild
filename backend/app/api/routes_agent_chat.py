@@ -46,9 +46,13 @@ async def agent_chat(project_id: str, req: AgentChatRequest, request: Request):
     profiling_summary = None
     art_dir = workspace_path(project_id) / "artifacts"
     if art_dir.exists():
+        # D-107: 产物分层于 artifacts/{stage}/，递归列出（根 + 各阶段子文件夹）供对话上下文。
         artifacts = [f.name for f in art_dir.iterdir() if f.is_file()]
+        for sub in sorted(p for p in art_dir.iterdir() if p.is_dir()):
+            artifacts.extend(f"{sub.name}/{f.name}" for f in sub.iterdir() if f.is_file())
 
-    summary_path = art_dir / "profiling_summary.md"
+    # profiling_summary.md 为 P1 产物（D-107: artifacts/p1/）。
+    summary_path = art_dir / "p1" / "profiling_summary.md"
     if summary_path.exists():
         try:
             profiling_summary = summary_path.read_text(encoding="utf-8")

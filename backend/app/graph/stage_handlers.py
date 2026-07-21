@@ -18,6 +18,11 @@ C5 runs real build/run/test/static commands. P6 stays a future stub.
 
 DOC-2: P1 handler returns the REAL identified item list from the profiler result as the single
 source of truth (replacing the hardcoded 14-item frontend/route list).
+
+D-107 (2026-07-21): 每个 P 阶段的领域产物写入 artifacts/{stage}/（p0/p1/p2 本轮统一，P3-P6 遵循），
+并产出 artifacts/{stage}/_stage_package.json 阶段完成包清单（products[{file,type,desc,key_for_next}]
++ 证据/风险摘要 + 下阶段建议）；下一阶段读前序各阶段清单后按需加载产物内容（清单驱动，非写死文件名
+列表）。DOC-2 单一事实源约定随之更新为 artifacts/{stage}/*.json。见 app/services/stage_package.py。
 """
 
 from __future__ import annotations
@@ -32,6 +37,9 @@ from typing import List
 from app.graph.state import GraphState
 from app.services.review_pass import ReviewResult
 from app.services import workspace_service
+from app.services.stage_package import (
+    stage_artifact_ref, stage_artifact_dir, write_stage_package, product_entry,
+)
 
 logger = logging.getLogger("rebuild.stage_handlers")
 
@@ -257,7 +265,8 @@ class RealP0Handler:
                             "errors": [str(e)]}
 
         file_count = _source_file_count(project_id)
-        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
+        # D-107: P0 产物写入 artifacts/p0/（分层文件夹）。
+        art_dir = stage_artifact_dir(project_id, "p0")
         art_dir.mkdir(parents=True, exist_ok=True)
         if not source_index:
             try:
@@ -320,10 +329,10 @@ class RealP0Handler:
             intake["identification"] = {
                 "status": intake_result.status, "reason": intake_result.reason,
                 "note": "P0 识别需有效模型 Key，未降级为规则识别（D-097/公理3）"}
-            _mediated_write(project_id, "artifacts/intake_report.json",
+            _mediated_write(project_id, stage_artifact_ref("p0", "intake_report.json"),
                             json.dumps(intake, ensure_ascii=False, indent=2),
                             auditor=self.auditor, stage="p0", action="write_intake_report")
-            produced = [f"artifacts/{n}" for n in ("intake_report.json", "source_index.json")
+            produced = [stage_artifact_ref("p0", n) for n in ("intake_report.json", "source_index.json")
                         if (art_dir / n).exists()]
             return {
                 "status": intake_result.status,
@@ -347,12 +356,14 @@ class RealP0Handler:
             if k in identification:
                 intake[k] = identification[k]
         intake["model_used"] = intake_result.model_used
-        _mediated_write(project_id, "artifacts/intake_report.json",
+        _mediated_write(project_id, stage_artifact_ref("p0", "intake_report.json"),
                         json.dumps(intake, ensure_ascii=False, indent=2),
                         auditor=self.auditor, stage="p0", action="write_intake_report")
 
-        produced_artifacts = [f"artifacts/{n}" for n in ("intake_report.json", "source_index.json")
+        produced_artifacts = [stage_artifact_ref("p0", n) for n in ("intake_report.json", "source_index.json")
                               if (art_dir / n).exists()]
+        # D-107: 产出 P0 阶段完成包清单（供 P1/P2 按需加载，非写死文件名列表）。
+        self._write_p0_package(project_id, produced_artifacts, identification)
         return {
             "status": "completed",
             "file_count": file_count,
@@ -374,6 +385,31 @@ class RealP0Handler:
                  "type": "onboarding_completed", "status": "candidate"},
             ],
         }
+
+    def _write_p0_package(self, project_id: str, produced: list, identification: dict) -> None:
+        """D-107: 写 artifacts/p0/_stage_package.json（P0 完成包清单）。
+
+        products 描述 + key_for_next（下阶段关键产物：intake_report/source_index 均为 P1 建档基线）
+        + 识别摘要 + 进入 P1 建议。产物文件名从 produced（真实落盘）派生，诚实不虚报。
+        """
+        _types = {"intake_report.json": ("intake_report", "P0 LLM 接入识别（技术栈/环境/可用性/入口/DB/P1 任务）"),
+                  "source_index.json": ("source_index", "源码索引（目录/关键文件候选/DB 文件/代码规模，采集）")}
+        products = []
+        for ref in produced:
+            fn = ref.split("/")[-1]
+            t, desc = _types.get(fn, (fn.rsplit(".", 1)[0], "P0 产物"))
+            products.append(product_entry(fn, t, desc, key_for_next=True))
+        av = (identification.get("availability_classification") or {}).get("class")
+        try:
+            write_stage_package(
+                project_id, "p0", products=products,
+                evidence_summary={"primary_language": identification.get("primary_language"),
+                                  "availability_class": av,
+                                  "key_files_count": len(identification.get("key_files") or [])},
+                risks=[], next_stage_advice="进入 P1 建档：复用 P0 接入识别，深化技术栈/依赖/入口/配置/测试并捕获原始验收基准。",
+                auditor=self.auditor, tracer=self.tracer)
+        except Exception:
+            logger.warning("P0 stage package 写入失败（advisory）", exc_info=True)
 
     def review(self, result: dict) -> ReviewResult:
         issues = []
@@ -429,18 +465,19 @@ class RealP1Handler:
         return AcceptanceBaselineService(tracer=self.tracer, auditor=self.auditor)
 
     def _read_upstream(self, project_id: str) -> dict:
-        """WP-2: 读 P0 已 LLM 产出的接入识别结论 + source_index 摘要（复用基线，解 P1-ARCH-1）。"""
-        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
+        """WP-2: 读 P0 已 LLM 产出的接入识别结论 + source_index 摘要（复用基线，解 P1-ARCH-1）。
+        D-107: P0 产物位于 artifacts/p0/。"""
+        p0_dir = stage_artifact_dir(project_id, "p0")
         intake = {}
         source_index = {}
         try:
-            p = art_dir / "intake_report.json"
+            p = p0_dir / "intake_report.json"
             if p.exists():
                 intake = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             logger.debug("P1 读取 intake_report.json 失败（advisory）", exc_info=True)
         try:
-            p = art_dir / "source_index.json"
+            p = p0_dir / "source_index.json"
             if p.exists():
                 si = json.loads(p.read_text(encoding="utf-8"))
                 source_index = {"file_count": si.get("file_count"),
@@ -467,7 +504,8 @@ class RealP1Handler:
     async def execute(self, state: GraphState) -> dict:
         project_id = state["project_id"]
         run_id = state.get("run_id", "")
-        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
+        # D-107: P1 产物写入 artifacts/p1/（分层文件夹）。
+        art_dir = stage_artifact_dir(project_id, "p1")
         art_dir.mkdir(parents=True, exist_ok=True)
 
         # ── 采集①：事实包 + 写盘纯采集产物（file_index/source_structure/cicd/doc） ──
@@ -510,7 +548,7 @@ class RealP1Handler:
             # 诚实 blocked：不伪造 completed、不回退规则识别（D-097/公理3）。
             self._write_json(project_id, "profiling_summary.md",
                              self._blocked_summary(project_id, prof_result), raw_text=True)
-            produced = [f"artifacts/{p.name}" for p in sorted(art_dir.glob("*.json"))]
+            produced = [stage_artifact_ref("p1", p.name) for p in sorted(art_dir.glob("*.json"))]
             return {
                 "status": prof_result.status, "reason": prof_result.reason,
                 "file_count": facts.get("file_count", 0), "artifacts": produced,
@@ -551,13 +589,18 @@ class RealP1Handler:
         refs: List[str] = []
         identified_items: List[str] = []
         for p in sorted(art_dir.glob("*.json")):
-            refs.append(f"artifacts/{p.name}")
+            if p.name.startswith("_"):   # D-107: 完成包清单等下划线文件不计入领域产物
+                continue
+            refs.append(stage_artifact_ref("p1", p.name))
             if p.name != "p2_input_manifest.json" and not p.name.startswith("p0_") \
                     and not p.name.startswith("p1_") and p.name != "intake_report.json" \
                     and p.name != "source_index.json":
                 identified_items.append(p.stem)
         if (art_dir / "profiling_summary.md").exists():
-            refs.append("artifacts/profiling_summary.md")
+            refs.append(stage_artifact_ref("p1", "profiling_summary.md"))
+
+        # D-107: 产出 P1 阶段完成包清单（含 acceptance_baseline，供 P2 按需加载解 GAP-P2-1/2）。
+        self._write_p1_package(project_id, refs, identification, baseline_result)
 
         tech = identification.get("tech_stack") or {}
         return {
@@ -575,18 +618,67 @@ class RealP1Handler:
 
     def _write_json(self, project_id: str, name: str, data, *, raw_text: bool = False) -> None:
         content = data if raw_text else json.dumps(data, ensure_ascii=False, indent=2)
-        _mediated_write(project_id, f"artifacts/{name}", content,
+        _mediated_write(project_id, stage_artifact_ref("p1", name), content,
                         auditor=self.auditor, stage="p1", action=f"write_{name.split('.')[0]}")
 
     def _write_p2_manifest(self, project_id: str) -> None:
-        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
+        art_dir = stage_artifact_dir(project_id, "p1")
         manifest = {
             "project_id": project_id, "p1_completed_at": _now(), "p1_stage": "completed",
-            "input_artifacts": [{"ref": f"artifacts/{p.name}", "type": p.stem}
-                                for p in sorted(art_dir.glob("*.json"))],
+            "input_artifacts": [{"ref": stage_artifact_ref("p1", p.name), "type": p.stem}
+                                for p in sorted(art_dir.glob("*.json")) if not p.name.startswith("_")],
             "environment_profile_ref": ".rebuild/environment.json",
         }
         self._write_json(project_id, "p2_input_manifest.json", manifest)
+
+    # LLM 建档识别产物 → 完成包 products 描述（通用锚点固定）。key_for_next=True 者供 P2 按需加载。
+    _P1_PRODUCT_META = {
+        "tech_stack.json": ("tech_stack", "技术栈识别（主语言/框架/运行时）", True),
+        "dependency_draft.json": ("dependency_draft", "依赖清单识别", True),
+        "entry_points.json": ("entry_points", "应用入口识别", True),
+        "config_inventory.json": ("config_inventory", "配置清单（值已脱敏）", True),
+        "infra_clues.json": ("infra_clues", "基础设施线索", False),
+        "test_inventory.json": ("test_inventory", "测试资产清单", False),
+        "module_structure.json": ("module_structure", "模块结构识别", False),
+        "uncertainty_manifest.json": ("uncertainty_manifest", "识别盲区/证据缺口（LLM 主动发声）", True),
+        "acceptance_baseline.json": ("acceptance_baseline", "原始验收基准（D-106 静态基线+动态黄金/needs_env）", True),
+        "profiling_summary.md": ("profiling_summary", "P1 建档摘要", True),
+        "p2_input_manifest.json": ("p2_input_manifest", "P2 输入清单（产物 refs）", False),
+        "file_index.json": ("file_index", "文件索引（采集）", False),
+        "source_structure.json": ("source_structure", "源码结构（采集）", False),
+        "cicd_inventory.json": ("cicd_inventory", "CI/CD 候选（采集）", False),
+        "doc_inventory.json": ("doc_inventory", "文档候选（采集）", False),
+    }
+
+    def _write_p1_package(self, project_id: str, refs: list, identification: dict, baseline) -> None:
+        """D-107: 写 artifacts/p1/_stage_package.json（P1 完成包清单）。
+
+        key_for_next=True 的产物（含 acceptance_baseline / tech_stack / dependency / entry_points /
+        config / uncertainty / profiling_summary）供 P2 _gather_inputs 按需加载内容——结构性
+        根治 GAP-P2-1（P2 看不到 acceptance_baseline 而误报"P1 无验证证据"）。
+        """
+        products = []
+        for ref in refs:
+            fn = ref.split("/")[-1]
+            t, desc, kfn = self._P1_PRODUCT_META.get(fn, (fn.rsplit(".", 1)[0], "P1 产物", False))
+            products.append(product_entry(fn, t, desc, key_for_next=kfn))
+        tech = identification.get("tech_stack") or {}
+        gaps = (identification.get("uncertainty_manifest") or {}).get("evidence_gaps", [])
+        golden = (getattr(baseline, "baseline", None) or {}).get("dynamic_golden", {}) if baseline else {}
+        try:
+            write_stage_package(
+                project_id, "p1", products=products,
+                evidence_summary={
+                    "primary_language": tech.get("primary_language"),
+                    "acceptance_baseline_status": getattr(baseline, "status", None),
+                    "dynamic_golden_captured": bool(golden.get("captured")),
+                    "evidence_gap_count": len(gaps)},
+                risks=[], next_stage_advice=(
+                    "进入 P2 评估：消费 acceptance_baseline（静态基线+动态黄金/needs_env）评估可验证性，"
+                    "结合 tech_stack/dependency/entry_points/config 识别迁移风险/阻塞/验证缺口/资源需求。"),
+                auditor=self.auditor, tracer=self.tracer)
+        except Exception:
+            logger.warning("P1 stage package 写入失败（advisory）", exc_info=True)
 
     @staticmethod
     def _blocked_summary(project_id: str, r) -> str:
@@ -687,13 +779,18 @@ class RealP2Handler:
         # context path, not an ad-hoc hardcoded prompt (S4). Advisory on failure.
         context_package: dict = {}
         system_prompt: str | None = None
+        skill_body = ""
         try:
             from app.services.context_assembler import assemble_context, build_system_prompt
             node_state = {"node_task": "P2 评估：识别迁移/重构风险、阻塞项、验证缺口与资源需求",
                           "task": "评估可行性与风险"}
+            # D-108: 加载 P2 评估 stage skill 正文（P-migration-assessment），评估需求随 skill 走，
+            # 提示词瘦身、给 Agent 灵活度（skill-first，仿 P0/P1 include_body + skill_disclosure=full）。
             context_package = assemble_context(
                 project_id, "p2", node_state=node_state,
-                task_type="assessment", skill_disclosure="metadata")
+                task_type="assessment", include_body=True, skill_disclosure="full")
+            bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
+            skill_body = "\n\n".join(bodies)[:12000]
             system_prompt = build_system_prompt(
                 project_id, "p2", node_state=node_state,
                 task_type="assessment", skill_disclosure="metadata")
@@ -703,7 +800,8 @@ class RealP2Handler:
 
         svc = self._service()
         result = await svc.assess(project_id, run_id=run_id, stage="p2", user_goal=user_goal,
-                                  system_prompt=system_prompt, context_package=context_package)
+                                  system_prompt=system_prompt, skill_body=skill_body,
+                                  context_package=context_package)
 
         artifacts: List[str] = []
         evidence_refs: List[str] = []
@@ -736,8 +834,9 @@ class RealP2Handler:
         }
 
     def _write_artifacts(self, project_id: str, result) -> List[str]:
-        """§4.6: 风险评估 / 阻塞项 / 验证缺口 / 资源需求 Artifact + §4.5 评估报告."""
-        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
+        """§4.6: 风险评估 / 阻塞项 / 验证缺口 / 资源需求 Artifact + §4.5 评估报告.
+        D-107: P2 产物写入 artifacts/p2/ + 产出 P2 阶段完成包清单。"""
+        art_dir = stage_artifact_dir(project_id, "p2")
         art_dir.mkdir(parents=True, exist_ok=True)
         files = {
             "p2_assessment_report.json": {
@@ -750,13 +849,44 @@ class RealP2Handler:
         }
         refs: List[str] = []
         for name, payload in files.items():
-            _mediated_write(project_id, f"artifacts/{name}",
+            _mediated_write(project_id, stage_artifact_ref("p2", name),
                             json.dumps({"project_id": project_id, "stage": "p2",
                                         "generated_at": _now(), **payload},
                                        ensure_ascii=False, indent=2),
                             auditor=self.auditor, stage="p2", action="write_p2_artifact")
-            refs.append(f"artifacts/{name}")
+            refs.append(stage_artifact_ref("p2", name))
+        self._write_p2_package(project_id, refs, result)
         return refs
+
+    _P2_PRODUCT_META = {
+        "p2_assessment_report.json": ("assessment_report", "P2 评估报告（含 uncertainty_list）", True),
+        "p2_risk_list.json": ("risk_assessment", "迁移/重构风险清单", True),
+        "p2_blocker_list.json": ("blocker_list", "阻塞项清单", True),
+        "p2_validation_gaps.json": ("validation_gap", "验证缺口清单", True),
+        "p2_resource_needs.json": ("resource_needs", "资源需求建议", False),
+    }
+
+    def _write_p2_package(self, project_id: str, refs: list, result) -> None:
+        """D-107: 写 artifacts/p2/_stage_package.json（P2 完成包清单，供 P3 按需加载）。"""
+        products = []
+        for ref in refs:
+            fn = ref.split("/")[-1]
+            t, desc, kfn = self._P2_PRODUCT_META.get(fn, (fn.rsplit(".", 1)[0], "P2 产物", False))
+            products.append(product_entry(fn, t, desc, key_for_next=kfn))
+        try:
+            write_stage_package(
+                project_id, "p2", products=products,
+                evidence_summary={"risk_count": len(result.risk_list),
+                                  "blocker_count": len(result.blocker_list),
+                                  "validation_gap_count": len(result.validation_gap_list),
+                                  "analysis_only": result.analysis_only},
+                risks=[{"title": r.get("title"), "risk_level": r.get("risk_level")}
+                       for r in (result.risk_list or []) if isinstance(r, dict)][:12],
+                next_stage_advice=("进入 P3 规划：基于 P2 风险/阻塞/验证缺口/资源需求生成 Stage Plan / "
+                                   "Task Plan(Batch) / TaskGraph。"),
+                auditor=self.auditor, tracer=self.tracer)
+        except Exception:
+            logger.warning("P2 stage package 写入失败（advisory）", exc_info=True)
 
     def review(self, result: dict) -> ReviewResult:
         status = result.get("status")

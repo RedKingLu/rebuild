@@ -151,9 +151,11 @@ SKILL_SEEDS = [
     {"name": "P-codebase-onboarding", "series": SkillSeries.P, "category": SkillCategory.p0, "description": "P0 接入：引导用户接入遗留代码仓库、识别技术栈(.NET/Java/Oracle/MSSQL)、构建项目结构与依赖清单、诚实标注未知项——ECC codebase-onboarding(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p0/P-codebase-onboarding/"},
     # P1 建档
     {"name": "P-api-design", "series": SkillSeries.P, "category": SkillCategory.p1, "description": "P1 建档：分析遗留系统 API/接口契约并建档，作为迁移后目标 API 设计参考——ECC api-design(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p1/P-api-design/"},
+    {"name": "full-stack-profiler", "series": SkillSeries.P, "category": SkillCategory.p1, "description": "P1 建档主工作流：全量项目识别基线（文件/目录/模块/语言/框架/构建/依赖/入口/测试/CI-CD/数据库/中间件/配置/文档），形成 P2-P6 可复用事实底座——rebuild 自有", "status": SkillStatus.platform_runtime, "skill_source": "rebuild", "directory_path": f"{_S_DIR}/p1/full-stack-profiler/"},
     {"name": "P-documentation-lookup", "series": SkillSeries.P, "category": SkillCategory.p1, "description": "P1 建档：经受控检索查达梦/openGauss/GaussDB/国产中间件官方迁移指南与兼容性矩阵，不臆测 API——ECC documentation-lookup(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p1/P-documentation-lookup/"},
     # P2 评估
     {"name": "P-architecture-decision-records", "series": SkillSeries.P, "category": SkillCategory.p2, "description": "P2 评估：将目标栈选型(达梦 vs openGauss、中间件替换)记录为 Nygard 式 ADR，作为评审与审计依据——ECC architecture-decision-records(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p2/P-architecture-decision-records/"},
+    {"name": "P-migration-assessment", "series": SkillSeries.P, "category": SkillCategory.p2, "description": "P2 评估工作流：基于 P0/P1 阶段完成包与原始验收基准，评估 8 维度(兼容承载/现代化/DB迁移/部署中间件/PoC范围/阻塞验证缺口/资源/待确认)、目标库证据化对比+ADR(不选定单一库)、evidence_gap 诚实不预判终局——rebuild R17.5(D-108)", "status": SkillStatus.platform_runtime, "skill_source": "rebuild", "directory_path": f"{_S_DIR}/p2/P-migration-assessment/"},
     {"name": "P-blueprint", "series": SkillSeries.P, "category": SkillCategory.p2, "description": "P2 评估：把迁移目标转为可执行迁移蓝图/技术路线图/风险矩阵/依赖图，每步自包含冷启动 brief——ECC blueprint(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p2/P-blueprint/"},
     # P3 规划
     {"name": "P-agentic-engineering", "series": SkillSeries.P, "category": SkillCategory.p3, "description": "P3 规划：把迁移任务分解为可验证小单元、设计 TaskGraph、按复杂度路由模型、每单元定义验收——ECC agentic-engineering(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p3/P-agentic-engineering/"},
@@ -189,13 +191,13 @@ RESOURCE_SEEDS = [
 
     # Skill entries
     {"resource_type": ResourceType.skill, "name": "R 系列建设 Skill（3 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.internal_current, "source_trust_level": TrustLevel.trusted_current, "description": "R-数据库施工规范 / R-资源创建登记 / R-工作准则，均有真实 SKILL.md（skills/R-建设执行/，置于 source/ 之外与平台运行期隔离）"},
-    {"resource_type": ResourceType.skill, "name": "P 系列平台 Skill（24 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.community, "source_trust_level": TrustLevel.reviewed_reference, "source_path_or_ref": f"{_S_DIR}/", "description": "来源 ECC(MIT) 改写为信创迁移语境，覆盖 P0-P6 + 跨阶段，均有真实 SKILL.md；原 30 候选剔除 6 个非迁移类（市场对标/营销/UI美学/harness运维/工具选型/运维监控）", "type_metadata": {"count": 24, "source_repo": "https://github.com/affaan-m/ECC", "license": "MIT", "dropped_non_migration": ["benchmark-methodology", "content-engine", "design-system", "config-gc", "agent-eval", "dashboard-builder"]}},
+    {"resource_type": ResourceType.skill, "name": "P 系列平台 Skill（26 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.community, "source_trust_level": TrustLevel.reviewed_reference, "source_path_or_ref": f"{_S_DIR}/", "description": "24 个源自 ECC(MIT) 改写为信创迁移语境 + 2 个 rebuild 自有 P 阶段主工作流 skill（P-migration-assessment P2 评估 D-108 / full-stack-profiler P1 建档），覆盖 P0-P6 + 跨阶段，均有真实 SKILL.md；原 30 候选剔除 6 个非迁移类（市场对标/营销/UI美学/harness运维/工具选型/运维监控）", "type_metadata": {"count": 26, "source_repo": "https://github.com/affaan-m/ECC", "license": "MIT", "dropped_non_migration": ["benchmark-methodology", "content-engine", "design-system", "config-gc", "agent-eval", "dashboard-builder"]}},
 
     # Tool entries — B-TOOL-SCHEMA-1 (R11-3): every tool carries a real OpenAI
     # `parameters` schema so the agent can call it WITH arguments (empty schema
     # meant the LLM saw the tool but had no arg to fill). Param names match what
     # tool_registry.execute_tool / _execute_* actually read.
-    {"resource_type": ResourceType.tool, "name": "fs_read", "description": "读取 workspace 内某个文件的内容（只读，限 workspace 内）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "要读取的文件路径，相对 workspace 根，如 source/xxx.cs 或 artifacts/intake_report.json"}}, "required": ["path"]}}},
+    {"resource_type": ResourceType.tool, "name": "fs_read", "description": "读取 workspace 内某个文件的内容（只读，限 workspace 内）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "要读取的文件路径，相对 workspace 根，如 source/xxx.cs 或 artifacts/p0/intake_report.json"}}, "required": ["path"]}}},
     {"resource_type": ResourceType.tool, "name": "list_files", "description": "列举 workspace 某个目录下的文件与子目录（只读）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "要列举的目录路径，相对 workspace 根，默认 source/"}}, "required": []}}},
     {"resource_type": ResourceType.tool, "name": "code_grep", "description": "在 workspace 代码库中按文本/正则模式检索（只读）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "type_metadata": {"dry_run_supported": True, "write_scope": "none", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "要检索的文本或正则模式"}, "path": {"type": "string", "description": "检索范围目录，相对 workspace 根，默认 source/"}}, "required": ["pattern"]}}},
     {"resource_type": ResourceType.tool, "name": "fs_write_artifact", "description": "写出 Artifact 到 workspace（受控，经 WorkspaceMediator）", "status": ResourceStatus.active, "risk_level": RiskLevel.L2, "type_metadata": {"dry_run_supported": True, "write_scope": "workspace", "binds_via": "execution_provider(R8)", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "产物写入路径，相对 workspace，须在 artifacts/ 或 output_code/ 下"}, "content": {"type": "string", "description": "要写入的文件内容"}}, "required": ["path", "content"]}}},
@@ -255,12 +257,29 @@ def seed_all(db: Session) -> dict:
             db.add(AgentDefinition(**s))
         counts["agents"] = len(AGENT_SEEDS)
 
-    # Skills
-    existing = db.query(SkillDefinition).count()
-    if existing == 0:
-        for s in SKILL_SEEDS:
+    # Skills — 增量按 name 补种缺失项（R17.5 P2：修 seed_all 幂等"非空即全跳过"隐患——
+    # 既有非空 DB 下新增的 skill（如 P-migration-assessment）此前永不入库，致 context_assembler
+    # 装配不到、skill-first 名存实亡。改为按 name 去重补种缺失 skill，不重复插入已存在项）。
+    # R17.5 P2 返工3：先按 name 去重清理历史遗留重复行（真实 DB 每 skill 曾 2×，致装配翻倍、
+    # 主 skill 被挤出 skill_body 预算，Q-R17.5-P2-6）——保留每 name 首行、删除其余；防复发。
+    seen_names: set[str] = set()
+    removed_dupes = 0
+    for row in db.query(SkillDefinition).order_by(SkillDefinition.name, SkillDefinition.skill_id).all():
+        if row.name in seen_names:
+            db.delete(row)
+            removed_dupes += 1
+        else:
+            seen_names.add(row.name)
+    if removed_dupes:
+        db.flush()
+    counts["skills_deduped"] = removed_dupes
+    existing_skill_names = seen_names
+    added_skills = 0
+    for s in SKILL_SEEDS:
+        if s["name"] not in existing_skill_names:
             db.add(SkillDefinition(**s))
-        counts["skills"] = len(SKILL_SEEDS)
+            added_skills += 1
+    counts["skills"] = added_skills
 
     # Resources
     existing = db.query(ResourceEntry).count()

@@ -45,7 +45,7 @@ def test_graph_http_drive_p0_p1(tmp_path, monkeypatch, isolated_data):
         assert d["pending_gate"]["stage"] == "p0"
         assert d["graph_capability_status"] == "live"
         art = workspace_service.workspace_path(pid) / "artifacts"
-        assert (art / "intake_report.json").exists(), "P0 real intake artifact via HTTP"
+        assert (art / "p0" / "intake_report.json").exists(), "P0 real intake artifact via HTTP"
         assert (art / "p0_acceptance.json").exists(), "P0 three-report via HTTP"
 
         # illegal decision → 400
@@ -58,8 +58,8 @@ def test_graph_http_drive_p0_p1(tmp_path, monkeypatch, isolated_data):
         d = r.json()["data"]
         assert d["paused"] is True
         assert d["pending_gate"]["stage"] == "p1"
-        assert (art / "profiling_summary.md").exists(), "P1 real profiling via HTTP"
-        assert (art / "p2_input_manifest.json").exists()
+        assert (art / "p1" / "profiling_summary.md").exists(), "P1 real profiling via HTTP"
+        assert (art / "p1" / "p2_input_manifest.json").exists()
 
         # state endpoint reflects checkpoint
         s = c.get(f"/api/projects/{pid}/graph/state", params={"run_id": run_id}).json()["data"]

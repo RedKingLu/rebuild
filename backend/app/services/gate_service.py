@@ -187,6 +187,22 @@ class GateService:
                 g.audit_ref = audit.get("audit_id")
                 db.commit()
 
+            # R17.5 P2（item 4）：P2→P3 路线风险接受由 Audit `risk_acceptance` 承载（非新
+            # gate_type，禁 route_decision_gate）。用户 approve P2→P3 stage_promotion Gate =
+            # 接受 P2 评估的迁移路线风险 → 补记 risk_acceptance 审计（可追溯"谁在何时接受了何种
+            # 路线风险"），不改 Gate 语义。仅在权威决策写一次（承 gate_decision 幂等保护之后）。
+            if g.gate_type == "stage_promotion" and decision == "approve" and g.stage == "p2":
+                try:
+                    self._svc.audit_writer.write(
+                        audit_type="risk_acceptance", gate_id=gate_id, risk_level=g.risk_level,
+                        action="p2_to_p3_route_risk_accepted",
+                        decision="accepted",
+                        reason=(req.reason or "用户批准 P2→P3 晋级，接受 P2 评估的迁移路线风险"),
+                        project_id=g.project_id, run_id=g.run_id, stage=g.stage,
+                    )
+                except Exception:
+                    _logger.warning("P2→P3 risk_acceptance 审计写入失败（advisory）", exc_info=True)
+
             return _gate_to_response(g), audit
         finally:
             db.close()

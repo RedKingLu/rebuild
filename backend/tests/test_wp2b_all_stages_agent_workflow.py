@@ -114,9 +114,9 @@ async def test_p0_llm_intake_workflow_with_key(isolated_data):
     assert cem["map_type"] == "claim_evidence"
     assert cem["entries"] and all(e["produced_by"] == "llm" for e in cem["entries"])
     assert all(e["bindings"]["artifact_refs"] for e in cem["entries"])
-    # intake_report.json 落盘且识别字段来自 LLM（produced_by 非 deterministic_tool）
+    # intake_report.json 落盘且识别字段来自 LLM（produced_by 非 deterministic_tool；D-107: artifacts/p0/）
     intake = json.loads((workspace_service.workspace_path(pid) /
-                         "artifacts" / "intake_report.json").read_text("utf-8"))
+                         "artifacts" / "p0" / "intake_report.json").read_text("utf-8"))
     assert intake["produced_by"] == "llm_node_worker_agent"
     assert intake["identification"]["primary_language"] == "Python"
 
@@ -185,8 +185,8 @@ _P2_GOOD = json.dumps({
     # C1: 主输出每条 risk 内联携带 evidence_refs（引用真实存在的上游产物）。
     "risk_list": [{"title": ".NET Framework→.NET 8 迁移风险", "risk_level": "L3",
                    "source": "tech_stack.json", "basis": "运行时不兼容",
-                   "evidence_refs": ["artifacts/tech_stack.json"]}],
-    "blocker_list": [{"title": "缺少数据库凭据", "evidence_refs": ["artifacts/tech_stack.json"]}],
+                   "evidence_refs": ["artifacts/p1/tech_stack.json"]}],
+    "blocker_list": [{"title": "缺少数据库凭据", "evidence_refs": ["artifacts/p1/tech_stack.json"]}],
     "uncertainty_list": [{"title": "运行环境未知"}],
     "validation_gap_list": [{"title": "无集成测试", "evidence_refs": []}],
     "resource_needs": [{"title": "需确定性转换工具"}],
@@ -205,8 +205,9 @@ async def test_p2_llm_workflow_with_key_inline_citations(isolated_data):
     pid = "wp2b-p2"
     _seed(pid)
     # 上游 P1 产物存在（claim 内联引用绑定目标）
-    (workspace_service.workspace_path(pid) / "artifacts").mkdir(parents=True, exist_ok=True)
-    (workspace_service.workspace_path(pid) / "artifacts" / "tech_stack.json").write_text(
+    # 上游 P1 产物存在（claim 内联引用绑定目标；D-107: artifacts/p1/）
+    (workspace_service.workspace_path(pid) / "artifacts" / "p1").mkdir(parents=True, exist_ok=True)
+    (workspace_service.workspace_path(pid) / "artifacts" / "p1" / "tech_stack.json").write_text(
         json.dumps({"languages": {"primary_language": "C#"}}), encoding="utf-8")
 
     gw = _SmartGateway([_P2_GOOD])
@@ -279,14 +280,14 @@ _P3_SP = json.dumps({
     "expected_artifacts": ["plan.md"], "expected_evidence": ["对照表"],
     "gate_policy": {"high_risk": "require_gate"}, "completion_criteria": ["计划完成"],
     "validation_strategy": "回归测试",
-    # C1: Stage Plan 主输出内联携带 basis_refs（引用真实存在的上游 P2 产物）。
-    "basis_refs": ["artifacts/p2_risk_list.json"],
+    # C1: Stage Plan 主输出内联携带 basis_refs（引用真实存在的上游 P2 产物；D-107: artifacts/p2/）。
+    "basis_refs": ["artifacts/p2/p2_risk_list.json"],
 })
 _P3_BATCH = json.dumps({
     "batch_objective": "迁移任务", "batch_scope": ["路由"], "permission_boundary": "source/",
     "validation_strategy": "逐任务回归", "exception_policy": "升级 Gate",
     "task_plans": [{"objective": "替换路由", "risk_level": "L2", "validation_method": "回归",
-                    "title": "路由", "basis_refs": ["artifacts/p2_risk_list.json"]}],
+                    "title": "路由", "basis_refs": ["artifacts/p2/p2_risk_list.json"]}],
 })
 _P3_EDGES = '{"edges": []}'
 
@@ -297,8 +298,8 @@ async def test_p3_llm_workflow_with_key(isolated_data):
     from app.services.aet_service import AETService
     pid = "wp2b-p3"
     _seed(pid)
-    (workspace_service.workspace_path(pid) / "artifacts").mkdir(parents=True, exist_ok=True)
-    (workspace_service.workspace_path(pid) / "artifacts" / "p2_risk_list.json").write_text(
+    (workspace_service.workspace_path(pid) / "artifacts" / "p2").mkdir(parents=True, exist_ok=True)
+    (workspace_service.workspace_path(pid) / "artifacts" / "p2" / "p2_risk_list.json").write_text(
         json.dumps({"items": [{"title": "风险"}]}), encoding="utf-8")
 
     gw = _SmartGateway([_P3_SP, _P3_BATCH, _P3_EDGES])
@@ -316,7 +317,7 @@ async def test_p3_llm_workflow_with_key(isolated_data):
     # C1 主输出真内联：P3 计划类结论内联引用其依据的上游 P2 产物（来自主输出 basis_refs）
     assert any(e["inline_citation"] for e in cem["entries"]), "P3 主输出内联引用应达成（有 Key）"
     cited = [e for e in cem["entries"] if e["inline_citation"]]
-    assert "artifacts/p2_risk_list.json" in cited[0]["bindings"].get("cited_upstream_refs", [])
+    assert "artifacts/p2/p2_risk_list.json" in cited[0]["bindings"].get("cited_upstream_refs", [])
 
     va = ValidationAgent("p3", pid, run_id="r1", handler=handler, gateway=gw)
     rr = va.validate(result)
@@ -420,14 +421,14 @@ async def test_generic_stage_rework_then_pass(isolated_data):
 
         async def execute(self, state):
             self.calls += 1
-            art = workspace_service.workspace_path(pid) / "artifacts"
+            art = workspace_service.workspace_path(pid) / "artifacts" / "p0"
             art.mkdir(parents=True, exist_ok=True)
             if self.calls == 1:
                 # 首轮：不产出 intake_report（真实退化，review 判不合格）
                 return {"status": "completed", "artifacts": []}
-            # rework 重跑：补齐 intake_report
+            # rework 重跑：补齐 intake_report（D-107: artifacts/p0/）
             (art / "intake_report.json").write_text(json.dumps({"stage": "p0"}), encoding="utf-8")
-            return {"status": "completed", "artifacts": ["artifacts/intake_report.json"],
+            return {"status": "completed", "artifacts": ["artifacts/p0/intake_report.json"],
                     "source_type": "manual", "file_count": 2,
                     "materialized": {"materialization_status": "empty"}}
 
@@ -471,8 +472,8 @@ async def test_c4_validation_reads_domain_from_disk_not_process(isolated_data):
     pid = "wp2b-c4-disk"
     _seed(pid)
     art = workspace_service.workspace_path(pid) / "artifacts"
-    art.mkdir(parents=True, exist_ok=True)
-    (art / "tech_stack.json").write_text(
+    (art / "p1").mkdir(parents=True, exist_ok=True)
+    (art / "p1" / "tech_stack.json").write_text(
         json.dumps({"languages": {"primary_language": "C#"}}), encoding="utf-8")
 
     gw = _SmartGateway([_P2_GOOD])
@@ -482,9 +483,9 @@ async def test_c4_validation_reads_domain_from_disk_not_process(isolated_data):
     result = await wa.execute({"project_id": pid, "run_id": "r1", "user_goal": "迁移"})
     assert result["status"] == "completed"
 
-    # 域产物落盘不一致：删除全部被 claim-evidence 引用的域产物（风险/阻塞/验证缺口清单）。
+    # 域产物落盘不一致：删除全部被 claim-evidence 引用的域产物（风险/阻塞/验证缺口清单，D-107: p2/）。
     for name in ("p2_risk_list.json", "p2_blocker_list.json", "p2_validation_gaps.json"):
-        fp = art / name
+        fp = art / "p2" / name
         if fp.exists():
             fp.unlink()
 

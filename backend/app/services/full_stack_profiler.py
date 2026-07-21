@@ -333,7 +333,8 @@ class FullStackProfiler:
         """采集事实包 + 写盘 4 个纯采集产物（file_index/source_structure/cicd/doc）。
         返回喂给 ProfilingService(LLM) 的事实包（无识别结论）。"""
         src = workspace_path(project_id) / "source"
-        art_dir = workspace_path(project_id) / "artifacts"
+        # D-107: P1 采集产物写入 artifacts/p1/（分层文件夹，非扁平根）。
+        art_dir = workspace_path(project_id) / "artifacts" / "p1"
         art_dir.mkdir(parents=True, exist_ok=True)
 
         files = self._scan(src)
@@ -384,7 +385,8 @@ class FullStackProfiler:
         """遗留采集通道：写采集产物 + p2_input_manifest + summary（不产 LLM 识别）。
         图 P1 建档识别走 RealP1Handler → ProfilingService(LLM)；本方法只做采集。"""
         src = workspace_path(project_id) / "source"
-        art_dir = workspace_path(project_id) / "artifacts"
+        # D-107: P1 采集产物写入 artifacts/p1/（分层文件夹，非扁平根）。
+        art_dir = workspace_path(project_id) / "artifacts" / "p1"
         facts = self.collect_facts(project_id)  # 写 file_index/source_structure/cicd/doc
         files = facts["file_count"]
 
@@ -428,7 +430,7 @@ class FullStackProfiler:
         p2_manifest = {
             "project_id": project_id, "p1_completed_at": _now(),
             "p1_stage": "collection_only",
-            "input_artifacts": [{"ref": f"artifacts/{p.name}", "type": p.stem}
+            "input_artifacts": [{"ref": f"artifacts/p1/{p.name}", "type": p.stem}
                                 for p in sorted(art_dir.glob("*.json"))],
             "pending_evidence_gaps": self.gaps,
             "environment_profile_ref": ".rebuild/environment.json",

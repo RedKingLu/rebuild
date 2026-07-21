@@ -185,6 +185,17 @@ def _analyze_sql_file(path: Path, size_bytes: int) -> dict:
         if any(re.search(mk, text, re.IGNORECASE) for mk in markers):
             info["dialect"] = dialect
             break
+    # R17.5 P2 补充（item 5a，确定性采集喂 P2 LLM 评估 DB 迁移方言差异，不做识别裁决）：
+    # 字段级方言标记计数（IDENTITY/GETDATE/[dbo].schema/NVARCHAR/AUTO_INCREMENT）+ 外键计数
+    # （0 FK 是达梦/金仓迁移常见特征）。仅计数，方言差异解读/目标库选型交 P2 LLM（AGENTS §2.3）。
+    info["dialect_features"] = {
+        "identity_count": len(re.findall(r"\bIDENTITY\s*\(", text, re.IGNORECASE)),
+        "getdate_count": len(re.findall(r"\bGETDATE\s*\(|\bGETUTCDATE\s*\(", text, re.IGNORECASE)),
+        "dbo_schema_count": len(re.findall(r"\[dbo\]\.", text, re.IGNORECASE)),
+        "nvarchar_count": len(re.findall(r"\bNVARCHAR\b", text, re.IGNORECASE)),
+        "auto_increment_count": len(re.findall(r"\bAUTO_INCREMENT\b", text, re.IGNORECASE)),
+        "foreign_key_count": len(re.findall(r"\bFOREIGN\s+KEY\b", text, re.IGNORECASE)),
+    }
     return info
 
 
@@ -832,7 +843,7 @@ def generate_source_index(project_id: str, source_type: str | None = None) -> di
     """Generate a structured source_index.json for the project workspace.
 
     Scans workspace/source/ and produces a machine-readable index.
-    Writes to artifacts/source_index.json.
+    Writes to artifacts/p0/source_index.json (D-107 分层文件夹).
 
     ISSUE-03 (WP-7): source_type is inherited from the real materialization
     metadata (git/zip/local_dir/…) instead of a hardcoded "unknown"; key_files
@@ -848,7 +859,8 @@ def generate_source_index(project_id: str, source_type: str | None = None) -> di
     and code_scale (extension count summary). All values measured, never guessed.
     """
     ws_source = workspace_path(project_id) / "source"
-    artifacts_dir = workspace_path(project_id) / "artifacts"
+    # D-107: P0 采集产物写入 artifacts/p0/（分层文件夹，非扁平根）。
+    artifacts_dir = workspace_path(project_id) / "artifacts" / "p0"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     # Inherit real source_type + git_info from materialization metadata.
@@ -948,7 +960,7 @@ def generate_source_index(project_id: str, source_type: str | None = None) -> di
         if index["materialization_status"] == "unknown":
             index["materialization_status"] = "indexed"
 
-    # Write to artifacts/
+    # Write to artifacts/p0/ (D-107)
     index_path = artifacts_dir / "source_index.json"
     index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
     return index

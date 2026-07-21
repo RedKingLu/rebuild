@@ -28,6 +28,28 @@ from app.services.workspace_service import workspace_path
 
 logger = logging.getLogger("rebuild.context_assembler")
 
+# R17.5 P2 返工3：每阶段的【主工作流 skill】——stage-default 会广选本阶段 + common 全部 skill，
+# 主 skill 若排在后面会被下游 skill_body 预算([:12000]) 截断出 prompt（skill-first 名存实亡）。
+# 装配后将主 skill 置顶，保证其正文优先落入预算。名称即 SkillDefinition.name（平台稳定配置，
+# 非样本实例值）；缺失则该阶段无置顶（安全降级）。
+STAGE_PRIMARY_SKILL = {
+    "p0": "P-codebase-onboarding",
+    "p1": "full-stack-profiler",
+    "p2": "P-migration-assessment",
+}
+
+
+def _primary_skill_first(skills: list, stage: str) -> list:
+    """把本阶段主 skill 移到列表首位（保序其余项），确保其正文优先进入 skill_body 预算。"""
+    primary = STAGE_PRIMARY_SKILL.get((stage or "").lower())
+    if not primary or not skills:
+        return skills
+    head = [s for s in skills if s.get("name") == primary]
+    if not head:
+        return skills
+    rest = [s for s in skills if s.get("name") != primary]
+    return head + rest
+
 
 def assemble_context(
     project_id: str,
@@ -126,6 +148,9 @@ def assemble_context(
         }
         for s in skills_with_body
     ]
+    # R17.5 P2 返工3：把本阶段【主工作流 skill】置顶，确保其正文落入下游 skill_body 预算
+    # （handlers join(bodies)[:12000]），不被广选的跨阶段 skill 挤出（skill-first 真生效）。
+    ctx["skills"] = _primary_skill_first(ctx["skills"], current_stage)
 
     # ── Assemble C0-C6 layers ──────────────────────────────────────────────
     layers: dict[str, dict] = {}

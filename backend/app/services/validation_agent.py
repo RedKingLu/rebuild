@@ -259,11 +259,21 @@ class ValidationAgent:
         return "rework_required" if declared == "completed" else "rework_required"
 
     def _disk_artifact_refs(self) -> list:
+        """从盘重读 artifact refs。D-107: 产物按 artifacts/{stage}/ 分层，故除根目录扁平
+        产物外，还扫描各阶段子文件夹（p0-p6）；完成包清单 _stage_package.json 不计入产物。"""
         art_dir = self._ws_root() / "artifacts"
         refs: list = []
-        if art_dir.exists():
-            for p in sorted(art_dir.glob("*.json")):
+        if not art_dir.exists():
+            return refs
+        for p in sorted(art_dir.glob("*.json")):
+            if not p.name.startswith("_"):
                 refs.append(f"artifacts/{p.name}")
+        for stage in ("p0", "p1", "p2", "p3", "p4", "p5", "p6"):
+            sub = art_dir / stage
+            if sub.is_dir():
+                for p in sorted(sub.glob("*.json")):
+                    if not p.name.startswith("_"):
+                        refs.append(f"artifacts/{stage}/{p.name}")
         return refs
 
     # 编排/验收报告（非域产物）：StageLoop 3 报告 + WorkAgent/ValidationAgent 4 报告。
@@ -317,15 +327,15 @@ class ValidationAgent:
         view["artifacts"] = self._disk_domain_artifacts()
         # 逐阶段域内容从盘重读
         if self.stage == "p0":
-            intake = self._read_json("artifacts/intake_report.json") or {}
+            intake = self._read_json("artifacts/p0/intake_report.json") or {}
             view["source_type"] = intake.get("source_type")
             view["file_count"] = intake.get("file_count", 0)
         elif self.stage == "p1":
             # P1 域校验（RealP1Handler.review）判定建档识别产物 + 原始验收基准存在性；
             # 从盘重读 artifacts 已在 view["artifacts"]。status 反映是否 completed。
-            view["file_count"] = (self._read_json("artifacts/source_index.json") or {}).get("file_count", 0)
+            view["file_count"] = (self._read_json("artifacts/p0/source_index.json") or {}).get("file_count", 0)
         elif self.stage == "p2":
-            rep = self._read_json("artifacts/p2_assessment_report.json") or {}
+            rep = self._read_json("artifacts/p2/p2_assessment_report.json") or {}
             view["assessment_report"] = rep.get("report", rep.get("assessment_report", {}))
             view["analysis_only"] = rep.get("analysis_only", True)
         return view

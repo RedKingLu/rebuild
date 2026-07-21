@@ -582,7 +582,8 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
     try:
         from app.services.workspace_service import workspace_path
         import json as _json
-        art_dir = workspace_path(project_id) / "artifacts"
+        # D-107: P0 产物写入 artifacts/p0/。图 P0 节点(RealP0Handler)后续会以真实识别覆盖此处。
+        art_dir = workspace_path(project_id) / "artifacts" / "p0"
         art_dir.mkdir(parents=True, exist_ok=True)
         (art_dir / "intake_report.json").write_text(_json.dumps({
             "artifact_id": intake_id, "project_id": project_id, "stage": "p0",
@@ -625,7 +626,7 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
     #     the node's work). `materialized` stays None here; the response reflects the
     #     Gate the graph resolves.
     materialized = None
-    p0_artifact_refs = ["artifacts/intake_report.json"]
+    p0_artifact_refs = ["artifacts/p0/intake_report.json"]
 
     # 6. Trace + Audit
     svc_deps.trace_writer.write("onboarding_complete", action="complete_onboarding",
@@ -934,7 +935,7 @@ async def run_profiling(project_id: str, req: ProfilingRequest | None = None, db
     def _review_profiling(prof_result: dict) -> ReviewResult:
         """Quality gate for P1 profiling output (real artifacts on disk)."""
         issues = []
-        art = _wp(project_id) / "artifacts"
+        art = _wp(project_id) / "artifacts" / "p1"   # D-107: P1 产物分层
         if prof_result.get("items_completed", 0) < 1:
             issues.append({"type": "no_artifacts", "detail": "profiler produced no identification artifacts"})
         if not (art / "p2_input_manifest.json").exists():
@@ -982,10 +983,10 @@ async def run_profiling(project_id: str, req: ProfilingRequest | None = None, db
     _reports = StageReports(project_id, "p1")
     _reports.start_plan(goal=_P1H.goal, acceptance_criteria=list(_P1H.acceptance_criteria),
                         planned_actions=list(_P1H.planned_actions))
-    _art = _wp(project_id) / "artifacts"
-    _produced = [f"artifacts/{p.name}" for p in sorted(_art.glob("*.json"))]
+    _art = _wp(project_id) / "artifacts" / "p1"   # D-107: P1 产物分层
+    _produced = [f"artifacts/p1/{p.name}" for p in sorted(_art.glob("*.json")) if not p.name.startswith("_")]
     if (_art / "profiling_summary.md").exists():
-        _produced.append("artifacts/profiling_summary.md")
+        _produced.append("artifacts/p1/profiling_summary.md")
     _reports.construction(rounds=review_outcome.get("rounds", []) or [],
                           actions=list(_P1H.planned_actions),
                           produced_artifacts=_produced)

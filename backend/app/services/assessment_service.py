@@ -43,15 +43,19 @@ ASSESSMENT_OUTPUTS = [
 ]
 
 _SYSTEM_PROMPT = (
-    "你是 rebuild 平台的 P2 评估 Agent。基于 P1 项目档案、Environment Profile 草案与 "
-    "p2_input_manifest，评估软件重构/信创迁移的风险、阻塞项、不确定项、验证缺口与资源需求。"
-    "严格输出 JSON，键为：assessment_report(对象), risk_list(数组，每项含 title/risk_level[L0-L5]/"
-    "source/basis/evidence_refs), blocker_list(数组，每项含 title/evidence_refs), uncertainty_list(数组), "
-    "validation_gap_list(数组，每项含 title/evidence_refs), resource_needs(数组)。"
-    "内联引用要求（硬约束）：每条 risk / blocker / validation_gap 必须在其 evidence_refs "
-    "字段内联列出所依据的上游产物 artifact ref——只能引用【可引用上游产物】清单中给出的 ref，"
-    "不得杜撰不存在的 id；确无可依据时给空数组（诚实，不编造）。"
-    "你的输出是【辅助分析，非事实】，不得替代 Evidence、不做代码修改、不替代 P3 规划或 P5 验证。"
+    "你是 rebuild 平台的 P2 评估 Agent。遵循已加载的 P-migration-assessment stage skill 完成迁移/重构评估"
+    "（评估维度、目标库证据化对比 + ADR、evidence_gap 诚实、不预判终局、DB 方言证据来源等要求以 skill 为准）。"
+    "基于 P0/P1 阶段完成包（含 acceptance_baseline 原始验收基准）与目标运行环境评估。"
+    "严格输出 JSON，锚点键（供机器解析）：assessment_report(对象), risk_list(数组，每项含 title/"
+    "risk_level[L0-L5]/source/basis/evidence_refs), blocker_list(数组，每项含 title/evidence_refs), "
+    "uncertainty_list(数组), validation_gap_list(数组，每项含 title/evidence_refs), resource_needs(数组)。"
+    # assessment_report 子字段仅列【输出 schema 键名】；含义/填法/rigor（证据化对比/不选定单一库/
+    # evidence_gap 不预判终局/DB 方言证据来源）由已加载的 P-migration-assessment skill 正文承载（skill-first）。
+    "assessment_report 对象必须含子字段键（含义与填法见 skill 正文）：compatibility_hosting, modernization, "
+    "database_migration(含 adr_candidates 数组), deployment_hosting, poc_scope, questions_for_user。"
+    "内联引用（硬约束）：每条 risk/blocker/validation_gap 的 evidence_refs 只能引用【可引用上游产物】清单中的 ref，"
+    "不得杜撰；确无可依据时给空数组。你的输出是【辅助分析，非事实】，不做代码修改、不替代 P3 规划或 P5 验证。"
+    "输出格式（硬约束）：只输出单个 JSON 对象本身，不要包裹任何散文说明、前后缀或 markdown 代码围栏。"
 )
 
 
@@ -125,6 +129,7 @@ class AssessmentService:
         user_goal: str = "",
         strategy_id: str = "system-default",
         system_prompt: Optional[str] = None,
+        skill_body: str = "",
         context_package: Optional[dict] = None,
     ) -> AssessmentResult:
         """Run the P2 assessment. Returns AssessmentResult (status ∈ completed/blocked/failed).
@@ -133,6 +138,10 @@ class AssessmentService:
         with C0-C6 + C3 Skill metadata) is provided, it is combined with the P2 domain
         output contract so the model receives the unified context AND the strict JSON
         schema. `context_package` supplies context_refs/skill_refs for Evidence/Trace.
+
+        D-108: `skill_body` 是已加载的 P2 评估 stage skill 正文（P-migration-assessment）——
+        评估需求（8 维度/ADR/evidence_gap 诚实/不预判终局等）随 skill 走，提示词只保留编排 +
+        锚点字段（skill-first，换需求=改 skill 而非改代码）。
         """
         gw = self._get_gateway()
 
@@ -151,11 +160,11 @@ class AssessmentService:
 
         context_refs, skill_refs = self._context_refs(context_package)
         inputs = self._gather_inputs(project_id, user_goal)
-        # Combine assembled context (governance/product/architecture/skill metadata)
-        # with the P2 domain output contract — the contract stays last so the JSON
-        # schema instruction is preserved (real products, not weakened).
-        system_content = (f"{system_prompt}\n\n---\n\n{_SYSTEM_PROMPT}"
-                          if system_prompt else _SYSTEM_PROMPT)
+        # Combine assembled context (governance/product/architecture metadata) + the loaded
+        # P2 assessment stage skill body (D-108: 评估需求随 skill 走) + the P2 orchestration
+        # contract. 契约放最后以保留 JSON schema 指令（真实产物）。
+        parts = [p for p in (system_prompt, (skill_body or None), _SYSTEM_PROMPT) if p]
+        system_content = "\n\n---\n\n".join(parts)
         messages = [
             {"role": "system", "content": system_content},
             {"role": "user", "content": self._build_user_prompt(inputs)},
@@ -198,49 +207,83 @@ class AssessmentService:
                       if s.get("skill_id") or s.get("name")]
         return context_refs, skill_refs
 
-    # ── inputs ───────────────────────────────────────────────────────────
+    # ── inputs (D-107 清单驱动按需加载) ──────────────────────────────────
     def _gather_inputs(self, project_id: str, user_goal: str) -> dict:
-        """Read P1 archive / p2_input_manifest / env profile from the workspace
-        (best-effort; missing inputs are recorded, not hallucinated — §4.7-1)."""
+        """读前序各阶段 Stage Completion Package 清单 → 据 key_for_next 按需加载关键产物内容。
+
+        D-107 / WP-2：不再写死文件名列表（对齐 AGENTS §2.3——由清单决定读什么）。P1 完成包
+        把 acceptance_baseline / tech_stack / dependency / entry_points / config / uncertainty /
+        profiling_summary 标记为 key_for_next=True，故 P2 天然读到 acceptance_baseline 内容——
+        结构性根治 GAP-P2-1（P2 曾因看不到基线内容而误报"No build/test validation evidence
+        from P1"）。缺失的清单/产物如实记入 missing，不臆造（§4.7-1）。
+        """
         inputs: dict[str, Any] = {"project_id": project_id, "user_goal": user_goal,
-                                  "sources_read": [], "missing": []}
+                                  "sources_read": [], "missing": [], "prior_packages": {}}
         try:
+            from app.services.stage_package import read_stage_package, stage_artifact_dir
             from app.services.workspace_service import workspace_path
-            ws = workspace_path(project_id)
-            # HDF-01 修复：P1 FullStackProfiler 写出的是 profiling_summary.md（Markdown），
-            # 旧版在此读 profiling_summary.json（不存在）→ 永远记入 missing，且即便存在也会被
-            # json.loads 判为 unreadable。改为按后缀区分：.md 读原文文本，其余按 JSON 解析。
-            for name in ("p2_input_manifest.json", "profiling_summary.md",
-                         "intake_report.json", "environment.json"):
-                fp = ws / "artifacts" / name
-                if not fp.exists():
-                    fp = ws / name if (ws / name).exists() else fp
-                if fp.exists():
+            # 前序阶段清单（P0/P1）；按需加载 key_for_next 产物内容。
+            for stage in ("p0", "p1"):
+                pkg = read_stage_package(project_id, stage)
+                if not pkg:
+                    inputs["missing"].append(f"{stage}/_stage_package.json")
+                    continue
+                # 清单摘要（产物描述 + 下阶段建议）进入 LLM 输入（Agent 据此判断读什么）。
+                inputs["prior_packages"][stage] = {
+                    "products": pkg.get("products", []),
+                    "evidence_summary": pkg.get("evidence_summary", {}),
+                    "next_stage_advice": pkg.get("next_stage_advice", ""),
+                }
+                stage_dir = stage_artifact_dir(project_id, stage)
+                for prod in pkg.get("products", []):
+                    if not prod.get("key_for_next"):
+                        continue
+                    fn = prod.get("file")
+                    if not fn:
+                        continue
+                    fp = stage_dir / fn
+                    ref = f"artifacts/{stage}/{fn}"
+                    if not fp.exists():
+                        inputs["missing"].append(ref)
+                        continue
                     try:
-                        if name.endswith(".md"):
-                            inputs[name] = fp.read_text(encoding="utf-8")
+                        if fn.endswith(".md"):
+                            inputs[ref] = fp.read_text(encoding="utf-8")
                         else:
-                            inputs[name] = json.loads(fp.read_text(encoding="utf-8"))
-                        inputs["sources_read"].append(name)
+                            inputs[ref] = json.loads(fp.read_text(encoding="utf-8"))
+                        inputs["sources_read"].append(ref)
                     except Exception:
-                        inputs["missing"].append(f"{name}(unreadable)")
-                else:
-                    inputs["missing"].append(name)
+                        inputs["missing"].append(f"{ref}(unreadable)")
+            # Environment Profile（D-051，位于 .rebuild/environment.json，非 artifacts/）。
+            env_fp = workspace_path(project_id) / ".rebuild" / "environment.json"
+            if env_fp.exists():
+                try:
+                    inputs["environment"] = json.loads(env_fp.read_text(encoding="utf-8"))
+                    inputs["sources_read"].append(".rebuild/environment.json")
+                except Exception:
+                    inputs["missing"].append(".rebuild/environment.json(unreadable)")
+            else:
+                inputs["missing"].append(".rebuild/environment.json")
         except Exception as e:
             inputs["missing"].append(f"workspace_error: {e}")
         return inputs
 
     def _build_user_prompt(self, inputs: dict) -> str:
-        # 可引用上游产物清单：由本阶段真实读取到的输入产物构造（confirmed on disk），
-        # 供模型在 evidence_refs 内联引用，避免模型杜撰不存在的 artifact id（C1 真内联）。
-        citable = [f"artifacts/{n}" for n in inputs.get("sources_read", [])]
+        # 可引用上游产物清单：由本阶段真实读取到的输入产物构造（confirmed on disk，含
+        # artifacts/{stage}/ 分层 ref），供模型在 evidence_refs 内联引用，避免杜撰 artifact id。
+        citable = [r for r in inputs.get("sources_read", []) if r.startswith("artifacts/")]
+        # 已加载产物内容（分层 ref → 内容），供 LLM 据真实基线评估可验证性/验证缺口。
+        loaded = {k: v for k, v in inputs.items() if isinstance(k, str) and k.startswith("artifacts/")}
         return (
             f"项目 ID：{inputs.get('project_id')}\n"
             f"用户目标：{inputs.get('user_goal') or '（未提供）'}\n"
+            f"前序阶段完成包清单（P0/P1 产物描述 + 下阶段建议）：{json.dumps(inputs.get('prior_packages', {}), ensure_ascii=False)[:1500]}\n"
             f"已读取输入：{inputs.get('sources_read')}\n"
             f"缺失输入（登记为不确定项来源）：{inputs.get('missing')}\n"
+            f"目标运行环境（Environment Profile）：{json.dumps(inputs.get('environment', {}), ensure_ascii=False)[:800]}\n"
             f"【可引用上游产物】（evidence_refs 只能取自此清单，勿杜撰）：{citable}\n"
-            f"P1 档案/清单摘要：{json.dumps({k: v for k, v in inputs.items() if k.endswith('.json')}, ensure_ascii=False)[:3000]}\n"
+            f"P1 档案/基准/清单内容（含 acceptance_baseline，据此评估可验证性与验证缺口）："
+            f"{json.dumps(loaded, ensure_ascii=False)[:4000]}\n"
             "请据此产出 6 类评估输出（JSON），并为每条 risk/blocker/validation_gap 内联填写 evidence_refs。"
         )
 

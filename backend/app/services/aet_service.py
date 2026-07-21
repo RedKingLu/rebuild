@@ -27,29 +27,33 @@ class AETService:
         if not art_dir.exists():
             return []
         results = []
-        for f in sorted(art_dir.iterdir()):
-            if f.is_file():
-                try:
-                    st = f.stat()
-                    atype = f.suffix.lstrip(".")
-                    results.append({
-                        "artifact_id": f"artifact-{f.stem}",
-                        "artifact_type": atype,
-                        "title": f.stem.replace("_", " ").replace("-", " "),
-                        "stage": stage or "",
-                        "artifact_status": "generated",
-                        "is_evidence_candidate": False,
-                        "content_hash": "",
-                        "bytes": st.st_size,
-                        "path": f"artifacts/{f.name}",
-                        "mock_level": "real",
-                        "source_status": "real",
-                        "name": f.name,
-                        "modified_at": st.st_mtime,
-                    })
-                except Exception:
-                    # 发声：artifact 文件 stat 失败会让其从清单中消失，掩盖存在的产物。
-                    logger.warning("list_artifacts: 读取 artifact 失败 file=%s", f, exc_info=True)
+        # D-107: 产物按 artifacts/{stage}/ 分层——除根目录扁平产物外，递归各阶段子文件夹。
+        files = [f for f in art_dir.iterdir() if f.is_file()]
+        for stage_dir in sorted(p for p in art_dir.iterdir() if p.is_dir()):
+            files.extend(f for f in stage_dir.iterdir() if f.is_file())
+        for f in sorted(files):
+            try:
+                st = f.stat()
+                atype = f.suffix.lstrip(".")
+                rel = str(f.relative_to(workspace_path(project_id)))
+                results.append({
+                    "artifact_id": f"artifact-{f.stem}",
+                    "artifact_type": atype,
+                    "title": f.stem.replace("_", " ").replace("-", " "),
+                    "stage": stage or "",
+                    "artifact_status": "generated",
+                    "is_evidence_candidate": False,
+                    "content_hash": "",
+                    "bytes": st.st_size,
+                    "path": rel,
+                    "mock_level": "real",
+                    "source_status": "real",
+                    "name": f.name,
+                    "modified_at": st.st_mtime,
+                })
+            except Exception:
+                # 发声：artifact 文件 stat 失败会让其从清单中消失，掩盖存在的产物。
+                logger.warning("list_artifacts: 读取 artifact 失败 file=%s", f, exc_info=True)
         return results
 
     def get_artifact(self, artifact_id: str, project_id: Optional[str] = None):
@@ -73,13 +77,18 @@ class AETService:
         art_dir = workspace_path(project_id) / "artifacts"
         if not art_dir.exists():
             return None
-        for f in sorted(art_dir.iterdir()):
-            if f.is_file() and f.stem == stem:
+        # D-107: 递归各阶段子文件夹（p0-p6）匹配 stem，兼容根目录扁平产物。
+        candidates = [f for f in art_dir.iterdir() if f.is_file()]
+        for stage_dir in sorted(p for p in art_dir.iterdir() if p.is_dir()):
+            candidates.extend(f for f in stage_dir.iterdir() if f.is_file())
+        for f in sorted(candidates):
+            if f.stem == stem:
                 try:
                     st = f.stat()
                     data = f.read_bytes()
                     content_hash = hashlib.sha256(data).hexdigest()
                     atype = f.suffix.lstrip(".")
+                    rel = str(f.relative_to(workspace_path(project_id)))
                     return {
                         "artifact_id": f"artifact-{f.stem}",
                         "artifact_type": atype,
@@ -89,7 +98,7 @@ class AETService:
                         "is_evidence_candidate": False,
                         "content_hash": content_hash,
                         "bytes": st.st_size,
-                        "path": f"artifacts/{f.name}",
+                        "path": rel,
                         "mock_level": "real",
                         "source_status": "real",
                         "name": f.name,
@@ -202,7 +211,11 @@ class AETService:
         """
         if not project_id:
             return []
-        manifest = workspace_path(project_id) / "artifacts" / "uncertainty_manifest.json"
+        # D-107: uncertainty_manifest 为 P1 产物，位于 artifacts/p1/（兼容旧扁平路径）。
+        manifest = workspace_path(project_id) / "artifacts" / "p1" / "uncertainty_manifest.json"
+        if not manifest.exists():
+            legacy = workspace_path(project_id) / "artifacts" / "uncertainty_manifest.json"
+            manifest = legacy if legacy.exists() else manifest
         if not manifest.exists():
             return []
         try:

@@ -72,11 +72,12 @@ _LLM_STAGES = {"p0", "p1", "p2", "p3", "p4"}
 _NON_LANG_EXTS = {".json", ".yaml", ".yml", ".xml", ".md", ".txt", ".lock", ".rst"}
 
 # 各阶段上游产物（供 claim-evidence 绑定「引用了哪些上游证据」；§3.6 通用，非硬编码 MicroOA）。
+# D-107: P0/P1/P2 产物位于 artifacts/{stage}/；P3+ 暂扁平（P3-P6 遵循，后续轮次）。
 _STAGE_UPSTREAM_ARTIFACTS = {
-    "p2": ["artifacts/tech_stack.json", "artifacts/p2_input_manifest.json",
-           "artifacts/dependency_draft.json"],
-    "p3": ["artifacts/p2_risk_list.json", "artifacts/p2_assessment_report.json",
-           "artifacts/p2_blocker_list.json"],
+    "p2": ["artifacts/p1/tech_stack.json", "artifacts/p1/p2_input_manifest.json",
+           "artifacts/p1/dependency_draft.json"],
+    "p3": ["artifacts/p2/p2_risk_list.json", "artifacts/p2/p2_assessment_report.json",
+           "artifacts/p2/p2_blocker_list.json"],
     "p4": ["artifacts/p3_task_graph.json", "artifacts/p3_task_plans.json"],
 }
 
@@ -562,7 +563,7 @@ class WorkAgent:
         for r in (tool_result.get("risk_list") or [])[:8]:
             risks.append({"level": r.get("risk_level", "info"),
                           "desc": r.get("title") or str(r)[:80],
-                          "source_ref": "artifacts/p2_risk_list.json"})
+                          "source_ref": "artifacts/p2/p2_risk_list.json"})
         desens = tool_result.get("desensitization") or {}
         if desens and not desens.get("ok", True):
             risks.append({"level": "L2", "desc": f"脱敏扫描 {len(desens.get('issues', []))} 项待确认",
@@ -607,8 +608,8 @@ class WorkAgent:
             # 采集产物（source_index.json 为主，intake_report.json 承载最终识别）。materialization/
             # source_type 为采集事实一并登记（引用 intake_report）。
             ident = tool_result.get("identification") or {}
-            si_ref = "artifacts/source_index.json"
-            ir_ref = "artifacts/intake_report.json"
+            si_ref = "artifacts/p0/source_index.json"
+            ir_ref = "artifacts/p0/intake_report.json"
             m = tool_result.get("materialized") or {}
             out.append({"key": "materialization",
                         "statement": f"源码物化状态={m.get('materialization_status')}，文件数={tool_result.get('file_count',0)}",
@@ -643,8 +644,8 @@ class WorkAgent:
             # R17.5 P1 WP-1: P1 是 LLM 建档识别阶段——claim 为 LLM 深化建档结论，内联引用其推理所据的
             # 上游 P0 产物（intake_report.json 承载 P0 识别、source_index.json 承载采集）。样本值 LLM 生成。
             ident = tool_result.get("identification") or {}
-            ir_ref = "artifacts/intake_report.json"          # P0 上游识别（复用基线）
-            si_ref = "artifacts/source_index.json"           # P0 采集
+            ir_ref = "artifacts/p0/intake_report.json"          # P0 上游识别（复用基线）
+            si_ref = "artifacts/p0/source_index.json"           # P0 采集
             tech = ident.get("tech_stack") or {}
             deps = ident.get("dependency_draft") or {}
             dep_total = deps.get("total", len(deps.get("dependencies", []) or []))
@@ -652,47 +653,47 @@ class WorkAgent:
             out.append({"key": "primary_language",
                         "statement": (f"P1 建档主语言：{tech.get('primary_language') or tool_result.get('primary_language') or '未确定'}"
                                       f"（复用 P0 识别：{tool_result.get('reused_p0_primary_language')}）"),
-                        "artifact_ref": "artifacts/tech_stack.json",
+                        "artifact_ref": "artifacts/p1/tech_stack.json",
                         "detail": {"primary_language": tech.get("primary_language"),
                                    "reused_p0": tool_result.get("reused_p0_primary_language")},
                         "cited_refs": [ir_ref, si_ref]})
             out.append({"key": "dependencies",
                         "statement": f"LLM 建档依赖项 {dep_total} 项",
-                        "artifact_ref": "artifacts/dependency_draft.json",
+                        "artifact_ref": "artifacts/p1/dependency_draft.json",
                         "detail": {"dependency_total": dep_total},
                         "cited_refs": [si_ref]})
             out.append({"key": "entry_points",
                         "statement": f"LLM 判定应用入口 {len(ident.get('entry_points') or [])} 项",
-                        "artifact_ref": "artifacts/entry_points.json",
+                        "artifact_ref": "artifacts/p1/entry_points.json",
                         "detail": {"entry_point_count": len(ident.get("entry_points") or [])},
                         "cited_refs": [ir_ref]})
             out.append({"key": "acceptance_baseline",
                         "statement": (f"原始验收基准已捕获（status={tool_result.get('acceptance_baseline_status')}；"
                                       f"D-106 静态基线+动态黄金/needs_env）"),
-                        "artifact_ref": "artifacts/acceptance_baseline.json",
+                        "artifact_ref": "artifacts/p1/acceptance_baseline.json",
                         "detail": {"baseline_status": tool_result.get("acceptance_baseline_status")},
                         "cited_refs": [si_ref]})
             out.append({"key": "uncertainty",
                         "statement": f"LLM 主动发声识别盲区 {len(gaps)} 项（防 0-gap 掩盖，公理3）",
-                        "artifact_ref": "artifacts/uncertainty_manifest.json",
+                        "artifact_ref": "artifacts/p1/uncertainty_manifest.json",
                         "detail": {"gap_count": len(gaps)},
                         "cited_refs": [ir_ref]})
         elif st == "p2":
             for i, r in enumerate((tool_result.get("risk_list") or [])[:8]):
                 out.append({"key": f"risk-{i}",
                             "statement": f"迁移/重构风险：{r.get('title') or r.get('desc') or str(r)[:80]}",
-                            "artifact_ref": f"artifacts/p2_risk_list.json#item[{i}]",
+                            "artifact_ref": f"artifacts/p2/p2_risk_list.json#item[{i}]",
                             "detail": {"risk_level": r.get("risk_level"), "source": r.get("source")},
                             "cited_refs": r.get("evidence_refs") or []})
             for i, b in enumerate((tool_result.get("blocker_list") or [])[:4]):
                 out.append({"key": f"blocker-{i}",
                             "statement": f"阻塞项：{b.get('title') or str(b)[:80]}",
-                            "artifact_ref": f"artifacts/p2_blocker_list.json#item[{i}]", "detail": {},
+                            "artifact_ref": f"artifacts/p2/p2_blocker_list.json#item[{i}]", "detail": {},
                             "cited_refs": (b.get("evidence_refs") or []) if isinstance(b, dict) else []})
             for i, g in enumerate((tool_result.get("validation_gap_list") or [])[:4]):
                 out.append({"key": f"vgap-{i}",
                             "statement": f"验证缺口：{g.get('title') or str(g)[:80]}",
-                            "artifact_ref": f"artifacts/p2_validation_gaps.json#item[{i}]", "detail": {},
+                            "artifact_ref": f"artifacts/p2/p2_validation_gaps.json#item[{i}]", "detail": {},
                             "cited_refs": (g.get("evidence_refs") or []) if isinstance(g, dict) else []})
         elif st == "p3":
             # C1: P3 计划类结论内联引用其所依据的上游 P2 产物（stage plan basis_refs /

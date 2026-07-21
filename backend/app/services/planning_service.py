@@ -285,7 +285,7 @@ class PlanningService:
         risk = parsed.get("risk_level", "L0")
         # C1: 内联 basis_refs——仅保留模型引用且真实存在于本阶段已读取上游产物中的 ref
         # （校验被引 ref 真实存在，勿杜撰；杜撰的 ref 被过滤，不进入内联引用）。
-        citable = set(f"artifacts/{n}" for n in inputs.get("sources_read", []))
+        citable = set(f"artifacts/p2/{n}" for n in inputs.get("sources_read", []))
         raw_basis = parsed.get("basis_refs", []) or []
         basis_refs = [r for r in raw_basis if isinstance(r, str) and r in citable]
         return StagePlanResult(
@@ -350,7 +350,7 @@ class PlanningService:
         finally:
             db.close()
 
-        citable = [f"artifacts/{n}" for n in sp_p2_sources]
+        citable = [f"artifacts/p2/{n}" for n in sp_p2_sources]
         messages = [
             {"role": "system", "content": self._combine_system(_TASK_PLAN_SYSTEM_PROMPT, system_prompt)},
             {"role": "user", "content": self._build_task_plan_prompt(sp_objective, sp_scope, user_goal, citable)},
@@ -758,7 +758,7 @@ class PlanningService:
         Best-effort; missing artifact → empty (recorded honestly, not invented)."""
         try:
             from app.services.workspace_service import workspace_path
-            fp = workspace_path(project_id) / "artifacts" / "p2_assessment_report.json"
+            fp = workspace_path(project_id) / "artifacts" / "p2" / "p2_assessment_report.json"
             if fp.exists():
                 data = json.loads(fp.read_text(encoding="utf-8"))
                 return data.get("uncertainty_list", []) or []
@@ -772,7 +772,8 @@ class PlanningService:
                                   "sources_read": [], "missing": []}
         try:
             from app.services.workspace_service import workspace_path
-            art = workspace_path(project_id) / "artifacts"
+            # D-107: P2 产物位于 artifacts/p2/。
+            art = workspace_path(project_id) / "artifacts" / "p2"
             for name in ("p2_assessment_report.json", "p2_risk_list.json",
                          "p2_blocker_list.json", "p2_validation_gaps.json",
                          "p2_resource_needs.json"):
@@ -792,7 +793,7 @@ class PlanningService:
     def _build_user_prompt(self, inputs: dict) -> str:
         # 可引用上游产物清单：由本阶段真实读取到的 P2 产物构造（confirmed on disk），
         # 供模型在 basis_refs 内联引用，避免杜撰不存在的 artifact id（C1 真内联）。
-        citable = [f"artifacts/{n}" for n in inputs.get("sources_read", [])]
+        citable = [f"artifacts/p2/{n}" for n in inputs.get("sources_read", [])]
         return (
             f"项目 ID：{inputs.get('project_id')}\n"
             f"用户目标/范围：{inputs.get('user_goal') or '（未提供）'}\n"

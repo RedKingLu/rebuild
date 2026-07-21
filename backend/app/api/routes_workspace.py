@@ -718,11 +718,20 @@ async def get_stage_artifacts(project_id: str, stage: str):
     art_dir = workspace_path(project_id) / "artifacts"
     stage_l = (stage or "").lower()
     if stage_l == "p0":
-        items = [{"name": name, "label": label, "exists": (art_dir / name).exists()}
+        # D-107: intake_report.json 为 P0 领域产物(artifacts/p0/)；p0_* 编排报告仍在根。
+        def _p0_exists(name: str) -> bool:
+            return (art_dir / "p0" / name).exists() or (art_dir / name).exists()
+        items = [{"name": name, "label": label, "exists": _p0_exists(name)}
                  for name, label in _P0_CORE_ARTIFACTS]
     else:
-        present = sorted(f.name for f in art_dir.glob("*")) if art_dir.exists() else []
-        items = [{"name": n, "label": n, "exists": True} for n in present]
+        # D-107: 领域产物分层于 artifacts/{stage}/，编排报告在根——两处都列（去重）。
+        present: list = []
+        if art_dir.exists():
+            present.extend(f.name for f in art_dir.glob("*") if f.is_file())
+            sub = art_dir / stage_l
+            if sub.is_dir():
+                present.extend(f.name for f in sub.glob("*") if f.is_file() and not f.name.startswith("_"))
+        items = [{"name": n, "label": n, "exists": True} for n in sorted(set(present))]
     return SuccessEnvelope(data={"stage": stage_l, "artifacts": items}, meta=Meta())
 
 
@@ -741,17 +750,18 @@ async def get_profiling_summary(project_id: str):
     if project is None:
         raise HTTPException(404, f"Project {project_id} not found")
     art_dir = workspace_path(project_id) / "artifacts"
-    summary_path = art_dir / "profiling_summary.md"
+    p1_dir = art_dir / "p1"   # D-107: P1 产物分层
+    summary_path = p1_dir / "profiling_summary.md"
 
     # Authoritative items + real existence (single source, T2)
     items = [
         {"key": key, "label": label,
-         "exists": (art_dir / f"{key}.json").exists()}
+         "exists": (p1_dir / f"{key}.json").exists()}
         for key, label in PROFILING_ITEMS
     ]
     # Evidence Gaps source = uncertainty_manifest.json content (T3, not inferred)
     uncertainty = None
-    um_path = art_dir / "uncertainty_manifest.json"
+    um_path = p1_dir / "uncertainty_manifest.json"
     if um_path.exists():
         try:
             uncertainty = _json.loads(um_path.read_text(encoding="utf-8"))
@@ -766,7 +776,7 @@ async def get_profiling_summary(project_id: str):
     return SuccessEnvelope(data={
         "available": True,
         "summary": summary_path.read_text(encoding="utf-8"),
-        "artifacts": [f.name for f in art_dir.glob("*.json")],
+        "artifacts": [f.name for f in p1_dir.glob("*.json") if not f.name.startswith("_")],
         "items": items,
         "uncertainty": uncertainty,
     }, meta=Meta())
@@ -786,7 +796,7 @@ async def get_assessment_summary(project_id: str):
     svc = get_services()
     if svc.project_service.get(project_id) is None:
         raise HTTPException(404, f"Project {project_id} not found")
-    art_dir = workspace_path(project_id) / "artifacts"
+    art_dir = workspace_path(project_id) / "artifacts" / "p2"  # D-107: P2 产物分层
 
     def _read(name: str) -> dict | None:
         fp = art_dir / name
@@ -805,7 +815,14 @@ async def get_assessment_summary(project_id: str):
     gaps = _read("p2_validation_gaps.json")
     resources = _read("p2_resource_needs.json")
     # WP-6 (Q-R17.3-6-2): 模型全失败强制中断的结构化报错（已尝试链路 + 原因 + 用户操作）。
-    model_error = _read("p2_model_error.json")
+    # model_error 为 WorkAgent 级产物，落于 artifacts/ 根（非 p2 分层），单独读取。
+    _me_fp = workspace_path(project_id) / "artifacts" / "p2_model_error.json"
+    model_error = None
+    if _me_fp.exists():
+        try:
+            model_error = _json.loads(_me_fp.read_text(encoding="utf-8"))
+        except Exception:
+            model_error = {"_unreadable": True}
 
     # P2 not assessed yet → honest empty state (§4.10; no fabricated content)
     if report is None and risk is None and blocker is None:
@@ -835,7 +852,7 @@ async def get_assessment_summary(project_id: str):
         "blocker_list": (blocker or {}).get("items", []),
         "validation_gap_list": (gaps or {}).get("items", []),
         "resource_needs": (resources or {}).get("items", []),
-        "artifacts": [f"artifacts/{n}" for n in (
+        "artifacts": [f"artifacts/p2/{n}" for n in (
             "p2_assessment_report.json", "p2_risk_list.json", "p2_blocker_list.json",
             "p2_validation_gaps.json", "p2_resource_needs.json")
             if (art_dir / n).exists()],

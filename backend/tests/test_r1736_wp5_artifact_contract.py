@@ -83,9 +83,9 @@ async def test_new05_p0_artifacts_reflect_written(isolated_data):
     result = await handler.execute({"project_id": pid, "source_type": "manual",
                                     "source_config": {}})
     arts = result["artifacts"]
-    # 真实反映：intake_report.json + source_index.json 均在磁盘且被报告
-    assert "artifacts/intake_report.json" in arts
-    assert "artifacts/source_index.json" in arts, f"漏报 source_index，arts={arts}"
+    # 真实反映：intake_report.json + source_index.json 均在磁盘且被报告（D-107: artifacts/p0/）
+    assert "artifacts/p0/intake_report.json" in arts
+    assert "artifacts/p0/source_index.json" in arts, f"漏报 source_index，arts={arts}"
     # 无幻影：每个 ref 都真实存在于盘
     for ref in arts:
         assert (workspace_service.workspace_path(pid) / ref).exists()

@@ -18,7 +18,7 @@ def _mk_project(client) -> str:
 
 
 def _seed_p2_artifacts(pid: str) -> None:
-    art = workspace_service.workspace_path(pid) / "artifacts"
+    art = workspace_service.workspace_path(pid) / "artifacts" / "p2"  # D-107: P2 产物分层
     art.mkdir(parents=True, exist_ok=True)
     (art / "p2_assessment_report.json").write_text(json.dumps({
         "artifact_type": "assessment_report", "analysis_only": True,

@@ -124,10 +124,11 @@ def _seed_source(project_id: str) -> None:
 
 
 def _seed_p0_upstream(project_id: str, primary="Python") -> None:
-    """WP-2：写 P0 上游产物（intake_report + source_index）供 P1 复用（不重算）。"""
+    """WP-2：写 P0 上游产物（intake_report + source_index）供 P1 复用（不重算）。D-107: artifacts/p0/。"""
     from app.services.source_materializer import generate_source_index
     generate_source_index(project_id, source_type="local_dir")
-    art = workspace_service.workspace_path(project_id) / "artifacts"
+    art = workspace_service.workspace_path(project_id) / "artifacts" / "p0"
+    art.mkdir(parents=True, exist_ok=True)
     intake = {"artifact_type": "intake_report", "produced_by": "llm_node_worker_agent",
               "primary_language": primary, "migration_target": {"os": "openEuler", "cpu": "ARM64"},
               "identification": {"primary_language": primary, "detected_stack": [primary, "TypeScript"],
@@ -181,8 +182,8 @@ async def test_p1_llm_profiling_produces_claim_evidence_and_reuses_p0(isolated_d
     assert cem["map_type"] == "claim_evidence"
     assert cem["entries"] and all(e["produced_by"] == "llm" for e in cem["entries"])
     assert all(e["bindings"]["artifact_refs"] for e in cem["entries"])
-    # LLM 建档识别产物真实落盘（produced_by 非 deterministic）
-    art = workspace_service.workspace_path(pid) / "artifacts"
+    # LLM 建档识别产物真实落盘（produced_by 非 deterministic；D-107: artifacts/p1/）
+    art = workspace_service.workspace_path(pid) / "artifacts" / "p1"
     tech = json.loads((art / "tech_stack.json").read_text("utf-8"))
     assert tech["primary_language"] == "Python"
     # WP-B：原始验收基准 acceptance_baseline.json 产出（静态 + 动态黄金真捕获）

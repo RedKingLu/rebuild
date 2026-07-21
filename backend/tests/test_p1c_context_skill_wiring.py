@@ -94,8 +94,9 @@ def _seed_real_skill(category: str, tmp: str):
 
 
 async def test_p2_handler_uses_context_and_skill_metadata(client):
-    """RealP2Handler.execute assembles context and the system prompt carries Skill
-    METADATA (name+description), not the full SKILL.md body (progressive disclosure)."""
+    """RealP2Handler.execute assembles context; per D-108 (skill-first) P2 now loads the
+    FULL P2 评估 stage skill body（P-migration-assessment）into the prompt（不再仅 metadata），
+    使评估需求随 skill 走、提示词瘦身。system_prompt 仍带 Skill 元数据（description）。"""
     pid = _mk_project(client)
     with tempfile.TemporaryDirectory() as tmp:
         _seed_real_skill("p2", tmp)
@@ -112,9 +113,12 @@ async def test_p2_handler_uses_context_and_skill_metadata(client):
     sys = gw.system_prompts[0]
     # assembled context reached the model (C0 governance text present)
     assert "治理" in sys or "ModelGateway" in sys, "assembled C0-C6 context not in system prompt"
-    # Skill METADATA present (description), full body NOT (progressive disclosure)
+    # Skill METADATA present (description) via build_system_prompt
     assert _SKILL_DESC in sys, "Skill metadata (description) must be in the system prompt"
-    assert "SECRETBODYMARKER" not in sys, "full SKILL.md body must NOT be dumped into the prompt"
+    # D-108 skill-first + R17.5 P2 返工3：本阶段【主工作流 skill】(P-migration-assessment) 正文必须
+    # 真正进入 prompt（primary-first 置顶，不被广选跨阶段 skill 挤出 12000 预算）——验证其独有内容。
+    assert "迁移评估工作流" in sys or "adr_candidates" in sys, \
+        "P2 主 skill(P-migration-assessment) 正文必须进入 skill_body（skill-first 真生效）"
     # domain output contract preserved (real products)
     assert "assessment_report" in sys
 

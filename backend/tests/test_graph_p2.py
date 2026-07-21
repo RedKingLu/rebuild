@@ -65,7 +65,7 @@ async def test_p2_handler_completed_produces_artifacts_and_evidence(tmp_path, mo
     assert res["analysis_only"] is True
     # §4.6 five artifacts on disk
     assert len(res["artifacts"]) == 5
-    art = tmp_path / "proj-1" / "artifacts"
+    art = tmp_path / "proj-1" / "artifacts" / "p2"  # D-107: P2 产物分层
     assert (art / "p2_risk_list.json").exists()
     assert (art / "p2_assessment_report.json").exists()
     # §4.7 five evidence persisted + queryable
