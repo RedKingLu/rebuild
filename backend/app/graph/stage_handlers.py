@@ -1041,8 +1041,12 @@ class RealP3Handler:
         }
 
     def _write_artifacts(self, project_id: str, sp, batch, tg) -> List[str]:
-        """§5.6: 方案 / Stage Plan / Task Plan / TaskGraph / Gate 策略 / 验证策略 Artifact."""
-        art_dir = workspace_service.workspace_path(project_id) / "artifacts"
+        """§5.6: 方案 / Stage Plan / Task Plan / TaskGraph / Gate 策略 / 验证策略 Artifact.
+
+        D-107: 领域 3 产物写入 artifacts/p3/（分层），并产出 artifacts/p3/_stage_package.json
+        完成包清单（对齐 P0/P1/P2，供 P4 按需加载）。
+        """
+        art_dir = stage_artifact_dir(project_id, "p3")
         art_dir.mkdir(parents=True, exist_ok=True)
         files = {
             "p3_stage_plan.json": {"artifact_type": "stage_plan", "stage_plan_ref": sp.stage_plan_id,
@@ -1059,13 +1063,46 @@ class RealP3Handler:
         }
         refs: List[str] = []
         for name, payload in files.items():
-            _mediated_write(project_id, f"artifacts/{name}",
+            _mediated_write(project_id, f"artifacts/p3/{name}",
                             json.dumps({"project_id": project_id, "stage": "p3",
                                         "generated_at": _now(), **payload},
                                        ensure_ascii=False, indent=2),
                             auditor=self.auditor, stage="p3", action="write_p3_artifact")
-            refs.append(f"artifacts/{name}")
+            refs.append(f"artifacts/p3/{name}")
+        self._write_p3_package(project_id, refs, sp, batch, tg)
         return refs
+
+    def _write_p3_package(self, project_id: str, refs: list, sp, batch, tg) -> None:
+        """D-107: 写 artifacts/p3/_stage_package.json（P3 完成包清单，供 P4 按需加载）。
+
+        products 描述 + key_for_next（task_graph/task_plans 是 P4 关键加载源 = True）+ 风险/证据
+        摘要 + 进入 P4 建议。产物文件名从 refs（真实落盘）派生，诚实不虚报。
+        """
+        _meta = {
+            "p3_stage_plan.json": ("stage_plan", "迁移 Stage Plan（目标/范围/out_of_scope/风险/Gate 策略/完成条件/P5 验证策略）", False),
+            "p3_task_plans.json": ("task_plan", "Task Plan Batch（每任务输入/动作/输出/风险/回退/验收/证据计划）", True),
+            "p3_task_graph.json": ("task_graph", "TaskGraph（节点+依赖边+DAG，P4 加载源）", True),
+        }
+        products = []
+        for ref in refs:
+            fn = ref.split("/")[-1]
+            t, desc, kfn = _meta.get(fn, (fn.rsplit(".", 1)[0], "P3 产物", False))
+            products.append(product_entry(fn, t, desc, key_for_next=kfn))
+        try:
+            write_stage_package(
+                project_id, "p3", products=products,
+                evidence_summary={"stage_plan_ref": sp.stage_plan_id,
+                                  "task_graph_ref": tg.task_graph_id,
+                                  "task_plan_count": len(batch.task_plan_ids),
+                                  "node_count": tg.node_count, "edge_count": tg.edge_count,
+                                  "degraded": tg.degraded},
+                risks=[{"title": "批次风险等级", "risk_level": batch.batch_risk_level,
+                        "gate_required": batch.gate_required}],
+                next_stage_advice=("进入 P4 执行：按 TaskGraph execution 节点受控施工，产出真实 "
+                                   "output_code/patch 并过 Acceptance；高风险任务遵循回退策略。"),
+                auditor=self.auditor, tracer=self.tracer)
+        except Exception:
+            logger.warning("P3 stage package 写入失败（advisory）", exc_info=True)
 
     def review(self, result: dict) -> ReviewResult:
         status = result.get("status")

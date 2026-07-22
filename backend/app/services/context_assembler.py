@@ -36,6 +36,7 @@ STAGE_PRIMARY_SKILL = {
     "p0": "P-codebase-onboarding",
     "p1": "full-stack-profiler",
     "p2": "P-migration-assessment",
+    "p3": "P-migration-planning",
 }
 
 

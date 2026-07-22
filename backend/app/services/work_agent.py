@@ -72,13 +72,13 @@ _LLM_STAGES = {"p0", "p1", "p2", "p3", "p4"}
 _NON_LANG_EXTS = {".json", ".yaml", ".yml", ".xml", ".md", ".txt", ".lock", ".rst"}
 
 # 各阶段上游产物（供 claim-evidence 绑定「引用了哪些上游证据」；§3.6 通用，非硬编码 MicroOA）。
-# D-107: P0/P1/P2 产物位于 artifacts/{stage}/；P3+ 暂扁平（P3-P6 遵循，后续轮次）。
+# D-107: P0-P3 产物均位于 artifacts/{stage}/（R17.5 P3 轮统一分层）；P4-P6 遵循，后续轮次。
 _STAGE_UPSTREAM_ARTIFACTS = {
     "p2": ["artifacts/p1/tech_stack.json", "artifacts/p1/p2_input_manifest.json",
            "artifacts/p1/dependency_draft.json"],
     "p3": ["artifacts/p2/p2_risk_list.json", "artifacts/p2/p2_assessment_report.json",
            "artifacts/p2/p2_blocker_list.json"],
-    "p4": ["artifacts/p3_task_graph.json", "artifacts/p3_task_plans.json"],
+    "p4": ["artifacts/p3/p3_task_graph.json", "artifacts/p3/p3_task_plans.json"],
 }
 
 
@@ -704,19 +704,19 @@ class WorkAgent:
             task_basis = tool_result.get("task_basis_refs") or plan_basis
             out.append({"key": "stage_plan",
                         "statement": f"迁移 Stage Plan 已生成（ref={tool_result.get('stage_plan_ref')}）",
-                        "artifact_ref": "artifacts/p3_stage_plan.json",
+                        "artifact_ref": "artifacts/p3/p3_stage_plan.json",
                         "detail": {"stage_plan_ref": tool_result.get("stage_plan_ref")},
                         "cited_refs": plan_basis})
             out.append({"key": "task_graph",
                         "statement": (f"TaskGraph 已生成（ref={tool_result.get('task_graph_ref')}，"
                                       f"degraded={tool_result.get('degraded')}）"),
-                        "artifact_ref": "artifacts/p3_task_graph.json",
+                        "artifact_ref": "artifacts/p3/p3_task_graph.json",
                         "detail": {"task_graph_ref": tool_result.get("task_graph_ref"),
                                    "batch_risk_level": tool_result.get("batch_risk_level")},
                         "cited_refs": plan_basis})
             out.append({"key": "task_plans",
                         "statement": f"Task Plan(Batch) 已生成（batch={tool_result.get('batch_id')}）",
-                        "artifact_ref": "artifacts/p3_task_plans.json",
+                        "artifact_ref": "artifacts/p3/p3_task_plans.json",
                         "detail": {"batch_id": tool_result.get("batch_id")},
                         "cited_refs": task_basis})
         elif st == "p4":

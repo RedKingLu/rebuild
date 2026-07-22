@@ -80,7 +80,8 @@ async def test_p3_handler_completed_full_chain(tmp_path, monkeypatch):
     assert len(res["artifacts"]) == 3                              # §5.6
     assert len(res["evidence_refs"]) == 6                          # §5.7 six items
     art = tmp_path / "proj-1" / "artifacts"
-    assert (art / "p3_task_graph.json").exists()
+    # D-107 (R17.5 P3): 领域 3 产物迁入 artifacts/p3/ 子目录（约定变更，非 bug）。
+    assert (art / "p3" / "p3_task_graph.json").exists()
     assert len(aet.list_evidence("proj-1", stage="p3")) == 6
     assert h.review(res).passed is True
 

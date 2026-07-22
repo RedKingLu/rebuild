@@ -50,12 +50,16 @@ class _CapturingGateway:
     async def call(self, *, messages, **kwargs):
         sys = messages[0]["content"] if messages else ""
         self.system_prompts.append(sys)
-        if "Stage Plan" in sys and "拆解" not in sys:
-            content = _P3_STAGE_PLAN
+        # R17.5 P3 (D-108 skill-first): 主 skill 描述含「Stage Plan + Task Plan Batch +
+        # TaskGraph」，经 context_assembler 注入并 threaded 进全部三个子调用的 system prompt，
+        # 故泛化的 "Stage Plan" 子串现于每个调用。先匹配调用专属标记（TaskGraph 的边 /
+        # 拆解出一批），最后才回落 "Stage Plan"，使 dispatch 不受上下文串污染。
+        if "TaskGraph 的边" in sys:
+            content = _P3_EDGES
         elif "拆解出一批任务级 Task Plan" in sys:
             content = _P3_TASK_PLANS
-        elif "TaskGraph 的边" in sys:
-            content = _P3_EDGES
+        elif "Stage Plan" in sys:
+            content = _P3_STAGE_PLAN
         else:
             content = _P2_CONTENT
         return {"status": "completed", "content": content, "model": "fake-model"}

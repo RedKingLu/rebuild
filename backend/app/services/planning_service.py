@@ -54,42 +54,42 @@ STAGE_PLAN_FIELDS = [
     "expected_artifacts", "expected_evidence", "gate_policy", "completion_criteria",
 ]
 
+# R17.5 P3（D-108 skill-first）：规划方法/要求正文已移入 P3 主 stage skill
+# `source/skills/p3/P-migration-planning/SKILL.md`（经 context_assembler 注入 system_prompt，
+# STAGE_PRIMARY_SKILL 置顶）。这里的 _SYSTEM_PROMPT 仅保留【编排 + 锚点 JSON 键契约】——
+# 机器解析（_parse / _persist_*）依赖这些键名，故键契约留在 Python 保证解析可靠性；
+# 方法论（方案须来源于 P2 / 声明 out_of_scope / 高风险显式 / 任务可追溯 / 回退策略 / PoC 先行 /
+# 条件化于用户裁决 / 不臆造 P5 slot 等）遵循 skill 正文。
 _STAGE_PLAN_SYSTEM_PROMPT = (
-    "你是 rebuild 平台的 P3 规划 Agent。基于 P2 评估产出（评估报告/风险/阻塞/验证缺口/资源需求），"
-    "为当前 P 阶段生成一份 Stage Plan（阶段级计划），供用户在 P3→P4 Gate 审核。"
+    "你是 rebuild 平台的 P3 规划 Agent，为当前 P 阶段生成 Stage Plan（供 P3→P4 Gate 审核）。"
+    "遵循已注入的 P3 规划工作流 skill（P-migration-planning）的方法与禁止项。"
     "严格输出 JSON，键为：objective(字符串,阶段目标), scope(数组,范围内事项), out_of_scope(数组,明确不做), "
     "risk_level(L0-L5), permission_boundary(字符串,权限边界), expected_artifacts(数组), "
     "expected_evidence(数组), gate_policy(对象,哪些情况触发 Gate), completion_criteria(数组,计划覆盖完成条件), "
     "validation_strategy(字符串,P5 验证策略), basis_refs(数组,本计划所依据的上游 P2 产物 artifact ref)。"
-    "要求：方案必须来源于 P2 评估；basis_refs 必须内联列出本计划实际依据的上游 P2 产物 artifact ref"
-    "（只能取自【可引用上游产物】清单，勿杜撰）；必须声明 out_of_scope；"
-    "高风险动作必须在 risk_level/gate_policy 中显式标识。你生成的是待用户审核的计划草案，"
-    "不得替代执行、不得越过 Gate。"
 )
 
 
 _HIGH_RISK = ("L4", "L5")
 
 _TASK_PLAN_SYSTEM_PROMPT = (
-    "你是 rebuild 平台的 P3 规划 Agent。基于已生成的 Stage Plan，拆解出一批任务级 Task Plan"
-    "（Task Plan Batch），供 TaskGraph 承接。严格输出 JSON，键为："
+    "你是 rebuild 平台的 P3 规划 Agent，基于已生成的 Stage Plan 拆解出一批任务级 Task Plan"
+    "（Task Plan Batch），供 TaskGraph 承接。遵循已注入的 P3 规划工作流 skill"
+    "（P-migration-planning）的方法与禁止项。严格输出 JSON，键为："
     "batch_objective(字符串), batch_scope(数组), permission_boundary(字符串), "
     "validation_strategy(字符串,批次验收方式), exception_policy(字符串,异常升级策略), "
     "task_plans(数组，每项含 objective(字符串), scope(数组), inputs(数组), expected_outputs(数组), "
     "risk_level(L0-L5), permission_boundary(字符串), required_resources(数组), "
     "model_policy_override(字符串或null), validation_method(字符串), expected_artifacts(数组), "
     "expected_evidence(数组), title(字符串), basis_refs(数组,本任务所依据的上游 Stage Plan/P2 产物 artifact ref)))。"
-    "硬约束：每个 Task Plan 不得超出 Stage Plan 的 scope；basis_refs 必须内联列出本任务实际依据的上游"
-    "产物 artifact ref（只能取自【可引用上游产物】清单，勿杜撰）；高风险(L4/L5)任务必须在 risk_level "
-    "显式标识；任务必须可追溯到 Stage Plan。"
 )
 
 _TASK_GRAPH_SYSTEM_PROMPT = (
-    "你是 rebuild 平台的 P3 规划 Agent。为给定的任务节点列表设计任务级 TaskGraph 的边（依赖顺序）。"
+    "你是 rebuild 平台的 P3 规划 Agent，为给定的任务节点列表设计任务级 TaskGraph 的边（依赖顺序）。"
+    "遵循已注入的 P3 规划工作流 skill（P-migration-planning）的方法与禁止项。"
     "严格输出 JSON：{\"edges\": [{source_index, target_index, edge_type}]}。"
-    "edge_type 表达任务间关系（串行 sequence / 并行 parallel / 条件 conditional / 失败 failure / "
-    "重试 retry / 返工 rework / 合并 merge 等）。只表达任务依赖，不得让 TaskGraph 越过用户 Gate。"
-    "若任务本就线性，用 sequence 单链即可。"
+    "edge_type ∈ 串行 sequence / 并行 parallel / 条件 conditional / 失败 failure / "
+    "重试 retry / 返工 rework / 合并 merge。若任务本就线性，用 sequence 单链即可。"
 )
 
 

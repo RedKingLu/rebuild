@@ -1,0 +1,74 @@
+---
+name: P-migration-planning
+description: P3 规划阶段 — 基于 P2 评估产出与用户 Gate 裁决，把迁移/重构转化为可执行、可授权、可验证、可追踪的 Stage Plan + Task Plan Batch + TaskGraph；条件化于 P2 用户裁决（未裁决=草案 contingent，不硬跑 P4）；PoC 先行（最小可验证闭环优先，显式声明非 Production）；每个高风险任务必备回退策略；验证计划映射既有 P5 结构、不臆造 P5 slot；只产固定 3 产物、不发明 artifact/Gate；不以计划替代执行/验证
+metadata:
+  series: P
+  phase: P3
+  category: stage_skill
+  status: platform_runtime
+  source: rebuild R17.5（D-108；吸收参考轨 2A/2B P3 + ECC agentic-engineering/dynamic-workflow-mode 语境）
+  license: MIT
+---
+
+# P-migration-planning（迁移规划工作流）
+
+## 适用阶段与触发条件
+- 阶段：P3 规划。承 P2 评估（8 维度/风险/阻塞/验证缺口/资源/待确认 + adr_candidates）之后。
+- 触发：P2 completed 或有等价评估 Evidence，且用户已授权进入 P3。
+- 目标：把 P2 评估转化为可执行、可授权、可验证、可追踪的方案 + Stage Plan + Task Plan Batch + TaskGraph，为 P3→P4 用户 Gate 与 P4 执行提供可加载的任务图。**规划是设计，不是执行；不修改代码、不替代 P4 执行或 P5 验证。**
+
+## 输入（清单驱动按需加载，D-107）
+- P2 阶段完成包 `artifacts/p2/_stage_package.json`：据 key_for_next + 描述按需加载关键产物，而非写死文件名列表。
+- P2 关键产物：assessment_report（8 维度 + adr_candidates）、risk_list、blocker_list、validation_gaps、resource_needs、questions_for_user。
+- P0/P1 底座（按需）：source_index（DB 方言/文件面）、tech_stack、entry_points、acceptance_baseline（P5 验证策略依据）。
+- 目标运行环境（Environment Profile）、用户迁移目标、以及**用户 Gate 裁决/风险接受记录**（Audit risk_acceptance）。
+
+## 执行步骤（P3-1~P3-9，汇入固定 3 产物）
+1. Stage Plan：迁移阶段拆分 + 目标/范围/out_of_scope + Gate 计划 + 完成条件 + P5 验证策略。方案必须来源于 P2 评估（basis_refs 内联引用上游 artifact ref）。
+2. Task Plan Batch：按模块/层拆工作包，每包全字段——输入/动作/输出/负责 Agent 类型/验收标准/所需工具/风险等级/回退方案/证据计划。任务不得超出 Stage Plan scope，须可追溯到 Stage Plan。
+3. TaskGraph：节点 + 依赖边（EDGE_TYPES：sequence/parallel/conditional/failure/retry/rework/merge），DAG 无环，作为 P4 加载源。只表达任务依赖，不得让图越过用户 Gate。
+4. PoC 优先级：将 P2 的 PoC 建议转为最小可验证闭环的优先任务；显式声明"这是 PoC 非 Production"，不伪装全量已迁。
+5. 数据库迁移计划：基于 P2 方言证据规划 DDL/DML/编码/完整性/种子/回退——**在 P3 只规划不生成转换脚本**。
+6. 应用/配置/部署计划：目标工程/页面·接口/数据访问/认证/配置外置/部署承载的迁移任务规划。
+7. 验证计划：定义 P5 验证输入，**映射现有 P5 report 可承载结构，不臆造新 P5 slot**；环境不足项标 evidence_gap，不伪造。
+8. 回退策略：每个高风险 P4 工作包必须有回退方案（源只读 D-099，回退=丢弃 output_code 对应产物）。
+9. 验收标准 + P3→P4 Gate：三产物齐全、TaskGraph 可解释、P4 输入包清晰、待裁决项经 Gate/Audit 承载。
+
+## 输出 / 产物（固定 3 项，不发明）
+- `p3_stage_plan.json`（锚点字段：objective/scope/out_of_scope/risk_level/permission_boundary/expected_artifacts/expected_evidence/gate_policy/completion_criteria/validation_strategy/basis_refs）
+- `p3_task_plans.json`（batch + task_plans[每项全字段 + basis_refs]）
+- `p3_task_graph.json`（nodes + edges[EDGE_TYPES] + DAG；P4 加载源，version→created_at desc）
+- 写入 `artifacts/p3/` 并产 `artifacts/p3/_stage_package.json` 完成包（供 P4 按需加载）。
+- 模型输出为计划草案（plan_status=draft），非 Evidence 本身；待 P3→P4 用户 Gate 裁决，不自批。
+
+## 质量门 / 验收标准
+- 方案来源于 P2（basis_refs 指向真实存在的上游 artifact ref，禁杜撰；无据给空数组）。
+- Task Plan 每项全字段（含回退/验收/证据计划）；高风险(L4/L5)任务显式标识。
+- TaskGraph 可解释、DAG 无环、边策略显式、是 P4 可加载源。
+- 条件化于 P2 用户裁决：目标库/运行时/PoC 范围未裁决时，计划标 contingent，**不硬跑 P4**。
+- 验证计划映射 P5 既有结构，不臆造 slot。
+- 无有效模型 Key 时诚实 blocked，不降级为规则/模板规划。
+
+## 信创迁移要点
+- 目标库选型/路线是高影响决策 → 承接 P2 的 adr_candidates + 用户 P3 Gate 裁决落定，P3 不越权预判终局。
+- 国产环境（麒麟/统信 + 达梦/人大金仓/openGauss + TongWeb/宝兰德）不确定项进风险/evidence_gap，勿臆测。
+- P2→P3→P4 路线风险接受由 Audit risk_acceptance 承载，复用 stage_promotion，不新增 gate_type。
+
+## 反例 / 禁止（一票否决）
+- 禁止发明 P3 artifact（route_decision/db_script/deploy_files/poc_output 等）——只产固定 3 项。
+- 禁止在 P3 生成真实代码/补丁/DB 转换脚本/部署文件（那是 P4）。
+- 禁止无 P2 输入即规划；禁止路线未裁决却伪装已裁决。
+- 禁止 TaskGraph 越过用户 Gate；禁止无回退策略的高风险任务。
+- 禁止为 P5 臆造 slot；禁止把计划显示/记录为已执行或 accepted。
+- 禁止杜撰 basis_refs；禁止把模型输出当 Evidence；禁止记录明文凭据/Key。
+
+## 与平台集成
+- 模型调用经 ModelGateway（D-098），不硬编码模型名/endpoint。
+- 输入按 D-107 清单驱动按需加载，不写死文件名列表（§2.3：Agent 决定读什么）。
+- 产物挂 Project/Run/Stage，附 Trace/Audit；计划落 draft，Evidence 落库（D-066）。
+- 本 Skill 自检不替代独立 Acceptance Agent 验收（D-082）。
+- 次级能力 skill：P-agentic-engineering（任务分解/TaskGraph 设计/复杂度路由）、P-dynamic-workflow-mode（执行模式选择）可被本阶段调用。
+
+## 参考
+- 参考轨 2A（Copilot）/2B（Claude Code）P3 基线；ECC agentic-engineering / dynamic-workflow-mode（MIT）
+- rebuild：契约 §5；D-107（分文件夹+完成包+按需加载）；D-108（需求入 skill）；AGENTS §2.3

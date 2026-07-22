@@ -65,7 +65,9 @@ function getMaterials(gate: any): MaterialItem[] {
       'p2/p2_validation_gaps.json', 'p2/p2_resource_needs.json'].map(f => labelForRef(f));
   }
   if (stage === 'p3') {
-    return ['p3_stage_plan.json', 'p3_task_plans.json', 'p3_task_graph.json'].map(f => labelForRef(f));
+    // D-107: P3 域产物随 R17.5 P3 轮迁入 artifacts/p3/ 子目录（与 P0/P1/P2 一致）。
+    return ['p3/p3_stage_plan.json', 'p3/p3_task_plans.json', 'p3/p3_task_graph.json']
+      .map(f => labelForRef(f));
   }
   // p1 (default): real StageReport names（D-107: artifacts/p1/ 子目录）
   return ['p1/p1_start_plan.json', 'p1/p1_construction.json', 'p1/p1_acceptance.json'].map(f => labelForRef(f));

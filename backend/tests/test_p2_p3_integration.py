@@ -71,12 +71,15 @@ class _FakeGateway:
 
     async def call(self, *, messages, **kwargs):
         sys = messages[0]["content"] if messages else ""
-        if "Stage Plan" in sys and "拆解" not in sys:
-            content = _P3_STAGE_PLAN
+        # R17.5 P3 (D-108 skill-first): 主 skill 描述含「Stage Plan + Task Plan Batch +
+        # TaskGraph」，经 context_assembler threaded 进全部三个子调用的 system prompt，故泛化
+        # 的 "Stage Plan" 子串现于每个调用。先匹配调用专属标记，最后回落 "Stage Plan"。
+        if "TaskGraph 的边" in sys:
+            content = _P3_EDGES
         elif "拆解出一批任务级 Task Plan" in sys:
             content = _P3_TASK_PLANS
-        elif "TaskGraph 的边" in sys:
-            content = _P3_EDGES
+        elif "Stage Plan" in sys:
+            content = _P3_STAGE_PLAN
         else:  # P2 assessment
             content = _P2_CONTENT
         return {"status": "completed", "content": content, "model": "fake-model"}

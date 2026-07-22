@@ -926,11 +926,11 @@ async def get_planning_summary(project_id: str):
                       "edge_type": e.get("edge_type")}
                      for e in (tg.edges or []) if isinstance(e, dict)]
             # degraded flag is not on the definition row — read best-effort from the
-            # p3_task_graph.json artifact (honest: null when absent)
+            # p3_task_graph.json artifact (honest: null when absent). D-107: artifacts/p3/。
             degraded = None
             try:
                 import json as _json
-                fp = workspace_path(project_id) / "artifacts" / "p3_task_graph.json"
+                fp = workspace_path(project_id) / "artifacts" / "p3" / "p3_task_graph.json"
                 if fp.exists():
                     degraded = _json.loads(fp.read_text(encoding="utf-8")).get("degraded")
             except Exception:
