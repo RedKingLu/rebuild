@@ -182,7 +182,9 @@ class WorkAgent:
         return _STAGE_TASK_TYPE.get(self.stage, "default")
 
     def _artifacts_dir(self) -> Path:
-        return workspace_service.workspace_path(self.project_id) / "artifacts"
+        # D-107: per-stage subdirectory, not the flat artifacts/ root.
+        from app.services.stage_package import stage_artifact_dir
+        return stage_artifact_dir(self.project_id, self.stage)
 
     def _ws_root(self) -> Path:
         return workspace_service.workspace_path(self.project_id)

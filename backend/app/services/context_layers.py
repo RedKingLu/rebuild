@@ -146,14 +146,23 @@ def assemble_c4(project: dict, run: Optional[dict], stage: str, workspace_info: 
     return {"layer": "C4", "content": content, "chars": len(content)}
 
 
-def assemble_c5(node_task: Optional[str] = None, upstream_output: Optional[str] = None,
+def assemble_c5(node_task: Optional[str] = None,
+                upstream_output: Optional[str | dict] = None,
                 acceptance_feedback: Optional[str] = None) -> dict:
-    """C5 Node 层：当前节点 task / 上游输出 / Acceptance 反馈（D-091 小循环返工重装配）。"""
+    """C5 Node 层：当前节点 task / 上游输出 / Acceptance 反馈（D-091 小循环返工重装配）。
+
+    ``upstream_output`` 接受 str 或 dict（stage_handlers 传入
+    ``{"migration_target": ...}``）；dict 时序列化为 JSON 后截断。"""
+    import json as _json
     parts = ["【C5 Node 层】"]
     if node_task:
         parts.append(f"当前节点任务: {node_task}")
     if upstream_output:
-        parts.append(f"上游节点输出摘要: {upstream_output[:1000]}")
+        # R17.6 fix: upstream_output may be a dict (e.g. {"migration_target": ...}).
+        # Strings slice directly; dicts are JSON-serialized then truncated.
+        text = upstream_output if isinstance(upstream_output, str) else _json.dumps(
+            upstream_output, ensure_ascii=False, default=str)
+        parts.append(f"上游节点输出摘要: {text[:1000]}")
     if acceptance_feedback:
         parts.append(f"Acceptance 反馈（返工原因）: {acceptance_feedback[:500]}")
     if len(parts) == 1:

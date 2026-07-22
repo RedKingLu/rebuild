@@ -244,7 +244,10 @@ export function WorkspacePage() {
   // 未在执行、无待决 Gate。已在运行的项目（p0 in_progress/completed/... 或存在 Gate）不显示。
   const wizardOpen = !!project && !project.onboarding_done && !onbDismissed;
   const p0Status = run?.stage_status?.p0;
-  const p0NotStarted = !p0Status || p0Status === 'pending';
+  // Fix: 增加 run_status 守卫 — 即使 stage_status 同步滞后（后台图 resume 竞态窗口），
+  // 只要 run 已进入活跃状态（running/waiting_gate/completed 等），欢迎页绝不显示。
+  const runNotStarted = !run || run.run_status === 'created';
+  const p0NotStarted = (!p0Status || p0Status === 'pending') && runNotStarted;
   const showWelcome = !!project && !loading && !wizardOpen && p0NotStarted && !p0Executing && !data?.active_gate;
 
   if (error && loading) {

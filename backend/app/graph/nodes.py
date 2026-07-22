@@ -167,7 +167,8 @@ def _finalize_agent_gate_material(stage: str, project_id: str, run_id: str,
         if r and r not in refs:
             refs.append(r)
     if va is not None:
-        va_ref = f"artifacts/{stage}_validation.json"
+        # D-107: validation report lives in artifacts/{stage}/ subdirectory.
+        va_ref = f"artifacts/{stage}/{stage}_validation.json"
         if va_ref not in refs:
             refs.append(va_ref)
     # GATE-01（承 R17.3-4）：P5 阶段把 p5_validation_report.json 挂到 Gate 审核材料，

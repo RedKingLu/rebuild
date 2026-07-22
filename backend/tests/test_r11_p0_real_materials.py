@@ -26,7 +26,8 @@ def _make_manual_project(client, name="MicroOA-real-mat"):
 
 
 def _artifacts_dir(pid):
-    return workspace_service.workspace_path(pid) / "artifacts"
+    # D-107: stage artifacts live in artifacts/{stage}/ subdirectory.
+    return workspace_service.workspace_path(pid) / "artifacts" / "p0"
 
 
 def test_fabricated_p0_files_are_not_produced(client):

@@ -46,7 +46,8 @@ def test_graph_http_drive_p0_p1(tmp_path, monkeypatch, isolated_data):
         assert d["graph_capability_status"] == "live"
         art = workspace_service.workspace_path(pid) / "artifacts"
         assert (art / "p0" / "intake_report.json").exists(), "P0 real intake artifact via HTTP"
-        assert (art / "p0_acceptance.json").exists(), "P0 three-report via HTTP"
+        # D-107: StageReports live in artifacts/{stage}/ subdirectory.
+        assert (art / "p0" / "p0_acceptance.json").exists(), "P0 three-report via HTTP"
 
         # illegal decision → 400
         assert c.post(f"/api/projects/{pid}/graph/resume",

@@ -57,7 +57,8 @@ def _active_gate(c, pid):
 
 
 def _artifacts(pid):
-    return workspace_service.workspace_path(pid) / "artifacts"
+    # D-107: stage artifacts live in artifacts/{stage}/ subdirectory.
+    return workspace_service.workspace_path(pid) / "artifacts" / "p0"
 
 
 def _wait_for_gate_type(c, pid, gate_type, timeout=None):

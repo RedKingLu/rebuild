@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.services import workspace_service
+from app.services.stage_package import stage_artifact_dir
 
 
 def _now() -> str:
@@ -25,14 +26,20 @@ def _now() -> str:
 
 
 class StageReports:
-    """Produce/locate the three review reports for a stage in a project workspace."""
+    """Produce/locate the three review reports for a stage in a project workspace.
+
+    D-107: reports land under ``artifacts/{stage}/`` (per-stage subdirectory),
+    NOT the flat ``artifacts/`` root.  This aligns with intake_service /
+    source_materializer / stage_package which all use ``stage_artifact_dir()``.
+    """
 
     KINDS = ("start_plan", "construction", "acceptance")
 
     def __init__(self, project_id: str, stage: str):
         self.project_id = project_id
         self.stage = stage
-        self.artifacts_dir: Path = workspace_service.workspace_path(project_id) / "artifacts"
+        # D-107 fix: write into the per-stage subdirectory, not the flat root.
+        self.artifacts_dir: Path = stage_artifact_dir(project_id, stage)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, kind: str, ext: str = "json") -> Path:

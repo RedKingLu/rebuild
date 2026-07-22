@@ -77,9 +77,10 @@ async def test_p0_p1_real_business_in_graph(realp0p1):
     art = ws_root / "projects" / project_id / "artifacts"
     assert (art / "p0" / "intake_report.json").exists(), "P0 produced a real intake_report"
     # three D-092 reports for p0
-    assert (art / "p0_start_plan.json").exists()
-    assert (art / "p0_construction.json").exists()
-    assert (art / "p0_acceptance.json").exists()
+    # D-107: StageReports live in artifacts/{stage}/ subdirectory.
+    assert (art / "p0" / "p0_start_plan.json").exists()
+    assert (art / "p0" / "p0_construction.json").exists()
+    assert (art / "p0" / "p0_acceptance.json").exists()
     intake = json.loads((art / "p0" / "intake_report.json").read_text(encoding="utf-8"))
     assert intake["file_count"] >= 2
 
@@ -91,9 +92,9 @@ async def test_p0_p1_real_business_in_graph(realp0p1):
     assert (art / "p1" / "p2_input_manifest.json").exists(), "P1 produced real P2 manifest"
     json_artifacts = list((art / "p1").glob("*.json"))
     assert len(json_artifacts) >= 5, "P1 produced multiple real identification JSONs"
-    # p1 three reports
-    assert (art / "p1_start_plan.json").exists()
-    assert (art / "p1_acceptance.json").exists()
+    # p1 three reports (D-107: artifacts/p1/)
+    assert (art / "p1" / "p1_start_plan.json").exists()
+    assert (art / "p1" / "p1_acceptance.json").exists()
 
     # both stages created real promotion gates with attached report+domain refs
     stages_gated = [c[1] for c in gb.created]

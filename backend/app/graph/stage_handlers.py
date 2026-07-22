@@ -251,13 +251,27 @@ class RealP0Handler:
         run_id = state.get("run_id", "")
 
         # ── 采集①：物化源码（clone/zip/local，确定性采集，KEEP） ────────────
+        # R17.6 D-107 fix: graph resume (plan_approved → full re-execute) must NOT
+        # re-clone if source is already materialized with the same config.  The
+        # materializer's _try_reuse_git_source handles this when fingerprint is
+        # stable; this guard adds a belt-and-suspenders check that skips
+        # materialize() entirely when source/ already has files AND the
+        # materialization meta commit matches the real HEAD — preventing the
+        # re-clone that temporarily empties workspace/source/.
         materialized = {"materialization_status": "skipped", "file_count": 0}
         source_index: dict = {}
         try:
             from app.services.source_materializer import SourceMaterializer, generate_source_index
             m = SourceMaterializer(trace_writer=self.tracer, audit_writer=self.auditor)
-            materialized = m.materialize(project_id, src_type, source_config,
-                                         run_id=run_id)
+            if m._already_materialized(project_id, src_type, source_config):
+                materialized = {"materialization_status": "completed",
+                                "materialization_mode": "reuse_guard",
+                                "file_count": _source_file_count(project_id)}
+                logger.info("P0 execute: source already materialized, skipping re-clone project=%s",
+                            project_id)
+            else:
+                materialized = m.materialize(project_id, src_type, source_config,
+                                             run_id=run_id)
             if materialized.get("file_count", 0) > 0:
                 source_index = generate_source_index(project_id)
         except Exception as e:  # honest: record, do not fake success (D-097/公理3)

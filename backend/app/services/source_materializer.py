@@ -430,6 +430,38 @@ class SourceMaterializer:
 
     # ── REC-06: reuse / fetch-reset / integrity helpers ─────────────────
 
+    def _already_materialized(self, project_id: str, source_type: str,
+                              config: dict) -> bool:
+        """Belt-and-suspenders reuse check for callers (e.g. RealP0Handler) that
+        want to skip materialize() entirely when source is already on disk.
+
+        Returns True only when ALL of: (a) source/ has files, (b) materialization
+        meta exists, (c) config fingerprint matches, (d) on-disk HEAD commit
+        matches the recorded commit.  Any uncertainty → False (caller will
+        materialize, which has its own safe reuse path).
+        """
+        try:
+            if source_type not in ("git", "github"):
+                return False  # only git/github have meaningful reuse semantics
+            prior = self._read_materialization_meta(project_id)
+            if not prior:
+                return False
+            if prior.get("config_fingerprint") != self._config_fingerprint(source_type, config):
+                return False
+            target = workspace_path(project_id) / "source"
+            if not (target.exists() and (target / ".git").exists()):
+                return False
+            fc, _ = self._count_files(target)
+            if fc == 0:
+                return False
+            recorded = (prior.get("git_info") or {}).get("commit")
+            current = self._git_head_commit(target)
+            if not recorded or not current:
+                return False
+            return recorded == current
+        except Exception:
+            return False  # any doubt → let materialize() handle it
+
     def _try_reuse_git_source(self, project_id: str, source_type: str,
                               fingerprint: str, branch: str, target: Path,
                               result: dict) -> bool:
@@ -491,9 +523,15 @@ class SourceMaterializer:
 
     @staticmethod
     def _config_fingerprint(source_type: str, config: dict) -> str:
-        """Stable hash of (source_type, url, branch). Stores NO raw url/token."""
+        """Stable hash of (source_type, canonical_url, branch). Stores NO raw url/token.
+
+        D-107 fix: use ONLY clone_url (the canonical source URL) for fingerprinting.
+        ``remote_url`` is a try-first probe URL that may differ from the actual
+        materialized repo; including it makes the fingerprint unstable across
+        graph resume (first run may lack remote_url, resume includes it → mismatch
+        → unnecessary re-clone).  Branch IS part of the identity."""
         import hashlib
-        url = config.get("remote_url") or config.get("clone_url") or config.get("path") or ""
+        url = config.get("clone_url") or config.get("remote_url") or config.get("path") or ""
         branch = config.get("branch", "")
         raw = f"{source_type}|{url}|{branch}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()

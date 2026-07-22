@@ -105,7 +105,17 @@ def assemble_context(
     arts = []
     art_dir = ws / "artifacts"
     if art_dir.exists():
-        arts = [p.name for p in sorted(art_dir.iterdir()) if p.is_file()]
+        # D-107: 产物按 artifacts/{stage}/ 分层。除根目录扁平产物外，递归各阶段
+        # 子目录（p0-p6）收集产物名，过滤 `_` 开头的清单文件（如 _stage_package.json）。
+        for p in sorted(art_dir.iterdir()):
+            if p.is_file() and not p.name.startswith("_"):
+                arts.append(p.name)
+        for stage in ("p0", "p1", "p2", "p3", "p4", "p5", "p6"):
+            sub = art_dir / stage
+            if sub.is_dir():
+                for p in sorted(sub.iterdir()):
+                    if p.is_file() and not p.name.startswith("_"):
+                        arts.append(f"{stage}/{p.name}")
     workspace_info = {
         "path": str(ws),
         "source_exists": (ws / "source").exists() and any((ws / "source").iterdir()),

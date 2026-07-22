@@ -39,7 +39,7 @@ async def test_fup3_acceptance_issues_are_structured_objects(isolated_data):
                    planned_actions=["调用模型生成规划"],
                    execute_fn=lambda: {"status": "blocked"}, review_fn=review_fn)
 
-    acc = json.loads((workspace_service.workspace_path(pid) / "artifacts"
+    acc = json.loads((workspace_service.workspace_path(pid) / "artifacts" / "p3"
                       / "p3_acceptance.json").read_text("utf-8"))
     assert isinstance(acc["issues"], list) and acc["issues"], "issues 应非空列表"
     first = acc["issues"][0]
@@ -61,7 +61,7 @@ async def test_fup3_self_check_issues_also_structured(isolated_data):
         execute_fn=lambda: {"status": "completed"},
         review_fn=lambda r: ReviewResult(passed=True, issues=[]),
         self_check_fn=lambda r: ["自检失败项 X"])
-    acc = json.loads((workspace_service.workspace_path(pid) / "artifacts"
+    acc = json.loads((workspace_service.workspace_path(pid) / "artifacts" / "p1"
                       / "p1_acceptance.json").read_text("utf-8"))
     assert acc["issues"], "self_check 触发 issues"
     assert all(isinstance(i, dict) for i in acc["issues"]), "issues 全为结构化对象"

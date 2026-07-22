@@ -216,7 +216,7 @@ async def test_p1_validation_agent_independent_pass(isolated_data):
     vres = va.last_result
     assert vres.read_from_disk_only is True
     assert vres.verdict in ("accepted", "accepted_with_warning")
-    assert (workspace_service.workspace_path(pid) / "artifacts" / "p1_validation.json").exists()
+    assert (workspace_service.workspace_path(pid) / "artifacts" / "p1" / "p1_validation.json").exists()
 
 
 async def test_p1_llm_profiling_blocked_no_key(isolated_data):
@@ -310,7 +310,7 @@ async def test_p1_plan_presentation_carries_dynamic_plan(isolated_data):
         plan_gate = gb.created[0]
         assert plan_gate["gate_type"] == "plan_presentation"
         assert any(r.endswith("p1_work_plan.json") for r in plan_gate["artifact_refs"])
-        plan = json.loads((workspace_service.workspace_path(pid) / "artifacts" /
+        plan = json.loads((workspace_service.workspace_path(pid) / "artifacts" / "p1" /
                            "p1_work_plan.json").read_text("utf-8"))
         assert plan["generated_by"] == "work_agent"
         assert plan["based_on"]["file_count"] == 3

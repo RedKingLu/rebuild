@@ -319,6 +319,14 @@ async def _run_graph_bg(run_id: str, decision: str | None, project_id: str, stag
             svc.run_service.set_run_status(run_id, "running")
         except Exception:
             logger.warning("图 resume 前同步 run_status=running 失败 run=%s", run_id, exc_info=True)
+        # Fix: 立即同步 stage_status=in_progress，消除批准 plan gate 后
+        # stage_status.p0 仍为 "pending" 的窗口（前端据此误判 P0 未启动，重新显示欢迎页）。
+        # 图完成后的最终同步（L351-356）保持不变，此处仅关闭竞态窗口。
+        try:
+            svc.run_service.set_stage_status(run_id, stage, "in_progress")
+        except Exception:
+            logger.warning("图 resume 前同步 stage_status=in_progress 失败 run=%s stage=%s",
+                           run_id, stage, exc_info=True)
 
         from app.graph.checkpoint import open_standalone_checkpointer, thread_config
         from app.graph.graph import build_graph

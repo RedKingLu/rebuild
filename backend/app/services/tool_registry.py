@@ -542,14 +542,34 @@ async def _execute_builtin(tool_name: str, args: dict, project_id: str, stage: s
         from app.services import workspace_service
         ws = workspace_service.workspace_path(project_id)
         art_dir = ws / "artifacts"
-        artifacts = [p.name for p in sorted(art_dir.iterdir()) if p.is_file()] if art_dir.exists() else []
+        # D-107: 产物按 artifacts/{stage}/ 分层；递归各阶段子目录收集，过滤 `_` 清单文件。
+        artifacts: list = []
+        if art_dir.exists():
+            for p in sorted(art_dir.iterdir()):
+                if p.is_file() and not p.name.startswith("_"):
+                    artifacts.append(p.name)
+            for st in ("p0", "p1", "p2", "p3", "p4", "p5", "p6"):
+                sub = art_dir / st
+                if sub.is_dir():
+                    for p in sorted(sub.iterdir()):
+                        if p.is_file() and not p.name.startswith("_"):
+                            artifacts.append(f"{st}/{p.name}")
         return {"project_id": project_id, "current_stage": stage,
                 "artifacts": artifacts, "source": "tool_registry_builtin"}
     elif tool_name == "read_artifact":
         path = args.get("artifact_path", "")
         try:
             from app.services.workspace_service import workspace_path
-            full = workspace_path(project_id) / "artifacts" / path
+            art_root = workspace_path(project_id) / "artifacts"
+            full = art_root / path
+            # D-107: 传入已含 {stage}/ 前缀时按原样解析；若传入裸文件名且扁平根找不到，
+            # 回退在 artifacts/{stage}/ 各子目录查找同名文件（找不到诚实返回不存在）。
+            if not full.exists() and "/" not in path:
+                for st in ("p0", "p1", "p2", "p3", "p4", "p5", "p6"):
+                    cand = art_root / st / path
+                    if cand.exists():
+                        full = cand
+                        break
             if full.exists():
                 return {"artifact_path": path, "content": full.read_text("utf-8", errors="replace")[:4000]}
             return {"artifact_path": path, "error": "文件不存在"}

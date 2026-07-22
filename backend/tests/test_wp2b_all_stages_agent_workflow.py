@@ -125,7 +125,8 @@ async def test_p0_llm_intake_workflow_with_key(isolated_data):
     rr = va.validate(result)
     assert rr.passed, f"P0 独立验收应通过 issues={rr.issues}"
     assert va.last_result.read_from_disk_only is True
-    assert (workspace_service.workspace_path(pid) / "artifacts" / "p0_validation.json").exists()
+    # D-107: validation report lives in artifacts/{stage}/ subdirectory.
+    assert (workspace_service.workspace_path(pid) / "artifacts" / "p0" / "p0_validation.json").exists()
 
 
 async def test_p0_llm_intake_blocked_no_key(isolated_data):
@@ -370,9 +371,9 @@ async def test_p5_deterministic_workflow_and_gate_material(isolated_data):
     # P5 无 P4 输入 → 诚实 blocked（不伪造）；WorkAgent 如实传导
     assert result["status"] in ("blocked", "completed")
     assert any(tc["tool"] == "p5_handler.execute" for tc in result["tool_calls"])
-    # 动态计划 + Gate Brief 落盘
-    assert (workspace_service.workspace_path(pid) / "artifacts" / "p5_work_plan.json").exists()
-    assert (workspace_service.workspace_path(pid) / "artifacts" / "p5_gate_brief.json").exists()
+    # 动态计划 + Gate Brief 落盘（D-107: artifacts/p5/）
+    assert (workspace_service.workspace_path(pid) / "artifacts" / "p5" / "p5_work_plan.json").exists()
+    assert (workspace_service.workspace_path(pid) / "artifacts" / "p5" / "p5_gate_brief.json").exists()
 
     rr = va.validate(result)
     # blocked → 不通过（诚实）
@@ -396,8 +397,8 @@ async def test_p6_deterministic_workflow_honest_blocked(isolated_data):
     result = await wa.execute({"project_id": pid, "run_id": "r1"})
     assert result["status"] == "blocked", "P5 未通过 → P6 诚实 blocked（不伪造交付）"
     assert any(tc["tool"] == "p6_handler.execute" for tc in result["tool_calls"])
-    # 动态计划 + Gate Brief 落盘（编排闭环成立）
-    assert (workspace_service.workspace_path(pid) / "artifacts" / "p6_work_plan.json").exists()
+    # 动态计划 + Gate Brief 落盘（编排闭环成立；D-107: artifacts/p6/）
+    assert (workspace_service.workspace_path(pid) / "artifacts" / "p6" / "p6_work_plan.json").exists()
 
     va = ValidationAgent("p6", pid, run_id="r1", handler=handler)
     rr = va.validate(result)
