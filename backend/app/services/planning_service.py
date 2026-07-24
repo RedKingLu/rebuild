@@ -46,7 +46,12 @@ _PLANNING_TIMEOUT = float(os.environ.get("P3_PLANNING_TIMEOUT", "240"))
 # JSON then truncates mid-object and fails to parse (empty task_plans → no TaskGraph).
 # Give the JSON-heavy planning calls more output headroom (env-tunable). The model's
 # context window (1M) easily accommodates this; edge proposal stays small.
-_PLANNING_MAX_TOKENS = int(os.environ.get("P3_PLANNING_MAX_TOKENS", "8192"))
+# R17.5-P4-FIX 批2.8: raised 8192 → 32768. On reasoning models (kimi/deepseek) the
+# reasoning chain consumes the token budget BEFORE the final large task_plans JSON is
+# emitted; at 8192 the forced-final synthesis hit the cap (real call_log: completion_tokens
+# =8192, final_text empty → P3 failed empty_content). 32768 leaves room for reasoning + the
+# large JSON product. Still env-tunable; context window (1M) easily accommodates it.
+_PLANNING_MAX_TOKENS = int(os.environ.get("P3_PLANNING_MAX_TOKENS", "32768"))
 
 # §5.2 Stage Plan content fields the model must produce (id/status/audit cols are set by us)
 STAGE_PLAN_FIELDS = [
@@ -71,6 +76,13 @@ _STAGE_PLAN_SYSTEM_PROMPT = (
 
 
 _HIGH_RISK = ("L4", "L5")
+
+# T2.2 (GAP-P4-2): the read-only source ROOT reference. P4's execution worker resolves
+# a node's source binding via `startswith("source/")`; binding this root (nothing more —
+# no filename list, §2.3 / 禁止项26) gives P4 a resolvable anchor to read the real source
+# on demand (用户 2026-07-23：给路径+按需读取). Kept as the canonical root so it works
+# regardless of the project's actual file names (清单驱动, not hardcoded).
+_SOURCE_ROOT_REF = "source/"
 
 _TASK_PLAN_SYSTEM_PROMPT = (
     "你是 rebuild 平台的 P3 规划 Agent，基于已生成的 Stage Plan 拆解出一批任务级 Task Plan"
@@ -250,7 +262,8 @@ class PlanningService:
         gw = self._get_gateway()
 
         # Q-R10-2 / WP-6: no available model → blocked, no rule fallback + 候选模型链路。
-        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id, project_id=project_id,
+                                             require_tool_calling=True)
         if not readiness.get("available"):
             self._trace("P3 stage-plan blocked: no model", project_id, run_id, stage)
             return StagePlanResult(
@@ -262,24 +275,27 @@ class PlanningService:
                 model_user_actions=readiness.get("user_actions", []))
 
         inputs = self._gather_p2_inputs(project_id, user_goal)
-        messages = [
-            {"role": "system", "content": self._combine_system(_STAGE_PLAN_SYSTEM_PROMPT, system_prompt)},
-            {"role": "user", "content": self._build_user_prompt(inputs)},
-        ]
-        result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=_PLANNING_MAX_TOKENS, temperature=0.3, source="api",
-                               timeout=_PLANNING_TIMEOUT,
-                               project_id=project_id, run_id=run_id, stage=stage)
-        if result.get("status") != "completed":
-            reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
+        # 批2 (D-110): P3 Stage Plan 从单次 chat → 工具循环 Node Worker Agent。P2 产物摘要仍作 user
+        # 提示帮助，agent 可按需 read_artifact/fs_read/code_grep/list_files 探读真实源与上游产物，基于
+        # 源码事实规划、多轮推理，末轮产出 Stage Plan JSON 契约（键契约不变，D-108）。走 call_stream
+        # 天然读项目模型选择。
+        from app.services.stage_agent_loop import run_stage_tool_loop
+        loop = await run_stage_tool_loop(
+            gw, system_content=self._combine_system(_STAGE_PLAN_SYSTEM_PROMPT, system_prompt),
+            user_content=self._build_user_prompt(inputs), project_id=project_id,
+            run_id=run_id or "", stage=stage, strategy_id=strategy_id,
+            max_tokens=_PLANNING_MAX_TOKENS, temperature=0.3, timeout=_PLANNING_TIMEOUT,
+            tracer=self.tracer)
+        if loop["status"] != "completed":
+            reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P3 stage-plan model call not completed: {reason}", project_id, run_id, stage)
-            return StagePlanResult(status="failed", reason=str(reason), model_used=result.get("model"),
-                                   attempted_chain=result.get("attempted_chain", []),
-                                   model_error_category=result.get("error_category", "model_unavailable"),
+            return StagePlanResult(status="failed", reason=str(reason), model_used=loop.get("model_used"),
+                                   attempted_chain=loop.get("attempted_chain", []),
+                                   model_error_category=loop.get("error_category", "model_unavailable"),
                                    model_user_actions=_MODEL_USER_ACTIONS)
 
-        parsed, parse_error = self._parse(result.get("content", ""))
-        model_used = result.get("model")
+        parsed, parse_error = self._parse(loop.get("content", ""))
+        model_used = loop.get("model_used")
         sp_id = self._persist_stage_plan(project_id, run_id, stage, parsed, model_used, inputs)
         self._trace("P3 stage-plan generated (draft)", project_id, run_id, stage)
         risk = parsed.get("risk_level", "L0")
@@ -324,7 +340,8 @@ class PlanningService:
         from app.models.stage_plan import StagePlan
 
         gw = self._get_gateway()
-        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id, project_id=project_id,
+                                             require_tool_calling=True)
         if not readiness.get("available"):
             self._trace("P3 task-plan blocked: no model", project_id, run_id, stage)
             return TaskPlanBatchResult(
@@ -351,25 +368,27 @@ class PlanningService:
             db.close()
 
         citable = [f"artifacts/p2/{n}" for n in sp_p2_sources]
-        messages = [
-            {"role": "system", "content": self._combine_system(_TASK_PLAN_SYSTEM_PROMPT, system_prompt)},
-            {"role": "user", "content": self._build_task_plan_prompt(sp_objective, sp_scope, user_goal, citable)},
-        ]
-        result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=_PLANNING_MAX_TOKENS, temperature=0.3, source="api",
-                               timeout=_PLANNING_TIMEOUT,
-                               project_id=project_id, run_id=run_id, stage=stage)
-        if result.get("status") != "completed":
-            reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
+        # 批2 (D-110): Task Plan 拆解从单次 chat → 工具循环 Node Worker Agent。agent 可按需读真实源
+        # （list_files/code_grep/fs_read）把任务落到具体源文件，产出可承接 TaskGraph 的接地 Task
+        # Plan（task_plans[].inputs 可含具体 source/ 路径 → C 节点源绑定接地）。契约不变（D-108）。
+        from app.services.stage_agent_loop import run_stage_tool_loop
+        loop = await run_stage_tool_loop(
+            gw, system_content=self._combine_system(_TASK_PLAN_SYSTEM_PROMPT, system_prompt),
+            user_content=self._build_task_plan_prompt(sp_objective, sp_scope, user_goal, citable),
+            project_id=project_id, run_id=run_id or "", stage=stage, strategy_id=strategy_id,
+            max_tokens=_PLANNING_MAX_TOKENS, temperature=0.3, timeout=_PLANNING_TIMEOUT,
+            tracer=self.tracer)
+        if loop["status"] != "completed":
+            reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P3 task-plan model call not completed: {reason}", project_id, run_id, stage)
             return TaskPlanBatchResult(status="failed", stage_plan_ref=stage_plan_id,
-                                       reason=str(reason), model_used=result.get("model"),
-                                       attempted_chain=result.get("attempted_chain", []),
-                                       model_error_category=result.get("error_category", "model_unavailable"),
+                                       reason=str(reason), model_used=loop.get("model_used"),
+                                       attempted_chain=loop.get("attempted_chain", []),
+                                       model_error_category=loop.get("error_category", "model_unavailable"),
                                        model_user_actions=_MODEL_USER_ACTIONS)
 
-        parsed, parse_error = self._parse(result.get("content", ""))
-        model_used = result.get("model")
+        parsed, parse_error = self._parse(loop.get("content", ""))
+        model_used = loop.get("model_used")
         task_specs = parsed.get("task_plans", []) if isinstance(parsed.get("task_plans"), list) else []
         return self._persist_task_batch(
             project_id, run_id, stage, stage_plan_id, parsed, task_specs, model_used,
@@ -383,7 +402,11 @@ class PlanningService:
             f"用户目标/约束：{user_goal or '（未提供）'}\n"
             f"【可引用上游产物】（basis_refs 只能取自此清单，勿杜撰）：{citable or []}\n"
             "请据此拆解出 Task Plan Batch（JSON）。每个 Task Plan 必须落在上述范围内，"
-            "并在 basis_refs 内联填写本任务所依据的上游产物 ref。"
+            "并在 basis_refs 内联填写本任务所依据的上游产物 ref。\n"
+            "接地要求（供 P4 执行按产物读取，D-110）：对涉及具体源码迁移/改造的任务，请用 "
+            "list_files/code_grep/fs_read 在 source/ 下定位真实文件，并在该任务的 inputs 中写出"
+            "**具体的 source/ 相对路径**（如 source/App_Code/Xxx.cs），而非笼统描述；确无对应具体源"
+            "文件的规划类任务可不写 source 路径。"
         )
 
     def _persist_task_batch(self, project_id: str, run_id: Optional[str], stage: str,
@@ -516,7 +539,7 @@ class PlanningService:
         from app.models.stage_plan import StagePlan, TaskPlan
 
         gw = self._get_gateway()
-        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id, project_id=project_id)
         if not readiness.get("available"):
             self._trace("P3 task-graph blocked: no model", project_id, run_id, stage)
             return TaskGraphResult(
@@ -550,6 +573,10 @@ class PlanningService:
         finally:
             db.close()
 
+        # T2.2 (GAP-P4-2): ensure each execution node carries a resolvable source
+        # binding so P4 grounds on the real source instead of title-only fabrication.
+        self._bind_source_root(project_id, nodes)
+
         # 必生 needs task source: no Task Plans → cannot form a graph → failed
         if not nodes:
             return TaskGraphResult(
@@ -557,7 +584,7 @@ class PlanningService:
                 reason="no_task_plans: TaskGraph 承接 Task Plan，无任务计划无法生成（先跑 T14）")
 
         proposed, model_used, parse_error, call_status, reason, _pe_chain = await self._propose_edges(
-            nodes, user_goal, strategy_id, system_prompt=system_prompt)
+            nodes, user_goal, strategy_id, system_prompt=system_prompt, project_id=project_id)
         if call_status == "failed":
             return TaskGraphResult(status="failed", stage_plan_ref=stage_plan_id,
                                    reason=reason, model_used=model_used,
@@ -576,7 +603,8 @@ class PlanningService:
             validation_errors=val_errors, model_used=model_used, parse_error=parse_error)
 
     async def _propose_edges(self, nodes: list, user_goal: str, strategy_id: str,
-                             system_prompt: Optional[str] = None):
+                             system_prompt: Optional[str] = None,
+                             project_id: Optional[str] = None):
         """Ask the LLM to propose edges (by node index) + strategy. Returns
         (edges, model_used, parse_error, status, reason)."""
         gw = self._get_gateway()
@@ -592,7 +620,7 @@ class PlanningService:
         ]
         result = await gw.call(messages=messages, strategy_id=strategy_id,
                                max_tokens=2048, temperature=0.2, source="api",
-                               timeout=_PLANNING_TIMEOUT)
+                               timeout=_PLANNING_TIMEOUT, project_id=project_id)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
             return [], result.get("model"), False, "failed", str(reason), result.get("attempted_chain", [])
@@ -640,6 +668,53 @@ class PlanningService:
         chain = [_edge(i, i + 1, "sequence") for i in range(n - 1)]
         gv = validate_edges(chain, normalize=True)
         return [e.normalized for e in gv.edges], (n > 1), val_errors
+
+    def _bind_source_root(self, project_id: str, nodes: list) -> None:
+        """T2.2 (GAP-P4-2): guarantee every TaskGraph execution node has a resolvable
+        source binding, so P4 can ground on the real materialized source instead of
+        falling back to title-only fabrication.
+
+        The Task Plan `inputs` the model writes are often prose (e.g. "源.aspx页面源码
+        （从p0接入获取）") that P4's `startswith("source/")` resolver cannot match →
+        P4 fabricates from the node title. Here we deterministically append the
+        read-only source ROOT (and nothing else) to any node whose input_refs lack a
+        resolvable source path — the worker then reads the real source manifest and
+        decides what to read on demand (用户 2026-07-23：给路径+按需读取，不硬编码输入).
+        No filename list is hardcoded (§2.3 / 禁止项26); this is 清单驱动 (D-107): the
+        binding is gated on a real materialized source (P1 source_structure manifest).
+
+        Honest non-fabrication: when no real source is materialized we bind NOTHING —
+        P4 then honestly blocks rather than pretend a source exists (No Evidence No
+        Completed). The model's own resolvable `source/…` refs are always preserved.
+        """
+        if not self._source_materialized(project_id):
+            return
+        for nd in nodes:
+            refs = list(nd.get("input_refs") or [])
+            if not any(isinstance(r, str) and r.startswith("source/") for r in refs):
+                refs.append(_SOURCE_ROOT_REF)
+                nd["input_refs"] = refs
+
+    def _source_materialized(self, project_id: str) -> bool:
+        """True when P0/P1 materialized a real source tree — checked via the P1
+        source_structure manifest (真实顶层清单), falling back to the source/ dir.
+        Best-effort; never raises (missing → False, recorded by returning False, not
+        invented)."""
+        try:
+            from app.services.workspace_service import workspace_path
+            ws = workspace_path(project_id)
+            manifest = ws / "artifacts" / "p1" / "source_structure.json"
+            if manifest.exists():
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+                if data.get("top_level"):
+                    return True
+                if data.get("not_applicable"):
+                    return False
+            src = ws / "source"
+            return src.is_dir() and any(src.iterdir())
+        except Exception:
+            logger.debug("source materialization check failed (advisory)", exc_info=True)
+            return False
 
     def _persist_task_graph(self, project_id: str, run_id: Optional[str], stage: str,
                             stage_plan_id: str, nodes: list, edges: list,
@@ -806,21 +881,14 @@ class PlanningService:
 
     # ── parse ────────────────────────────────────────────────────────────────
     def _parse(self, content: str) -> tuple[dict, bool]:
-        text = (content or "").strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lstrip().lower().startswith("json"):
-                text = text.lstrip()[4:]
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                return data, False
-        except Exception:
-            # advisory：LLM 输出未必是合法 JSON；解析失败在下方诚实标记 parse_error 返回
-            # （NodeLoop ReviewPass 会重试），故失败已被显式surfaced，非隐藏吞噬。
-            logger.debug("规划输出 JSON 解析失败，标记 parse_error 交由 ReviewPass 重试", exc_info=True)
-        # unparseable → honest: keep raw, mark parse_error (NodeLoop ReviewPass retries)
-        return {"objective": "", "raw": text[:2000]}, True
+        # 批2: robust extractor handles prose-wrapped / fenced JSON from the tool loop.
+        from app.services.stage_agent_loop import extract_json_object
+        data = extract_json_object(content)
+        if data is not None:
+            return data, False
+        # advisory：LLM 输出未必是合法 JSON；解析失败诚实标记 parse_error（ReviewPass 重试）。
+        logger.debug("规划输出 JSON 解析失败，标记 parse_error 交由 ReviewPass 重试")
+        return {"objective": "", "raw": (content or "").strip()[:2000]}, True
 
     # ── persist (real StagePlan row, draft pending Gate) ─────────────────────
     def _persist_stage_plan(self, project_id: str, run_id: Optional[str], stage: str,

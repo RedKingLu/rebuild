@@ -10,7 +10,7 @@
     → refs 缺失 → 200 + evidence_gaps 列表（诚实标记，不伪造）
 
   GET /api/projects/{project_id}/runs/{run_id}/p5/input/summary
-    → 仅 P4 execution summary（artifacts/p4_execution_summary.json 解析）
+    → 仅 P4 execution summary（artifacts/p4/p4_execution_summary.json 解析）
     → 文件不存在 → 404（诚实）
 
   GET /api/projects/{project_id}/runs/{run_id}/p5/input/gate
@@ -89,11 +89,11 @@ def _load_p5_validation_report(project_id: str) -> dict | None:
 
 @router.get("/input/summary")
 async def get_p5_input_summary(project_id: str, run_id: str):
-    """仅 P4 execution summary（artifacts/p4_execution_summary.json）。"""
+    """仅 P4 execution summary（artifacts/p4/p4_execution_summary.json）。"""
     svc = _svc()
     facts = svc.read_p4_input(project_id, run_id)
     if facts.p4_execution_summary is None:
-        raise HTTPException(404, "P4 execution summary 不存在（artifacts/p4_execution_summary.json）")
+        raise HTTPException(404, "P4 execution summary 不存在（artifacts/p4/p4_execution_summary.json）")
     return SuccessEnvelope(data={
         "project_id": project_id,
         "run_id": run_id,

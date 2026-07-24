@@ -294,7 +294,7 @@ class P5VerificationService:
     # ── 4. P4 summary 可读 ────────────────────────────────────────────────
 
     def _verify_p4_summary_readable(self, project_id: str, p4_input) -> SlotVerificationResult:
-        """验证 artifacts/p4_execution_summary.json 可解析。"""
+        """验证 artifacts/p4/p4_execution_summary.json 可解析。"""
         ws = workspace_path(project_id)
         result = SlotVerificationResult(
             slot_id="p4_summary_readable", passed=False,

@@ -31,6 +31,9 @@ class GateDecisionRequest(BaseModel):
     decision: str = Field(..., description="approve/reject/request_changes/pause/cancel")
     reason: str = ""
     accepted_risk: Optional[str] = None
+    # D-109: 用户在 P1→P2 gate 裁决技术选型时，可选携带【修改后的选型】覆盖 LLM 建议；
+    # 缺省（None）则批准时采用 P1 产出的 tech_selection 提案。仅对 p1 stage_promotion approve 生效。
+    tech_selection: Optional[dict] = None
 
 
 class PolicyCheckRequest(BaseModel):

@@ -8,7 +8,7 @@
     - output_code refs（来自 P4 worker 写入 + task_node_run.artifact_refs + p4_execution_summary.change_manifest）
     - patch refs（同上 + p4_execution_summary.patch_index）
     - evidence refs（AETService 真实 Evidence 对象列表 + p4_execution_summary.evidence_refs）
-    - P4 execution summary（artifacts/p4_execution_summary.json 解析）
+    - P4 execution summary（artifacts/p4/p4_execution_summary.json 解析，D-107 分层）
     - P4→P5 Gate 状态（p_gate 表 gate_type=stage_promotion stage=p4）
 
 诚实状态（V10 教训 / D-066 / D-101）：
@@ -100,7 +100,7 @@ class P5InputService:
         # 2. Gather artifact_refs from task_node_run rows (DB is the single truth source)
         self._gather_run_refs(project_id, run_id, facts)
 
-        # 3. Read P4 execution summary from artifacts/p4_execution_summary.json
+        # 3. Read P4 execution summary from artifacts/p4/p4_execution_summary.json
         self._read_p4_summary(project_id, facts)
 
         # 4. Derive evidence refs (from summary + AETService cross-check)
@@ -194,21 +194,30 @@ class P5InputService:
     # ── P4 summary ────────────────────────────────────────────────────────
 
     def _read_p4_summary(self, project_id: str, facts: P4InputFacts):
-        """Read artifacts/p4_execution_summary.json（真实落盘产物）。"""
+        """Read artifacts/p4/p4_execution_summary.json（真实落盘产物，D-107 分层）。
+
+        R17.5 P4/T4.1：报告迁至 artifacts/p4/；兼容读取旧的扁平 artifacts/p4_execution_summary.json
+        （历史工作区），以新路径优先。"""
         ws = workspace_path(project_id)
-        summary_path = ws / "artifacts" / "p4_execution_summary.json"
+        new_rel = "artifacts/p4/p4_execution_summary.json"
+        legacy_rel = "artifacts/p4_execution_summary.json"
+        summary_path = ws / new_rel
+        summary_rel = new_rel
+        if not summary_path.exists() and (ws / legacy_rel).exists():
+            summary_path = ws / legacy_rel
+            summary_rel = legacy_rel
         if not summary_path.exists():
             facts.evidence_gaps.append({
                 "gap_id": "no_p4_summary",
                 "evidence_type": "p4_execution_summary",
-                "description": "artifacts/p4_execution_summary.json 不存在",
+                "description": "artifacts/p4/p4_execution_summary.json 不存在",
                 "blocking": False,
             })
             return
         try:
             data = json.loads(summary_path.read_text(encoding="utf-8"))
             facts.p4_execution_summary = data
-            facts.p4_summary_ref = "artifacts/p4_execution_summary.json"
+            facts.p4_summary_ref = summary_rel
             # Merge change_manifest / patch_index refs if not already present
             cm = data.get("change_manifest", [])
             pi = data.get("patch_index", [])

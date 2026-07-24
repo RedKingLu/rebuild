@@ -203,9 +203,62 @@ class GateService:
                 except Exception:
                     _logger.warning("P2→P3 risk_acceptance 审计写入失败（advisory）", exc_info=True)
 
+            # D-109：用户批准 P1→P2 stage_promotion Gate = 批准技术路线选型 → 落 project.tech_selection
+            # 成为项目红线（贯穿注入 P2/P4 + 验收校验）。裁决携带 req.tech_selection 则用其覆盖 LLM 建议，
+            # 否则采用 P1 产出的 tech_selection 提案（artifacts/p1/tech_selection.json）。仅在权威决策写一次。
+            if g.gate_type == "stage_promotion" and decision == "approve" and g.stage == "p1":
+                try:
+                    self._persist_tech_selection(g, getattr(req, "tech_selection", None))
+                except Exception:
+                    _logger.warning("P1→P2 技术选型红线落库失败（advisory）", exc_info=True)
+
             return _gate_to_response(g), audit
         finally:
             db.close()
+
+    def _persist_tech_selection(self, g: Gate, override: dict | None) -> None:
+        """D-109：把批准的技术路线选型落 project.tech_selection（项目红线）。
+
+        override（用户 gate 裁决时修改的选型）优先；否则读 P1 产出的选型提案
+        artifacts/p1/tech_selection.json 的 selection 段。补 status=approved + 裁决元数据。
+        无可用选型（提案缺失/未完成且无 override）→ 不写（诚实，不伪造空红线），仅记日志。
+        """
+        selection_body: dict | None = None
+        source = "gate_override" if override else "p1_proposal"
+        if isinstance(override, dict) and override:
+            selection_body = override
+        else:
+            try:
+                from app.services import workspace_service
+                p = (workspace_service.workspace_path(g.project_id)
+                     / "artifacts" / "p1" / "tech_selection.json")
+                if p.exists():
+                    import json as _json
+                    doc = _json.loads(p.read_text(encoding="utf-8"))
+                    if doc.get("status") == "proposed" and isinstance(doc.get("selection"), dict):
+                        selection_body = doc.get("selection")
+            except Exception:
+                _logger.warning("读取 P1 tech_selection 提案失败（advisory）", exc_info=True)
+        if not selection_body:
+            _logger.warning("P1→P2 approve：无可用技术选型提案（未完成/缺失且无 override），"
+                            "不写 project.tech_selection（诚实，不伪造空红线） project=%s", g.project_id)
+            return
+        redline = dict(selection_body)
+        redline.update({
+            "status": "approved",
+            "source": source,
+            "decided_at": _now(),
+            "decided_gate_id": g.gate_id,
+        })
+        self._svc.project_service.update(g.project_id, tech_selection=redline)
+        try:
+            self._svc.audit_writer.write(
+                audit_type="tech_selection", gate_id=g.gate_id, risk_level=g.risk_level,
+                action="p1_to_p2_tech_selection_approved", decision="approved",
+                reason=f"用户批准 P1→P2 技术路线选型红线（来源={source}）",
+                project_id=g.project_id, run_id=g.run_id, stage=g.stage)
+        except Exception:
+            _logger.warning("tech_selection 审计写入失败（advisory）", exc_info=True)
 
     def mark_consumed(self, gate_id: str) -> bool:
         """One-time consumption of an action_approval Gate (R18→R17.2).

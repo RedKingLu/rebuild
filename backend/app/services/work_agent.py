@@ -735,7 +735,7 @@ class WorkAgent:
                 out.append({"key": "exec_summary",
                             "statement": (f"P4 执行 {tool_result.get('completed_node_count',0)}/"
                                           f"{tool_result.get('execution_node_count',0)} execution 节点完成"),
-                            "artifact_ref": "artifacts/p4_execution_summary.json", "detail": {},
+                            "artifact_ref": "artifacts/p4/p4_execution_summary.json", "detail": {},
                             "cited_refs": [tool_result.get("task_graph_ref")]
                             if tool_result.get("task_graph_ref") else []})
         elif st == "p5":

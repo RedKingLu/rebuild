@@ -181,6 +181,23 @@ def _build_p0_migration_target(project_id: str) -> dict | None:
         return None
 
 
+def _build_project_tech_selection(project_id: str) -> dict | None:
+    """D-109：读取 Project 级技术路线选型红线（P1→P2 gate 用户批准后落库）。
+    项目红线（非识别）；缺失（未到 P1 或未批准）则 None（诚实，不编造）。供 P2/P4 上下文注入。"""
+    try:
+        from app.core.database import get_session
+        from app.models.project import Project
+        db = get_session()
+        try:
+            proj = db.get(Project, project_id)
+            return getattr(proj, "tech_selection", None) if proj else None
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("读取 project.tech_selection 失败（advisory）", exc_info=True)
+        return None
+
+
 def _build_intake_facts(project_id: str, source_index: dict, materialized: dict,
                         *, src_type: str, source_config: dict) -> dict:
     """采集：组装 P0 【事实包】喂给 LLM 识别（R17.5 WP-2）。
@@ -460,11 +477,13 @@ class RealP1Handler:
                           "config_inventory", "infra_clues", "test_inventory",
                           "module_structure", "uncertainty_manifest"]
 
-    def __init__(self, tracer=None, auditor=None, profiling_service=None, baseline_service=None):
+    def __init__(self, tracer=None, auditor=None, profiling_service=None, baseline_service=None,
+                 tech_selection_service=None):
         self.tracer = tracer
         self.auditor = auditor
         self._profiling_service = profiling_service      # R17.5: 可注入以测试 LLM/blocked 路径
         self._baseline_service = baseline_service
+        self._tech_selection_service = tech_selection_service  # D-109: 可注入以测试选型生成
 
     def _profiler_svc(self):
         if self._profiling_service is not None:
@@ -477,6 +496,12 @@ class RealP1Handler:
             return self._baseline_service
         from app.services.acceptance_baseline_service import AcceptanceBaselineService
         return AcceptanceBaselineService(tracer=self.tracer, auditor=self.auditor)
+
+    def _tech_selection_svc(self):
+        if self._tech_selection_service is not None:
+            return self._tech_selection_service
+        from app.services.tech_selection_service import TechSelectionService
+        return TechSelectionService(tracer=self.tracer, auditor=self.auditor)
 
     def _read_upstream(self, project_id: str) -> dict:
         """WP-2: 读 P0 已 LLM 产出的接入识别结论 + source_index 摘要（复用基线，解 P1-ARCH-1）。
@@ -600,6 +625,11 @@ class RealP1Handler:
                                              baseline_result), raw_text=True)
         self._write_p2_manifest(project_id)
 
+        # ── D-109：P1→P2 技术路线选型建议（LLM 基于识别事实 + migration_target 产出，挂 gate 供裁决）──
+        #    诚实：blocked/failed 不伪造，写入含 status 的诚实产物（不降级规则选型）。选型是 P1→P2
+        #    gate 的裁决材料，随 P1 产物挂到晋级 Gate（nodes.py make_work_node 用 P1 artifacts 建 gate）。
+        await self._generate_tech_selection(project_id, run_id, identification, upstream)
+
         refs: List[str] = []
         identified_items: List[str] = []
         for p in sorted(art_dir.glob("*.json")):
@@ -635,6 +665,51 @@ class RealP1Handler:
         _mediated_write(project_id, stage_artifact_ref("p1", name), content,
                         auditor=self.auditor, stage="p1", action=f"write_{name.split('.')[0]}")
 
+    async def _generate_tech_selection(self, project_id: str, run_id: str,
+                                       identification: dict, upstream: dict) -> None:
+        """D-109：产出技术路线选型建议并写 artifacts/p1/tech_selection.json。
+
+        status=proposed（待用户经 P1→P2 gate 裁决）；blocked/failed 时写诚实标注产物（不伪造、
+        不降级规则选型，D-097/公理3）。选型基于 P0/P1 真实识别事实 + 项目 migration_target。
+        """
+        migration_target = upstream.get("migration_target") or _build_p0_migration_target(project_id)
+        try:
+            svc = self._tech_selection_svc()
+            result = await svc.select(
+                project_id, identification=identification, upstream=upstream,
+                migration_target=migration_target, run_id=run_id, stage="p1")
+        except Exception as e:  # honest: surface, never fake a selection (公理3)
+            logger.warning("P1 tech_selection 生成异常（advisory，写诚实 failed 产物）", exc_info=True)
+            self._write_json(project_id, "tech_selection.json", {
+                "artifact_type": "tech_selection", "project_id": project_id, "stage": "p1",
+                "status": "failed", "reason": f"选型生成异常：{type(e).__name__}",
+                "migration_target": migration_target,
+                "note": "技术路线选型未完成（诚实标注，未伪造/未降级规则选型 D-097）"})
+            return
+
+        if result.status == "completed":
+            payload = {
+                "artifact_type": "tech_selection", "project_id": project_id, "stage": "p1",
+                "status": "proposed",  # 待 P1→P2 gate 用户裁决批准 → 落 project.tech_selection 红线
+                "generated_at": _now(),
+                "migration_target": migration_target,
+                "model_used": result.model_used,
+                "selection": result.selection,
+                "decision_status": "pending_p1_gate",
+                "note": ("LLM 基于 P0/P1 真实识别事实 + migration_target 产出的技术路线选型建议；"
+                         "经 P1→P2 gate 用户裁决批准后写入 project.tech_selection 成为项目红线。"),
+            }
+        else:
+            payload = {
+                "artifact_type": "tech_selection", "project_id": project_id, "stage": "p1",
+                "status": result.status, "reason": result.reason,
+                "migration_target": migration_target,
+                "attempted_chain": result.attempted_chain,
+                "model_error_category": result.model_error_category,
+                "note": "技术路线选型未完成（诚实标注，未伪造/未降级规则选型 D-097/公理3）",
+            }
+        self._write_json(project_id, "tech_selection.json", payload)
+
     def _write_p2_manifest(self, project_id: str) -> None:
         art_dir = stage_artifact_dir(project_id, "p1")
         manifest = {
@@ -656,6 +731,7 @@ class RealP1Handler:
         "module_structure.json": ("module_structure", "模块结构识别", False),
         "uncertainty_manifest.json": ("uncertainty_manifest", "识别盲区/证据缺口（LLM 主动发声）", True),
         "acceptance_baseline.json": ("acceptance_baseline", "原始验收基准（D-106 静态基线+动态黄金/needs_env）", True),
+        "tech_selection.json": ("tech_selection", "技术路线选型建议（D-109，含推荐+理由+备选；挂 P1→P2 gate 供裁决）", True),
         "profiling_summary.md": ("profiling_summary", "P1 建档摘要", True),
         "p2_input_manifest.json": ("p2_input_manifest", "P2 输入清单（产物 refs）", False),
         "file_index.json": ("file_index", "文件索引（采集）", False),
@@ -798,6 +874,17 @@ class RealP2Handler:
             from app.services.context_assembler import assemble_context, build_system_prompt
             node_state = {"node_task": "P2 评估：识别迁移/重构风险、阻塞项、验证缺口与资源需求",
                           "task": "评估可行性与风险"}
+            # D-109：把项目红线（技术路线选型 + 目标运行环境 migration_target）注入 P2 规划上下文
+            # （C5 upstream_output），使评估服从用户已裁决的选定路线（仿 migration_target 注入范式）。
+            _redlines = {}
+            _mt = _build_p0_migration_target(project_id)
+            _ts = _build_project_tech_selection(project_id)
+            if _mt:
+                _redlines["migration_target"] = _mt
+            if _ts:
+                _redlines["tech_selection"] = _ts
+            if _redlines:
+                node_state["upstream_output"] = _redlines
             # D-108: 加载 P2 评估 stage skill 正文（P-migration-assessment），评估需求随 skill 走，
             # 提示词瘦身、给 Agent 灵活度（skill-first，仿 P0/P1 include_body + skill_disclosure=full）。
             context_package = assemble_context(
@@ -1045,9 +1132,20 @@ class RealP3Handler:
 
         D-107: 领域 3 产物写入 artifacts/p3/（分层），并产出 artifacts/p3/_stage_package.json
         完成包清单（对齐 P0/P1/P2，供 P4 按需加载）。
+
+        批2 (task C): p3_task_graph.json / p3_task_plans.json 不再是 255B/422B 摘要桩——从 DB
+        物化【完整节点/边/任务细节】进产物，使「按产物清单读」（D-107）能真正拿到节点迁移上下文
+        （节点标题/类型/风险/input_refs 源绑定/权限边界/边策略），不必绕回 DB。
         """
         art_dir = stage_artifact_dir(project_id, "p3")
         art_dir.mkdir(parents=True, exist_ok=True)
+        full_nodes, full_edges = self._load_full_graph(tg.task_graph_id)
+        full_task_plans = self._load_full_task_plans(sp.stage_plan_id)
+        # 批2.5 (task B): p3_task_graph.json 的 degraded 语义 = 「本产物是否退化桩」。完整节点已
+        # 从 DB 物化进产物（full_nodes 非空）时 → degraded=false（下游按产物读能拿到完整节点，
+        # 不应误走退化分支）；仅当节点未能物化（只有 ref 无节点）时 degraded=true（诚实）。
+        # 边是否退化为单链是独立信号，另存 edges_degraded 保留（不丢真实退化信息）。
+        artifact_degraded = not bool(full_nodes)
         files = {
             "p3_stage_plan.json": {"artifact_type": "stage_plan", "stage_plan_ref": sp.stage_plan_id,
                                    "objective": sp.objective, "scope": sp.scope,
@@ -1056,10 +1154,12 @@ class RealP3Handler:
             "p3_task_plans.json": {"artifact_type": "task_plan", "batch_id": batch.batch_id,
                                    "task_plan_refs": batch.task_plan_ids,
                                    "batch_risk_level": batch.batch_risk_level,
-                                   "gate_required": batch.gate_required},
+                                   "gate_required": batch.gate_required,
+                                   "task_plans": full_task_plans},
             "p3_task_graph.json": {"artifact_type": "task_graph", "task_graph_ref": tg.task_graph_id,
                                    "node_count": tg.node_count, "edge_count": tg.edge_count,
-                                   "degraded": tg.degraded},
+                                   "degraded": artifact_degraded, "edges_degraded": tg.degraded,
+                                   "nodes": full_nodes, "edges": full_edges},
         }
         refs: List[str] = []
         for name, payload in files.items():
@@ -1071,6 +1171,53 @@ class RealP3Handler:
             refs.append(f"artifacts/p3/{name}")
         self._write_p3_package(project_id, refs, sp, batch, tg)
         return refs
+
+    @staticmethod
+    def _load_full_graph(task_graph_id: Optional[str]) -> tuple[list, list]:
+        """Materialize full TaskGraph nodes + edges from DB for the artifact (task C)."""
+        if not task_graph_id:
+            return [], []
+        from app.core.database import get_session
+        from app.models.task_graph import TaskGraph, TaskNode
+        db = get_session()
+        try:
+            tg = db.get(TaskGraph, task_graph_id)
+            edges = list(tg.edges or []) if tg else []
+            tns = (db.query(TaskNode)
+                   .filter(TaskNode.task_graph_id == task_graph_id)
+                   .order_by(TaskNode.created_at).all())
+            nodes = [{"node_id": n.node_id, "node_type": n.node_type, "title": n.title,
+                      "risk_level": n.risk_level, "input_refs": n.input_refs or [],
+                      "resource_refs": n.resource_refs or [],
+                      "permission_boundary": n.permission_boundary,
+                      "model_policy_override": n.model_policy_override,
+                      "task_plan_ref": getattr(n, "task_plan_ref", None)} for n in tns]
+            return nodes, edges
+        finally:
+            db.close()
+
+    @staticmethod
+    def _load_full_task_plans(stage_plan_id: Optional[str]) -> list:
+        """Materialize full Task Plan rows from DB for the artifact (task C)."""
+        if not stage_plan_id:
+            return []
+        from app.core.database import get_session
+        from app.models.stage_plan import TaskPlan
+        db = get_session()
+        try:
+            tps = (db.query(TaskPlan)
+                   .filter(TaskPlan.stage_plan_ref == stage_plan_id)
+                   .order_by(TaskPlan.created_at).all())
+            return [{"task_plan_id": t.task_plan_id, "title": t.title, "objective": t.objective,
+                     "scope": t.scope or {}, "inputs": t.inputs or [],
+                     "expected_outputs": t.expected_outputs or [], "risk_level": t.risk_level,
+                     "permission_boundary": t.permission_boundary,
+                     "required_resources": t.required_resources or [],
+                     "validation_method": t.validation_method,
+                     "expected_artifacts": t.expected_artifacts or [],
+                     "expected_evidence": t.expected_evidence or []} for t in tps]
+        finally:
+            db.close()
 
     def _write_p3_package(self, project_id: str, refs: list, sp, batch, tg) -> None:
         """D-107: 写 artifacts/p3/_stage_package.json（P3 完成包清单，供 P4 按需加载）。
@@ -1095,7 +1242,8 @@ class RealP3Handler:
                                   "task_graph_ref": tg.task_graph_id,
                                   "task_plan_count": len(batch.task_plan_ids),
                                   "node_count": tg.node_count, "edge_count": tg.edge_count,
-                                  "degraded": tg.degraded},
+                                  "degraded": (not bool(tg.node_count)),
+                                  "edges_degraded": tg.degraded},
                 risks=[{"title": "批次风险等级", "risk_level": batch.batch_risk_level,
                         "gate_required": batch.gate_required}],
                 next_stage_advice=("进入 P4 执行：按 TaskGraph execution 节点受控施工，产出真实 "
@@ -1169,7 +1317,8 @@ class RealP4Handler:
         from app.dependencies import get_services
         return get_services()
 
-    def _build_worker(self, project_id: str, reference_context: str = ""):
+    def _build_worker(self, project_id: str, reference_context: str = "",
+                      skill_body: str = ""):
         from app.services.p4_execution_worker import P4ExecutionWorker
         gateway = self._gateway
         aet = self._aet
@@ -1179,7 +1328,8 @@ class RealP4Handler:
             aet = aet if aet is not None else svc.aet_service
         return P4ExecutionWorker(project_id, tracer=self.tracer, auditor=self.auditor,
                                  aet=aet, gateway=gateway,
-                                 reference_context=reference_context)
+                                 reference_context=reference_context,
+                                 skill_body=skill_body)
 
     def _load_p3_task_graph(self, project_id: str) -> dict | None:
         """Load the latest P3 TaskGraph (definition) + its nodes for this project.
@@ -1215,13 +1365,18 @@ class RealP4Handler:
         project_id = state["project_id"]
 
         # 读取 project/run/stage context（advisory，与 P2/P3 一致；task_type=execution）
+        # D-108: include_body 加载 P4 主执行 stage skill 正文（P-migration-execution），执行需求
+        # 随 skill 走、worker 生成提示词瘦身为编排+锚点（skill-first，仿 P2 include_body）。
         context_package: dict = {}
+        skill_body = ""
         try:
             from app.services.context_assembler import assemble_context
             context_package = assemble_context(
                 project_id, "p4",
                 node_state={"node_task": "P4 执行：按 P3 TaskGraph 执行 execution 节点"},
-                task_type="execution")
+                task_type="execution", include_body=True, skill_disclosure="full")
+            bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
+            skill_body = "\n\n".join(bodies)[:12000]
         except Exception:
             logger.warning("P4 context assembly failed (advisory, skeleton proceeds)",
                            exc_info=True)  # 公理3: surface, not silent
@@ -1258,7 +1413,8 @@ class RealP4Handler:
         _c6 = (context_package.get("layers") or {}).get("C6") or {}
         if _c6.get("capability_status") == "active":
             p4_ref_ctx = _c6.get("content", "")
-        worker = self._build_worker(project_id, reference_context=p4_ref_ctx)
+        worker = self._build_worker(project_id, reference_context=p4_ref_ctx,
+                                     skill_body=skill_body)
 
         # P3 TaskNode 无 acceptance_criteria 列 → NodeLoop step1 会因"缺 acceptance_criteria"
         # 阻塞。为 execution 节点注入默认 P4 结构化验收标准（由真实产物落盘背书），worker 据此
@@ -1288,6 +1444,10 @@ class RealP4Handler:
         except Exception:
             logger.warning("P4 evidence 汇集失败（advisory）", exc_info=True)
             p4_ev = []
+        # D-111 幽灵条目修复：list_evidence 会返回该项目 evidence/ 目录下【所有历史 run】的 p4
+        # 证据（evidence_id 按 node 命名，跨 run 混入旧图节点、引用已被覆盖/删除的文件）。
+        # → 只保留本次 run 真实写出的证据（worker 落 extra.run_id）。旧证据无 run_id → 排除。
+        p4_ev = [e for e in p4_ev if e.get("run_id") == run_id]
         evidence_refs = [e.get("evidence_id") for e in p4_ev if e.get("evidence_id")]
         artifacts: list[str] = []
         patch_refs: list[str] = []
@@ -1313,6 +1473,11 @@ class RealP4Handler:
         # graph_status → handler status：completed→completed；其余（failed/waiting_gate/blocked/
         # rework_required）→ blocked（诚实非 completed，交 StageLoop 升级 Gate / 准备 P4→P5 Gate）。
         status = "completed" if eng.graph_status == "completed" else "blocked"
+
+        # D-107（R17.5 P4/T4.2）：P4 完成时产出 artifacts/p4/_stage_package.json 完成包清单
+        # （products 从真实落盘 refs 动态收集，供 P5 按需加载），对齐 P0-P3 的 _write_pN_package。
+        if status == "completed":
+            self._write_p4_package(project_id, artifacts, patch_refs, summary_ref, eng, tg)
 
         # WP-6 (Q-R17.3-6-2): 若有 execution 节点因模型全失败中断 → 汇总首个模型错误链路到
         # 阶段级，供 WorkAgent/前端显式报错（不静默降级）。
@@ -1371,11 +1536,14 @@ class RealP4Handler:
     def _write_execution_summary(self, project_id, tg, exec_nodes, eng, p4_evidence,
                                  patch_refs, node_type_dist,
                                  acceptance_results) -> str | None:
-        """C7: persist a structured P4 execution summary to artifacts/p4_execution_summary.json.
+        """C7: persist a structured P4 execution summary to artifacts/p4/p4_execution_summary.json.
 
         Contains a change manifest (output_code files with real sha256/bytes), a patch index,
         and per-node execution results — all derived from real on-disk files (never the model's
         self-report). Returns the relative ref, or None if nothing to report.
+
+        D-107（R17.5 P4/T4.1）：阶段级元报告归入 artifacts/p4/（对齐 P0-P3 的 artifacts/{stage}/），
+        output_code/ 与 patches/ 顶层交付目录保持不变（P4 核心交付，见 change_manifest/patch_index 引用）。
         """
         evidence_refs = [e.get("evidence_id") for e in (p4_evidence or [])
                          if e.get("evidence_id")]
@@ -1389,7 +1557,7 @@ class RealP4Handler:
         def _now():
             return datetime.now(timezone.utc).isoformat()
 
-        out_dir = workspace_path(project_id) / "artifacts"
+        out_dir = stage_artifact_dir(project_id, "p4")
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # Map output_code_ref → evidence_id so each output file carries its evidence links.
@@ -1402,6 +1570,11 @@ class RealP4Handler:
                 continue
             seen_out.add(rel)
             facts = self._file_facts(project_id, rel)
+            # D-111 幽灵条目修复：只登记磁盘上真实存在的文件（真实 bytes）。_file_facts 对
+            # 不存在/不可读文件返回 bytes=0 / sha256=""——这类幽灵引用不得进入变更清单。
+            if not facts.get("sha256") or facts.get("bytes", 0) <= 0:
+                logger.warning("P4 change_manifest: 跳过磁盘上不存在的幽灵引用 %s", rel)
+                continue
             ev = ev_by_output.get(rel)
             change_manifest.append({**facts, "kind": "output_code",
                                    "evidence_refs": [ev] if ev else []})
@@ -1450,13 +1623,53 @@ class RealP4Handler:
             "evidence_refs": evidence_refs,
         }
         out = out_dir / "p4_execution_summary.json"
-        ref = _mediated_write(project_id, f"artifacts/{out.name}",
+        ref = _mediated_write(project_id, stage_artifact_ref("p4", out.name),
                               json.dumps(summary, ensure_ascii=False, indent=2),
                               auditor=self.auditor, stage="p4",
                               action="write_execution_summary")
         logger.info("C7: wrote P4 execution summary %s (%d output_code, %d patches)",
                     ref, len(change_manifest), len(patch_refs))
         return ref
+
+    def _write_p4_package(self, project_id: str, artifacts: list, patch_refs: list,
+                          summary_ref: str | None, eng, tg: dict) -> None:
+        """D-107（T4.2）：写 artifacts/p4/_stage_package.json（P4 完成包清单，供 P5 按需加载）。
+
+        products 从真实落盘 refs 动态收集（execution_summary + output_code/ + patches/），非硬编码
+        文件名数组；key_for_next=True 标记 P5 验证的关键加载源。output_code/ 与 patches/ 是 P4 顶层
+        核心交付（不迁移），此处以 ref 形式纳入清单供下游定位。对齐 _write_p3_package。
+        """
+        out_code = [r for r in dict.fromkeys(artifacts)
+                    if isinstance(r, str) and r.startswith("output_code/")]
+        patches = list(dict.fromkeys(patch_refs))
+        products = []
+        if summary_ref:
+            products.append(product_entry(
+                summary_ref.split("/")[-1], "execution_summary",
+                "P4 执行汇总（变更清单/补丁索引/逐节点结果/证据 refs，P5 验证读取源）",
+                key_for_next=True))
+        for ref in out_code:
+            products.append(product_entry(
+                ref, "output_code", "迁移产出代码（真实落盘，sha256 背书）", key_for_next=True))
+        for ref in patches:
+            products.append(product_entry(
+                ref, "patch", "迁移补丁/diff（真实落盘）", key_for_next=True))
+        try:
+            write_stage_package(
+                project_id, "p4", products=products,
+                evidence_summary={"task_graph_ref": tg.get("task_graph_id"),
+                                  "graph_status": eng.graph_status,
+                                  "completed_node_count": len(eng.completed_nodes),
+                                  "output_code_count": len(out_code),
+                                  "patch_count": len(patches)},
+                risks=([{"title": "存在失败/待决策节点", "failed": len(eng.failed_nodes),
+                         "gated": len(eng.gated_nodes)}]
+                       if (eng.failed_nodes or eng.gated_nodes) else []),
+                next_stage_advice=("进入 P5 验证：按需加载 p4_execution_summary.json 的变更清单/补丁索引，"
+                                   "对 output_code/patches 做编译/测试/等价校验，无环境则诚实 evidence_gap。"),
+                auditor=self.auditor, tracer=self.tracer)
+        except Exception:
+            logger.warning("P4 stage package 写入失败（advisory）", exc_info=True)
 
     def review(self, result: dict) -> ReviewResult:
         status = result.get("status")

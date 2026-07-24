@@ -25,8 +25,8 @@ metadata:
 
 ## 执行步骤（P3-1~P3-9，汇入固定 3 产物）
 1. Stage Plan：迁移阶段拆分 + 目标/范围/out_of_scope + Gate 计划 + 完成条件 + P5 验证策略。方案必须来源于 P2 评估（basis_refs 内联引用上游 artifact ref）。
-2. Task Plan Batch：按模块/层拆工作包，每包全字段——输入/动作/输出/负责 Agent 类型/验收标准/所需工具/风险等级/回退方案/证据计划。任务不得超出 Stage Plan scope，须可追溯到 Stage Plan。
-3. TaskGraph：节点 + 依赖边（EDGE_TYPES：sequence/parallel/conditional/failure/retry/rework/merge），DAG 无环，作为 P4 加载源。只表达任务依赖，不得让图越过用户 Gate。
+2. Task Plan Batch：按模块/层拆工作包，每包全字段——输入/动作/输出/负责 Agent 类型/验收标准/所需工具/风险等级/回退方案/证据计划。任务不得超出 Stage Plan scope，须可追溯到 Stage Plan。**`inputs` 必须给 P4 可解析的源定位**——真实 `source/…` 路径或源根引用（如 `source/`，供 P4 按需读取），**而非散文**（禁止如「源.aspx页面源码（从p0接入获取）」这类无法解析到文件的自然语言，P4 解析不到 `source/` 即被迫照标题臆造）。源定位以 P0/P1 采集的 `source_structure.json`（真实顶层目录/文件清单）为准按需选取，不臆测不存在的路径；无法定位到具体件时至少给源根 `source/` 让 P4 自行按需读取。
+3. TaskGraph：节点 + 依赖边（EDGE_TYPES：sequence/parallel/conditional/failure/retry/rework/merge），DAG 无环，作为 P4 加载源。只表达任务依赖，不得让图越过用户 Gate。**每个节点 = 绑定真实源文件/源根的 P4 迁移工作包**（可回溯到 `source/` 下真实件），节点 input_refs 承接对应 Task Plan 的可解析源定位；**禁止把 P3 规划过程自身建成节点**——「目标栈选型 / 画 TaskGraph 图 / 定 Task 规格 / 编纂三产物」等是 P3 自己的规划动作、不是 P4 执行工作包，一律不得作为 TaskGraph 节点。
 4. PoC 优先级：将 P2 的 PoC 建议转为最小可验证闭环的优先任务；显式声明"这是 PoC 非 Production"，不伪装全量已迁。
 5. 数据库迁移计划：基于 P2 方言证据规划 DDL/DML/编码/完整性/种子/回退——**在 P3 只规划不生成转换脚本**。
 6. 应用/配置/部署计划：目标工程/页面·接口/数据访问/认证/配置外置/部署承载的迁移任务规划。
@@ -45,6 +45,7 @@ metadata:
 - 方案来源于 P2（basis_refs 指向真实存在的上游 artifact ref，禁杜撰；无据给空数组）。
 - Task Plan 每项全字段（含回退/验收/证据计划）；高风险(L4/L5)任务显式标识。
 - TaskGraph 可解释、DAG 无环、边策略显式、是 P4 可加载源。
+- TaskGraph 节点均为**绑定真实源的 P4 迁移工作包**（input_refs 含可解析 `source/…` 路径或源根引用），**无「把 P3 规划过程当节点」的元步骤**（选型/画图/定规格/编纂产物不作为执行节点）。
 - 条件化于 P2 用户裁决：目标库/运行时/PoC 范围未裁决时，计划标 contingent，**不硬跑 P4**。
 - 验证计划映射 P5 既有结构，不臆造 slot。
 - 无有效模型 Key 时诚实 blocked，不降级为规则/模板规划。
@@ -56,6 +57,8 @@ metadata:
 
 ## 反例 / 禁止（一票否决）
 - 禁止发明 P3 artifact（route_decision/db_script/deploy_files/poc_output 等）——只产固定 3 项。
+- 禁止把 Task Plan `inputs` / TaskGraph 节点 input_refs 写成无法解析的散文——必须给 P4 可解析的 `source/…` 路径或源根引用。
+- 禁止把 P3 规划过程步骤（目标栈选型 / 画 TaskGraph 图 / 定 Task 规格 / 编纂三产物）当作 TaskGraph 执行节点——节点须是绑定真实源的 P4 迁移工作包。
 - 禁止在 P3 生成真实代码/补丁/DB 转换脚本/部署文件（那是 P4）。
 - 禁止无 P2 输入即规划；禁止路线未裁决却伪装已裁决。
 - 禁止 TaskGraph 越过用户 Gate；禁止无回退策略的高风险任务。

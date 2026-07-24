@@ -1,7 +1,7 @@
 /** StagePageP4 — R11-3-C8: P4 执行阶段页，展示执行进度 / 产出 / patch / Evidence / P4→P5 Gate。
  *  数据来自真实后端：
  *   - GET .../stages/{run}/stages/{stage}/taskgraph  → TaskGraph + 每节点执行状态(retry、node_status)
- *   - GET /api/projects/{id}/file?path=artifacts/p4_execution_summary.json → 变更清单 + patch 索引
+ *   - GET /api/projects/{id}/file?path=artifacts/p4/p4_execution_summary.json → 变更清单 + patch 索引
  *   - GET /api/projects/{id}/file?path=output_code/|patches/|source/ → 真实产出 / diff / 源码(只读参考)
  *   - GET .../gates/active + GatePanel → P4→P5 晋级 Gate
  *  硬要求：中文优先 / Icon.tsx 线性图标(无 emoji) / 真实数据不挂 mock 横幅(D-049) / 真源只读
@@ -81,7 +81,7 @@ export function StagePageP4({ projectId, runId = '', stageStatus, onReExecute }:
       // to avoid a 404 console error in the (honest) not-yet-executed case.
       if (tg && tg.graph_run_id) {
         const smRes = await fetch(
-          `/api/projects/${projectId}/file?path=${encodeURIComponent('artifacts/p4_execution_summary.json')}`);
+          `/api/projects/${projectId}/file?path=${encodeURIComponent('artifacts/p4/p4_execution_summary.json')}`);
         if (smRes.ok) setSummary((await smRes.json()).data || (await smRes.json()));
       }
       if (gateRes.ok) {

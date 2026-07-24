@@ -47,7 +47,7 @@ def p4_input_ok(ws_with_p4):
         output_code_refs=["output_code/migrate.py"],
         patch_refs=["patches/tn-001.diff"],
         evidence_refs=["ev-p4-tn-001"],
-        p4_summary_ref="artifacts/p4_execution_summary.json",
+        p4_summary_ref="artifacts/p4/p4_execution_summary.json",
         p4_execution_summary={"stage": "p4", "graph_status": "completed",
                               "change_manifest": []},
     )

@@ -37,6 +37,7 @@ STAGE_PRIMARY_SKILL = {
     "p1": "full-stack-profiler",
     "p2": "P-migration-assessment",
     "p3": "P-migration-planning",
+    "p4": "P-migration-execution",
 }
 
 

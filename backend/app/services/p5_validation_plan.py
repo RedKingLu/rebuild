@@ -267,7 +267,7 @@ def create_p5_validation_plan(project_id: str, run_id: str) -> P5ValidationPlan:
         P5SlotId.OUTPUT_CODE_EXISTS: "P4 output_code 文件存在且非空",
         P5SlotId.PATCHES_EXIST: "P4 patches/diff 存在且与 output_code 对应",
         P5SlotId.P4_EVIDENCE_REAL: "P4 Evidence basis 真实（非 LLM 自报）",
-        P5SlotId.P4_SUMMARY_READABLE: "artifacts/p4_execution_summary.json 可解析",
+        P5SlotId.P4_SUMMARY_READABLE: "artifacts/p4/p4_execution_summary.json 可解析",
         P5SlotId.P4_P5_GATE_APPROVED: "P4→P5 Gate 状态为 approved",
         P5SlotId.BUILD_VERIFIED: "经 ExecutionProvider 真实执行构建命令",
         P5SlotId.RUN_VERIFIED: "经 ExecutionProvider 真实执行运行/启动 + 健康检查",

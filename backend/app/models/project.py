@@ -93,6 +93,15 @@ class Project(Base):
     #    "source": "user_onboarding", "note": str}
     # 这是【用户输入采集】而非识别逻辑（识别归 LLM）；样本值随项目由用户点选/输入，不硬编码枚举。
     migration_target: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    # R17.5-P4-FIX 批3 (D-109): 技术路线选型红线（与 migration_target 同级 CPU/OS 红线）。
+    # LLM 在 P1→P2 gate 基于 P0/P1 识别事实 + migration_target 产出「技术选型建议」（目标语言/
+    # 运行时/数据库/Web 框架/中间件替换/关键架构决策，每项含 推荐+理由+备选），用户裁决批准后
+    # 落此字段成为项目红线，贯穿注入 P2 规划 / P4 执行并被验收校验。结构（开放可扩展，非封闭枚举）：
+    #   {"target_language": {recommendation, reasoning, alternatives[]}, "runtime": {...},
+    #    "database": {...}, "web_framework": {...}, "middleware_replacements": [{...}],
+    #    "key_arch_decisions": [{...}], "status": "approved", "decided_at": str, "source": str}
+    # 选型由 LLM 基于真实源码事实推荐、用户拍板；样本值随项目生成，不硬编码维度枚举（§2.3）。
+    tech_selection: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

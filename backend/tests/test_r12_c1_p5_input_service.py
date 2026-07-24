@@ -64,7 +64,7 @@ def _make_p4_summary(project_id: str, *, output_refs=None, patch_refs=None, evid
                                        "source_ref": "source/app.py"})
         (ws / ref).parent.mkdir(parents=True, exist_ok=True)
         (ws / ref).write_text("diff", encoding="utf-8")
-    _write_json(ws / "artifacts" / "p4_execution_summary.json", summary)
+    _write_json(ws / "artifacts" / "p4" / "p4_execution_summary.json", summary)
     return summary
 
 
@@ -180,7 +180,7 @@ class TestP5InputRefs:
         assert "output_code/migrate.py" in facts.output_code_refs
         assert "patches/tn-001.diff" in facts.patch_refs
         assert "ev-p4-tn-001" in facts.evidence_refs
-        assert facts.p4_summary_ref == "artifacts/p4_execution_summary.json"
+        assert facts.p4_summary_ref == "artifacts/p4/p4_execution_summary.json"
 
     def test_missing_file_evidence_gap(self, tmp_path):
         """summary 引用了文件但文件不存在 → evidence_gap（不伪造存在）。"""
@@ -200,7 +200,7 @@ class TestP5InputRefs:
             "patch_index": [],
             "nodes": [], "evidence_refs": [],
         }
-        _write_json(ws / "artifacts" / "p4_execution_summary.json", summary)
+        _write_json(ws / "artifacts" / "p4" / "p4_execution_summary.json", summary)
         # Do NOT create output_code/gone.py — it's missing
         svc, mock_db = self._make_service_with_gate_approved()
         mock_db.query.return_value.filter.return_value.all.return_value = []
@@ -242,7 +242,7 @@ class TestP5InputDTO:
             output_code_refs=["output_code/a.py"],
             patch_refs=["patches/a.diff"],
             evidence_refs=["ev-1"],
-            p4_summary_ref="artifacts/p4_execution_summary.json",
+            p4_summary_ref="artifacts/p4/p4_execution_summary.json",
             p4_to_p5_gate_id="gate-1",
             p4_to_p5_gate_status="approved",
             evidence_gaps=[{"gap_id": "g1"}],

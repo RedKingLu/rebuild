@@ -975,7 +975,7 @@ async def get_planning_summary(project_id: str):
 
 # ── P4 Model-Interruption Summary (R17.3-6 WP-6 EG-WP6-1) ──────────────────
 # Read-only view of the P4 model-interruption artifact written by WorkAgent
-# (_write_model_error_artifact → artifacts/p4_model_error.json). Surfaces the
+# (_write_model_error_artifact → artifacts/p4/p4_model_error.json). Surfaces the
 # structured `model_unavailable` payload so StagePageP4 renders
 # ModelUnavailableBanner (4-point explicit error: interrupted stage / failure
 # reason / error_category / attempted_chain + user_no-op=false guarantee).
@@ -988,8 +988,12 @@ async def get_p4_summary(project_id: str):
     if svc.project_service.get(project_id) is None:
         raise HTTPException(404, f"Project {project_id} not found")
 
+    # D-107（R17.5 P4/T4.1）：WorkAgent 将 {stage}_model_error.json 写入 artifacts/{stage}/，
+    # 故读 artifacts/p4/p4_model_error.json；兼容历史扁平路径 artifacts/p4_model_error.json。
     art_dir: _Path = workspace_path(project_id) / "artifacts"
-    fp = art_dir / "p4_model_error.json"
+    fp = art_dir / "p4" / "p4_model_error.json"
+    if not fp.exists() and (art_dir / "p4_model_error.json").exists():
+        fp = art_dir / "p4_model_error.json"
     model_error: dict | None = None
     if fp.exists():
         try:

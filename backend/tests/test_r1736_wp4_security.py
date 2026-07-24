@@ -258,7 +258,8 @@ def test_sec01_p6_handler_blocks_on_secret(isolated_data):
 
     # 构造 P4 input manifest 供 P5InputService 读取
     ws = workspace_path(project_id)
-    (ws / "artifacts" / "p4_execution_summary.json").write_text(
+    (ws / "artifacts" / "p4").mkdir(parents=True, exist_ok=True)
+    (ws / "artifacts" / "p4" / "p4_execution_summary.json").write_text(
         json.dumps({"output_code_refs": ["output_code/mod.py"], "patch_refs": [],
                     "evidence_refs": [], "p4_to_p5_gate_status": "approved"}),
         encoding="utf-8")

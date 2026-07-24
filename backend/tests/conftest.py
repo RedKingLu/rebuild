@@ -34,7 +34,27 @@ def _maybe_mock_llm(request, monkeypatch):
             self.choices = [_MockChoice()]
             self.usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1})()
 
+    # 批2: services now route through call_stream (tool loop). When stream=True,
+    # litellm.acompletion must return an async iterator of chunks — mirror that so the
+    # streaming adapter yields a token then a done sentinel (no tool calls → single round).
+    class _MockStreamChoice:
+        def __init__(self, content):
+            self.delta = type("D", (), {"content": content, "tool_calls": None})()
+
+    class _MockStreamChunk:
+        def __init__(self, content="", usage=None):
+            self.choices = [_MockStreamChoice(content)] if content is not None else []
+            self.usage = usage
+
+    async def _fake_stream(content="mocked llm response"):
+        yield _MockStreamChunk(content=content)
+        yield _MockStreamChunk(content=None,
+                               usage=type("U", (), {"prompt_tokens": 1, "completion_tokens": 1,
+                                                    "total_tokens": 2})())
+
     async def _fake_acompletion(*args, **kwargs):
+        if kwargs.get("stream"):
+            return _fake_stream()
         await asyncio.sleep(0)  # yield once
         return _MockResponse()
 

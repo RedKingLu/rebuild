@@ -202,8 +202,13 @@ class ValidationAgent:
             checks.append({"item": "独立结构核验（AcceptanceService 门控）", "passed": acc_gate_ok,
                            "reason": f"result={acc_result or acc_error}", "evidence_ref": None})
 
-        # ④ LLM 阶段：内联引用校验 + LLM 语义验收（无 Key → evidence_gap，不据此判失败）
+        # ④ LLM 阶段：内联引用校验 + LLM 语义验收。
+        #    P0-P3：语义为 advisory（结构/域校验为准）。
+        #    P4（T3.2）：语义内容保真结论作 pass/fail 门禁——读真实源+产出内容判「真实源的真实
+        #    迁移/自洽/遵守上游裁决路线」，臆造/违反路线 → 拒绝；无 Key/无法读取 → 诚实不通过
+        #    （不假 pass，去掉「结构过了就 accepted」，D-097/公理3/stage-agent-loop §7）。
         cev_verification = dict(cem_verify)
+        sem_gate_ok = True
         if llm:
             inline_stats, inline_issue = self._verify_inline_citations(cem_ref, declared)
             cev_verification["inline_citation"] = inline_stats
@@ -212,10 +217,26 @@ class ValidationAgent:
             sem = self._llm_semantic_check(work_result, declared)
             if sem:
                 cev_verification["llm_semantic"] = sem
+                if self.stage == "p4" and declared == "completed":
+                    sem_gate_ok, sem_issue = self._semantic_gate_p4(sem)
+                    if sem_issue:
+                        issues.append(sem_issue)
+                        recs.append("依据独立验收语义结论修正/重做迁移产物后重跑"
+                                    "（禁止照节点标题臆造通用样例）")
+
+        # ④'（D-109）P2/P3 技术路线红线符合性【advisory】校验：项目已批准 project.tech_selection
+        #    时，记录红线治理状态并对明显偏离发声（recommendation，不 flip passed——P0-P3 advisory；
+        #    P4 由上面 _semantic_gate_p4 依红线作门禁拦截）。
+        if self.stage in ("p2", "p3") and declared == "completed":
+            adh_check, adh_rec = self._tech_selection_adherence_advisory()
+            if adh_check:
+                checks.append(adh_check)
+            if adh_rec:
+                recs.append(adh_rec)
 
         # ⑤ 综合裁决：pass = 域基线通过 且 无反伪造违规 且 独立结构核验门控通过
-        #    （LLM 语义/内联为 advisory）
-        passed = base_passed and antifake_ok and acc_gate_ok
+        #    且（P4）LLM 内容保真语义门控通过（P0-P3 语义/内联仍为 advisory）
+        passed = base_passed and antifake_ok and acc_gate_ok and sem_gate_ok
         if declared != "completed":
             passed = False
             # WP-6 (Q-R17.3-6-2): 未完成且系模型全失败强制中断 → 结构化 model_unavailable issue，
@@ -401,9 +422,18 @@ class ValidationAgent:
                            "detail": f"主输出内联引用了不存在的上游 ref（勿杜撰，已剔除）：{invalid}"}
         return stats, None
 
+    _MAX_SEMANTIC_BYTES = 12_000  # per-file read cap for semantic acceptance (advisory)
+
     def _llm_semantic_check(self, work_result: dict, declared: str) -> Optional[dict]:
-        """LLM 语义验收（独立上下文）：读落盘产物，判断 claim 是否被上游支撑。
-        无 Key/失败 → 诚实 evidence_gap（不据此判失败，结构/域校验为准，D-097）。"""
+        """LLM 语义验收（独立上下文）。
+
+        P4 执行阶段（T3.1 内容保真）：给源路径 + 迁移产物路径，读**真实源与真实产出内容**
+        （不再只喂 claim_evidence_map 声明语句），判三点——①是否真实源的真实迁移（产物可追溯
+        source/ 真实文件、非通用臆造样例）②是否内部自洽 ③是否遵守上游裁决的目标技术栈/库路线；
+        产出结构化 verdict 供 _semantic_gate_p4 作 pass/fail 门禁（T3.2）。
+        其余 LLM 阶段（P0-P3）：沿用 claim 结构合理性 advisory 检查（结构/域校验为准）。
+        无 Key/失败/无法读取 → 诚实 evidence_gap（P4 作门禁不假 pass，D-097）。
+        """
         if declared != "completed":
             return None
         gw = self._gateway
@@ -416,11 +446,46 @@ class ValidationAgent:
         if gw is None:
             return {"status": "evidence_gap",
                     "detail": "模型网关不可用，LLM 语义验收未执行（需有效 Key 端到端验证）"}
+        if self.stage == "p4":
+            return self._llm_semantic_check_p4(gw)
+        # P0-P3：claim 结构合理性 advisory（不作门禁）
         cem = self._read_json(work_result.get("claim_evidence_map_ref")) or {}
         claims = [e.get("statement", "") for e in (cem.get("entries") or [])][:12]
         prompt = ("你是独立验收 Agent。请判断以下阶段结论是否结构合理、无自相矛盾，"
                   "仅输出 JSON：{\"verdict\":\"accepted|rework\",\"reason\":\"...\"}\n结论：\n"
                   + "\n".join(f"- {c}" for c in claims))
+        return self._run_semantic_call(gw, prompt)
+
+    def _llm_semantic_check_p4(self, gw) -> dict:
+        """T3.1：P4 内容保真语义验收——给源根路径 + 迁移产物路径，读真实产出内容与其引用的真实
+        源片段，判「真实源的真实迁移 / 内部自洽 / 遵守上游裁决路线」。该 Agent 无工具循环范式
+        → 走「给路径 + 读关键文件」（读关键产物 + 绑定源片段 + 上游裁决路线摘要，不预装配无关
+        内容）。无产物 → rework（No Evidence No Completed）；无法读取/无 Key → evidence_gap。"""
+        products = self._p4_product_files()
+        if not products:
+            return {"status": "completed", "verdict": "rework", "grounded": False,
+                    "reason": ("P4 声明完成但 output_code/ 无任何迁移产物落盘，无法确认真实迁移"
+                               "（疑空壳/臆造，No Evidence No Completed）")}
+        prod_blocks, src_blocks = self._p4_read_products_and_sources(products)
+        route = self._p4_route_summary()
+        prompt = (
+            "你是 rebuild 信创迁移平台 P4 执行阶段的【独立验收 Agent】。只依据下面提供的真实内容"
+            "判定，不得脑补或臆测未提供的信息。判定迁移产物是否达标，须同时判三点：\n"
+            "① 真实源的真实迁移：产物是否可追溯到 source/ 的真实文件与真实结构，而非与源无关的"
+            "通用臆造样例（例如凭空的通用 EMPLOYEE 表、与源栈无关的 Vue3/Java 样板）；\n"
+            "② 内部自洽：产物自身是否一致、无自相矛盾；\n"
+            "③ 遵守上游裁决路线：是否迁移到上游裁决的目标技术栈/库（见【上游裁决路线】）。\n"
+            "任一不满足（脱离真实源臆造 / 违反目标路线 / 不自洽）→ verdict=rework，且 grounded=false。\n"
+            "仅输出 JSON：{\"verdict\":\"accepted|rework\",\"grounded\":true|false,\"reason\":\"...\"}\n\n"
+            f"【源根路径】source/（真实文件样本清单）：\n{self._p4_source_manifest()}\n\n"
+            f"【上游裁决路线（目标栈/库）】\n{route}\n\n"
+            f"【迁移产物内容（output_code/ 与 patches/，路径已标注）】\n{prod_blocks}\n\n"
+            f"【产物引用的真实源片段】\n{src_blocks or '（产物未绑定可读取的 source/ 文件——若产物脱离真实源应判 rework）'}")
+        return self._run_semantic_call(gw, prompt, parse_verdict=True)
+
+    def _run_semantic_call(self, gw, prompt: str, *, parse_verdict: bool = False) -> dict:
+        """经 ModelGateway 发起一次语义验收调用（D-098）。无 Key/失败 → evidence_gap。
+        parse_verdict=True 时解析结构化 verdict/grounded/reason（P4 门禁用）。"""
         try:
             from app.services.work_agent import _run_coro
             resp = _run_coro(gw.call(messages=[{"role": "user", "content": prompt}],
@@ -431,7 +496,225 @@ class ValidationAgent:
             cat = (resp or {}).get("error_category", "unknown")
             return {"status": "evidence_gap",
                     "detail": f"LLM 语义验收未完成（{cat}）：需有效模型 Key 端到端验证"}
-        return {"status": "completed", "raw": (resp.get("content", "") or "")[:200]}
+        content = resp.get("content", "") or ""
+        out = {"status": "completed", "raw": content[:200]}
+        if parse_verdict:
+            verdict, grounded, reason = self._parse_verdict(content)
+            out.update({"verdict": verdict, "grounded": grounded, "reason": reason})
+        return out
+
+    def _semantic_gate_p4(self, sem: dict) -> tuple[bool, Optional[dict]]:
+        """T3.2：把 P4 内容保真语义结论转为 pass/fail 门禁（不再 advisory）。
+          - verdict=accepted 且未标 grounded=false → 通过；
+          - verdict=rework/reject（脱离真实源臆造 / 违反上游裁决路线 / 不自洽）→ 拒绝；
+          - status=evidence_gap 或无法解析 verdict（无 Key / 无法读取产物内容）→ 诚实不通过
+            （不假 pass，D-097；去掉「结构过了就 accepted」）。"""
+        status = sem.get("status")
+        verdict = (sem.get("verdict") or "").lower()
+        reason = str(sem.get("reason") or sem.get("detail") or "")[:200]
+        if status == "completed" and verdict in ("accepted", "pass", "approved"):
+            if sem.get("grounded") is False:
+                return False, {"type": "semantic_not_grounded",
+                               "detail": f"语义判定通过但标注 grounded=false（产物未接地真实源）：{reason}"}
+            return True, None
+        if status == "completed" and verdict in ("rework", "reject", "rejected", "fail", "failed"):
+            return False, {"type": "semantic_fidelity_fail",
+                           "detail": f"P4 内容保真语义验收判定 {verdict}（脱离真实源臆造/违反裁决路线/不自洽）：{reason}"}
+        # evidence_gap / verdict 不可解析 → 诚实不通过（不假 pass）
+        return False, {"type": "semantic_evidence_gap",
+                       "detail": (f"P4 内容保真语义验收未能给出有效结论（status={status}, verdict={verdict or 'unknown'}）："
+                                  f"{reason}；无法确认迁移产物真实接地 → 诚实不通过（需有效模型 Key 端到端复验，不假 pass）")}
+
+    # ── P4 内容保真：给路径 + 读关键文件（真实源 + 迁移产物 + 上游裁决路线）────────
+    def _read_text_capped(self, rel_path: str) -> Optional[str]:
+        try:
+            data = (self._ws_root() / rel_path).read_bytes()[:self._MAX_SEMANTIC_BYTES]
+            return data.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+    def _p4_product_files(self) -> list:
+        """从盘扫描 P4 真实迁移产物（output_code/ + patches/）。"""
+        ws = self._ws_root()
+        refs: list = []
+        for top in ("output_code", "patches"):
+            d = ws / top
+            if not d.is_dir():
+                continue
+            for p in sorted(d.rglob("*")):
+                if p.is_file():
+                    refs.append(str(p.relative_to(ws)))
+                if len(refs) >= 60:
+                    break
+        return refs
+
+    def _p4_source_refs(self) -> list:
+        """P4 产物引用的真实源路径（从 AET 落盘证据的 source_ref 收集，供读取源片段对照）。"""
+        refs: list = []
+        try:
+            from app.services.aet_service import AETService
+            for e in AETService(None).list_evidence(self.project_id, stage="p4"):
+                sr = e.get("source_ref") or (e.get("extra") or {}).get("source_ref")
+                if sr and sr not in refs:
+                    refs.append(sr)
+        except Exception:
+            logger.debug("validation_agent P4 source_ref 读取失败（advisory）", exc_info=True)
+        return refs
+
+    def _p4_read_products_and_sources(self, products: list) -> tuple[str, str]:
+        """读关键产物内容（优先 output_code/）+ 其引用的真实源片段，拼为可判读文本块。"""
+        prod_sel = [r for r in products if r.startswith("output_code/")][:6] or products[:6]
+        prod_blocks: list = []
+        for r in prod_sel:
+            txt = self._read_text_capped(r)
+            if txt is not None:
+                prod_blocks.append(f"### {r}\n```\n{txt}\n```")
+        src_blocks: list = []
+        for r in self._p4_source_refs()[:6]:
+            txt = self._read_text_capped(r)
+            if txt is not None:
+                src_blocks.append(f"### {r}\n```\n{txt}\n```")
+        return "\n\n".join(prod_blocks), "\n\n".join(src_blocks)
+
+    def _p4_source_manifest(self) -> str:
+        """source/ 真实文件样本清单（给源根路径 + 真实文件名，供判定可追溯性）。"""
+        src = self._ws_root() / "source"
+        if not src.is_dir():
+            return "（未发现 source/ 目录）"
+        names: list = []
+        for p in sorted(src.rglob("*")):
+            if p.is_file():
+                names.append(str(p.relative_to(src)))
+            if len(names) >= 40:
+                names.append("…（更多略）")
+                break
+        return "\n".join(f"- {n}" for n in names) or "（source/ 为空）"
+
+    def _p4_route_summary(self) -> str:
+        """上游裁决路线摘要（给路径 + 读关键：项目红线 project.tech_selection > P3 stage plan 目标 +
+        P2 评估目标库/栈候选）。D-109：project.tech_selection（用户经 P1→P2 gate 批准的技术路线红线）
+        为【权威】选定路线，置顶——P4 产物偏离红线 → 语义门禁 rework。"""
+        parts: list = []
+        ts = self._project_tech_selection()
+        if isinstance(ts, dict) and ts:
+            route_bits = []
+            for key, label in (("target_language", "目标语言"), ("runtime", "运行时"),
+                               ("database", "数据库"), ("web_framework", "Web 框架")):
+                item = ts.get(key)
+                if isinstance(item, dict) and item.get("recommendation"):
+                    route_bits.append(f"{label}={item.get('recommendation')}")
+            mws = ts.get("middleware_replacements")
+            if isinstance(mws, list) and mws:
+                names = [f"{m.get('component','')}→{m.get('recommendation','')}"
+                         for m in mws if isinstance(m, dict) and m.get("recommendation")]
+                if names:
+                    route_bits.append("中间件替换=" + "; ".join(names))
+            if route_bits:
+                parts.append("【项目红线·选定技术路线（权威，用户已裁决，偏离即 rework）】："
+                             + "；".join(route_bits))
+        sp = (self._read_json("artifacts/p3/p3_stage_plan.json")
+              or self._read_json("artifacts/p3/stage_plan.json") or {})
+        plan = sp.get("stage_plan", sp) if isinstance(sp, dict) else {}
+        obj = plan.get("objective") if isinstance(plan, dict) else None
+        tgt = (plan.get("target_stack") or plan.get("target") or plan.get("scope")) \
+            if isinstance(plan, dict) else None
+        if obj:
+            parts.append(f"P3 迁移目标：{str(obj)[:400]}")
+        if tgt:
+            parts.append(f"P3 目标范围/栈：{str(tgt)[:400]}")
+        p2 = self._read_json("artifacts/p2/p2_assessment_report.json") or {}
+        rep = (p2.get("report") or p2.get("assessment_report") or p2) if isinstance(p2, dict) else {}
+        adr = rep.get("adr_candidates") if isinstance(rep, dict) else None
+        if adr:
+            parts.append(f"P2 目标库/栈候选（裁决路线依据）：{json.dumps(adr, ensure_ascii=False)[:600]}")
+        return "\n".join(parts) or ("（未从项目红线/上游 P2/P3 产物解析到明确目标栈/库；"
+                                    "以「产物是否接地真实源、是否内部自洽」为主判据）")
+
+    def _project_tech_selection(self) -> Optional[dict]:
+        """D-109：读取 project.tech_selection（P1→P2 gate 批准的技术路线红线）。缺失 → None。"""
+        try:
+            from app.core.database import get_session
+            from app.models.project import Project
+            db = get_session()
+            try:
+                proj = db.get(Project, self.project_id)
+                ts = getattr(proj, "tech_selection", None) if proj else None
+                return ts if isinstance(ts, dict) and ts else None
+            finally:
+                db.close()
+        except Exception:
+            logger.debug("validation_agent 读取 project.tech_selection 失败（advisory）", exc_info=True)
+            return None
+
+    def _tech_selection_adherence_advisory(self) -> tuple[Optional[dict], Optional[str]]:
+        """D-109（P2/P3 advisory）：项目红线 project.tech_selection 存在时，检测本阶段产物是否明显
+        偏离选定目标语言。返回 (check_dict, rec_str|None)。advisory——不 flip passed（P0-P3 语义为
+        advisory），仅记 check + recommendation 发声；P4 由 _semantic_gate_p4 依红线作门禁。
+        无红线（未到 P1 或未批准）→ (None, None) 不参与。"""
+        ts = self._project_tech_selection()
+        if not isinstance(ts, dict) or not ts:
+            return None, None
+        expected: dict[str, str] = {}
+        for key in ("target_language", "runtime", "database", "web_framework"):
+            item = ts.get(key)
+            if isinstance(item, dict) and item.get("recommendation"):
+                expected[key] = str(item["recommendation"]).lower()
+        if not expected:
+            return None, None
+        if self.stage == "p2":
+            blob = json.dumps(self._read_json("artifacts/p2/p2_assessment_report.json") or {},
+                              ensure_ascii=False).lower()
+        else:  # p3
+            blob = json.dumps(self._read_json("artifacts/p3/p3_stage_plan.json")
+                              or self._read_json("artifacts/p3/stage_plan.json") or {},
+                              ensure_ascii=False).lower()
+        lang_families = {"c#": ["c#", ".net", "csharp"], "java": ["java", "spring"],
+                         "python": ["python", "django", "fastapi", "flask"],
+                         "go": ["golang", "gin gonic"], "rust": ["rust", "cargo"],
+                         "node": ["node.js", "express", "typescript", "javascript"]}
+        sel_lang = expected.get("target_language", "")
+        deviations: list[str] = []
+        if sel_lang and blob:
+            sel_fam = next((fam for fam, kws in lang_families.items()
+                            if any(k in sel_lang for k in kws)), None)
+            for fam, kws in lang_families.items():
+                if fam == sel_fam:
+                    continue
+                if any(k in blob for k in kws) and (
+                        not sel_fam or not any(k in blob for k in lang_families[sel_fam])):
+                    deviations.append(fam)
+        adhered = not deviations
+        check = {"item": "技术路线红线符合性（D-109 advisory）", "passed": adhered,
+                 "reason": ("产物未见与选定目标语言冲突的其他语言族" if adhered else
+                            f"产物出现与选定路线（{sel_lang}）不一致的语言族信号：{deviations}"),
+                 "evidence_ref": None, "advisory": True}
+        rec = (None if adhered else
+               f"{self.stage.upper()} 产物疑似偏离项目选定技术路线（目标语言={sel_lang}）：出现 "
+               f"{deviations} 语言族信号，请核对是否偏离已批准红线（advisory；P4 执行将由验收门禁强制）")
+        return check, rec
+
+    @staticmethod
+    def _parse_verdict(content: str) -> tuple[Optional[str], Optional[bool], str]:
+        """从 LLM 回答中解析结构化 verdict/grounded/reason（容错：优先 JSON，退化关键词扫描）。"""
+        import re as _re
+        text = content or ""
+        m = _re.search(r"\{.*\}", text, _re.DOTALL)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                v = obj.get("verdict")
+                g = obj.get("grounded")
+                return (str(v).lower() if v else None,
+                        (bool(g) if isinstance(g, bool) else None),
+                        str(obj.get("reason", "")))
+            except Exception:
+                pass
+        low = text.lower()
+        if "rework" in low or "reject" in low:
+            return "rework", None, text[:200]
+        if "accepted" in low or "accept" in low:
+            return "accepted", None, text[:200]
+        return None, None, text[:200]
 
     # ── AcceptanceService 结构核验（独立身份 + 独立 DB 会话） ────────────
     def _acceptance_check(self, disk_refs: list, criteria_met: dict) -> dict:

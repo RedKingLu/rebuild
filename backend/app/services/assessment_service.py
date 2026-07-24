@@ -147,7 +147,8 @@ class AssessmentService:
 
         # Q-R10-2 / WP-6: no available model → blocked, no rule fallback. 就绪度预检给出
         # 「候选模型链路」，即便一次调用都未发生也能让前端显式看到考察过的模型链路。
-        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id, project_id=project_id,
+                                             require_tool_calling=True)
         if not readiness.get("available"):
             self._trace("P2 assessment blocked: no model", project_id, run_id, stage)
             return AssessmentResult(
@@ -165,27 +166,28 @@ class AssessmentService:
         # contract. 契约放最后以保留 JSON schema 指令（真实产物）。
         parts = [p for p in (system_prompt, (skill_body or None), _SYSTEM_PROMPT) if p]
         system_content = "\n\n---\n\n".join(parts)
-        messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": self._build_user_prompt(inputs)},
-        ]
 
-        result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=4096, temperature=0.3, source="api",
-                               project_id=project_id, run_id=run_id, stage=stage)
-        if result.get("status") != "completed":
-            reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
+        # 批2 (D-110): P2 从单次 chat → 工具循环 Node Worker Agent。前序产物清单/内容仍作 user 提示
+        # 帮助，agent 可按需 read_artifact/fs_read/code_grep 探读真实源与上游产物做证据化评估、多轮
+        # 推理，末轮产出 6 类结构化评估契约（契约不变，D-108）。走 call_stream 天然读项目模型选择。
+        from app.services.stage_agent_loop import run_stage_tool_loop
+        loop = await run_stage_tool_loop(
+            gw, system_content=system_content, user_content=self._build_user_prompt(inputs),
+            project_id=project_id, run_id=run_id or "", stage=stage,
+            strategy_id=strategy_id, max_tokens=16384, temperature=0.3, tracer=self.tracer)
+        if loop["status"] != "completed":
+            reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P2 assessment model call not completed: {reason}", project_id, run_id, stage)
             # a configured-but-failing model is a failure, not a silent success (公理3);
             # WP-6: 携「已尝试模型链路」透传前端显式报错（不静默降级）。
             return AssessmentResult(status="failed", reason=str(reason),
-                                    model_used=result.get("model"),
-                                    attempted_chain=result.get("attempted_chain", []),
-                                    model_error_category=result.get("error_category", "model_unavailable"),
+                                    model_used=loop.get("model_used"),
+                                    attempted_chain=loop.get("attempted_chain", []),
+                                    model_error_category=loop.get("error_category", "model_unavailable"),
                                     model_user_actions=_MODEL_USER_ACTIONS)
 
-        parsed = self._parse(result.get("content", ""))
-        model_used = result.get("model")
+        parsed = self._parse(loop.get("content", ""))
+        model_used = loop.get("model_used")
         evidence = self._build_evidence(inputs, parsed, model_used, context_refs, skill_refs)
         self._trace("P2 assessment completed (analysis_only)", project_id, run_id, stage)
         return AssessmentResult(
@@ -289,22 +291,18 @@ class AssessmentService:
 
     # ── parse ──────────────────────────────────────────────────────────────
     def _parse(self, content: str) -> dict:
-        """Parse the LLM JSON output defensively into the 6 outputs."""
-        out: dict[str, Any] = {}
-        text = (content or "").strip()
-        # tolerate ```json fences
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lstrip().lower().startswith("json"):
-                text = text.lstrip()[4:]
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                out = data
-        except Exception:
+        """Parse the LLM JSON output defensively into the 6 outputs.
+
+        批2: robust extractor handles prose-wrapped / fenced JSON from the tool loop.
+        """
+        from app.services.stage_agent_loop import extract_json_object
+        data = extract_json_object(content)
+        if data is not None:
+            out: dict[str, Any] = data
+        else:
             # unparseable → keep raw text in the report; lists stay empty (honest,
             # the NodeLoop ReviewPass retries structured output — T2)
-            out = {"assessment_report": {"raw": text[:2000], "parse_error": True}}
+            out = {"assessment_report": {"raw": (content or "").strip()[:2000], "parse_error": True}}
         # assessment_report must be an OBJECT; a non-dict value (model returned a bare
         # string / prose while the JSON itself parsed) is unstructured output — normalize
         # to a parse_error report so downstream never receives a bare str (single source

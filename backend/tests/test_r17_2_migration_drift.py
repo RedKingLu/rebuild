@@ -22,8 +22,8 @@ BACKEND = Path(__file__).resolve().parents[1]
 
 # Reference revisions. _HEAD is ALSO asserted dynamically (test_head_is_read_dynamically)
 # so this file does not become a second source of truth for the head value.
-_HEAD = "f8a1b2c3d4e5"        # migration chain head (R17.5 WP-6: project.migration_target)
-_PREV_HEAD = "e4f5a6b7c8d9"   # down_revision of head (R16-B) — used to manufacture drift
+_HEAD = "b1c2d3e4f5a6"        # migration chain head (R17.5-P4-FIX 批4 D-111: call_log 内容/归因列)
+_PREV_HEAD = "a1c2e3f40901"   # down_revision of head (R17.5-P4-FIX 批3 D-109) — used to manufacture drift
 
 
 def _alembic_cfg() -> Config:

@@ -359,6 +359,134 @@ async def test_p4_blocked_evidence_gap(isolated_data):
     assert not rr.passed
 
 
+# ── P4 内容保真语义门禁（R17.5 P4 T3：负例三条）─────────────────────────
+class _P4SemGW:
+    """模拟有效 Key 的独立验收语义模型：按构造 verdict/grounded/reason 返回结构化 JSON。
+    P4 语义 prompt 已给源清单+产物内容+裁决路线，此 fake 只回既定判定，用于验证门禁生效。"""
+
+    def __init__(self, verdict, grounded=None, reason=""):
+        self._v, self._g, self._r = verdict, grounded, reason
+        self.calls = []
+
+    async def call(self, *, messages=None, **kw):
+        self.calls.append(messages)
+        obj = {"verdict": self._v, "reason": self._r}
+        if self._g is not None:
+            obj["grounded"] = self._g
+        return {"status": "completed", "model": "fake-strong",
+                "content": json.dumps(obj, ensure_ascii=False)}
+
+
+class _NoKeyGW:
+    """模拟无 Key / 模型不可用：语义调用返回 not_configured（同 _BlockedGW 范式）。"""
+
+    async def call(self, **kw):
+        return {"status": "not_configured", "content": "", "error_category": "model_unavailable"}
+
+
+class _PassReviewHandler:
+    """域基线通过的 P4 handler 替身（review 返回 passed）：使结构门控可全通过，从而隔离
+    验证「语义结论是否真正作 pass/fail 门禁」——同一结构产物集，仅语义 verdict 不同→结果翻转。"""
+    goal = "P4 执行迁移工作包"
+    acceptance_criteria: list = []
+    planned_actions: list = []
+
+    def review(self, view):
+        return ReviewResult(passed=True, issues=[], recommendations=[])
+
+
+def _seed_p4_completed(pid: str) -> dict:
+    """构造【结构门控全通过】的 P4 completed 产物集：真实源 + output_code/patches 迁移产物 +
+    artifacts/p4 领域产物 + 磁盘可解析 claim-evidence map + AET 证据（source_ref/output_code_ref）
+    + 上游 P2/P3 裁决路线。语义 verdict 由注入 gateway 决定。返回 work_result。"""
+    import hashlib
+    _seed(pid)
+    ws = workspace_service.workspace_path(pid)
+    # 真实迁移产物（output_code + patch）——语义检查按需读取其内容
+    (ws / "output_code").mkdir(parents=True, exist_ok=True)
+    (ws / "output_code" / "Program.cs").write_text(
+        "// 迁移自 source/app.py（Flask）→ ASP.NET Core Minimal API\n"
+        "var builder = WebApplication.CreateBuilder(args);\n"
+        "var app = builder.Build();\napp.MapGet(\"/\", () => \"x\");\napp.Run();\n",
+        encoding="utf-8")
+    (ws / "patches").mkdir(parents=True, exist_ok=True)
+    (ws / "patches" / "app.diff").write_text(
+        "--- a/source/app.py\n+++ b/output_code/Program.cs\n", encoding="utf-8")
+    # 领域产物（供 disk_refs / AcceptanceService artifact 门控）
+    p4dir = ws / "artifacts" / "p4"
+    p4dir.mkdir(parents=True, exist_ok=True)
+    (p4dir / "execution_summary.json").write_text(
+        json.dumps({"stage": "p4", "nodes": 1, "build": "evidence_gap"}, ensure_ascii=False),
+        encoding="utf-8")
+    # 上游裁决路线（P3 目标栈 + P2 候选）——供语义 prompt 的路线摘要
+    (ws / "artifacts" / "p3").mkdir(parents=True, exist_ok=True)
+    (ws / "artifacts" / "p3" / "p3_stage_plan.json").write_text(
+        json.dumps({"stage_plan": {"objective": "Flask→ASP.NET Core 迁移", "target_stack": ".NET 8"}},
+                   ensure_ascii=False), encoding="utf-8")
+    (ws / "artifacts" / "p2").mkdir(parents=True, exist_ok=True)
+    (ws / "artifacts" / "p2" / "p2_assessment_report.json").write_text(
+        json.dumps({"report": {"adr_candidates": [{"option": ".NET 8", "note": "目标运行时"}]}},
+                   ensure_ascii=False), encoding="utf-8")
+    # claim-evidence map（磁盘可解析 fact，避开 AGT-05 内联路径）
+    exec_rel = "artifacts/p4/execution_summary.json"
+    sha = hashlib.sha256((ws / exec_rel).read_bytes()).hexdigest()
+    cem = {"map_type": "claim_evidence", "entries": [
+        {"id": "ev-p4-exec", "kind": "fact", "produced_by": "deterministic_tool",
+         "statement": "P4 执行汇总落盘",
+         "bindings": {"artifact_refs": [exec_rel], "sha256": sha}}]}
+    cem_rel = "artifacts/p4/p4_claim_evidence_map.json"
+    (ws / cem_rel).write_text(json.dumps(cem, ensure_ascii=False), encoding="utf-8")
+    # AET 证据（含 output_code_ref/source_ref）——供 acc 门控 evidence + 语义源片段读取
+    from app.services.aet_service import AETService
+    AETService(None).write_evidence(
+        pid, "ev-p4-code", "code", stage="p4",
+        extra={"output_code_ref": "output_code/Program.cs", "source_ref": "source/app.py",
+               "evidence_basis": "real_file_on_disk"})
+    return {"status": "completed", "claim_evidence_map_ref": cem_rel,
+            "output_code_ref": "output_code/Program.cs"}
+
+
+async def test_p4_semantic_gate_rejects_fabricated(isolated_data):
+    """负例①：结构门控全通过，但独立语义验收判 rework（脱离真实源臆造/违反裁决路线）→ 验收
+    拒绝。证明语义内容保真结论作 pass/fail 门禁（非当前 advisory，T3.2）。"""
+    pid = "wp2b-p4-fab"
+    wr = _seed_p4_completed(pid)
+    gw = _P4SemGW("rework", grounded=False, reason="产出为通用 EMPLOYEE 表，脱离真实 Flask 源")
+    va = ValidationAgent("p4", pid, run_id="r1", handler=_PassReviewHandler(), gateway=gw)
+    rr = va.validate(wr)
+    assert gw.calls, "语义验收必须真实发起模型调用（读产物+源，非只喂声明语句）"
+    assert not rr.passed, "臆造/违反路线 → 验收必须拒绝"
+    assert any(i.get("type") == "semantic_fidelity_fail" for i in rr.issues), \
+        f"必须因内容保真语义门禁拒绝 issues={rr.issues}"
+
+
+async def test_p4_semantic_gate_passes_real_migration(isolated_data):
+    """负例②（正向对照）：同一结构产物集，语义验收判 accepted+grounded → 通过。与①仅 verdict
+    不同→结果翻转，证明门禁真正作数（若结果不随语义 verdict 变，即证明「上层仍按结构判」）。"""
+    pid = "wp2b-p4-real"
+    wr = _seed_p4_completed(pid)
+    gw = _P4SemGW("accepted", grounded=True,
+                  reason="真实 Flask→.NET 迁移，接地 source/app.py，遵守 .NET 8 路线")
+    va = ValidationAgent("p4", pid, run_id="r1", handler=_PassReviewHandler(), gateway=gw)
+    rr = va.validate(wr)
+    assert gw.calls, "语义验收真实发起模型调用"
+    assert rr.passed, f"真实迁移 + 结构门控通过 → 应通过 issues={rr.issues}"
+    assert not any(i.get("type", "").startswith("semantic_") for i in rr.issues), \
+        f"accepted+grounded 不应产生语义门禁 issue issues={rr.issues}"
+
+
+async def test_p4_semantic_gate_no_key_not_pass(isolated_data):
+    """负例③：无 Key / 模型不可用 → 语义 evidence_gap → 诚实不通过（不假 pass，D-097）。即使
+    结构门控全通过，也因无法确认内容保真而拒绝（去掉「结构过了就 accepted」）。"""
+    pid = "wp2b-p4-nokey"
+    wr = _seed_p4_completed(pid)
+    va = ValidationAgent("p4", pid, run_id="r1", handler=_PassReviewHandler(), gateway=_NoKeyGW())
+    rr = va.validate(wr)
+    assert not rr.passed, "无 Key 不得假 pass（D-097 诚实降级）"
+    assert any(i.get("type") == "semantic_evidence_gap" for i in rr.issues), \
+        f"无 Key → semantic_evidence_gap（诚实不通过）issues={rr.issues}"
+
+
 # ── P5 验证（确定性，无 Key 端到端）+ GATE-01 报告挂 Gate ───────────────
 async def test_p5_deterministic_workflow_and_gate_material(isolated_data):
     from app.graph.stage_handlers import RealP5Handler

@@ -60,6 +60,7 @@ export function ModelsPage() {
   // catalogFilter moved into ModelCatalogTab (R15-4-C9).
   const [callPage, setCallPage] = useState(0);
   const [callTotal, setCallTotal] = useState(0);
+  const [expandedCall, setExpandedCall] = useState<string | null>(null);
   const PAGE_SIZE = 10;
 
   const fetchData = useCallback(async () => {
@@ -307,12 +308,44 @@ export function ModelsPage() {
                   <div className="sub" style={{ fontSize: 11 }}>
                     {c.selected_model} · {c.provider_id} · 来源 {SOURCE_LABELS[c.source] || c.source} · {c.latency_ms}ms
                   </div>
+                  {/* D-111: 归因（项目 / 阶段 / 运行）——可空，旧记录不显示 */}
+                  {(c.project_id || c.stage || c.run_id) && (
+                    <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>
+                      归因：{c.project_id ? <>项目 <code style={{ fontSize: 10 }}>{c.project_id.slice(0, 8)}…</code></> : '项目 —'}
+                      {c.stage ? ` · 阶段 ${c.stage.toUpperCase()}` : ''}
+                      {c.run_id ? <> · 运行 <code style={{ fontSize: 10 }}>{c.run_id.slice(0, 8)}…</code></> : ''}
+                    </div>
+                  )}
                   <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>
                     输入 {c.usage_summary?.prompt_tokens?.toLocaleString() ?? 0}
                     · 输出 {c.usage_summary?.completion_tokens?.toLocaleString() ?? 0}
                     · 缓存命中 {c.usage_summary?.cache_hit_tokens?.toLocaleString() ?? 0}
                     · 总计 {c.usage_summary?.total_tokens?.toLocaleString() ?? 0} tokens
                   </div>
+                  {/* D-111: 查看每条调用内容（脱敏）。仅当持久化了内容时可展开 */}
+                  {(c.request_messages || c.response_content) && (
+                    <div style={{ marginTop: 6 }}>
+                      <button className="btn sm ghost"
+                        onClick={() => setExpandedCall(expandedCall === c.model_call_id ? null : c.model_call_id)}>
+                        {expandedCall === c.model_call_id ? '收起调用内容' : '查看调用内容'}
+                      </button>
+                      {expandedCall === c.model_call_id && (
+                        <div style={{ marginTop: 6 }}>
+                          <div className="sub" style={{ fontSize: 10, marginBottom: 4 }}>
+                            内容已脱敏（Key/Token/连接串 → [REDACTED]）{c.content_truncated ? ' · 已截断' : ''}
+                          </div>
+                          <div className="sub" style={{ fontSize: 11, fontWeight: 600 }}>请求 messages</div>
+                          <pre style={{ fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-all', background: 'var(--bg-subtle, #f6f8fa)', padding: 8, borderRadius: 4, maxHeight: 240, overflow: 'auto' }}>
+                            {c.request_messages || '（无）'}
+                          </pre>
+                          <div className="sub" style={{ fontSize: 11, fontWeight: 600, marginTop: 6 }}>响应内容</div>
+                          <pre style={{ fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-all', background: 'var(--bg-subtle, #f6f8fa)', padding: 8, borderRadius: 4, maxHeight: 240, overflow: 'auto' }}>
+                            {c.response_content || '（无 / 调用未成功）'}
+                          </pre>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

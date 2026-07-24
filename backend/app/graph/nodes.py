@@ -26,6 +26,7 @@ from langgraph.types import interrupt
 
 from app.graph.state import GraphState, next_stage
 from app.graph.stage_loop import StageLoop
+from app.graph.stage_retry import run_stage_with_transient_retry
 from app.services.review_pass import ReviewResult
 
 logger = logging.getLogger("rebuild.graph.nodes")
@@ -328,7 +329,11 @@ def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
                 goal=getattr(handler, "goal", f"{stage} stage"),
                 acceptance_criteria=getattr(handler, "acceptance_criteria", []),
                 planned_actions=getattr(handler, "planned_actions", []),
-                execute_fn=lambda: _work_agent.execute(state),
+                execute_fn=lambda: run_stage_with_transient_retry(
+                    stage=stage,
+                    execute_fn=lambda: _work_agent.execute(state),
+                    tracer=_tracer, auditor=_auditor,
+                    project_id=project_id, run_id=run_id),
                 review_fn=_agent_review,
             )
         else:
@@ -336,7 +341,11 @@ def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
                 goal=getattr(handler, "goal", f"{stage} stage"),
                 acceptance_criteria=getattr(handler, "acceptance_criteria", []),
                 planned_actions=getattr(handler, "planned_actions", []),
-                execute_fn=lambda: handler.execute(state),
+                execute_fn=lambda: run_stage_with_transient_retry(
+                    stage=stage,
+                    execute_fn=lambda: handler.execute(state),
+                    tracer=_tracer, auditor=_auditor,
+                    project_id=project_id, run_id=run_id),
                 review_fn=handler.review,
             )
 

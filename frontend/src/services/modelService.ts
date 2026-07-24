@@ -119,6 +119,13 @@ export interface CallLogEntry {
     cache_read_input_tokens?: number;
   };
   source: string;
+  // D-111: 归因 + 脱敏后的调用内容（内容已脱敏，可能被截断）
+  project_id?: string | null;
+  stage?: string | null;
+  run_id?: string | null;
+  request_messages?: string | null;
+  response_content?: string | null;
+  content_truncated?: boolean;
   created_at: string;
   completed_at?: string;
 }
@@ -164,8 +171,11 @@ export function selfTest(providerId: string, profileId?: string): Promise<{ data
   });
 }
 
-export function listCalls(limit = 10, offset = 0): Promise<{ data: { calls: CallLogEntry[]; total: number; limit: number; offset: number } }> {
-  return get<{ calls: CallLogEntry[]; total: number; limit: number; offset: number }>(`/model/calls?limit=${limit}&offset=${offset}`);
+export function listCalls(limit = 10, offset = 0, filters?: { projectId?: string; stage?: string }): Promise<{ data: { calls: CallLogEntry[]; total: number; limit: number; offset: number } }> {
+  const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (filters?.projectId) qs.set('project_id', filters.projectId);
+  if (filters?.stage) qs.set('stage', filters.stage);
+  return get<{ calls: CallLogEntry[]; total: number; limit: number; offset: number }>(`/model/calls?${qs.toString()}`);
 }
 
 export interface CallLogPage {

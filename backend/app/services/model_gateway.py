@@ -318,6 +318,7 @@ class ModelGateway:
     def stage_model_readiness(self, *, strategy_id: str = "system-default",
                               user_override: Optional[str] = None,
                               preferred_ref: Optional[str] = None,
+                              project_id: Optional[str] = None,
                               require_tool_calling: bool = False) -> dict:
         """阶段模型就绪度预检（Q-R17.3-6-2）：在真正调用前判断「是否存在任一按策略
         可用的模型」以及「阶段所需能力是否可满足」。返回结构化候选链，供阶段服务在
@@ -327,7 +328,13 @@ class ModelGateway:
         available=False → 阶段应彻底中断（禁止规则兜底冒充 LLM，D-097/公理3）。
         探查为「configured + 具备凭据」（非实时网络可达；可达失败由运行期调用驱动回退
         捕获，见 call()/call_stream 的 attempted_chain）。
+
+        批2 (D-110/task B): 传入 project_id → 预检解析【项目模型选择】(global_model_ref via
+        preferred_ref) 作为首选，使 P0-P3 预检与真实 call_stream 路径一致地尊重用户模型选择
+        （否则预检只看 strategy 默认，会因默认档位凭据缺失而误判 blocked，而项目所选模型其实可用）。
         """
+        if preferred_ref is None and user_override is None and project_id:
+            preferred_ref = self._project_preferred_ref(project_id, None)
         profile, reason, provider = self._registry.resolve_model(
             user_override=user_override, strategy_id=strategy_id, preferred_ref=preferred_ref)
         candidates: list[dict] = []
@@ -367,7 +374,9 @@ class ModelGateway:
             candidates.append(_attempt_entry(cand_profile, cand_provider, model_name,
                                              "candidate_ready" if cap_ok else "capability_unmet",
                                              error_category="" if cap_ok else "capability_unmet",
-                                             error_message="" if cap_ok else "该模型不支持阶段所需的 tool_calling 能力",
+                                             error_message="" if cap_ok else
+                                             f"所选模型 {model_name} 不支持 tool_calling（工具调用），"
+                                             f"本阶段需要模型调用工具才能完成",
                                              is_fallback=is_fb))
             if cap_ok:
                 available = True
@@ -376,7 +385,8 @@ class ModelGateway:
         if available:
             rsn = ""
         elif require_tool_calling and any(c["outcome"] == "capability_unmet" for c in candidates):
-            rsn = "阶段所需模型能力（tool_calling）不可满足：无任一已配置模型支持该能力"
+            rsn = ("所选模型不支持 tool_calling（工具调用）：本阶段需模型调用工具才能完成，"
+                   "请改选支持工具调用的模型（平台尊重你的模型选择，不会自动降级或替换）")
         else:
             rsn = "无任一已配置且具备有效凭据的模型可用"
         return {"available": available, "capability_ok": capability_ok,
@@ -448,20 +458,24 @@ class ModelGateway:
                                f"Fusion virtual model '{user_override}' 不存在", "fusion_lookup")
 
         # R13-8-FIX: 软优先级链（strategy 默认）命中 Fusion → 透明分派（像普通模型；AC-U3）。
-        # call() 无 project 上下文，preferred_ref 由 call_stream 承载；此处覆盖 strategy 默认为 Fusion 的情形。
+        # 批2 (D-110/task B): call() 现在也解析项目模型选择（global_model_ref via preferred_ref），
+        # 使非流式路径（如 P3 边提议、测试兜底单调）同样尊重用户模型选择，与 call_stream 对齐。
+        preferred_ref = (self._project_preferred_ref(project_id, None)
+                         if user_override is None else None)
         if user_override is None:
-            soft_fp = self._soft_fusion_profile(None, strategy_id)
+            soft_fp = self._soft_fusion_profile(preferred_ref, strategy_id)
             if soft_fp is not None:
                 return await self._dispatch_fusion(soft_fp, messages, source=source)
 
         # 1. Resolve model
         profile, reason, provider = self._registry.resolve_model(
-            user_override=user_override, strategy_id=strategy_id,
+            user_override=user_override, strategy_id=strategy_id, preferred_ref=preferred_ref,
         )
 
         if not profile or not provider:
             # 无任一按策略可用的模型 → 全失败强制中断（Q-R17.3-6-2）。给出候选链路供前端显式报错。
-            readiness = self.stage_model_readiness(strategy_id=strategy_id, user_override=user_override)
+            readiness = self.stage_model_readiness(strategy_id=strategy_id, user_override=user_override,
+                                                   preferred_ref=preferred_ref)
             self._emit_model_event(
                 action="model_unavailable", summary="无任一按策略可用的模型（未配置 / 无凭据）",
                 project_id=project_id, run_id=run_id, stage=stage,
@@ -566,6 +580,11 @@ class ModelGateway:
             "created_at": _now_iso(),
             "completed_at": _now_iso(),
         }
+        # D-111: 落脱敏后的调用内容 + 项目/阶段/运行归因（绝不落明文密钥）。
+        _attach_call_content(
+            call_record, messages=messages,
+            response=(result.content if result.status == "completed" else ""),
+            project_id=project_id, run_id=run_id, stage=stage)
         self._calls.append(call_record)
         self._persist_call(call_record)
 
@@ -600,6 +619,9 @@ class ModelGateway:
         source: str = "api",
         project_id: Optional[str] = None,
         agent_ref: Optional[str] = None,
+        run_id: Optional[str] = None,
+        stage: Optional[str] = None,
+        timeout: Optional[float] = None,
     ):
         """Stream a model call through the gateway as an async generator.
 
@@ -672,6 +694,10 @@ class ModelGateway:
         selected_reason = reason
         tokens_committed = False
         stream_done = False
+        # D-111: 累积完成文本（脱敏后落 call_log；有界，超过上限即停止累积 + 标记截断）。
+        resp_buf: list[str] = []
+        resp_len = 0
+        resp_truncated = False
         # Q-R17.3-6-2: 已尝试模型链路（流式），供全失败中断时前端显式报错。
         attempted_chain: list[dict] = []
 
@@ -706,6 +732,7 @@ class ModelGateway:
                 async for frame in self._adapter.stream_complete(
                     model=litellm_model, messages=messages, api_base=api_base, api_key=key_val,
                     max_tokens=max_tokens, temperature=temperature, tools=tools,
+                    timeout=timeout,
                 ):
                     ftype = frame.get("type")
 
@@ -750,6 +777,10 @@ class ModelGateway:
                         attempted_chain.append(_attempt_entry(
                             try_profile, try_provider, litellm_model, "completed",
                             is_fallback=is_fb))
+                        # Surface the resolved model on the done frame so streaming
+                        # consumers (stage tool loops / agent_loop) can attribute the
+                        # selected model without re-querying (批2: model_used 归因)。
+                        frame.setdefault("selected_model", litellm_model)
                         yield frame
                         stream_done = True
                         break
@@ -770,6 +801,13 @@ class ModelGateway:
                                              f"已按策略回退至 {try_profile.profile_id}（流式）"),
                                     project_id=project_id, run_id=None, stage=None,
                                     attempted_chain=attempted_chain)
+                        # D-111: 累积完成文本（仅 token 文本；tool_calls 不入内容正文）。
+                        if frame.get("type") == "token" and resp_len < _CONTENT_CAP:
+                            _tok = frame.get("content", "") or ""
+                            resp_buf.append(_tok)
+                            resp_len += len(_tok)
+                            if resp_len >= _CONTENT_CAP:
+                                resp_truncated = True
                         yield frame
 
                 if stream_done:
@@ -816,6 +854,11 @@ class ModelGateway:
                 "created_at": _now_iso(),
                 "completed_at": _now_iso(),
             }
+            # D-111: 落脱敏后的调用内容（累积的完成文本）+ 项目/阶段/运行归因。
+            _attach_call_content(call_record, messages=messages, response="".join(resp_buf),
+                                 project_id=project_id, run_id=run_id, stage=stage)
+            if resp_truncated:
+                call_record["content_truncated"] = True
             self._calls.append(call_record)
             self._persist_call(call_record)
 
@@ -975,6 +1018,12 @@ class ModelGateway:
                     completion_tokens=usage.get("completion_tokens", 0),
                     total_tokens=usage.get("total_tokens", 0),
                     source=record.get("source", "api"),
+                    project_id=record.get("project_id"),
+                    stage=record.get("stage"),
+                    run_id=record.get("run_id"),
+                    request_messages=record.get("request_messages"),
+                    response_content=record.get("response_content"),
+                    content_truncated=int(bool(record.get("content_truncated", False))),
                 )
                 db.add(cl)
                 db.commit()
@@ -985,17 +1034,26 @@ class ModelGateway:
         except Exception as e:
             logger.debug("background call-log DB write failed (in-memory log still available): %s", e)
 
-    def list_calls(self, limit: int = 10, offset: int = 0) -> tuple[list[dict], int]:
-        """List calls from DB with pagination (FB-M). Returns (records, total_count)."""
+    def list_calls(self, limit: int = 10, offset: int = 0, *,
+                   project_id: Optional[str] = None,
+                   stage: Optional[str] = None) -> tuple[list[dict], int]:
+        """List calls from DB with pagination (FB-M). Returns (records, total_count).
+
+        D-111: 可按 project_id / stage 归因过滤（None = 不过滤）。
+        """
         try:
             from app.core.database import get_session
             from app.models.call_log import CallLog
             db = get_session()
             try:
-                total = db.query(CallLog).count()
+                q = db.query(CallLog)
+                if project_id is not None:
+                    q = q.filter(CallLog.project_id == project_id)
+                if stage is not None:
+                    q = q.filter(CallLog.stage == stage)
+                total = q.count()
                 rows = (
-                    db.query(CallLog)
-                    .order_by(CallLog.created_at.desc())
+                    q.order_by(CallLog.created_at.desc())
                     .offset(offset)
                     .limit(limit)
                     .all()
@@ -1006,6 +1064,10 @@ class ModelGateway:
         except Exception:
             # DB unavailable — fallback to in-memory
             mem = list(reversed(self._calls))
+            if project_id is not None:
+                mem = [c for c in mem if c.get("project_id") == project_id]
+            if stage is not None:
+                mem = [c for c in mem if c.get("stage") == stage]
             return mem[offset:offset + limit], len(mem)
 
     def get_call(self, call_id: str) -> Optional[dict]:
@@ -1248,3 +1310,74 @@ def _call_error(error_category: str, message: str, reason: str = "",
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── D-111: 调用内容落库前的脱敏 + 截断（可观测性；绝不落明文密钥）─────────────────
+# 单一事实源：脱敏复用 intake_service.redact_config_text（连接串 + api_key/secret/
+# password/token → [REDACTED]，D-032）。内容可能很大 → 逐条截断控体积。
+_CONTENT_CAP = 8000          # 单条 messages / 完成文本落库上限（字符）
+_MSG_CONTENT_CAP = 2000      # 单条 message.content 截断上限（字符），避免超长单条挤占
+
+
+def _redact_text(text: str) -> str:
+    """脱敏任意文本（D-032）：复用采集层单一事实源，绝不把密钥/连接串值落库。"""
+    if not text:
+        return text or ""
+    try:
+        from app.services.intake_service import redact_config_text
+        return redact_config_text(text)
+    except Exception:  # 公理3: 脱敏工具异常必须发声，但不得因此泄漏原文 → 保守回退为占位
+        logger.warning("call-log 内容脱敏失败，保守丢弃原文（不落明文）", exc_info=True)
+        return "[REDACTION_FAILED]"
+
+
+def _redacted_messages(messages: list[dict] | None) -> tuple[str, bool]:
+    """把请求 messages 脱敏 + 截断为可落库的 JSON 文本。返回 (json_text, truncated)。"""
+    import json as _json
+    if not messages:
+        return "", False
+    truncated = False
+    out: list[dict] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role", ""))
+        raw = m.get("content", "")
+        # content 可能是 str 或 OpenAI 多模态 list → 统一转文本再脱敏
+        if not isinstance(raw, str):
+            raw = _json.dumps(raw, ensure_ascii=False)
+        red = _redact_text(raw)
+        if len(red) > _MSG_CONTENT_CAP:
+            red = red[:_MSG_CONTENT_CAP] + "…[截断]"
+            truncated = True
+        out.append({"role": role, "content": red})
+    text = _json.dumps(out, ensure_ascii=False)
+    if len(text) > _CONTENT_CAP:
+        text = text[:_CONTENT_CAP] + "…[截断]"
+        truncated = True
+    return text, truncated
+
+
+def _redacted_completion(content: str | None) -> tuple[str, bool]:
+    """把完成文本脱敏 + 截断为可落库文本。返回 (text, truncated)。"""
+    if not content:
+        return "", False
+    red = _redact_text(content)
+    if len(red) > _CONTENT_CAP:
+        return red[:_CONTENT_CAP] + "…[截断]", True
+    return red, False
+
+
+def _attach_call_content(record: dict, *, messages: list[dict] | None, response: str | None,
+                         project_id: Optional[str], run_id: Optional[str],
+                         stage: Optional[str]) -> None:
+    """给 call_record 注入脱敏后的内容 + 归因字段（D-111）。就地修改 record。"""
+    req_text, req_trunc = _redacted_messages(messages)
+    resp_text, resp_trunc = _redacted_completion(response)
+    record["request_messages"] = req_text
+    record["response_content"] = resp_text
+    record["content_truncated"] = bool(req_trunc or resp_trunc)
+    record["project_id"] = project_id
+    record["run_id"] = run_id
+    record["stage"] = stage
+

@@ -257,6 +257,13 @@ class CallLogEntry(BaseModel):
     fallback_used: bool = False
     usage_summary: UsageSummaryResponse = Field(default_factory=UsageSummaryResponse)
     source: str = "api"
+    # ── D-111: 归因 + 脱敏后的调用内容（内容已脱敏 D-032，可能被截断）──
+    project_id: str | None = None
+    stage: str | None = None
+    run_id: str | None = None
+    request_messages: str | None = None
+    response_content: str | None = None
+    content_truncated: bool = False
     created_at: str = ""
     completed_at: str = ""
 

@@ -86,9 +86,9 @@ async def test_c5_sequence_two_nodes_completed():
     # 真实产物落盘（两节点各 output_code + patch）+ C7 执行摘要（change manifest + patch index）
     assert len(res["patch_refs"]) == 2
     assert len(res["evidence_refs"]) == 2
-    assert any(a == "artifacts/p4_execution_summary.json" for a in res["artifacts"]), \
+    assert any(a == "artifacts/p4/p4_execution_summary.json" for a in res["artifacts"]), \
         "C7 execution summary should be attached as the primary Gate review artifact"
-    core = [a for a in res["artifacts"] if a != "artifacts/p4_execution_summary.json"]
+    core = [a for a in res["artifacts"] if a != "artifacts/p4/p4_execution_summary.json"]
     assert len(core) == 4 and all(
         a.startswith("output_code/") or a.startswith("patches/") for a in core)
     for nid in ("n1", "n2"):
@@ -169,9 +169,9 @@ async def test_c7_execution_summary_written(monkeypatch):
     _mk_graph(pid, [("c1", ["source/S.cs"])])
     res = await _handler(_StubGateway()).execute({"project_id": pid, "run_id": "r7"})
     assert res["status"] == "completed"
-    assert "artifacts/p4_execution_summary.json" in res["artifacts"]
+    assert "artifacts/p4/p4_execution_summary.json" in res["artifacts"]
 
-    summ = json.loads((ws / "artifacts/p4_execution_summary.json").read_text())
+    summ = json.loads((ws / "artifacts/p4/p4_execution_summary.json").read_text())
     assert summ["stage"] == "p4" and summ["graph_status"] == "completed"
     # change manifest: every output_code file with REAL re-read sha256 + bytes
     assert len(summ["change_manifest"]) >= 1
@@ -196,6 +196,43 @@ async def test_c7_no_summary_when_blocked(monkeypatch):
     _mk_graph(pid, [("bad", [])])
     res = await _handler(_BlockedGateway()).execute({"project_id": pid, "run_id": "rB"})
     assert res["status"] == "blocked"
-    assert "artifacts/p4_execution_summary.json" not in res["artifacts"]
-    assert not (workspace_service.workspace_path(pid) / "artifacts"
+    assert "artifacts/p4/p4_execution_summary.json" not in res["artifacts"]
+    assert not (workspace_service.workspace_path(pid) / "artifacts" / "p4"
                 / "p4_execution_summary.json").exists()
+
+
+# ── T4.2（R17.5 P4）：D-107 阶段完成包 artifacts/p4/_stage_package.json ────────────
+
+async def test_p4_stage_package_written_on_completed():
+    """T4.2: P4 完成时产出 artifacts/p4/_stage_package.json 完成包（products 从真实落盘 refs
+    动态收集，含 execution_summary + output_code + patch，key_for_next 标记，next_stage_advice
+    指向 P5），对齐 P0-P3 的 _stage_package.json 契约。"""
+    from app.services.stage_package import read_stage_package
+    pid = "proj-p4-pkg"
+    _mk_ws(pid, {"source/S.cs": "class S{}\n"})
+    _mk_graph(pid, [("c1", ["source/S.cs"])])
+    res = await _handler(_StubGateway()).execute({"project_id": pid, "run_id": "rP"})
+    assert res["status"] == "completed"
+    pkg = read_stage_package(pid, "p4")
+    assert pkg is not None, "P4 完成必须写 artifacts/p4/_stage_package.json"
+    assert pkg["stage"] == "p4"
+    assert "进入 P5" in pkg["next_stage_advice"]
+    # products 动态收集自真实 refs：至少含 execution_summary + output_code + patch，均 key_for_next
+    types = {p["type"] for p in pkg["products"]}
+    assert {"execution_summary", "output_code", "patch"} <= types, f"products types={types}"
+    assert any(p["file"].endswith("p4_execution_summary.json") and p["key_for_next"]
+               for p in pkg["products"])
+    assert all(p["key_for_next"] for p in pkg["products"])
+    assert pkg["evidence_summary"]["output_code_count"] >= 1
+    assert pkg["evidence_summary"]["graph_status"] == "completed"
+
+
+async def test_p4_stage_package_absent_when_blocked():
+    """T4.2: P4 blocked（无产物）不写完成包——诚实不伪造阶段完成。"""
+    from app.services.stage_package import read_stage_package
+    pid = "proj-p4-pkg-block"
+    _mk_ws(pid, {"source/keep.cs": "orig\n"})
+    _mk_graph(pid, [("bad", [])])
+    res = await _handler(_BlockedGateway()).execute({"project_id": pid, "run_id": "rPB"})
+    assert res["status"] == "blocked"
+    assert read_stage_package(pid, "p4") is None

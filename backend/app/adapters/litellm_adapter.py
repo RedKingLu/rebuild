@@ -6,6 +6,7 @@ Uses litellm.Router for multi-provider routing with fallback support.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -23,6 +24,15 @@ _RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_BASE_DELAY", "2.0"))
 # R9-5-1: hard request timeout so a non-responding provider FAILS FAST instead of
 # hanging forever (公理3 失败必发声). Configurable via LLM_REQUEST_TIMEOUT (seconds).
 _REQUEST_TIMEOUT = float(os.environ.get("LLM_REQUEST_TIMEOUT", "60"))
+# R17.5-P4-FIX 批2.6: overall wall-clock ceiling for a STREAMING call. The per-chunk
+# litellm `timeout` only bounds connect / single-chunk read — it does NOT bound the whole
+# stream, so a slow-dripping / stalling provider could run 13+ minutes for ~7.5k tokens
+# (real P0→P2 call_log: single calls of 791s / 531s). This ceiling wraps the entire stream
+# iteration so a stalled stream FAILS FAST and can be retried/fallen back. A caller may pass
+# a longer per-call `timeout` for legitimately slow stages (P3 planning / P4 multi-file
+# nodes); we honour it as the ceiling — but the ceiling is always finite (never unbounded).
+# Configurable via LLM_STREAM_TOTAL_TIMEOUT (seconds).
+_STREAM_TOTAL_TIMEOUT = float(os.environ.get("LLM_STREAM_TOTAL_TIMEOUT", "240"))
 
 
 @dataclass
@@ -181,6 +191,7 @@ class LiteLLMAdapter:
         temperature: float = 0.7,
         tools: Optional[list[dict]] = None,
         extra_params: Optional[dict] = None,
+        timeout: Optional[float] = None,
     ):
         """Stream a completion as an async generator yielding dicts.
 
@@ -193,9 +204,18 @@ class LiteLLMAdapter:
 
         Chunk parsing logic adapted from AgentLoop real streaming (三步法吸收, T1).
         Once any token has been yielded, errors emit an error frame — no silent swallow (公理3).
+
+        R17.5-P4-FIX 批2.6 (performance / robustness hardening):
+        - Overall wall-clock ceiling (`_STREAM_TOTAL_TIMEOUT`, or the caller's per-call
+          `timeout` when longer) wraps the WHOLE stream iteration via asyncio.wait_for, so a
+          slow-dripping / stalling provider FAILS FAST at the ceiling (timeout) instead of
+          running many minutes — the per-chunk litellm timeout alone cannot bound this.
+        - Backoff retry (up to `_MAX_RETRIES`, mirroring complete()) for transient failures
+          (timeout / rate_limited / provider_unreachable) — BUT only while nothing has been
+          committed to the consumer yet. Once a token / tool_calls frame has been yielded we
+          NEVER dirty-retry (would duplicate output); we emit an honest error frame instead.
         """
-        call_id = f"scall_{uuid.uuid4().hex[:12]}"
-        kwargs: dict[str, Any] = {
+        base_kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
@@ -204,54 +224,116 @@ class LiteLLMAdapter:
             "api_base": api_base,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "timeout": _REQUEST_TIMEOUT,
+            "timeout": timeout if timeout is not None else _REQUEST_TIMEOUT,
         }
         if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            base_kwargs["tools"] = tools
+            base_kwargs["tool_choice"] = "auto"
         if extra_params:
-            kwargs.update(extra_params)
+            base_kwargs.update(extra_params)
 
-        tokens_yielded = False
-        usage: dict = {}
-        try:
-            response = await litellm.acompletion(**kwargs)
-            async for chunk in response:
-                if not chunk.choices:
-                    # Usage-only final chunk
+        # Wall-clock ceiling for the entire stream. Honour a longer per-call timeout (slow
+        # stages), else the module default; always finite (兜底).
+        stream_total_timeout = (
+            max(float(timeout), _STREAM_TOTAL_TIMEOUT) if timeout is not None
+            else _STREAM_TOTAL_TIMEOUT
+        )
+
+        # Committed = a token/tool_calls frame has been yielded to the consumer. Once True,
+        # a clean retry is impossible (would duplicate already-emitted output) → error frame.
+        committed = False
+        for attempt in range(_MAX_RETRIES + 1):
+            call_id = f"scall_{uuid.uuid4().hex[:12]}"
+            usage: dict = {}
+            # R17.5-P4-FIX 批2.8: reasoning-model bypass. kimi/deepseek 等推理模型把推理链
+            # 走 delta.reasoning_content、最终答案走 delta.content。若只读 delta.content，
+            # 推理阶段会产出 0 个 token 帧，上层误判 empty_content（P3 强制合成实测：满 8192
+            # completion_tokens 但 final_text 为空）。这里累积 reasoning_content 作兜底：
+            #   - 正常有 content → 按原逻辑 emit token，reasoning 只旁路累积、绝不混入答案；
+            #   - 整段流结束仍无任何 content token 且非工具轮 → 把 reasoning 作为最终内容 emit，
+            #     避免把"其实产出了内容、只是落在 reasoning 流"误判成空失败。
+            reasoning_buf = ""
+            content_emitted = False   # 本次流是否 emit 过真正的 delta.content token
+            tool_emitted = False      # 本次流是否 emit 过 tool_calls（工具轮不注入 reasoning 旁白）
+            deadline = time.monotonic() + stream_total_timeout
+            response = None
+            try:
+                response = await asyncio.wait_for(
+                    litellm.acompletion(**base_kwargs),
+                    timeout=max(1.0, deadline - time.monotonic()),
+                )
+                stream_iter = response.__aiter__()
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("stream total wall-clock timeout exceeded")
+                    try:
+                        chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=remaining)
+                    except StopAsyncIteration:
+                        break
+                    if not chunk.choices:
+                        # Usage-only final chunk
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            usage = {
+                                "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
+                                "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
+                                "total_tokens": getattr(chunk.usage, "total_tokens", 0),
+                            }
+                        continue
+                    delta = chunk.choices[0].delta
+                    if delta is None:
+                        continue
+                    # Text token
+                    if delta.content:
+                        committed = True
+                        content_emitted = True
+                        yield {"type": "token", "content": delta.content, "call_id": call_id}
+                    else:
+                        # 推理模型旁路：content 为空的这一帧若带 reasoning_content，不静默丢弃，
+                        # 累积起来作兜底（仅当整段流最终没有任何 content 时才使用，不污染答案）。
+                        rc = getattr(delta, "reasoning_content", None)
+                        if rc:
+                            reasoning_buf += rc
+                    # Tool call delta
+                    if delta.tool_calls:
+                        committed = True
+                        tool_emitted = True
+                        yield {"type": "tool_calls", "tool_calls": delta.tool_calls, "call_id": call_id}
+                    # Usage in delta (some providers)
                     if hasattr(chunk, "usage") and chunk.usage:
                         usage = {
                             "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
                             "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
                             "total_tokens": getattr(chunk.usage, "total_tokens", 0),
                         }
+                # 兜底：整段流结束、没吐过任何真正 content token、也不是工具轮，但推理流有内容
+                # → 把 reasoning_content 作为最终答案 emit，避免上层假 empty_content 失败。
+                # （对某些推理模型，最终 JSON 就落在 reasoning 流里；extract_json_object 能从
+                # 散文/围栏中提取锚点 JSON。有 content 或有工具调用时绝不注入，防污染。）
+                if not content_emitted and not tool_emitted and reasoning_buf.strip():
+                    committed = True
+                    yield {"type": "token", "content": reasoning_buf, "call_id": call_id}
+                yield {"type": "done", "usage": usage, "call_id": call_id}
+                return
+            except Exception as e:
+                error_cat, error_msg = _classify_litellm_error(e)
+                # Only clean-retry when nothing was emitted yet (公理3: no dirty retry).
+                if (not committed and attempt < _MAX_RETRIES
+                        and error_cat in ("rate_limited", "timeout", "provider_unreachable")):
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "stream_complete pre-token retry %d/%d after %.1fs: %s",
+                        attempt + 1, _MAX_RETRIES, delay, error_cat)
+                    await _aclose_stream(response)
+                    await asyncio.sleep(delay)
                     continue
-                delta = chunk.choices[0].delta
-                if delta is None:
-                    continue
-                # Text token
-                if delta.content:
-                    tokens_yielded = True
-                    yield {"type": "token", "content": delta.content, "call_id": call_id}
-                # Tool call delta
-                if delta.tool_calls:
-                    yield {"type": "tool_calls", "tool_calls": delta.tool_calls, "call_id": call_id}
-                # Usage in delta (some providers)
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage = {
-                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
-                        "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
-                        "total_tokens": getattr(chunk.usage, "total_tokens", 0),
-                    }
-        except Exception as e:
-            error_cat, error_msg = _classify_litellm_error(e)
-            logger.warning("stream_complete error after tokens_yielded=%s: %s %s",
-                           tokens_yielded, error_cat, error_msg)
-            yield {"type": "error", "error_category": error_cat,
-                   "error_message": error_msg, "call_id": call_id}
-            return
-
-        yield {"type": "done", "usage": usage, "call_id": call_id}
+                logger.warning(
+                    "stream_complete error committed=%s attempt=%d: %s %s",
+                    committed, attempt, error_cat, error_msg)
+                await _aclose_stream(response)
+                yield {"type": "error", "error_category": error_cat,
+                       "error_message": error_msg, "call_id": call_id}
+                return
 
     # ── Self-test / connectivity check ────────────────────────────────
 
@@ -279,3 +361,21 @@ async def _async_sleep(seconds: float) -> None:
     """Async sleep helper."""
     import asyncio
     await asyncio.sleep(seconds)
+
+
+async def _aclose_stream(response) -> None:
+    """Best-effort close of a litellm streaming response so a stalled/aborted stream does
+    not leak the underlying connection before a retry or on error. Never raises."""
+    if response is None:
+        return
+    for attr in ("aclose", "close"):
+        fn = getattr(response, attr, None)
+        if fn is None:
+            continue
+        try:
+            res = fn()
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception:
+            pass
+        return

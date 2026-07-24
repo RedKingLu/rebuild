@@ -788,3 +788,330 @@ class TestProviderAPIImport:
         assert "secret-xyz-123" not in r.text  # 不回显 Key
         assert r.json()["data"]["credential_status"] == "configured"
         client.delete(f"/api/model/providers/{pid}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# R17.5-P4-FIX 批2.6: streaming robustness — wall-clock timeout + pre-token
+# backoff retry + no dirty-retry-after-commit.
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestStreamRobustness:
+    """stream_complete: total wall-clock timeout, retry-before-commit, no dirty retry."""
+
+    @pytest.mark.asyncio
+    async def test_stream_total_wall_clock_timeout_fails_fast(self, monkeypatch):
+        """A stream that drips tokens then stalls forever must FAIL FAST at the wall-clock
+        ceiling (timeout) rather than hang — this is the 791s-stall fix."""
+        import asyncio as _asyncio
+        from app.adapters import litellm_adapter as la
+
+        # Tiny ceiling so the test is fast; caller passes no timeout → module default used.
+        monkeypatch.setattr(la, "_STREAM_TOTAL_TIMEOUT", 0.3)
+
+        class _Choice:
+            def __init__(self, content):
+                self.delta = type("D", (), {"content": content, "tool_calls": None})()
+
+        class _Chunk:
+            def __init__(self, content):
+                self.choices = [_Choice(content)]
+                self.usage = None
+
+        async def _stalling_stream():
+            yield _Chunk("partial ")   # commit a token
+            await _asyncio.sleep(10)   # then stall well past the ceiling
+            yield _Chunk("never")
+
+        async def _fake_acompletion(**kwargs):
+            return _stalling_stream()
+
+        monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+
+        adapter = la.LiteLLMAdapter()
+        frames = []
+        t0 = _asyncio.get_event_loop().time()
+        async for fr in adapter.stream_complete(
+                model="openai/deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+                api_base="https://x/v1", api_key="k"):
+            frames.append(fr)
+        elapsed = _asyncio.get_event_loop().time() - t0
+
+        # Fails fast near the ceiling, not after 10s.
+        assert elapsed < 3.0, f"did not fail fast: {elapsed:.1f}s"
+        assert frames[0]["type"] == "token" and frames[0]["content"] == "partial "
+        assert frames[-1]["type"] == "error"
+        assert frames[-1]["error_category"] == "timeout"
+        # committed → no duplicate 'partial ' token from a dirty retry
+        assert sum(1 for f in frames if f.get("type") == "token") == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_pre_token_timeout_retries_then_succeeds(self, monkeypatch):
+        """A transient pre-token failure must be retried with backoff and then succeed —
+        this is the 'network blip at connect' recovery (isolated-P4 death fix)."""
+        from app.adapters import litellm_adapter as la
+
+        monkeypatch.setattr(la, "_RETRY_BASE_DELAY", 0.01)  # keep test fast
+
+        class _Choice:
+            def __init__(self, content):
+                self.delta = type("D", (), {"content": content, "tool_calls": None})()
+
+        class _Chunk:
+            def __init__(self, content, usage=None):
+                self.choices = [_Choice(content)] if content is not None else []
+                self.usage = usage
+
+        async def _good_stream():
+            yield _Chunk("ok")
+            yield _Chunk(None, usage=type("U", (), {"prompt_tokens": 1, "completion_tokens": 1,
+                                                    "total_tokens": 2})())
+
+        calls = {"n": 0}
+
+        class _Timeout(Exception):
+            pass
+
+        async def _fake_acompletion(**kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _Timeout("Request timed out")  # pre-token transient failure
+            return _good_stream()
+
+        monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+
+        adapter = la.LiteLLMAdapter()
+        frames = [fr async for fr in adapter.stream_complete(
+            model="openai/deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+            api_base="https://x/v1", api_key="k")]
+
+        assert calls["n"] == 2, "should have retried once"
+        assert any(f["type"] == "token" and f["content"] == "ok" for f in frames)
+        assert frames[-1]["type"] == "done"
+        assert frames[-1]["usage"]["total_tokens"] == 2
+
+    @pytest.mark.asyncio
+    async def test_stream_no_dirty_retry_after_commit(self, monkeypatch):
+        """Once a token is committed, a subsequent transient failure must NOT re-run the
+        stream (no duplicated output) — it must emit an honest error frame instead."""
+        from app.adapters import litellm_adapter as la
+
+        monkeypatch.setattr(la, "_RETRY_BASE_DELAY", 0.01)
+
+        class _Choice:
+            def __init__(self, content):
+                self.delta = type("D", (), {"content": content, "tool_calls": None})()
+
+        class _Chunk:
+            def __init__(self, content):
+                self.choices = [_Choice(content)]
+                self.usage = None
+
+        calls = {"n": 0}
+
+        class _Conn(Exception):
+            pass
+
+        async def _stream_then_fail():
+            yield _Chunk("committed-token")  # commit
+            raise _Conn("connection dropped mid-stream")
+
+        async def _fake_acompletion(**kwargs):
+            calls["n"] += 1
+            return _stream_then_fail()
+
+        monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+
+        adapter = la.LiteLLMAdapter()
+        frames = [fr async for fr in adapter.stream_complete(
+            model="openai/deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+            api_base="https://x/v1", api_key="k")]
+
+        assert calls["n"] == 1, "must not dirty-retry after commit"
+        assert sum(1 for f in frames if f.get("type") == "token") == 1
+        assert frames[-1]["type"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_stream_caller_longer_timeout_is_honoured_as_ceiling(self, monkeypatch):
+        """A caller-supplied longer per-call timeout raises the ceiling (slow P3/P4 stages)
+        while the default remains the floor."""
+        from app.adapters import litellm_adapter as la
+        import asyncio as _a
+        monkeypatch.setattr(la, "_STREAM_TOTAL_TIMEOUT", 5.0)
+
+        class _Choice:
+            def __init__(self, content):
+                self.delta = type("D", (), {"content": content, "tool_calls": None})()
+
+        class _Chunk:
+            def __init__(self, content):
+                self.choices = [_Choice(content)]
+                self.usage = None
+
+        async def _slow_but_ok():
+            await _a.sleep(0.4)  # slow, but within the 6s caller ceiling
+            yield _Chunk("done-slow")
+
+        async def _fake_acompletion(**kwargs):
+            return _slow_but_ok()
+
+        monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+        adapter = la.LiteLLMAdapter()
+        frames = [fr async for fr in adapter.stream_complete(
+            model="openai/deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+            api_base="https://x/v1", api_key="k", timeout=6.0)]
+        assert any(f["type"] == "token" for f in frames)
+        assert frames[-1]["type"] == "done"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# R17.5-P4-FIX 批2.8: reasoning-model reasoning_content fallback + max_tokens
+# ═══════════════════════════════════════════════════════════════════════
+class TestStreamReasoningFallback:
+    """stream_complete: reasoning models (kimi/deepseek) stream the chain-of-thought on
+    delta.reasoning_content while delta.content is empty. The adapter must not silently
+    drop it (→ upstream假 empty_content); it surfaces reasoning as the final content ONLY
+    when no real content token was emitted, and NEVER mixes it into a real answer."""
+
+    @staticmethod
+    def _delta(content=None, reasoning_content=None, tool_calls=None):
+        # Plain object so hasattr/getattr behave like a real litellm delta (no auto-attrs).
+        return type("D", (), {"content": content,
+                              "reasoning_content": reasoning_content,
+                              "tool_calls": tool_calls})()
+
+    @classmethod
+    def _chunk(cls, delta=None, usage=None):
+        obj = type("C", (), {})()
+        obj.choices = [type("Ch", (), {"delta": delta})()] if delta is not None else []
+        if usage is not None:
+            obj.usage = usage
+        return obj
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_stream_falls_back_not_empty(self, monkeypatch):
+        """(a) content empty for the WHOLE stream but reasoning_content produced → the
+        adapter emits the accumulated reasoning as a final token so upstream does NOT
+        判 empty_content."""
+        from app.adapters import litellm_adapter as la
+
+        chunks = [
+            self._chunk(self._delta(content=None, reasoning_content="推理：先看源码，")),
+            self._chunk(self._delta(content="", reasoning_content='{"objective":"迁移"}')),
+        ]
+
+        async def _stream():
+            for c in chunks:
+                yield c
+
+        async def _fake_acompletion(**kwargs):
+            return _stream()
+
+        monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+        adapter = la.LiteLLMAdapter()
+        frames = [fr async for fr in adapter.stream_complete(
+            model="openai/deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+            api_base="https://x/v1", api_key="k")]
+
+        token_frames = [f for f in frames if f["type"] == "token"]
+        assert len(token_frames) == 1, "reasoning should be surfaced as exactly one fallback token"
+        assert token_frames[0]["content"] == '推理：先看源码，{"objective":"迁移"}'
+        assert frames[-1]["type"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_content_present_reasoning_not_mixed(self, monkeypatch):
+        """(b) When delta.content is present, reasoning_content is a side-channel only —
+        it must NEVER be mixed into the answer (would pollute the JSON contract)."""
+        from app.adapters import litellm_adapter as la
+
+        chunks = [
+            self._chunk(self._delta(content=None, reasoning_content="思考中……")),
+            self._chunk(self._delta(content='{"objective":', reasoning_content="旁白")),
+            self._chunk(self._delta(content='"迁移"}', reasoning_content=None)),
+        ]
+
+        async def _stream():
+            for c in chunks:
+                yield c
+
+        async def _fake_acompletion(**kwargs):
+            return _stream()
+
+        monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+        adapter = la.LiteLLMAdapter()
+        frames = [fr async for fr in adapter.stream_complete(
+            model="openai/deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+            api_base="https://x/v1", api_key="k")]
+
+        answer = "".join(f["content"] for f in frames if f["type"] == "token")
+        assert answer == '{"objective":"迁移"}'
+        assert "思考中" not in answer and "旁白" not in answer
+
+    @pytest.mark.asyncio
+    async def test_tool_round_reasoning_not_injected(self, monkeypatch):
+        """Guard: on a tool-calling round (content empty, tool_calls emitted) the reasoning
+        side-channel must NOT be injected as a token — otherwise it would pollute the
+        assistant turn / an intermediate round."""
+        from app.adapters import litellm_adapter as la
+
+        tc = type("TC", (), {"index": 0,
+                             "id": "call_1",
+                             "function": type("F", (), {"name": "list_files",
+                                                        "arguments": "{}"})()})()
+        chunks = [
+            self._chunk(self._delta(content=None, reasoning_content="要先列文件")),
+            self._chunk(self._delta(content=None, reasoning_content=None, tool_calls=[tc])),
+        ]
+
+        async def _stream():
+            for c in chunks:
+                yield c
+
+        async def _fake_acompletion(**kwargs):
+            return _stream()
+
+        monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+        adapter = la.LiteLLMAdapter()
+        frames = [fr async for fr in adapter.stream_complete(
+            model="openai/deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+            api_base="https://x/v1", api_key="k", tools=[{"type": "function"}])]
+
+        assert not any(f["type"] == "token" for f in frames), "no reasoning token on a tool round"
+        assert any(f["type"] == "tool_calls" for f in frames)
+        assert frames[-1]["type"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_max_tokens_forwarded_to_litellm(self, monkeypatch):
+        """(c) The raised max_tokens is forwarded verbatim into litellm.acompletion so the
+        reasoning-model output cap is actually lifted at the provider call."""
+        from app.adapters import litellm_adapter as la
+        captured = {}
+
+        async def _stream():
+            yield self._chunk(self._delta(content="ok"))
+
+        async def _fake_acompletion(**kwargs):
+            captured.update(kwargs)
+            return _stream()
+
+        monkeypatch.setattr("litellm.acompletion", _fake_acompletion)
+        adapter = la.LiteLLMAdapter()
+        _ = [fr async for fr in adapter.stream_complete(
+            model="openai/deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+            api_base="https://x/v1", api_key="k", max_tokens=32768)]
+
+        assert captured["max_tokens"] == 32768
+
+    def test_stage_and_planning_max_tokens_raised(self):
+        """(c) The stage loop default + P3 planning cap are raised so reasoning + large JSON
+        产物 fit (was 8192 → truncated at the cap producing empty_content)."""
+        import inspect
+        from app.services import stage_agent_loop, planning_service
+        sig = inspect.signature(stage_agent_loop.run_stage_tool_loop)
+        assert sig.parameters["max_tokens"].default == 32768
+        assert planning_service._PLANNING_MAX_TOKENS >= 32768
+
+    def test_p4_gen_max_tokens_raised(self):
+        """(c) P4 generation cap raised above the former hardcoded 16384 so reasoning models
+        don't truncate the migrated code / multi-file product mid-output."""
+        from app.services import p4_execution_worker
+        assert p4_execution_worker._GEN_MAX_TOKENS >= 32768

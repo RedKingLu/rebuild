@@ -615,9 +615,12 @@ async def model_call(req: ModelCallRequest):
 # ═══════════════════════════════════════════════════════════════════════
 
 @model_router.get("/calls")
-async def list_calls(limit: int = Query(default=10, le=100), offset: int = Query(default=0, ge=0)):
+async def list_calls(limit: int = Query(default=10, le=100), offset: int = Query(default=0, ge=0),
+                     project_id: str | None = Query(default=None),
+                     stage: str | None = Query(default=None)):
     gw = _gateway()
-    calls, total = gw.list_calls(limit=limit, offset=offset)
+    calls, total = gw.list_calls(limit=limit, offset=offset,
+                                 project_id=project_id, stage=stage)
     resp = [
         CallLogEntry(
             model_call_id=c["model_call_id"],
@@ -633,6 +636,12 @@ async def list_calls(limit: int = Query(default=10, le=100), offset: int = Query
             fallback_used=c.get("fallback_used", False),
             usage_summary=UsageSummaryResponse(**c.get("usage_summary", {})),
             source=c.get("source", "api"),
+            project_id=c.get("project_id"),
+            stage=c.get("stage"),
+            run_id=c.get("run_id"),
+            request_messages=c.get("request_messages"),
+            response_content=c.get("response_content"),
+            content_truncated=bool(c.get("content_truncated", False)),
             created_at=c.get("created_at", ""),
             completed_at=c.get("completed_at", ""),
         )

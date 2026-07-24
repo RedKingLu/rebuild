@@ -34,6 +34,184 @@ class _BlockedGateway:
         return {"status": "credential_missing", "content": "", "error": "no key"}
 
 
+# ── R17.5 P4 (T1.3): grounded tool-loop generation (call_stream + full toolset) ──
+
+class _TCFn:
+    def __init__(self, name, arguments):
+        self.name = name
+        self.arguments = arguments
+
+
+class _TC:
+    def __init__(self, index, tid, name, arguments):
+        self.index = index
+        self.id = tid
+        self.function = _TCFn(name, arguments)
+
+
+class _StreamGateway:
+    """Fake ModelGateway supporting call_stream (the real runtime's grounded path).
+
+    Round 1: emits an fs_read tool_call on the bound source. The worker dispatches it
+    via tool_registry.execute_tool (L0-L5) and feeds the result back. Round 2: the
+    gateway echoes the REAL read content it received back into the migrated output —
+    proving on-demand reading flowed through (not臆造 from the title).
+    """
+    def __init__(self):
+        self.round = 0
+        self.seen_source = None
+
+    async def call_stream(self, *, messages, tools=None, **kwargs):
+        self.round += 1
+        if self.round == 1:
+            yield {"type": "tool_calls",
+                   "tool_calls": [_TC(0, "c1", "fs_read", '{"path": "source/Legacy.cs"}')]}
+            yield {"type": "done", "model": "fake-stream-model"}
+        else:
+            import json as _j
+            tool_msgs = [m for m in messages if m.get("role") == "tool"]
+            payload = _j.loads(tool_msgs[-1]["content"]) if tool_msgs else {}
+            self.seen_source = payload.get("content", "")
+            migrated = (self.seen_source.replace("int A;", "public int A { get; set; }")
+                        + "// migrated to target stack\n")
+            for ch in migrated:
+                yield {"type": "token", "content": ch}
+            yield {"type": "done", "model": "fake-stream-model"}
+
+
+class _BlockedStreamGateway:
+    """call_stream gateway whose model honestly reports it cannot ground → 'BLOCKED:'."""
+    async def call_stream(self, *, messages, tools=None, **kwargs):
+        for ch in "BLOCKED: 无法在 source/ 下定位到本节点应迁移的真实文件":
+            yield {"type": "token", "content": ch}
+        yield {"type": "done", "model": "fake-stream-model"}
+
+
+class _MultiFileStreamGateway:
+    """批2.5 multi-file: round 1 writes TWO output_code files via fs_write_artifact (one
+    body carries a ```csharp fence to exercise task-C cleaning); round 2 ends with a plain
+    narration summary. The node must complete off the tool-written files, not the summary."""
+    def __init__(self):
+        self.round = 0
+
+    async def call_stream(self, *, messages, tools=None, **kwargs):
+        self.round += 1
+        if self.round == 1:
+            yield {"type": "tool_calls", "tool_calls": [
+                _TC(0, "w1", "fs_write_artifact",
+                    '{"path": "output_code/mf1/Program.cs", "content": "```csharp\\nusing System;\\npublic class Program {}\\n```"}'),
+                _TC(1, "w2", "fs_write_artifact",
+                    '{"path": "output_code/mf1/app.csproj", "content": "<Project Sdk=\\"Microsoft.NET.Sdk.Web\\"></Project>"}'),
+            ]}
+            yield {"type": "done", "model": "fake-stream-model"}
+        else:
+            for ch in "已生成脚手架文件：Program.cs 与 app.csproj。":
+                yield {"type": "token", "content": ch}
+            yield {"type": "done", "model": "fake-stream-model"}
+
+
+def _seed_fs_write_tool():
+    """Seed fs_write_artifact (write_scope=workspace, L2 — not gated) for the tool loop."""
+    from app.core.database import get_session
+    from app.models.resource_entry import (ResourceEntry, ResourceType, SourceType,
+                                            TrustLevel, RiskLevel, ResourceStatus)
+    import uuid
+    db = get_session()
+    try:
+        db.add(ResourceEntry(
+            resource_id=str(uuid.uuid4()), name="fs_write_artifact", resource_type=ResourceType.tool,
+            source_type=SourceType.internal_current, source_trust_level=TrustLevel.trusted_current,
+            risk_level=RiskLevel.L2, status=ResourceStatus.active, enabled=True,
+            description="写入 workspace 内产物（output_code/artifacts）",
+            type_metadata={"tool_name": "fs_write_artifact", "write_scope": "workspace",
+                           "parameters": {"type": "object",
+                                          "properties": {"path": {"type": "string"},
+                                                         "content": {"type": "string"}},
+                                          "required": ["path", "content"]}}))
+        db.commit()
+    finally:
+        db.close()
+
+
+async def test_multifile_node_collects_tool_written_files():
+    """A node whose model writes several output_code/ files via fs_write_artifact completes
+    with ALL files as deliverables (multi-file scaffolding), and tool-written bodies are
+    fence-cleaned (task C)."""
+    pid = "proj-c4-mf"
+    ws = _mk_ws(pid, {"source/MicroOA.sln": "sln\n", "source/Web.config": "<c/>\n"})
+    _seed_fs_write_tool()
+    gw = _MultiFileStreamGateway()
+    node = {"node_id": "mf1", "node_type": "execution",
+            "title": "T01 基础设施搭建：.NET 8+ 项目骨架",
+            "input_refs": ["source/MicroOA.sln", "source/Web.config"]}
+    pkg = await P4ExecutionWorker(pid, aet=AETService(None), gateway=gw).execute_node(
+        node, run_id="rmf")
+
+    assert pkg["node_status"] == "completed"
+    assert pkg.get("multi_file") is True
+    refs = sorted(pkg["output_code_refs"])
+    assert refs == ["output_code/mf1/Program.cs", "output_code/mf1/app.csproj"]
+    assert len(pkg["patch_refs"]) == 2
+    # task C: the ```csharp fence the model wrapped around Program.cs is stripped on disk.
+    prog = (ws / "output_code/mf1/Program.cs").read_text()
+    assert prog.splitlines()[0] == "using System;"
+    assert "```" not in prog
+
+
+def _seed_fs_read_tool():
+    """Seed a real fs_read tool (write_scope=none, L1) so execute_tool dispatches a real read."""
+    from app.core.database import get_session
+    from app.models.resource_entry import (ResourceEntry, ResourceType, SourceType,
+                                            TrustLevel, RiskLevel, ResourceStatus)
+    import uuid
+    db = get_session()
+    try:
+        db.add(ResourceEntry(
+            resource_id=str(uuid.uuid4()), name="fs_read", resource_type=ResourceType.tool,
+            source_type=SourceType.internal_current, source_trust_level=TrustLevel.trusted_current,
+            risk_level=RiskLevel.L1, status=ResourceStatus.active, enabled=True,
+            description="读取 workspace 内文件（只读）",
+            type_metadata={"tool_name": "fs_read", "write_scope": "none",
+                           "parameters": {"type": "object",
+                                          "properties": {"path": {"type": "string"}},
+                                          "required": ["path"]}}))
+        db.commit()
+    finally:
+        db.close()
+
+
+async def test_tool_loop_reads_real_source_on_demand():
+    """Grounded path: model reads real source via fs_read tool, migrated output derives
+    from the REAL bytes (not the node title). Kills the title-only臆造病根 (T1.3)."""
+    pid = "proj-c4-tl"
+    ws = _mk_ws(pid, {"source/Legacy.cs": "public class Legacy { int A; }\n"})
+    _seed_fs_read_tool()
+    gw = _StreamGateway()
+    node = {"node_id": "tl1", "node_type": "execution", "title": "迁移 Legacy",
+            "input_refs": ["source/Legacy.cs"]}
+    pkg = await P4ExecutionWorker(pid, aet=AETService(None), gateway=gw).execute_node(
+        node, run_id="rt")
+
+    assert pkg["node_status"] == "completed"
+    # 真实源被工具按需读取并回流（非照标题臆造）
+    assert gw.seen_source == "public class Legacy { int A; }\n"
+    out = ws / pkg["output_code_refs"][0]
+    body = out.read_text()
+    assert "public int A { get; set; }" in body and "// migrated" in body
+
+
+async def test_tool_loop_blocked_when_no_grounding_not_fabricated():
+    """无接地诚实 blocked：模型回答 'BLOCKED:' → 节点 blocked，不写产物、不臆造（T1.3）。"""
+    pid = "proj-c4-tlb"
+    ws = _mk_ws(pid, {"source/x.cs": "x\n"})
+    node = {"node_id": "tlb", "node_type": "execution", "title": "迁移", "input_refs": []}
+    pkg = await P4ExecutionWorker(pid, aet=AETService(None),
+                                  gateway=_BlockedStreamGateway()).execute_node(node, run_id="rtb")
+    assert pkg["node_status"] == "blocked"
+    assert pkg["artifacts"] == []
+    assert not (ws / "output_code/tlb").exists()
+
+
 def _mk_ws(pid: str, sources: dict[str, str]):
     ws = workspace_service.init_workspace(pid)
     for rel, content in sources.items():
@@ -102,9 +280,10 @@ async def test_write_source_rejected_and_audited():
     ws = _mk_ws(pid, {"source/keep.cs": "original\n"})
     auditor = AuditWriter()
     stub = _StubGateway()
-    # 误规划：节点要求写回 source/ → 必须被拒
+    # 误规划：节点要求写回 source/ → 必须被拒。R17.5 P4：给真实源绑定使生成先接地
+    # （新契约：无源绑定→诚实 blocked 不臆造），再由 output_target=source/ 触发写盘负路径拒绝。
     node = {"node_id": "n3", "node_type": "execution", "title": "bad",
-            "output_target": "source/keep.cs"}
+            "input_refs": ["source/keep.cs"], "output_target": "source/keep.cs"}
     pkg = await _worker(pid, stub, auditor=auditor).execute_node(node, run_id="r3")
 
     assert pkg["node_status"] == "blocked"

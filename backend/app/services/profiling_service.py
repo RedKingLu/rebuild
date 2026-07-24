@@ -135,7 +135,8 @@ class ProfilingService:
         """
         gw = self._get_gateway()
 
-        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id, project_id=project_id,
+                                             require_tool_calling=True)
         if not readiness.get("available"):
             self._trace("P1 profiling blocked: no model", project_id, run_id, stage)
             return ProfilingResult(
@@ -150,27 +151,29 @@ class ProfilingService:
         head_parts = [p for p in (system_prompt, skill_body) if p]
         system_content = ("\n\n---\n\n".join(head_parts) + "\n\n---\n\n" + _SYSTEM_PROMPT
                           if head_parts else _SYSTEM_PROMPT)
-        messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": self._build_user_prompt(facts, upstream or {})},
-        ]
 
-        result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=8192, temperature=0.3, source="api",
-                               project_id=project_id, run_id=run_id, stage=stage)
-        if result.get("status") != "completed":
-            reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
+        # 批2 (D-110): P1 从单次 chat → 工具循环 Node Worker Agent。事实包 + 上游 P0 结论仍作 user
+        # 提示帮助，agent 可按需 list_files/code_grep/fs_read 探读真实源深化建档、多轮推理，末轮产出
+        # 结构化建档契约（契约不变，D-108）。走 call_stream 天然读项目模型选择。
+        from app.services.stage_agent_loop import run_stage_tool_loop
+        loop = await run_stage_tool_loop(
+            gw, system_content=system_content,
+            user_content=self._build_user_prompt(facts, upstream or {}),
+            project_id=project_id, run_id=run_id or "", stage=stage,
+            strategy_id=strategy_id, max_tokens=16384, temperature=0.3, tracer=self.tracer)
+        if loop["status"] != "completed":
+            reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P1 profiling model call not completed: {reason}", project_id, run_id, stage)
             return ProfilingResult(status="failed", reason=str(reason),
-                                   model_used=result.get("model"),
-                                   attempted_chain=result.get("attempted_chain", []),
-                                   model_error_category=result.get("error_category", "model_unavailable"),
+                                   model_used=loop.get("model_used"),
+                                   attempted_chain=loop.get("attempted_chain", []),
+                                   model_error_category=loop.get("error_category", "model_unavailable"),
                                    model_user_actions=_MODEL_USER_ACTIONS)
 
-        parsed = self._parse(result.get("content", ""))
+        parsed = self._parse(loop.get("content", ""))
         self._trace("P1 profiling completed (LLM identification)", project_id, run_id, stage)
         return ProfilingResult(
-            status="completed", identification=parsed, model_used=result.get("model"),
+            status="completed", identification=parsed, model_used=loop.get("model_used"),
             context_refs=context_refs, skill_refs=skill_refs,
         )
 
@@ -204,18 +207,12 @@ class ProfilingService:
         )
 
     def _parse(self, content: str) -> dict:
-        text = (content or "").strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lstrip().lower().startswith("json"):
-                text = text.lstrip()[4:]
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            logger.warning("P1 profiling: LLM 输出无法解析为 JSON（返工重试结构化输出）", exc_info=True)
-        return {"parse_error": True, "raw": text[:2000]}
+        from app.services.stage_agent_loop import extract_json_object
+        data = extract_json_object(content)
+        if data is not None:
+            return data
+        logger.warning("P1 profiling: LLM 输出无法解析为 JSON（返工重试结构化输出）")
+        return {"parse_error": True, "raw": (content or "").strip()[:2000]}
 
     def _trace(self, summary: str, project_id, run_id, stage) -> None:
         if self.tracer is None:

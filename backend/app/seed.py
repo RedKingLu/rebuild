@@ -162,6 +162,7 @@ SKILL_SEEDS = [
     {"name": "P-agentic-engineering", "series": SkillSeries.P, "category": SkillCategory.p3, "description": "P3 规划：把迁移任务分解为可验证小单元、设计 TaskGraph、按复杂度路由模型、每单元定义验收——ECC agentic-engineering(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p3/P-agentic-engineering/"},
     {"name": "P-dynamic-workflow-mode", "series": SkillSeries.P, "category": SkillCategory.p3, "description": "P3 规划：按项目特征动态选择执行模式(Manual/Plan/Auto)，plan/queue/run/gate/handoff 对齐平台 run-state 与 HITL——ECC dynamic-workflow-mode(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p3/P-dynamic-workflow-mode/"},
     # P4 执行
+    {"name": "P-migration-execution", "series": SkillSeries.P, "category": SkillCategory.p4, "description": "P4 执行主工作流：按 P3 TaskGraph 逐节点执行真实迁移工作包，给源路径+产物路径→按需读真实源→迁移→写 output_code+patch，每节点独立验收挂 P4→P5 Gate；不照节点标题臆造(禁通用 EMPLOYEE/无关 Vue3/Java)、无源绑定/无 Key/无环境诚实 blocked 或 evidence_gap、PoC vs Production 分级、对齐真实方言/框架转换、只产固定产物——rebuild R17.5(D-108)", "status": SkillStatus.platform_runtime, "skill_source": "rebuild", "directory_path": f"{_S_DIR}/p4/P-migration-execution/"},
     {"name": "P-database-migrations", "series": SkillSeries.P, "category": SkillCategory.p4, "description": "P4 执行：信创数据库迁移(Oracle→达梦/GaussDB、MSSQL→openGauss)——schema/对象/数据迁移、expand-contract、分批与三重校验、可回滚——ECC database-migrations(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p4/P-database-migrations/"},
     {"name": "P-dotnet-patterns", "series": SkillSeries.P, "category": SkillCategory.p4, "description": "P4 执行：.NET Framework(WebForms/WCF/MVC5)→.NET Core/ASP.NET Core 迁移模式，麒麟 Linux 运行兼容——ECC dotnet-patterns(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p4/P-dotnet-patterns/"},
     {"name": "P-backend-patterns", "series": SkillSeries.P, "category": SkillCategory.p4, "description": "P4 执行：迁移后服务分层架构(repository/service/router)、查询优化(国产DB执行计划差异)、缓存与连接池——ECC backend-patterns(MIT)", "status": SkillStatus.platform_runtime, "skill_source": "ecc", "directory_path": f"{_S_DIR}/p4/P-backend-patterns/"},
@@ -192,7 +193,7 @@ RESOURCE_SEEDS = [
 
     # Skill entries
     {"resource_type": ResourceType.skill, "name": "R 系列建设 Skill（3 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.internal_current, "source_trust_level": TrustLevel.trusted_current, "description": "R-数据库施工规范 / R-资源创建登记 / R-工作准则，均有真实 SKILL.md（skills/R-建设执行/，置于 source/ 之外与平台运行期隔离）"},
-    {"resource_type": ResourceType.skill, "name": "P 系列平台 Skill（27 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.community, "source_trust_level": TrustLevel.reviewed_reference, "source_path_or_ref": f"{_S_DIR}/", "description": "24 个源自 ECC(MIT) 改写为信创迁移语境 + 3 个 rebuild 自有 P 阶段主工作流 skill（full-stack-profiler P1 建档 / P-migration-assessment P2 评估 D-108 / P-migration-planning P3 规划 D-108），覆盖 P0-P6 + 跨阶段，均有真实 SKILL.md；原 30 候选剔除 6 个非迁移类（市场对标/营销/UI美学/harness运维/工具选型/运维监控）", "type_metadata": {"count": 27, "source_repo": "https://github.com/affaan-m/ECC", "license": "MIT", "dropped_non_migration": ["benchmark-methodology", "content-engine", "design-system", "config-gc", "agent-eval", "dashboard-builder"]}},
+    {"resource_type": ResourceType.skill, "name": "P 系列平台 Skill（28 个）", "status": ResourceStatus.active, "risk_level": RiskLevel.L1, "source_type": SourceType.community, "source_trust_level": TrustLevel.reviewed_reference, "source_path_or_ref": f"{_S_DIR}/", "description": "24 个源自 ECC(MIT) 改写为信创迁移语境 + 4 个 rebuild 自有 P 阶段主工作流 skill（full-stack-profiler P1 建档 / P-migration-assessment P2 评估 / P-migration-planning P3 规划 / P-migration-execution P4 执行，均 D-108），覆盖 P0-P6 + 跨阶段，均有真实 SKILL.md；原 30 候选剔除 6 个非迁移类（市场对标/营销/UI美学/harness运维/工具选型/运维监控）", "type_metadata": {"count": 28, "source_repo": "https://github.com/affaan-m/ECC", "license": "MIT", "dropped_non_migration": ["benchmark-methodology", "content-engine", "design-system", "config-gc", "agent-eval", "dashboard-builder"]}},
 
     # Tool entries — B-TOOL-SCHEMA-1 (R11-3): every tool carries a real OpenAI
     # `parameters` schema so the agent can call it WITH arguments (empty schema
@@ -282,7 +283,35 @@ def seed_all(db: Session) -> dict:
             added_skills += 1
     counts["skills"] = added_skills
 
-    # Resources
+    # Resources — R17.5-P4-FIX 批1：先按 name 清理历史遗留重复 tool 记录（防复发）。
+    # 真实 DB 中 fs_write_artifact/generate_patch/apply_patch_with_confirm/run_safe_command
+    # 各 3 份：R6 原始 seed 1 份（含完整 parameters schema + binds_via + 正确权限位），
+    # 另有 R17.2 开发期一次性注册路径（现已不存在）又插入 2 份退化副本（type_metadata 仅
+    # {tool_name,requires_gate}、无 parameters、权限位退化为 read_only）。重复函数名致
+    # load_schemas 吐重名 tool → OpenAI 兼容端点 bad_request → P4 工具循环恒崩→零迁移产物。
+    # seed_all 的资源初始插入本就以 existing==0 守门（不重复插入），此处再加去重 pass 主动
+    # 清理任意来源产生的重名 tool（自愈+幂等）：每 name 保留 type_metadata 含 parameters 的
+    # 富记录，删除退化副本；无引用（已核 agent/skill required_tools 与全表无外键/JSON 引用）。
+    tool_rows = db.query(ResourceEntry).filter(ResourceEntry.resource_type == ResourceType.tool).all()
+    by_name: dict[str, list] = {}
+    for r in tool_rows:
+        by_name.setdefault(r.name, []).append(r)
+    removed_tool_dupes = 0
+    for _name, rows in by_name.items():
+        if len(rows) <= 1:
+            continue
+        # 富度排序：优先含 parameters schema，其次 metadata 更完整，其次更早创建
+        def _richness(r):
+            meta = r.type_metadata or {}
+            return (1 if meta.get("parameters") else 0, len(str(meta)), r.created_at is not None)
+        rows_sorted = sorted(rows, key=_richness, reverse=True)
+        for extra in rows_sorted[1:]:
+            db.delete(extra)
+            removed_tool_dupes += 1
+    if removed_tool_dupes:
+        db.flush()
+    counts["tool_dupes_removed"] = removed_tool_dupes
+
     existing = db.query(ResourceEntry).count()
     if existing == 0:
         for s in RESOURCE_SEEDS:

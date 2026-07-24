@@ -146,7 +146,8 @@ class IntakeService:
 
         # WP-5 (Q-R10-2扩展 P0): no available model → blocked, no rule fallback. 就绪度
         # 预检给出候选模型链路，即便一次调用都未发生也让前端显式看到考察过的模型链路。
-        readiness = gw.stage_model_readiness(strategy_id=strategy_id)
+        readiness = gw.stage_model_readiness(strategy_id=strategy_id, project_id=project_id,
+                                             require_tool_calling=True)
         if not readiness.get("available"):
             self._trace("P0 intake blocked: no model", project_id, run_id, stage)
             return IntakeResult(
@@ -163,25 +164,26 @@ class IntakeService:
         head_parts = [p for p in (system_prompt, skill_body) if p]
         system_content = ("\n\n---\n\n".join(head_parts) + "\n\n---\n\n" + _SYSTEM_PROMPT
                           if head_parts else _SYSTEM_PROMPT)
-        messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": self._build_user_prompt(facts)},
-        ]
 
-        result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=8192, temperature=0.3, source="api",
-                               project_id=project_id, run_id=run_id, stage=stage)
-        if result.get("status") != "completed":
-            reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
+        # 批2 (D-110): P0 从单次 chat → 工具循环 Node Worker Agent。事实包仍作为 user 提示帮助，
+        # 但 agent 可按需 list_files/code_grep/fs_read 探读真实源、多轮推理，末轮产出结构化识别
+        # 契约（契约不变，D-108）。走 call_stream 天然读项目模型选择（global_model_ref）。
+        from app.services.stage_agent_loop import run_stage_tool_loop
+        loop = await run_stage_tool_loop(
+            gw, system_content=system_content, user_content=self._build_user_prompt(facts),
+            project_id=project_id, run_id=run_id or "", stage=stage,
+            strategy_id=strategy_id, max_tokens=16384, temperature=0.3, tracer=self.tracer)
+        if loop["status"] != "completed":
+            reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P0 intake model call not completed: {reason}", project_id, run_id, stage)
             return IntakeResult(status="failed", reason=str(reason),
-                                model_used=result.get("model"),
-                                attempted_chain=result.get("attempted_chain", []),
-                                model_error_category=result.get("error_category", "model_unavailable"),
+                                model_used=loop.get("model_used"),
+                                attempted_chain=loop.get("attempted_chain", []),
+                                model_error_category=loop.get("error_category", "model_unavailable"),
                                 model_user_actions=_MODEL_USER_ACTIONS)
 
-        parsed = self._parse(result.get("content", ""))
-        model_used = result.get("model")
+        parsed = self._parse(loop.get("content", ""))
+        model_used = loop.get("model_used")
         # 目标运行环境是用户输入采集（非识别），由采集直接透传进 intake（migration_target）。
         parsed.setdefault("migration_target", facts.get("migration_target"))
         self._trace("P0 intake completed (LLM identification)", project_id, run_id, stage)
@@ -216,20 +218,17 @@ class IntakeService:
         )
 
     def _parse(self, content: str) -> dict:
-        """Parse the LLM JSON output defensively into the identification fields."""
-        text = (content or "").strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lstrip().lower().startswith("json"):
-                text = text.lstrip()[4:]
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            logger.warning("P0 intake: LLM 输出无法解析为 JSON（返工重试结构化输出）", exc_info=True)
-        # unparseable → honest parse_error marker (NodeLoop ReviewPass retries structured output)
-        return {"parse_error": True, "raw": text[:2000]}
+        """Parse the LLM JSON output defensively into the identification fields.
+
+        批2: uses the robust extractor (handles prose-wrapped / fenced JSON from the tool
+        loop). Unparseable → honest parse_error marker (NodeLoop ReviewPass retries).
+        """
+        from app.services.stage_agent_loop import extract_json_object
+        data = extract_json_object(content)
+        if data is not None:
+            return data
+        logger.warning("P0 intake: LLM 输出无法解析为 JSON（返工重试结构化输出）")
+        return {"parse_error": True, "raw": (content or "").strip()[:2000]}
 
     def _trace(self, summary: str, project_id, run_id, stage) -> None:
         if self.tracer is None:

@@ -571,7 +571,10 @@ async def _execute_builtin(tool_name: str, args: dict, project_id: str, stage: s
                         full = cand
                         break
             if full.exists():
-                return {"artifact_path": path, "content": full.read_text("utf-8", errors="replace")[:4000]}
+                # 批2: raise the 4000-char cap so agents can read large upstream artifacts
+                # (e.g. 25KB p3_task_plans.json) fully; still bounded to avoid unbounded blobs.
+                return {"artifact_path": path,
+                        "content": full.read_text("utf-8", errors="replace")[:200_000]}
             return {"artifact_path": path, "error": "文件不存在"}
         except Exception as e:
             return {"artifact_path": path, "error": str(e)}
@@ -701,7 +704,22 @@ async def _execute_read(tool_name: str, args: dict, project_id: str) -> dict:
     if full is None:
         return {"error": "路径越界: 仅允许访问项目 workspace 内文件"}
     if full.exists() and full.is_file():
-        return {"content": full.read_text("utf-8", errors="replace")[:4000], "path": target}
+        # 批2: fs_read previously hard-truncated to 4000 chars — far too small for the
+        # P0-P4 agents to read a real source file (e.g. a 39KB .cs) for migration, so the
+        # model saw a chopped file, narrated "the file is truncated, let me try…" and never
+        # produced migrated code. Raise the window and add offset paging so large files can
+        # be read fully (in chunks when needed); report total/truncation honestly.
+        text = full.read_text("utf-8", errors="replace")
+        try:
+            offset = max(0, int(args.get("offset", 0) or 0))
+            limit = int(args.get("limit", 50000) or 50000)
+        except (TypeError, ValueError):
+            offset, limit = 0, 50000
+        limit = max(1, min(limit, 200_000))
+        chunk = text[offset:offset + limit]
+        return {"content": chunk, "path": target, "total_chars": len(text),
+                "offset": offset, "returned_chars": len(chunk),
+                "truncated": (offset + limit) < len(text)}
     return {"error": f"文件不存在: {target}"}
 
 

@@ -126,9 +126,10 @@ class TestMigratedSchema:
         try:
             ver = c.execute("SELECT version_num FROM alembic_version").fetchone()[0]
             # R15-4 C1/C2 c4f1a9d7e2b8, C8 7c407d04e07b, C10 39528fb4d798;
-            # R16-B E3 e4f5a6b7c8d9; R17.5 WP-6 f8a1b2c3d4e5 (project.migration_target).
-            # Alembic head must be the R17.5 head.
-            assert ver == "f8a1b2c3d4e5", ver
+            # R16-B E3 e4f5a6b7c8d9; R17.5 WP-6 f8a1b2c3d4e5 (project.migration_target);
+            # R17.5-P4-FIX 批3 a1c2e3f40901 (project.tech_selection, D-109);
+            # R17.5-P4-FIX 批4 b1c2d3e4f5a6 (call_log 内容/归因列, D-111). Head must be latest.
+            assert ver == "b1c2d3e4f5a6", ver
         finally:
             c.close()
 
@@ -198,8 +199,9 @@ class TestR15Migration:
             # R16-B E3 must ALSO have added imported_version
             assert "imported_version" in cols, f"imported_version missing; cols={cols}"
             ver = c.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-            # R15-4 = 39528fb4d798; R16-B E3 = e4f5a6b7c8d9; R17.5 WP-6 = f8a1b2c3d4e5 (head).
-            assert ver == "f8a1b2c3d4e5", ver
+            # R15-4 = 39528fb4d798; R16-B E3 = e4f5a6b7c8d9; R17.5 WP-6 = f8a1b2c3d4e5;
+            # R17.5-P4-FIX 批3 = a1c2e3f40901 (D-109); 批4 = b1c2d3e4f5a6 (call_log 内容/归因列, D-111, head).
+            assert ver == "b1c2d3e4f5a6", ver
         finally:
             c.close()
 
