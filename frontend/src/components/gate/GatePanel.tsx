@@ -20,6 +20,7 @@ function labelForRef(ref: string): MaterialItem {
   // Known real StageReport / domain artifact stems → 中文标签
   const known: Record<string, string> = {
     intake_report: '接入报告 (intake_report)',
+    tech_selection: '技术选型建议 (tech_selection)',
   };
   let label = known[stem];
   if (!label) {
@@ -289,6 +290,15 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
     desc: '描述', source_ref: '来源引用', item: '检查项', reason: '理由',
     total: '总数', resolved: '已解析', unresolved: '未解析', issues_count: '问题数',
     with_inline_citation: '含内联引用',
+    // D-109：P1-gate 技术选型建议（tech_selection）字段中文名
+    tech_selection: '技术选型建议', selection: '选型', migration_target: '迁移目标',
+    target_language: '目标语言/运行时', runtime: '运行时', database: '数据库',
+    web_framework: 'Web 框架', recommendation: '推荐', reasoning: '理由',
+    alternatives: '备选方案', option: '备选', middleware_replacements: '中间件替换',
+    key_arch_decisions: '关键架构决策', decision: '决策项', component: '组件',
+    from: '现状', overall_rationale: '总体理由', open_questions: '待澄清问题',
+    decision_status: '裁决状态', note: '说明', cpu_arch: 'CPU 架构', os: '操作系统',
+    db: '数据库', cpu_arch_label: 'CPU 架构', os_label: '操作系统',
   };
 
   // Collapsible long-string component (inline function component)
@@ -356,6 +366,100 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
       return <pre style={{ fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-all', background: 'var(--color-surface-subtle)', padding: 12, borderRadius: 6, margin: 0 }}>{rawContent}</pre>;
     }
     const kind = j.kind as string | undefined;
+    // D-109：P1-gate 技术选型建议卡片（tech_selection.json，artifact_type==='tech_selection'，无 kind）。
+    // 结构化呈现 LLM 基于真实源码 + migration_target(CPU/OS/DB 红线) 产出的目标路线建议
+    // （目标语言/运行时/数据库/Web 框架 + 中间件替换 + 关键架构决策，各含 推荐/理由/备选）。
+    // 用户在此 gate 裁决（本轮 approve 落 LLM 原案，reject/request_changes 走返工；不做 override 内联编辑）。
+    // blocked/failed 诚实空态，绝不伪造 selection。
+    if (j.artifact_type === 'tech_selection') {
+      const sel = (j.selection && typeof j.selection === 'object') ? j.selection as Record<string, any> : null;
+      const status = (j.status as string) || '';
+      const mt = (j.migration_target && typeof j.migration_target === 'object') ? j.migration_target as Record<string, any> : null;
+      const statusColor = status === 'proposed' ? 'var(--amber)' : (status === 'blocked' || status === 'failed') ? 'var(--red)' : 'var(--color-text-muted)';
+      const statusLabel = status === 'proposed' ? '待用户裁决' : status === 'blocked' ? '阻塞（未产出选型）' : status === 'failed' ? '失败（未产出选型）' : status;
+      // 一个选型维度（推荐 + 理由 + 备选）
+      const renderDim = (dimKey: string, dim: any) => {
+        if (!dim || typeof dim !== 'object') return null;
+        const alts = Array.isArray(dim.alternatives) ? dim.alternatives : [];
+        return (
+          <div key={dimKey} style={{ marginBottom: 8, padding: '8px 10px', background: 'var(--color-surface-subtle)', borderRadius: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 600 }}>{FIELD_LABELS[dimKey] || dimKey}：<span style={{ color: 'var(--color-primary)' }}>{dim.recommendation || '—'}</span></div>
+            {dim.reasoning && <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 3 }}>理由：{dim.reasoning}</div>}
+            {alts.length > 0 && (
+              <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 3 }}>备选：{alts.map((a: any, i: number) => (
+                <span key={i}>{i > 0 ? '；' : ''}{typeof a === 'string' ? a : `${a.option || ''}${a.reasoning ? `（${a.reasoning}）` : ''}`}</span>
+              ))}</div>
+            )}
+          </div>
+        );
+      };
+      return (
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>技术选型建议（D-109）</div>
+          <div style={{ fontSize: 12, marginBottom: 8 }}>状态：<span style={{ color: statusColor, fontWeight: 600 }}>{statusLabel}</span>
+            {!!j.model_used && <span style={{ color: 'var(--color-text-muted)', marginLeft: 8 }}>模型：{String(j.model_used)}</span>}
+          </div>
+          {mt && (
+            <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 8, padding: '6px 8px', background: 'var(--color-surface-subtle)', borderRadius: 4 }}>
+              迁移目标红线：{[mt.cpu_arch_label || mt.cpu_arch, mt.os_label || mt.os, mt.db].filter(Boolean).join(' · ') || '—'}
+            </div>
+          )}
+          {sel ? (
+            <div>
+              {renderDim('target_language', sel.target_language)}
+              {renderDim('runtime', sel.runtime)}
+              {renderDim('database', sel.database)}
+              {renderDim('web_framework', sel.web_framework)}
+              {Array.isArray(sel.middleware_replacements) && sel.middleware_replacements.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: 'var(--color-text-muted)' }}>中间件替换：</div>
+                  {sel.middleware_replacements.map((m: any, i: number) => (
+                    <div key={i} style={{ fontSize: 12, marginLeft: 12, marginBottom: 4 }}>
+                      • {m.component || ''}{m.from ? `（现状 ${m.from}）` : ''} → <span style={{ color: 'var(--color-primary)' }}>{m.recommendation || '—'}</span>
+                      {m.reasoning && <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginLeft: 12 }}>理由：{m.reasoning}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {Array.isArray(sel.key_arch_decisions) && sel.key_arch_decisions.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: 'var(--color-text-muted)' }}>关键架构决策：</div>
+                  {sel.key_arch_decisions.map((d: any, i: number) => (
+                    <div key={i} style={{ fontSize: 12, marginLeft: 12, marginBottom: 4 }}>
+                      • {d.decision || ''} → <span style={{ color: 'var(--color-primary)' }}>{d.recommendation || '—'}</span>
+                      {d.reasoning && <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginLeft: 12 }}>理由：{d.reasoning}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {!!sel.overall_rationale && (
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: 'var(--color-text-muted)' }}>总体理由：</div>
+                  <div style={{ fontSize: 12, marginLeft: 12 }}><LongValue text={String(sel.overall_rationale)} /></div>
+                </div>
+              )}
+              {Array.isArray(sel.open_questions) && sel.open_questions.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: 'var(--color-text-muted)' }}>待澄清问题：</div>
+                  {sel.open_questions.map((q: any, i: number) => <div key={i} style={{ fontSize: 12, marginLeft: 12, marginBottom: 2 }}>? {String(q)}</div>)}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', padding: '8px 10px', background: 'var(--color-surface-subtle)', borderRadius: 6 }}>
+              未产出选型建议（{statusLabel}）。{!!j.reason && <div style={{ marginTop: 4 }}>原因：{String(j.reason)}</div>}
+              {Array.isArray(j.attempted_chain) && j.attempted_chain.length > 0 && (
+                <div style={{ marginTop: 4 }}>已尝试模型：{(j.attempted_chain as any[]).map(String).join(' → ')}</div>
+              )}
+              {Array.isArray(j.model_user_actions) && (j.model_user_actions as any[]).length > 0 && (
+                <div style={{ marginTop: 4 }}>建议操作：{(j.model_user_actions as any[]).map(String).join('；')}</div>
+              )}
+            </div>
+          )}
+          {!!j.note && <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 6 }}>说明：{String(j.note)}</div>}
+        </div>
+      );
+    }
     // start_plan — kind 明确为 start_plan，或无 kind 的遗留计划产物（goal+planned_actions）。
     // 注意：work_plan（WP-2）同样含 goal/planned_actions 但其 planned_actions 为对象数组，
     // 必须由下方 kind==='work_plan' 分支处理，故此处用 !kind 排除。

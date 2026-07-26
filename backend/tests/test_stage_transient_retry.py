@@ -33,6 +33,16 @@ def test_completed_is_never_transient():
         {"status": "completed", "model_error_category": "timeout"})
 
 
+def test_output_contract_parse_error_is_retryable():
+    """D-112 真跑实证：P3 task_plans 结构化输出未解析是模型非确定性失败（attempt1 失败、
+    attempt2 成功）→ output_contract_parse_error 标为可重试，stage 自动重跑自愈。"""
+    assert is_transient_stage_failure(
+        {"status": "failed", "model_error_category": "output_contract_parse_error"})
+    # 真正的空产出（no_task_plans，无类别）不重试
+    assert not is_transient_stage_failure(
+        {"status": "failed", "reason": "no_task_plans_generated: 模型未产出任何有效 Task Plan"})
+
+
 def test_reason_text_fallback():
     # no explicit category → transient inferred from reason text
     assert is_transient_stage_failure({"status": "failed", "reason": "Request timed out"})

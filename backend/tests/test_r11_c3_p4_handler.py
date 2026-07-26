@@ -64,15 +64,35 @@ async def test_p4_blocked_when_no_model_available():
     assert h.review(res).passed is False
 
 
-async def test_p4_blocked_when_no_execution_node():
-    """TaskGraph 存在但无 execution 节点 → blocked（附 node_type 分布）。"""
+async def test_p4_no_execution_node_routes_to_review():
+    """D-112 方案B：TaskGraph 只有非 execution 节点 → 不再 blocked，而是收集为待用户评审项
+    （completed + pending_review），随 P4→P5 Gate 交用户裁决。绝不假通过（不进引擎默认执行器）。"""
     pid = "proj-c3-noexec"
-    _mk_p3_task_graph(pid, ["planning", "gate"])
+    _mk_p3_task_graph(pid, ["decision", "verification"])
     h = RealP4Handler()
-    res = await h.execute({"project_id": pid, "run_id": ""})
-    assert res["status"] == "blocked"
-    assert "无 execution 节点" in res["reason"]
-    assert h.review(res).passed is False
+    res = await h.execute({"project_id": pid, "run_id": "r-noexec"})
+    assert res["status"] == "completed"                       # 非 blocked：评审项交用户
+    assert res["execution_node_count"] == 0
+    assert res["review_node_count"] == 2
+    assert res["pending_review_ref"]                          # 评审材料已落盘
+    assert res["completed_nodes"] == [] and res["failed_nodes"] == []
+    assert res["artifacts"] == [res["pending_review_ref"]]    # 无伪造代码产物
+    assert "待用户评审" in res["reason"]
+
+
+async def test_p4_non_execution_nodes_never_fake_pass(monkeypatch):
+    """D-112：混合图（execution + 非 execution）——execution 走 worker（无模型→blocked），
+    非 execution 节点收集为评审项且绝不假通过（引擎默认执行器对其不可达）。"""
+    pid = "proj-c3-mixed"
+    _mk_p3_task_graph(pid, ["execution", "decision", "poc"])
+    h = RealP4Handler(gateway=_BlockedGateway())
+    res = await h.execute({"project_id": pid, "run_id": "r-mixed"})
+    assert res["execution_node_count"] == 1
+    assert res["review_node_count"] == 2
+    assert res["pending_review_ref"]
+    # 非 execution 节点不在引擎完成集里（未被 _default_executor 假通过）
+    assert res["completed_node_count"] == 0                    # 无模型 → execution 也未完成
+    assert res["node_type_distribution"] == {"execution": 1, "decision": 1, "poc": 1}
 
 
 async def test_p4_loads_latest_graph_and_counts_execution_only():

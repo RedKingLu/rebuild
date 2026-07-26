@@ -1392,20 +1392,42 @@ class RealP4Handler:
         node_type_dist: dict = {}
         for n in tg["nodes"]:
             node_type_dist[n["node_type"]] = node_type_dist.get(n["node_type"], 0) + 1
+        # D-112 方案B：execution 节点自动跑（代码产出）；非 execution 节点（decision/poc/verification
+        # 及任何未知类型）收集为「待用户评审项」，随 P4→P5 阶段级晋级 Gate 交用户裁决——绝不交给引擎
+        # 默认执行器假通过（criteria 全 True 是诚实红线隐患）。归一为"非 execution"确保未知类型也不假通过。
         exec_nodes = [n for n in tg["nodes"] if n["node_type"] == "execution"]
-        if not exec_nodes:
+        review_nodes = [n for n in tg["nodes"] if n["node_type"] != "execution"]
+        if not exec_nodes and not review_nodes:
             return {"status": "blocked",
-                    "reason": f"P3 TaskGraph {tg['task_graph_id']} 无 execution 节点"
-                              f"（node_type 分布 {node_type_dist}）",
+                    "reason": f"P3 TaskGraph {tg['task_graph_id']} 无任何节点",
                     "task_graph_ref": tg["task_graph_id"], "assembly_trace": assembly_trace,
                     "artifacts": [], "evidence_refs": []}
+        # 非 execution 节点的评审材料（诚实：未自动执行、未伪造完成，待用户在晋级 Gate 裁决）。
+        run_id = state.get("run_id", "")
+        review_ref = self._write_pending_review(project_id, review_nodes, node_type_dist,
+                                                 run_id) if review_nodes else None
+        if not exec_nodes:
+            # 只有非 execution 节点：无代码可自动产出。P4 执行阶段完成（产出评审材料），
+            # review 项随 P4→P5 晋级 Gate 呈现给用户裁决（"决策节点等用户"）。
+            refs = [review_ref] if review_ref else []
+            return {"status": "completed", "graph_status": "completed",
+                    "reason": (f"P4 无 execution（代码）节点；{len(review_nodes)} 个非代码节点"
+                               f"（{node_type_dist}）已汇总为待用户评审项，随 P4→P5 Gate 裁决"),
+                    "task_graph_ref": tg["task_graph_id"], "stage_plan_ref": tg["stage_plan_ref"],
+                    "node_count": len(tg["nodes"]), "execution_node_count": 0,
+                    "review_node_count": len(review_nodes), "pending_review_ref": review_ref,
+                    "node_type_distribution": node_type_dist,
+                    "completed_nodes": [], "failed_nodes": [], "gated_nodes": [],
+                    "artifacts": refs, "evidence_refs": [], "patch_refs": [],
+                    "assembly_trace": assembly_trace}
+
 
         # C5：把 execution 节点接入 TaskGraphEngine + NodeLoop，按 TaskGraph 边策略推进。
         # 每个 execution 节点的 Node Worker = P4ExecutionWorker.execute_node（真实写闭环）；
-        # 非 execution 节点走 engine 默认执行器。NodeLoop 9 步内含 Acceptance；边策略
-        # success/failure/retry/rework/gate 由 engine 路由；失败/阻塞/Gate 经 _finalize 诚实
-        # 归类（绝不伪造 completed）。engine 由 handler 在 LangGraph p4_work 节点内调用（D-037）。
-        run_id = state.get("run_id", "")
+        # D-112 方案B：非 execution 节点已在上方剔除、不进引擎（避免 _default_executor 假通过）。
+        # NodeLoop 9 步内含 Acceptance；边策略 success/failure/retry/rework/gate 由 engine 路由；
+        # 失败/阻塞/Gate 经 _finalize 诚实归类（绝不伪造 completed）。engine 由 handler 在
+        # LangGraph p4_work 节点内调用（D-037）。
         # WP-B: pass C6 retrieved case/knowledge (already assembled in context_package)
         # into the worker so P4 code generation is informed by migration case/knowledge
         # reference. Empty retrieval → empty string (no reference block injected).
@@ -1433,7 +1455,13 @@ class RealP4Handler:
         from app.services.task_graph_service import TaskGraphEngine
         mode = workspace_service.get_execution_mode(project_id)
         engine = TaskGraphEngine(tracer=self.tracer, auditor=self.auditor)
-        eng = await engine.execute({"nodes": tg["nodes"], "edges": tg["edges"]},
+        # D-112 方案B：只把 execution 节点及其内部（exec→exec）边喂给引擎——review 节点不入引擎，
+        # 引擎默认执行器对其不可达（假通过隐患由构造消除）。跨到 review 节点的边被剔除，故 exec
+        # 节点不会因依赖 review 节点而卡死（_deps_ready 只看 exec 子图内的边）。
+        exec_ids = {n["node_id"] for n in exec_nodes}
+        exec_edges = [e for e in tg["edges"]
+                      if e.get("source_node_id") in exec_ids and e.get("target_node_id") in exec_ids]
+        eng = await engine.execute({"nodes": exec_nodes, "edges": exec_edges},
                                    node_executors=node_executors, project_id=project_id,
                                    run_id=run_id, mode=mode)
 
@@ -1499,6 +1527,8 @@ class RealP4Handler:
             "stage_plan_ref": tg["stage_plan_ref"],
             "node_count": len(tg["nodes"]),
             "execution_node_count": len(exec_nodes),
+            "review_node_count": len(review_nodes),
+            "pending_review_ref": review_ref,
             "completed_node_count": len(eng.completed_nodes),
             "failed_node_count": len(eng.failed_nodes),
             "gated_node_count": len(eng.gated_nodes),
@@ -1512,7 +1542,8 @@ class RealP4Handler:
             "attempted_chain": _p4_chain,
             "model_error_category": _p4_cat,
             "model_user_actions": _p4_actions,
-            "artifacts": artifacts + ([summary_ref] if summary_ref else []),
+            "artifacts": artifacts + ([summary_ref] if summary_ref else [])
+                        + ([review_ref] if review_ref else []),
             "evidence_refs": evidence_refs,
             "patch_refs": patch_refs,
             "code_source_map": code_source_map,
@@ -1532,6 +1563,43 @@ class RealP4Handler:
                     "bytes": len(raw)}
         except Exception:
             return {"path": rel_path, "sha256": "", "bytes": 0}
+
+    def _write_pending_review(self, project_id, review_nodes, node_type_dist,
+                              run_id="") -> str | None:
+        """D-112 方案B：把非 execution 节点（decision/poc/verification 等）写为待用户评审材料
+        artifacts/p4/p4_pending_review.json，随 P4→P5 晋级 Gate 呈现给用户裁决。
+
+        诚实：这些节点未自动执行、未伪造 criteria_met/completed——它们等用户决策。仅登记 P3 已产出
+        的节点事实（node_id/title/node_type/风险/输入引用），不产出代码、不推断结论。"""
+        if not review_nodes:
+            return None
+        from datetime import datetime, timezone
+        items = [{
+            "node_id": n.get("node_id"),
+            "title": n.get("title") or n.get("node_id"),
+            "node_type": n.get("node_type"),
+            "risk_level": n.get("risk_level", "L0"),
+            "input_refs": n.get("input_refs", []) or [],
+            "status": "pending_user_review",
+            "note": "非代码产出节点，需用户在 P4→P5 Gate 裁决；未自动执行、未伪造完成",
+        } for n in review_nodes]
+        doc = {
+            "artifact_type": "p4_pending_review",
+            "kind": "p4_pending_review",
+            "stage": "p4",
+            "run_id": run_id,
+            "review_node_count": len(items),
+            "node_type_distribution": node_type_dist,
+            "items": items,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        ref = _mediated_write(project_id, stage_artifact_ref("p4", "p4_pending_review.json"),
+                              json.dumps(doc, ensure_ascii=False, indent=2),
+                              auditor=self.auditor, stage="p4",
+                              action="write_pending_review")
+        logger.info("D-112: wrote P4 pending-review %s (%d non-execution node(s))",
+                    ref, len(items))
+        return ref
 
     def _write_execution_summary(self, project_id, tg, exec_nodes, eng, p4_evidence,
                                  patch_refs, node_type_dist,

@@ -35,6 +35,11 @@ logger = logging.getLogger("rebuild.stage_retry")
 # Mirrors the adapter's own per-call retry set (litellm_adapter.py:159/296).
 TRANSIENT_CATEGORIES = frozenset({"timeout", "provider_unreachable", "rate_limited"})
 
+# 结构化输出未解析（模型输出非确定性）——同一输入重跑常成功（真跑实证：P3 task_plans
+# attempt1 parse_error、attempt2 completed）。非基础设施瞬态，但同属"重跑可自愈"，故纳入
+# 可重试类别。空产出（no_task_plans）不在此列，不会误重试。
+RETRYABLE_CATEGORIES = TRANSIENT_CATEGORIES | frozenset({"output_contract_parse_error"})
+
 # Bounded stage retries + exponential backoff. Kept small: each retry re-runs the
 # whole stage (potentially minutes of LLM work), so this is a last-resort safety
 # net for infra blips, not a substitute for a healthy provider.
@@ -73,7 +78,7 @@ def is_transient_stage_failure(result) -> bool:
         return False
     cat = _extract_category(result)
     if cat:
-        return cat in TRANSIENT_CATEGORIES
+        return cat in RETRYABLE_CATEGORIES
     # No explicit category → fall back to reason text (honest best-effort).
     reason = (result.get("reason") or "").lower()
     return any(hint in reason for hint in _TRANSIENT_REASON_HINTS)

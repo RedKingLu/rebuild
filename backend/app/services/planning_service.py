@@ -41,6 +41,34 @@ logger = logging.getLogger(__name__)
 # timeout, not the model/endpoint (D-098 — the strategy still resolves the model).
 _PLANNING_TIMEOUT = float(os.environ.get("P3_PLANNING_TIMEOUT", "240"))
 
+# D-112: P3 node typing (方案B). TaskGraph nodes carry a node_type so P4 can auto-run
+# code (execution) nodes and route decision/PoC/verification nodes to a stage-level
+# review Gate (代码节点自动产出、决策节点等用户) instead of fabricating completion.
+# 保守启发式：仅当任务标题/目标强指示为"非代码产出"（选型/架构决策、PoC/原型、验证/回归）
+# 时才归类，否则默认 execution——绝大多数迁移代码任务保持 execution 自动执行。
+# 注：这是标题启发式（非语义判定）；REC 后续可由 P3 规划 LLM 直接产出 node_type 更精准。
+VALID_NODE_TYPES = ("execution", "decision", "poc", "verification")
+_DECISION_HINTS = ("选型", "技术路线", "架构决策", "方案抉择", "裁决", "决策", "decision", "trade-off", "tradeoff")
+_POC_HINTS = ("poc", "概念验证", "原型", "spike", "可行性验证")
+_VERIFICATION_HINTS = ("验证", "验收", "回归测试", "回归", "测试用例", "verification", "verify", "acceptance test")
+
+
+def classify_node_type(title: str) -> str:
+    """Heuristically classify a TaskGraph node by its title/objective (D-112).
+
+    Conservative: returns 'execution' (auto-run code) unless the title strongly
+    signals a non-code task. Decision > PoC > verification precedence when a title
+    matches multiple (a "架构决策" wins over an incidental "验证" mention)."""
+    t = (title or "").lower()
+    if any(h in t for h in _DECISION_HINTS):
+        return "decision"
+    if any(h in t for h in _POC_HINTS):
+        return "poc"
+    if any(h in t for h in _VERIFICATION_HINTS):
+        return "verification"
+    return "execution"
+
+
 # R11-7 (B-P3-NO-TASKPLANS): a Task Plan Batch is verbose (a batch of tasks, each with
 # scope/inputs/outputs/validation/artifacts) and easily exceeds a 4096-token cap — the
 # JSON then truncates mid-object and fails to parse (empty task_plans → no TaskGraph).
@@ -474,7 +502,12 @@ class PlanningService:
                 self._trace(f"P3 task-plan batch empty → failed: {reason}", project_id, run_id, stage)
                 return TaskPlanBatchResult(
                     status="failed", stage_plan_ref=stage_plan_id, reason=reason,
-                    model_used=model_used, parse_error=parse_error)
+                    model_used=model_used, parse_error=parse_error,
+                    # 结构化输出未解析出批次是【模型输出非确定性】的可重试失败（真跑实证：同图
+                    # 重试即成功），标为独立可重试类别供 stage_retry 自动重跑；真正的空批次
+                    # （no_task_plans，模型确产 0 计划）不标类别 → 不重试（重试也无意义）。
+                    model_error_category=("output_contract_parse_error" if parse_error else ""))
+
 
             # §4.2-3: batch risk = max task risk; §4.2-4: high-risk → Gate
             batch_risk = self._max_risk(risks)
@@ -736,7 +769,8 @@ class PlanningService:
                 db.add(TaskNode(
                     node_id=nd["node_id"], task_graph_id=tg.task_graph_id,
                     project_id=project_id, run_id=run_id or None,
-                    stage=(stage or "p3").lower(), node_type="execution",
+                    stage=(stage or "p3").lower(),
+                    node_type=classify_node_type(nd.get("title", "")),  # D-112: 分型（默认 execution）
                     title=nd["title"], input_refs=nd["input_refs"],
                     resource_refs=nd["required_resources"],
                     model_policy_override=nd["model_policy_override"],

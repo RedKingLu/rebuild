@@ -6,6 +6,8 @@
 
 # === 密钥与配置 ===
 .env
+.env*
+!.env.example
 *.key
 *.secret
 *.pem

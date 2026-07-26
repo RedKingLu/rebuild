@@ -162,16 +162,52 @@ class ProviderRegistry:
     def loaded(self) -> bool:
         return self._loaded
 
+    def _lookup_db_credential_ref(self, provider_id: str) -> str:
+        """R6/BYOK 持久绑定：返回 provider_ref==provider_id 的最新 active DB 凭证 id。
+
+        修复病根：前端"添加 Key"经 set_credential/add_user_provider 只注入进程内存
+        （volatile，重启即丢），而 CredentialService 持久化的加密凭证从不被绑到
+        provider.credential_ref → 加密凭证成孤儿、解析退回易变的 LLM_API_KEY 兜底 →
+        "刚加能用、重启失效"。此处在加载时按 provider_ref 自动绑定持久加密凭证，使
+        _resolve_key 优先用可解密、跨重启稳定的 DB Key。
+        Best-effort：DB 不可用 / 无匹配 → "" （回退 env 解析，不抛错）。"""
+        try:
+            from app.core.database import get_session
+            from app.models.credential import Credential, CredentialStatus
+            db = get_session()
+            try:
+                cred = (db.query(Credential)
+                        .filter(Credential.provider_ref == provider_id,
+                                Credential.status == CredentialStatus.active)
+                        .order_by(Credential.created_at.desc())
+                        .first())
+                return cred.credential_id if cred else ""
+            finally:
+                db.close()
+        except Exception:
+            logger.debug("DB credential auto-link skipped for %s (advisory)",
+                         provider_id, exc_info=True)
+            return ""
+
     def _build_provider(self, p: dict, origin: str) -> ProviderInfo:
         """从原始配置字典构建 ProviderInfo（内置/用户共用）。Key 仅从 env 解析。"""
         env_key_var = p.get("env_key_var", "")
         key_val, key_source = _resolve_api_key(env_key_var, p["provider_id"])
+
+        # R6/BYOK 持久绑定：yaml 未显式给 credential_ref 时，按 provider_ref==provider_id
+        # 自动绑定持久化的 DB 加密凭证（修复"前端加 Key 仅进内存、重启即失效"）。
+        credential_ref = p.get("credential_ref", "")
+        if not credential_ref:
+            credential_ref = self._lookup_db_credential_ref(p["provider_id"])
 
         cred_status = "missing"
         if key_val:
             cred_status = "configured"
         elif key_source == "generic_fallback":
             cred_status = "configured"
+        elif credential_ref:
+            cred_status = "configured"        # 绑定了持久加密凭证 → 已配置
+            key_source = "credential_ref"
 
         provider = ProviderInfo(
             provider_id=p["provider_id"],
@@ -187,7 +223,7 @@ class ProviderRegistry:
             origin=origin,
             note=p.get("note", ""),
             homepage=p.get("homepage", ""),
-            credential_ref=p.get("credential_ref", ""),
+            credential_ref=credential_ref,
         )
         provider.capability_marker = _compute_capability_marker(cred_status, "not_connected", "")
 
