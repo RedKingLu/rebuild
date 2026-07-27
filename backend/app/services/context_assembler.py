@@ -38,6 +38,7 @@ STAGE_PRIMARY_SKILL = {
     "p2": "P-migration-assessment",
     "p3": "P-migration-planning",
     "p4": "P-migration-execution",
+    "p5": "P-migration-verification",
 }
 
 

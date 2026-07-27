@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -61,6 +62,9 @@ class P5DetectedCommands:
     project_type: Optional[str] = None
     # 诚实状态
     all_identified: bool = False
+    # R17.5-P5-R2 (GAP-P5-3, capability-first)：.NET SDK 探测 + 维度能力提示（非门禁）
+    dotnet_sdk_present: Optional[bool] = None
+    capability_notes: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -128,6 +132,33 @@ def _match_markers(all_files: set[str], markers: list[str]) -> bool:
 class P5CommandDetectionService:
     """识别项目构建/运行/测试/静态检查命令。R12-3-C5 新建。"""
 
+    def _resolve_dotnet_commands(self, result: "P5DetectedCommands") -> None:
+        """R17.5-P5-R2 (GAP-P5-3, capability-first)：.NET build/test/static 命令 SDK-aware 补全。
+
+        R12-12 因"本机通常无 msbuild"故意留空（防 echo 假 pass）。capability-first：探测 dotnet
+        CLI——【有 SDK】则填真实命令（dotnet build/test/format，经 ExecutionProvider 产真实退出码
+        事实，非 echo 伪造）；【无 SDK】保持 None → 上游诚实 needs_user_input（阻断，不伪造通过），
+        并记 capability_ready 提示（能力已接线，待 SDK / 远程执行主机环境真验）。
+        """
+        if result.project_type not in ("dotnet", "dotnet/legacy"):
+            return
+        if shutil.which("dotnet"):
+            # 真实命令（-warnaserror 让静态期告警反映到退出码；--verify-no-changes 不改盘）
+            result.build_cmd = result.build_cmd or "dotnet build -warnaserror"
+            result.test_cmd = result.test_cmd or "dotnet test --nologo"
+            result.static_check_cmd = (result.static_check_cmd
+                                       or "dotnet format --verify-no-changes")
+            result.dotnet_sdk_present = True
+        else:
+            result.dotnet_sdk_present = False
+            result.capability_notes.append({
+                "dimension": "dotnet_build",
+                "capability_ready": True,
+                "detail": ("本地无 dotnet SDK：.NET build/test/static 能力已接线（SDK-aware 命令补全 + "
+                           "可绑定远程执行主机），待具备 SDK / 远程主机环境真验；当前诚实 "
+                           "needs_user_input，非伪造通过。"),
+            })
+
     def detect_commands(self, project_id: str) -> P5DetectedCommands:
         """扫描工作区，识别构建/运行/测试/静态检查命令。
 
@@ -168,6 +199,9 @@ class P5CommandDetectionService:
                 result.static_check_cmd = static if static else None
                 matched = True
                 break
+
+        # R17.5-P5-R2 (GAP-P5-3)：.NET 命令 SDK-aware 补全（SDK 在则真实命令；不在则诚实待环境真验）
+        self._resolve_dotnet_commands(result)
 
         if not matched:
             result.needs_user_input.append({

@@ -78,6 +78,10 @@ class TestVerifyOutputCode:
 class TestVerifyPatches:
 
     def test_patches_exist_correlated(self, verify_svc, tmp_path):
+        # R17.5-P5-R3 GAP-P5-4：patches_exist 确定性槽位只核验【存在+非空】，
+        # 不再用 len(patch)<=len(output) 计数启发式（correlation_ok）当门禁——
+        # 那会把合法重写式迁移误判 patch_output_mismatch。source→target 结构对应改由
+        # LLM advisory 的 structure_mapping 产出（此处只留中立事实 patch_output_ratio）。
         ws = _make_ws("p1", tmp_path)
         (ws / "output_code" / "x.py").write_text("x", encoding="utf-8")
         (ws / "patches" / "tn-001.diff").write_text("diff content", encoding="utf-8")
@@ -87,7 +91,9 @@ class TestVerifyPatches:
         with patch("app.services.p5_verification_service.workspace_path", return_value=ws):
             r = verify_svc._verify_patches_exist("p1", p4)
         assert r.passed is True
-        assert r.details["correlation_ok"] is True
+        assert "correlation_ok" not in r.details  # 计数启发式已废除
+        assert r.details["correspondence_assessed_by"] == "llm_structure_mapping_advisory"
+        assert r.details["patch_output_ratio"] is not None
 
     def test_patches_missing(self, verify_svc, tmp_path):
         ws = _make_ws("p1", tmp_path)

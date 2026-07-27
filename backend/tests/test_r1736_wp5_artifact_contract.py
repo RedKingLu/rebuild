@@ -152,7 +152,9 @@ def test_new05_p6_persists_and_reflects_delivery_report(isolated_data):
     mock_input_svc = MagicMock()
     mock_input_svc.read_p4_input.return_value = p4_input
     with patch.object(handler, "_services", return_value=mock_svc), \
-         patch.object(RealP6Handler, "_check_p5_validation_passed", return_value=True), \
+         patch.object(RealP6Handler, "_load_p5_report",
+                      return_value={"can_be_completed": True,
+                                    "validation_plan": {"slots": []}}), \
          patch("app.services.p5_input_service.P5InputService") as mock_cls:
         mock_cls.return_value = mock_input_svc
         result = asyncio.run(handler.execute({"project_id": pid, "run_id": "r"}))

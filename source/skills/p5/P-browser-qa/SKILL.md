@@ -60,6 +60,7 @@ P5 验证阶段，当迁移对象为 Web 应用（如 ASP.NET WebForms/MVC、JSP
 - 禁止把模型对截图的描述当作交互正确性 Evidence
 
 ## 与平台集成
+- **能力接线（capability-first，R17.5-P5-R2）**：本维度已接线为平台能力——先用 `p5_verify_dimension` 探 `browser_qa`（探测 Playwright 是否安装 + 浏览器内核二进制是否可用），或 `p5_dimension_capabilities` 看全量矩阵。**浏览器运行时具备** → 按上述步骤跑真实回放/截图/断言产铁证；**运行时缺失**（无 Playwright / 无浏览器二进制 / 无可访问目标 URL）→ 该维度诚实标 `evidence_gap`（`capability_ready=true`，记"浏览器 QA 能力已接线，待浏览器运行时/目标部署环境真验"），**非阻断、绝不伪造 SHIP**。能力/环境探测是确定性事实，工具不产"通过"结论、不翻转 `can_be_completed`。
 - 若用模型辅助分析截图/差异，调用经 ModelGateway；模型描述须有截图/断言佐证，模型输出不等于 Evidence。
 - 自动化对目标系统执行写操作（提交表单、改数据）属高风险（L4-L5），须经用户 Gate 或限定在隔离测试数据。
 - 脚本、截图集、diff、裁决报告挂 Artifact/Evidence，回放动作记 Trace/Audit。

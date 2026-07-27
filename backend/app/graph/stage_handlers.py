@@ -1809,28 +1809,30 @@ class RealP4Handler:
 
 
 class RealP5Handler:
-    """P5 验证（R12-3-C3 骨架 + C4 硬必需槽位真实验证）。
+    """P5 验证（R12-3-C3 骨架 + C4 硬必需真实验证 + R17.5-P5-R1 skill-first LLM 策略层）。
 
-    C4 完成 5 个硬必需槽位的真实验证：
-      1. output_code 存在且非空
-      2. patches 存在且与 output_code 对应
-      3. P4 Evidence basis 真实（sha256 校验）
-      4. P4 summary 可解析
-      5. P4→P5 Gate approved
+    验证方法论 / 验证维度 / 反伪造红线随 P5 stage skill（P-migration-verification）正文走
+    （skill-first D-108，换需求=改 skill 而非改 handler）。handler 瘦身为编排 + 锚点：
 
-    C5 起执行有条件必需（构建/运行/测试/静态检查）真实命令。
+      A. 确定性事实内核（权威，反伪造，不因 LLM 层放松）：
+         1. output_code 存在且非空  2. patches 存在且与 output_code 对应
+         3. P4 Evidence basis 真实（sha256 校验，D-101）  4. P4 summary 可解析
+         5. P4→P5 Gate approved  + 有条件必需槽位（构建/运行/测试/静态检查）真实命令。
+         completed 认定唯一来自 `can_mark_completed`——LLM 不参与、不能翻转。
+      B. LLM 验证策略/失败解读 advisory 层（GAP-P5-2 方向A，P5VerificationAgent）：
+         规划本次适用验证维度 + 解读失败根因 + 提回 P4 rework 修复建议；显式 analysis_only；
+         无可用模型 Key → 诚实缺席（evidence_gap），**非阻断**，确定性内核照常。
 
     诚实状态（V10 教训 / D-066 / D-101 / D-105①）：
       - 缺失任一硬必需槽位 → P5 不得 completed（硬约束）
-      - 失败/缺失 → blocked / evidence_gap（不伪造）
-      - P5→P6 Gate 由 make_work_node 在 review passed 时创建（C7 起）
-      - P6 仍保持 stub
-      - 缺输入时 blocked
+      - 失败/缺失 → blocked / evidence_gap（不伪造）；LLM 绝不产"通过"替代真实测试
+      - 单一核心产物 artifacts/p5_validation_report.json（不发明第二产物/新槽位/新 Gate）
+      - P5→P6 Gate 由 make_work_node 在 review passed 时创建；缺输入时 blocked
 
     P5 handler 由 make_work_node 在 LangGraph p5_work 节点内调用（D-037 不绕主编排）。
     """
 
-    goal = "P5 验证：读取 P4 产物，执行 5 个硬必需槽位真实验证，创建 10 槽位 validation plan，诚实标记状态"
+    goal = "P5 验证：读取 P4 产物，确定性验证十槽位（硬必需真验 + 条件命令），LLM 辅助规划维度/解读失败，诚实标记状态"
     acceptance_criteria = [
         "P5 输入事实源已读取（P4 output_code/patches/Evidence refs + summary + Gate）",
         "P5ValidationPlan 已创建（10 槽位）",
@@ -1848,11 +1850,14 @@ class RealP5Handler:
     ]
 
     def __init__(self, tracer=None, auditor=None, p5_input_service=None,
-                 p5_verification_service=None):
+                 p5_verification_service=None, p5_verification_agent=None,
+                 p5_capability_service=None):
         self.tracer = tracer
         self.auditor = auditor
         self._p5_input = p5_input_service
         self._p5_verify = p5_verification_service
+        self._p5_agent = p5_verification_agent
+        self._p5_capability = p5_capability_service
 
     def _p5_input_service(self):
         if self._p5_input is not None:
@@ -1866,6 +1871,20 @@ class RealP5Handler:
         from app.services.p5_verification_service import P5VerificationService
         return P5VerificationService(tracer=self.tracer, auditor=self.auditor,
                                      aet=self._services().aet_service)
+
+    def _p5_verification_agent(self):
+        # GAP-P5-2: LLM 验证策略/失败解读 advisory 层（方向A）。可注入（测试用 mock-LLM）。
+        if self._p5_agent is not None:
+            return self._p5_agent
+        from app.services.p5_verification_agent import P5VerificationAgent
+        return P5VerificationAgent(tracer=self.tracer)
+
+    def _p5_capability_service(self):
+        # R17.5-P5-R2 (GAP-P5-1/3): 验证维度能力探测 + capability-first 诚实降级。可注入（测试用 mock）。
+        if self._p5_capability is not None:
+            return self._p5_capability
+        from app.services.p5_capability_service import P5CapabilityService
+        return P5CapabilityService(tracer=self.tracer)
 
     def _services(self):
         from app.dependencies import get_services
@@ -1883,12 +1902,14 @@ class RealP5Handler:
             logger.warning("P5: P4 input read failed (honest blocked): %s", e, exc_info=True)
             return {"status": "blocked",
                     "reason": f"P4 输入读取异常：{type(e).__name__}",
+                    "project_id": project_id, "run_id": run_id,
                     "artifacts": [], "evidence_refs": []}
 
         # ② Gate 未 approved → 诚实 blocked
         if p4_input.blocked:
             return {"status": "blocked",
                     "reason": p4_input.blocked_reason,
+                    "project_id": project_id, "run_id": run_id,
                     "p4_to_p5_gate_id": p4_input.p4_to_p5_gate_id,
                     "p4_to_p5_gate_status": p4_input.p4_to_p5_gate_status,
                     "evidence_gaps": p4_input.evidence_gaps,
@@ -1959,6 +1980,36 @@ class RealP5Handler:
         plan.can_be_completed = can_complete
         plan.blocked_reason = None if can_complete else reason
 
+        # ⑤b GAP-P5-5 (R17.5-P5-R3)：source_unmodified 增强槽真实 verifier（D-099 源只读正向证据）。
+        # 【增强项，非门禁】：不参与 can_mark_completed（⑤ 已定 can_complete），绝不翻转 can_be_completed；
+        # 绝不用恒 True/占位假证据填死槽——git 工作树干净=validated(真证据)、被改=validation_failed、
+        # 非 git 无基线=诚实 evidence_gap（capability_ready，待基线快照真验）。异常降级不阻断。
+        try:
+            src_vr = verify_svc.verify_source_unmodified(project_id)
+            src_slot = plan.get_slot(src_vr.slot_id)
+            if src_slot is not None:
+                if src_vr.status == P5SlotStatus.EVIDENCE_GAP:
+                    transition_slot_status(src_slot, P5SlotStatus.EVIDENCE_GAP)  # PENDING→EVIDENCE_GAP 合法
+                else:
+                    transition_slot_status(src_slot, P5SlotStatus.IN_PROGRESS)
+                    transition_slot_status(src_slot, src_vr.status)
+                src_slot.evidence_refs = src_vr.evidence_refs
+                src_slot.details.update(src_vr.details)
+                for issue in src_vr.issues:
+                    src_slot.issues.append(issue)
+        except Exception as e:
+            logger.warning("P5: source_unmodified verify failed (non-blocking): %s", e,
+                           exc_info=True)  # 公理3
+        # 确定性事实（有没有 dotnet/浏览器/远程主机/P1 金标准）；维度是否适用由 skill/LLM 判断。
+        # 【非门禁】：不参与 can_mark_completed（⑥ 已定），不改槽位状态，不翻转 can_be_completed。
+        # 环境缺失维度诚实标 evidence_gap（+capability_ready，待环境真验），非阻断、不伪造。
+        try:
+            dimension_capabilities = self._p5_capability_service().probe_all(project_id)
+        except Exception as e:
+            logger.warning("P5: dimension capability probe failed (non-blocking): %s", e,
+                           exc_info=True)  # 公理3
+            dimension_capabilities = {"error": str(e), "dimensions": []}
+
         # ⑥ 汇总验证结果
         hard_required_passed = sum(1 for vr in verify_results if vr.passed)
         conditional_passed = sum(1 for vr in conditional_results if vr.passed)
@@ -1970,7 +2021,23 @@ class RealP5Handler:
         # ⑦ 持久化 P5 验证结果（R12-7 修复 B-P6-UNGATED-BY-P5 + R12-4-04）
         plan_dict = plan_to_dict(plan)
         self._persist_p5_validation_report(project_id, run_id, plan_dict,
-                                            verify_results, conditional_details)
+                                            verify_results, conditional_details,
+                                            dimension_capabilities=dimension_capabilities)
+
+        # ⑦b R17.5-P5-R1 (GAP-P5-2)：LLM 验证策略/失败解读 advisory 层（方向A）。
+        # 在确定性验证 + can_mark_completed（权威，⑤⑥）之后运行——本层【只】规划维度/解读失败/
+        # 提修复建议，显式 analysis_only，绝不改写槽位状态或 can_be_completed（反伪造门禁不受影响）。
+        # 无可用模型 Key / 任何异常 → 诚实缺席（status=skipped），非阻断，确定性结论照常。
+        advisory = await self._run_advisory(
+            project_id, run_id, verify_results, conditional_details,
+            can_complete, reason, p4_input.p4_execution_summary,
+            dimension_capabilities=dimension_capabilities)
+        if advisory.get("status") == "completed":
+            # 纳入 advisory 重新持久化（plan_dict / can_be_completed 不变，仅追加 advisory 分区）。
+            self._persist_p5_validation_report(project_id, run_id, plan_dict,
+                                               verify_results, conditional_details,
+                                               advisory=advisory,
+                                               dimension_capabilities=dimension_capabilities)
 
         # NEW-05 (R17.3-6 WP-5): artifacts 真实反映实际写入的产物。P5 handler 已把验证结果
         # 持久化到 artifacts/p5_validation_report.json（⑦），旧实现却硬编码 artifacts:[]，
@@ -1991,6 +2058,9 @@ class RealP5Handler:
             "status": "completed" if can_complete else "blocked",
             "reason": reason if not can_complete
                       else "P5 全量验证通过（硬必需 + 条件必需真实命令）",
+            # GAP-P5-6: 回传 project_id/run_id，供 review() 从真实 run state 计算 retry_count。
+            "project_id": project_id,
+            "run_id": run_id,
             "p4_to_p5_gate_id": p4_input.p4_to_p5_gate_id,
             "p4_output_code_refs": p4_input.output_code_refs,
             "p4_patch_refs": p4_input.patch_refs,
@@ -2005,6 +2075,10 @@ class RealP5Handler:
             "evidence_gaps": p4_input.evidence_gaps,
             "artifacts": p5_produced,
             "evidence_refs": p4_input.evidence_refs,
+            # GAP-P5-2: LLM 策略/解读 advisory（analysis_only，不参与 status 判定）。
+            "llm_advisory": advisory,
+            # GAP-P5-1/3: 验证维度能力清单 + 环境探测（capability-first，非门禁，不参与 status 判定）。
+            "dimension_capabilities": dimension_capabilities,
         }
 
     def review(self, result: dict) -> ReviewResult:
@@ -2019,7 +2093,12 @@ class RealP5Handler:
         # C6: 失败分类 → 路由决策
         router = P5FailureRouter(max_retries=2)
         failure_type = self._classify_failure(result)
-        route = router.route(failure_type, {"retry_count": 0, "result": result})
+        # GAP-P5-6 (R17.5-P5-R3): 从【真实 run state】计算 retry_count，不再恒 0。
+        # 旧实现硬编码 {"retry_count": 0}，令有界重试永不耗尽（P5FailureRouter._retry_route
+        # 依赖 retry_count 收敛到 Gate 升级）。真实来源 = ReviewPass 每轮写的 review_pass
+        # round_end trace（本轮 review 尚未写盘，故已落盘的 round_end 数 = 之前重试次数）。
+        retry_count = self._p5_retry_count(result.get("project_id"), result.get("run_id"))
+        route = router.route(failure_type, {"retry_count": retry_count, "result": result})
 
         # Evidence Gap → 标记 Gate 需求
         if route.gate_required:
@@ -2064,12 +2143,80 @@ class RealP5Handler:
             reviewer="p5_review_skill",
         )
 
+    def _p5_retry_count(self, project_id, run_id) -> int:
+        """GAP-P5-6: 从真实 run state 读取 P5 已重试次数（不再恒 0）。
+
+        真实信号 = ReviewPass 每轮 review 通过后写的 `review_pass` / action=`round_end` trace。
+        本轮 review 尚未写盘（round_end 在 review_fn 返回后才写），故已落盘的 round_end 条数
+        = 之前已完成的重试轮数 = retry_count。缺 tracer / 无 .query / 任何异常 → 诚实回退 0
+        （首次尝试语义，非阻断）。仅读 trace，不产判断、不改任何状态。
+        """
+        if not project_id or self.tracer is None or not hasattr(self.tracer, "query"):
+            return 0
+        try:
+            traces = self.tracer.query(project_id=project_id, run_id=run_id or None,
+                                       stage="p5", trace_type="review_pass", limit=200)
+            return sum(1 for t in traces if t.get("action") == "round_end")
+        except Exception as e:
+            logger.warning("P5: retry_count query failed (fallback 0, non-blocking): %s", e,
+                           exc_info=True)  # 公理3
+            return 0
+
+    async def _run_advisory(self, project_id, run_id, verify_results, conditional_details,
+                            can_complete, reason, p4_summary,
+                            dimension_capabilities=None) -> dict:
+        """GAP-P5-2: 调 P5VerificationAgent 产 LLM 策略/失败解读/修复建议（advisory）。
+
+        本层【绝不】改写确定性槽位状态或 can_be_completed——只喂真实事实、取回判断参考。
+        任何异常/无模型 → 诚实 skipped（非阻断），确定性 P5 验证内核照常认定 completed/blocked。
+        """
+        try:
+            agent = self._p5_verification_agent()
+            # D-108 skill-first：由 handler（X-4-5 白名单调用方）经 canonical assemble_context
+            # 装配 P5 主 stage skill 正文 + system_prompt，作参数传入 advisory agent（agent 是纯
+            # 消费者，不自碰 assemble_context —— 满足 X-4-5 单一事实源）。装配失败=advisory 降级，非阻断。
+            skill_body, system_prompt = "", ""
+            try:
+                from app.services.context_assembler import assemble_context
+                pkg = assemble_context(
+                    project_id, "p5",
+                    node_state={"node_task": "P5 验证：规划验证策略、解读失败、提修复建议（不替代真实测试）"},
+                    task_type="verification", include_body=True, skill_disclosure="full")
+                bodies = [s.get("body") for s in (pkg.get("skills") or []) if s.get("body")]
+                skill_body = "\n\n".join(bodies)[:12000]
+                system_prompt = pkg.get("system_prompt", "") or ""
+            except Exception:
+                logger.warning("P5 advisory context assembly failed (advisory)", exc_info=True)  # 公理3
+            facts = {
+                "project_id": project_id,
+                "p4_summary": p4_summary or {},
+                "hard_required": [{"slot_id": vr.slot_id, "passed": vr.passed,
+                                   "status": vr.status, "issues": vr.issues}
+                                  for vr in verify_results],
+                "conditional": conditional_details,
+                "can_be_completed": can_complete,
+                "reason": reason,
+                # GAP-P5-1/3: 维度能力+环境探测事实——供 LLM 据真实环境判断各维度适用性/降级依据。
+                "dimension_capabilities": dimension_capabilities or {},
+            }
+            result = await agent.interpret(project_id, run_id=run_id, deterministic_facts=facts,
+                                           skill_body=skill_body, system_prompt=system_prompt)
+            return result.to_dict() if hasattr(result, "to_dict") else dict(result)
+        except Exception as e:
+            logger.warning("P5: LLM advisory layer failed (non-blocking): %s", e, exc_info=True)  # 公理3
+            return {"status": "skipped", "reason": f"advisory_error: {e}",
+                    "analysis_only": True, "evidence_gap": "llm_advisory_unavailable"}
+
     def _persist_p5_validation_report(self, project_id, run_id, plan_dict,
-                                       verify_results, conditional_details):
+                                       verify_results, conditional_details, advisory=None,
+                                       dimension_capabilities=None):
         """R12-7 持久化 P5 验证结果到工作区 artifacts/p5_validation_report.json。
 
         供 P6 门禁（B-P6-UNGATED-BY-P5）与 StagePageP5（R12-4-04）复用。
         单一事实源 = 工作区 JSON 文件（重启存活 + DB 持久化）。
+
+        R17.5-P5-R1: 可选 `advisory` = LLM 策略/解读层输出，作独立分区 llm_verification_advisory
+        写入（analysis_only；不改 can_be_completed / 槽位状态——反伪造事实核心不受影响）。
         """
         try:
             from datetime import datetime, timezone
@@ -2085,6 +2232,13 @@ class RealP5Handler:
                 "conditional_results": conditional_details,
                 "can_be_completed": plan_dict.get("can_be_completed", False),
             }
+            if advisory is not None:
+                # analysis_only 分区：LLM 判断参考，非事实、非门禁（GAP-P5-2 方向A）。
+                report["llm_verification_advisory"] = advisory
+            if dimension_capabilities is not None:
+                # capability-first 分区：验证维度能力清单 + 环境探测（确定性事实，非门禁）。
+                # 不参与 can_be_completed；环境缺失维度诚实标 evidence_gap（+capability_ready）。
+                report["dimension_capabilities"] = dimension_capabilities
             ref = _mediated_write(project_id, "artifacts/p5_validation_report.json",
                                   json.dumps(report, ensure_ascii=False, indent=2),
                                   auditor=self.auditor, stage="p5",
@@ -2194,18 +2348,23 @@ class RealP6Handler:
     @staticmethod
     def _check_p5_validation_passed(project_id: str, run_id: str) -> bool:
         """R12-7 检查 P5 验证是否通过（读取持久化结果）。"""
+        data = RealP6Handler._load_p5_report(project_id, run_id)
+        return bool(data.get("can_be_completed", False)) if data else False
+
+    @staticmethod
+    def _load_p5_report(project_id: str, run_id: str) -> dict:
+        """读取持久化的 p5_validation_report.json（真 P5 产物，非 P4 摘要）。失败→{}。"""
         try:
             from app.services.workspace_service import workspace_path
             from app.services.workspace_mediator import WorkspaceMediator
             report_path = workspace_path(project_id) / "artifacts" / "p5_validation_report.json"
             if not report_path.exists():
-                return False
+                return {}
             WorkspaceMediator(str(workspace_path(project_id))).guard_read(str(report_path))
-            data = json.loads(report_path.read_text(encoding="utf-8"))
-            return data.get("can_be_completed", False)
+            return json.loads(report_path.read_text(encoding="utf-8"))
         except Exception as e:
-            logger.warning("P6: P5 validation check failed: %s", e, exc_info=True)
-            return False
+            logger.warning("P6: P5 report load failed: %s", e, exc_info=True)
+            return {}
 
     async def execute(self, state: GraphState) -> dict:
         project_id = state["project_id"]
@@ -2227,7 +2386,8 @@ class RealP6Handler:
                     "artifacts": [], "evidence_refs": []}
 
         # R12-7 修复 B-P6-UNGATED-BY-P5：读取 P5 验证结果（非仅 P4→P5 gate）
-        p5_passed = self._check_p5_validation_passed(project_id, run_id)
+        p5_report = self._load_p5_report(project_id, run_id)
+        p5_passed = bool(p5_report.get("can_be_completed", False))
         if not p5_passed:
             return {"status": "blocked",
                     "reason": "P5 验证未通过（读取 p5_validation_report.json），P6 不得执行",
@@ -2235,7 +2395,11 @@ class RealP6Handler:
 
         # ② 生成交付包（P6DeliveryService，C8）
         p6_svc = self._p6_service()
-        validation_plan = p4_input.p4_execution_summary or {}
+        # REC (R17.5-P5-R3)：p5_plan 必须是【真 P5 验证计划】（含十槽位状态），而非 P4 执行摘要。
+        # 旧实现传 p4_input.p4_execution_summary（无 "slots" 键）当 p5_plan，导致 risk_manifest
+        # 丢失 P5 槽位失败风险、p5_validation_report 分区标注为 P4 摘要（字段来源错标）。
+        # 现取持久化 p5_validation_report.json 的 validation_plan（十槽位真状态）传入。
+        validation_plan = p5_report.get("validation_plan") or {}
         pkg = p6_svc.generate_delivery_package(project_id, run_id,
                                                 p5_plan=validation_plan)
 

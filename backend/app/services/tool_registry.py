@@ -255,6 +255,71 @@ _BUILTIN_SCHEMAS = [
         "_risk_level": "L2",
         "_write_scope": "none",
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "p5_verification_facts",
+            "description": (
+                "读取本项目 P5 确定性验证的【真实事实】：十槽位状态 + can_be_completed + 条件命令结果，"
+                "来源=已落盘的 artifacts/p5_validation_report.json（由确定性验证器产出，非模型自报）。"
+                "P5 策略/失败解读用：据此规划验证维度、解读失败根因、提修复建议——"
+                "但【不得改写】这些事实，completed 由确定性门禁认定，不由本工具或模型翻转。"
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+        "_source": "builtin",
+        "_tool_id": "builtin:p5_verification_facts",
+        "_risk_level": "L0",
+        "_write_scope": "none",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "p5_dimension_capabilities",
+            "description": (
+                "读取本项目 P5 验证维度的【能力清单 + 环境探测】（capability-first，R17.5-P5-R2）："
+                "浏览器/E2E QA、行为等价/断言、DB 结构+数据迁移、业务闭环、回归对 P1 金标准、性能基准、"
+                ".NET build/test/static 等维度——每项标 capability_ready（能力是否已接线）与 "
+                "environment_available（运行环境是否具备）。这是【非门禁】的确定性能力/环境事实，"
+                "不参与 can_be_completed；维度是否适用由你（按 P5 stage skill）判断。环境缺失维度诚实标 "
+                "evidence_gap（待环境真验），不伪造通过。"
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+        "_source": "builtin",
+        "_tool_id": "builtin:p5_dimension_capabilities",
+        "_risk_level": "L0",
+        "_write_scope": "none",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "p5_verify_dimension",
+            "description": (
+                "探测单个 P5 验证维度的能力接线与运行环境（确定性事实），供你按本次迁移选维度调用。"
+                "dimension 取值：browser_qa / eval_harness / db_migration / business_flow / "
+                "regression_baseline / benchmark / dotnet_build。返回 capability_ready + "
+                "environment_available + status（available=环境具备可经对应子 skill 工作流产真实事实；"
+                "evidence_gap=能力已接线但环境缺失，待环境真验，非阻断）。本工具【只报事实、不产"
+                "\"通过\"结论、不改槽位状态、不翻转 can_be_completed】。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dimension": {
+                        "type": "string",
+                        "description": ("验证维度名：browser_qa / eval_harness / db_migration / "
+                                        "business_flow / regression_baseline / benchmark / dotnet_build"),
+                    },
+                },
+                "required": ["dimension"],
+            },
+        },
+        "_source": "builtin",
+        "_tool_id": "builtin:p5_verify_dimension",
+        "_risk_level": "L2",
+        "_write_scope": "none",
+    },
 ]
 
 # Risk levels that require gate review (T2.3 / S3 note: full HITL接线→R9-5-7)
@@ -630,6 +695,48 @@ async def _execute_builtin(tool_name: str, args: dict, project_id: str, stage: s
             return {"status": "completed", "items_completed": result.get("items_completed", 0)}
         except Exception as e:
             return {"error": f"全量识别执行失败: {e}"}
+    elif tool_name == "p5_verification_facts":
+        # R17.5-P5-R1: 暴露 P5 确定性验证的真实事实（读已落盘报告，只读 L0）。供 P5 策略/解读
+        # agent 在工具循环中按需取 ground-truth；不得改写、不由此翻转 can_be_completed。
+        try:
+            from app.services.workspace_service import workspace_path
+            fp = workspace_path(project_id) / "artifacts" / "p5_validation_report.json"
+            if not fp.exists():
+                return {"available": False,
+                        "error": "P5 验证报告尚未生成（确定性验证未运行或本项目无 P5 产物）"}
+            import json as _json
+            report = _json.loads(fp.read_text("utf-8", errors="replace"))
+            plan = report.get("validation_plan", {}) or {}
+            return {
+                "available": True,
+                "source": "artifacts/p5_validation_report.json (deterministic ground truth)",
+                "can_be_completed": report.get("can_be_completed", False),
+                "slots": plan.get("slots", []),
+                "verify_results_failed": report.get("verify_results", []),
+                "conditional_results": report.get("conditional_results", []),
+                "note": ("以上为确定性验证器铁证，只可解读/规划，不可改写；"
+                         "completed 由 can_mark_completed 认定，不由本工具或模型翻转"),
+            }
+        except Exception as e:
+            return {"available": False, "error": str(e)}
+    elif tool_name == "p5_dimension_capabilities":
+        # R17.5-P5-R2 (GAP-P5-1/3, capability-first): 验证维度能力清单 + 环境探测（只读 L0）。
+        # 非门禁事实——不参与 can_be_completed；维度适用性由 P5 skill/LLM 判断。
+        try:
+            from app.services.p5_capability_service import P5CapabilityService
+            return P5CapabilityService().probe_all(project_id)
+        except Exception as e:
+            logger.warning("p5_dimension_capabilities failed (non-blocking): %s", e, exc_info=True)
+            return {"error": str(e), "dimensions": []}
+    elif tool_name == "p5_verify_dimension":
+        # R17.5-P5-R2: 探测单个维度能力+环境（确定性事实，不产"通过"结论、不翻转门禁）。
+        try:
+            from app.services.p5_capability_service import P5CapabilityService
+            dim = (args or {}).get("dimension", "")
+            return P5CapabilityService().verify_dimension(project_id, dim).to_dict()
+        except Exception as e:
+            logger.warning("p5_verify_dimension failed (non-blocking): %s", e, exc_info=True)
+            return {"error": str(e)}
     if tool_name == "introduce_community_resource":
         from app.services.community_introduction import introduce
         from app.core.database import get_session

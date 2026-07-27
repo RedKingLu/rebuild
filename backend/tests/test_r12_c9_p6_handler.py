@@ -80,7 +80,9 @@ class TestP6HandlerExecution:
         mock_svc.gate_service.create.return_value = mock_gate_resp
 
         with patch.object(handler, '_services', return_value=mock_svc), \
-             patch.object(RealP6Handler, '_check_p5_validation_passed', return_value=True), \
+             patch.object(RealP6Handler, '_load_p5_report',
+                          return_value={"can_be_completed": True,
+                                        "validation_plan": {"slots": []}}), \
              patch("app.services.p5_input_service.P5InputService") as mock_cls:
             mock_cls.return_value = mock_input_svc
             result = asyncio.run(handler.execute({"project_id": "p", "run_id": "r"}))

@@ -155,7 +155,18 @@ class P5VerificationService:
     # ── 2. patches 存在且与 output_code 对应 ──────────────────────────────
 
     def _verify_patches_exist(self, project_id: str, p4_input) -> SlotVerificationResult:
-        """验证 patches 存在且与 output_code 对应。"""
+        """验证 patches 存在且非空（确定性事实）。
+
+        GAP-P5-4（R17.5-P5-R3）：本槽位【只产确定性事实】——patch 文件真实存在且非空。
+        旧实现用启发式 `len(patch) <= len(output)+2` 当 PASS/FAIL 门禁（correlation_ok），
+        会把合法【重写式迁移】误判为 patch_output_mismatch：如 WebForms→Razor 整体重写，
+        一个源产出多个目标文件 + 转换脚本，patch 非行级 diff、数量与 output_code 不成 1:1，
+        真跑 8666035c（73 patch > 72）即因此假阴。数量对应/重写式 source→target 结构对应
+        是【语义判断】，归 LLM advisory 层的 `structure_mapping`（diff 等价证据）产出，
+        不由确定性计数产"对应/不对应"判断结论（红线：确定性只产事实——存在/非空/计数）。
+        因此本槽位判定 = patch 文件真实存在且非空即 validated；缺文件/空文件 →
+        validation_failed（真实缺失，非启发式误判）；无 patch refs → evidence_gap。
+        """
         ws = workspace_path(project_id)
         out_refs = p4_input.output_code_refs
         patch_refs = p4_input.patch_refs
@@ -186,14 +197,14 @@ class P5VerificationService:
             result.issues.append({"type": "patch_missing",
                                   "detail": f"缺失 {len(missing)} 个 patch 文件"})
 
-        # 验证对应关系：patch 文件名应关联到 output_code 文件名（宽松：patch 数量 ≤ output_code 数量 + 2）
-        correlation_ok = len(patch_refs) <= len(out_refs) + 2
-        result.details["correlation_ok"] = correlation_ok
-        if not correlation_ok:
-            result.issues.append({"type": "patch_output_mismatch",
-                                  "detail": f"patch 数量({len(patch_refs)}) 远多于 output_code({len(out_refs)})"})
+        # patch 与 output_code 的【数量关系】只作中立事实登记，不再当 PASS/FAIL 门禁。
+        # source→target 结构对应（含重写式非行级 diff）由 LLM advisory 的 structure_mapping 评估。
+        result.details["patch_output_ratio"] = (
+            round(len(patch_refs) / len(out_refs), 3) if out_refs else None)
+        result.details["correspondence_assessed_by"] = "llm_structure_mapping_advisory"
 
-        if found and not missing and correlation_ok:
+        # 确定性判定：patch 文件真实存在且非空 → validated（存在性铁证，不依赖计数启发式）。
+        if found and not missing:
             result.passed = True
             result.status = "validated"
 
@@ -338,6 +349,82 @@ class P5VerificationService:
             else [{"type": "gate_not_approved",
                    "detail": f"Gate 状态 {p4_input.p4_to_p5_gate_status}"}],
         )
+
+    # ── 增强项（非门禁）：source 未被修改（GAP-P5-5，R17.5-P5-R3）──────────
+
+    def verify_source_unmodified(self, project_id: str) -> SlotVerificationResult:
+        """source/ 未被修改的真实证明（D-099 源只读的正向证据）。
+
+        GAP-P5-5：source_unmodified 原为【死槽】（从不产真实证据，恒 PENDING）。本轮按用户
+        裁决（先不硬约束、优先真 verifier、不可用则诚实软证据、绝不用恒 True/占位假证据填死槽）
+        接入真实确定性 verifier：
+          - source/ 是 git 检出（有 .git）→ 读 `git status --porcelain`（只读，不改源）：
+            工作树干净 = 未改（validated，D-099 正向铁证）；非空 = 被改（validation_failed，
+            列出改动条目）。这是【确定性事实】，非 LLM 判断。
+          - source/ 非 git（zip/手工导入，无 byte 级基线快照）→ 诚实 evidence_gap
+            （capability_ready=True）：无基线可正向比对，D-099 由 WorkspaceMediator 单一写闸
+            + READONLY_DIRS 保障；【绝不伪造恒 True/占位通过】（反伪造红线，R12 多轮教训）。
+          - source/ 不存在 → 诚实 evidence_gap。
+        本槽为【增强项】(ENHANCED)，不在 can_mark_completed 门禁内，
+        任何状态都不翻转 can_be_completed（门禁只读硬必需 + 有条件必需）。
+        """
+        ws = workspace_path(project_id)
+        src = ws / "source"
+        result = SlotVerificationResult(
+            slot_id="source_unmodified", passed=False, status="evidence_gap", details={})
+
+        if not src.exists():
+            result.details["source_present"] = False
+            result.issues.append({"type": "no_source",
+                                  "detail": "source/ 不存在，无法做未改证明（诚实 evidence_gap，非伪造）"})
+            return result
+
+        result.details["source_present"] = True
+        if (src / ".git").exists():
+            porcelain = self._git_status_porcelain(src)
+            result.details["method"] = "git_status_porcelain"
+            if porcelain is None:
+                result.issues.append({"type": "git_query_failed",
+                                      "detail": "git 状态读取失败，诚实 evidence_gap（非伪造）"})
+                return result
+            changed = [ln for ln in porcelain.splitlines() if ln.strip()]
+            result.details["changed_count"] = len(changed)
+            result.details["changed_entries"] = changed[:50]
+            if changed:
+                result.status = "validation_failed"
+                result.issues.append({"type": "source_modified",
+                                      "detail": f"source/ 检出到 {len(changed)} 处改动（D-099 源只读被破坏）"})
+                return result
+            result.passed = True
+            result.status = "validated"
+            result.details["note"] = "git 工作树干净：source/ 未被修改（D-099 正向证据）"
+            return result
+
+        # 非 git → 诚实软证据（不伪造）：能力已接线，待基线快照能力真验。
+        result.details["method"] = "no_baseline"
+        result.details["capability_ready"] = True
+        result.issues.append({
+            "type": "no_source_baseline",
+            "detail": ("source/ 非 git 检出，无 byte 级基线快照，无法做未改的正向证明；"
+                       "D-099 源只读由 WorkspaceMediator 单一写闸 + READONLY_DIRS 保障。"
+                       "诚实标 evidence_gap（能力已接线、待基线快照真验），非伪造通过。")})
+        return result
+
+    @staticmethod
+    def _git_status_porcelain(target: Path) -> Optional[str]:
+        """只读 git 状态（不改 source/，D-099）。失败返回 None，不抛（非阻断）。"""
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(target), "status", "--porcelain"],
+                capture_output=True, text=True, timeout=15)
+            if out.returncode != 0:
+                return None
+            return out.stdout
+        except Exception:
+            logger.warning("P5 source_unmodified: git status failed (non-blocking)",
+                           exc_info=True)  # 公理3
+            return None
 
     # ── C5: 有条件必需槽位真实命令验证 ─────────────────────────────────────
 

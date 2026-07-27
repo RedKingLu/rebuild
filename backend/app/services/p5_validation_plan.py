@@ -85,6 +85,32 @@ class P5SlotId(str, Enum):
     SOURCE_UNMODIFIED = "source_unmodified"            # 10. source 未被修改（sha256）
 
 
+# ── 十槽位 ↔ 文档 6/8 证据类别 词表映射（GAP-P5-7，R17.5-P5-R3）─────────────
+# 背景：运行时以本文件的【十槽位 P5SlotId】为权威（can_mark_completed 唯一读取的门禁枚举）；
+# 文档 08-测试与验收/02（§3 六证据槽位）与 04（§3 八证据槽位）用的是【面向 agent 的证据类别
+# 词表】。用户裁决（2026-07-27 裁决4）：以【面向 agent 的证据类别】为准，运行时十槽位与文档
+# 6/8 类别做【映射对齐】即可——不新增刚性枚举、不加门禁约束，仅作词表对照说明。
+# P5 stage skill（P-migration-verification）§验证维度已把这些证据类别写为"指引非必填槽位"，
+# 新维度证据【桥接进现有十槽】或【诚实登记 evidence_gap】，不另立枚举。
+#
+#   运行时十槽位（本文件，门禁权威）      文档 02 §3（6 类）        文档 04 §3（8 类）
+#   ─────────────────────────────────  ──────────────────────  ────────────────────────────
+#   output_code_exists (hard)          （P4 产物前置，非验证证据类别；桥接进 verification_trace 溯源）
+#   patches_exist      (hard)          差异登记                 verification_trace（+LLM structure_mapping 补语义对应）
+#   p4_evidence_real   (hard)          （反伪造 sha256 前置）    verification_audit / build·test evidence 之 basis
+#   p4_summary_readable(hard)          （P4 摘要可解析前置）      verification_trace
+#   p4_p5_gate_approved(hard)          （P4→P5 Gate 前置）       verification_audit
+#   build_verified     (cond)          构建证据                 build_evidence
+#   run_verified       (cond)          启动运行证据              runtime_evidence
+#   tests_pass         (cond)          测试证据                 test_evidence
+#   static_check       (cond)          （静态检查，并入构建/测试） build_evidence（静态子项）
+#   source_unmodified  (enh)           （源只读正向证据，D-099）  verification_audit（源未改）
+#
+# 文档 6/8 类别中运行时十槽位【未直接立槽】的（回归对比/behavior_evidence/security_redaction_evidence
+# /benchmark 等）→ 由 capability-first 的 dimension_capabilities 分区（非门禁）+ P5 skill 维度指引
+# 承载，环境具备时桥接进现有槽/证据、缺失则诚实 evidence_gap，均不新增刚性门禁槽位。
+
+
 # ── Slot → Type 映射 ──────────────────────────────────────────────────────
 
 SLOT_TYPE_MAP: dict[str, P5SlotType] = {

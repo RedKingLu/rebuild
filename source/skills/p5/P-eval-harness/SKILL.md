@@ -59,6 +59,7 @@ P5 验证阶段，对任何迁移交付物做正确性判定时触发。核心�
 - 禁止在评估数据中包含真实密钥/未脱敏敏感数据
 
 ## 与平台集成
+- **能力接线（capability-first，R17.5-P5-R2）**：本维度已接线为平台能力——先用 `p5_verify_dimension` 探 `eval_harness`（行为等价/断言，探测 P4 目标产物可执行入口 + P1 acceptance_baseline 金标准是否就位）与 `regression_baseline`（回归对 P1 金标准，D-106），或 `p5_dimension_capabilities` 看全量矩阵。**入口 + 基准就位** → 按上述步骤定义断言、批量执行、pass@k 产铁证；**缺失**（无可执行目标 / 无 P1 基线 / 无对照数据）→ 该维度诚实标 `evidence_gap`（`capability_ready=true`，记"评估/回归能力已接线，待目标可执行入口/P1 金标准环境真验"），**非阻断、绝不把 flaky 或臆测当 go**。能力/环境探测是确定性事实，工具不产"go/pass"结论、不翻转 `can_be_completed`。
 - model grader 及辅助分析的模型调用一律经 ModelGateway；模型判定结论须人工抽检，模型输出不等于 Evidence。
 - 评估若需对生产数据/系统执行写操作（L4-L5），须经用户 Gate。
 - 断言清单、评估集、结果矩阵、判定报告挂 Artifact/Evidence，执行动作记 Trace/Audit，评估集登记 Registry。
