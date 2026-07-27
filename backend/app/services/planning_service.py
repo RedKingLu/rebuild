@@ -53,20 +53,34 @@ _POC_HINTS = ("poc", "概念验证", "原型", "spike", "可行性验证")
 _VERIFICATION_HINTS = ("验证", "验收", "回归测试", "回归", "测试用例", "verification", "verify", "acceptance test")
 
 
-def classify_node_type(title: str) -> str:
-    """Heuristically classify a TaskGraph node by its title/objective (D-112).
+def classify_node_type(title: str, output_target: str | None = None) -> str:
+    """Classify a TaskGraph node (D-112 + D-114).
 
-    Conservative: returns 'execution' (auto-run code) unless the title strongly
-    signals a non-code task. Decision > PoC > verification precedence when a title
-    matches multiple (a "架构决策" wins over an incidental "验证" mention)."""
+    D-114 优先信号：**产出写入 output_code/ 的节点 = execution**（脚手架/代码/部署/测试代码，
+    auto-run 产出真实工程代码），无论标题是否含 PoC/验证等字样——单一可构建工程要靠这些节点自动跑。
+    产出写 artifacts/（架构文档/规划/决策说明）或无产码的节点 → 按标题归 decision/poc/verification
+    走评审 gate（默认 decision）。**仅当节点无 output_target（旧图/向后兼容）时**回退纯标题启发式
+    （默认 execution，保持既有行为）。decision > poc > verification 优先级。"""
+    ot = (output_target or "").strip()
+    # 剔除 LLM 可能写进 output_target 的中文括注/说明，取纯路径前缀
+    ot_path = ot.split("（")[0].split("(")[0].split(" ")[0].strip() if ot else ""
     t = (title or "").lower()
-    if any(h in t for h in _DECISION_HINTS):
-        return "decision"
-    if any(h in t for h in _POC_HINTS):
-        return "poc"
-    if any(h in t for h in _VERIFICATION_HINTS):
-        return "verification"
-    return "execution"
+
+    def _by_title(default: str) -> str:
+        if any(h in t for h in _DECISION_HINTS):
+            return "decision"
+        if any(h in t for h in _POC_HINTS):
+            return "poc"
+        if any(h in t for h in _VERIFICATION_HINTS):
+            return "verification"
+        return default
+
+    if ot_path:
+        if ot_path.startswith("output_code/"):
+            return "execution"          # 产码 → auto-run
+        return _by_title("decision")    # 不产码（artifacts/文档/决策）→ 评审，默认 decision
+    # 无 output_target → 向后兼容旧图：纯标题启发式，默认 execution
+    return _by_title("execution")
 
 
 # R11-7 (B-P3-NO-TASKPLANS): a Task Plan Batch is verbose (a batch of tasks, each with
@@ -121,7 +135,10 @@ _TASK_PLAN_SYSTEM_PROMPT = (
     "task_plans(数组，每项含 objective(字符串), scope(数组), inputs(数组), expected_outputs(数组), "
     "risk_level(L0-L5), permission_boundary(字符串), required_resources(数组), "
     "model_policy_override(字符串或null), validation_method(字符串), expected_artifacts(数组), "
-    "expected_evidence(数组), title(字符串), basis_refs(数组,本任务所依据的上游 Stage Plan/P2 产物 artifact ref)))。"
+    "expected_evidence(数组), title(字符串), basis_refs(数组,本任务所依据的上游 Stage Plan/P2 产物 artifact ref), "
+    "output_target(字符串,本任务产物写入的【目标工程相对路径】,如 output_code/{目标工程名}/Services/ 或 "
+    "output_code/{目标工程名}/Program.cs;首个「工程脚手架」任务的 output_target 指向工程根 output_code/{目标工程名}/;"
+    "全批次共用同一目标工程名与命名空间——不要每个任务各自建工程。inputs 是源侧定位,output_target 是目标侧写入路径)))。"
 )
 
 _TASK_GRAPH_SYSTEM_PROMPT = (
@@ -480,6 +497,7 @@ class PlanningService:
                     validation_method=spec.get("validation_method") or None,
                     expected_artifacts=spec.get("expected_artifacts", []),
                     expected_evidence=spec.get("expected_evidence", []),
+                    output_target=(spec.get("output_target") or None),  # D-114 目标工程相对写入路径
                     title=(spec.get("title") or spec.get("objective") or "")[:255],
                     description=spec.get("objective") or None,
                     status="draft",
@@ -602,6 +620,7 @@ class PlanningService:
                 "model_policy_override": t.model_policy_override,
                 "required_resources": t.required_resources or [],
                 "input_refs": t.inputs or [],
+                "output_target": t.output_target,  # D-114 目标工程相对写入路径
             } for i, t in enumerate(tps)]
         finally:
             db.close()
@@ -770,12 +789,13 @@ class PlanningService:
                     node_id=nd["node_id"], task_graph_id=tg.task_graph_id,
                     project_id=project_id, run_id=run_id or None,
                     stage=(stage or "p3").lower(),
-                    node_type=classify_node_type(nd.get("title", "")),  # D-112: 分型（默认 execution）
+                    node_type=classify_node_type(nd.get("title", ""), nd.get("output_target")),  # D-112/D-114: output_target-aware 分型
                     title=nd["title"], input_refs=nd["input_refs"],
                     resource_refs=nd["required_resources"],
                     model_policy_override=nd["model_policy_override"],
                     permission_boundary=nd["permission_boundary"],
                     risk_level=nd["risk_level"],
+                    output_target=nd.get("output_target"),  # D-114 目标工程相对写入路径
                 ))
             db.commit()
             return tg.task_graph_id

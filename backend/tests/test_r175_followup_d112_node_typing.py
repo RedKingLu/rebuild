@@ -43,6 +43,36 @@ def test_classify_precedence_decision_over_verification():
     assert classify_node_type("架构决策并验证可行性") == "decision"
 
 
+def test_output_target_code_forces_execution():
+    """D-114：产出写 output_code/ 的节点 = execution，无论标题含 PoC/脚手架/验证等。"""
+    # 脚手架节点（标题无强关键词）写 output_code → execution（必须自动跑建工程）
+    assert classify_node_type("目标工程脚手架搭建", "output_code/MicroOA/") == "execution"
+    # PoC 数据层（标题含 PoC）但写 output_code → 仍 execution（PoC 是范围不是"非产码"）
+    assert classify_node_type("数据访问层迁移 PoC", "output_code/MicroOA/MicroOA.Data/") == "execution"
+    # 测试代码（标题含验证/测试）写 output_code → execution（产出测试代码）
+    assert classify_node_type("验收测试基础设施", "output_code/MicroOA/MicroOA.Tests/") == "execution"
+
+
+def test_output_target_noncode_goes_to_review():
+    """D-114：写 artifacts/（文档/规划）或不产码 → 评审类型（decision/poc/verification）。"""
+    # 架构映射文档写 artifacts → 非 execution（默认 decision）
+    assert classify_node_type("WebForms→ASP.NET Core 架构映射", "artifacts/p3/arch.md") == "decision"
+    # 验证计划写 artifacts → verification（标题命中）
+    assert classify_node_type("回归测试策略规划", "artifacts/p3/") == "verification"
+
+
+def test_output_target_pollution_stripped():
+    """D-114：output_target 含中文括注/尾随描述仍能识别为 output_code → execution。"""
+    assert classify_node_type("环境验证", "output_code/MicroOA/ （仅写入 PoC 测试工程）") == "execution"
+
+
+def test_no_output_target_backward_compat():
+    """无 output_target（旧图）→ 纯标题启发式，默认 execution（向后兼容不破坏既有行为）。"""
+    assert classify_node_type("迁移数据访问层代码") == "execution"
+    assert classify_node_type("迁移数据访问层代码", None) == "execution"
+    assert classify_node_type("目标数据库选型确认", None) == "decision"
+
+
 def test_valid_node_types_enum():
     assert set(VALID_NODE_TYPES) == {"execution", "decision", "poc", "verification"}
     # classifier 只产出这四类之一

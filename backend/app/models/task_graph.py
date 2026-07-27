@@ -92,6 +92,9 @@ class TaskNode(Base):
     tool_policy: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     permission_boundary: Mapped[str | None] = mapped_column(String(64), nullable=True)
     risk_level: Mapped[str] = mapped_column(String(8), default="L0")
+    # D-114: 目标产出路径（目标工程相对路径）。P4 worker 据此把产物写入同一目标工程树
+    # （output_code/{Project}/{层}/），实现脚手架先行的单一可构建工程；缺失回退 output_code/{node_id}/。
+    output_target: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

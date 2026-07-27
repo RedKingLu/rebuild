@@ -26,6 +26,46 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger("rebuild.tool_registry")
 
+# ── D-114 写盘路径文件名清洗 ────────────────────────────────────────────────
+# 模型在 fs_write_artifact 的 path 里常把中文描述/括注写进文件名，产出非法、不可编译的
+# 路径（如 `output_code/x/MicroDBHelper.cs（QueryExcel 方法——OleDb 读取）`）。此处逐段清洗。
+_WRITE_TOP_DIRS = ("output_code", "artifacts", "patches", "source")
+# 合法"文件名.扩展名"后跟中文括注/顿号描述 → 截断到扩展名（如 foo.cs（说明）→ foo.cs）。
+_EXT_THEN_JUNK_RE = re.compile(r"^(.*?\.[A-Za-z0-9]{1,10})\s*[（(、，。：:].*$")
+# 保留的合法路径段字符（ASCII 标识符 + . - _ 空格→_）。
+_ILLEGAL_SEG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_segment(seg: str) -> str:
+    seg = (seg or "").strip()
+    if not seg or seg in (".", ".."):
+        return ""
+    m = _EXT_THEN_JUNK_RE.match(seg)          # 截断扩展名后的中文描述
+    if m:
+        seg = m.group(1)
+    seg = _ILLEGAL_SEG_RE.sub("_", seg).strip("._-")   # 剔除 CJK/空格/标点
+    return seg
+
+
+def _sanitize_write_path(rel: str) -> str:
+    """逐段清洗写盘相对路径：顶层白名单目录保持原样，其余段清洗非法字符/截断括注。
+    末段（文件名）清洗后为空则回退 file.txt。纯清洗，不改变目录层级/顶层归属。"""
+    parts = rel.replace("\\", "/").split("/")
+    out = []
+    for i, p in enumerate(parts):
+        if i == 0 and p in _WRITE_TOP_DIRS:
+            out.append(p)
+            continue
+        cleaned = _sanitize_segment(p)
+        if cleaned:
+            out.append(cleaned)
+    if not out:
+        return "output_code/file.txt"
+    # 若清洗后只剩顶层目录（其余段全被剥空）→ 补一个兜底文件名
+    if len(out) == 1:
+        out.append("file.txt")
+    return "/".join(out)
+
 # ── Minimal stdlib unified-diff engine (R17.2 apply_patch REC) ─────────────────
 # apply_patch previously wrote the draft's "diff" field verbatim as the whole file
 # content. If that field is an actual unified diff, writing it raw corrupts the
@@ -744,6 +784,12 @@ async def _execute_workspace_write(tool_name: str, args: dict, project_id: str, 
         # Canonicalize bare/unknown paths into the new-code write area (source stays source/
         # so the D-099① read-only rejection below still fires).
         rel = f"output_code/{rel}"
+
+    # D-114 文件名清洗（治"中文描述污染文件名"）：模型常把描述写进 path（如
+    # `output_code/x/MicroDBHelper.cs（QueryExcel 方法）` 或 `.../JS、Layui 面板）`），
+    # 产出非法路径、不可编译。此处对每个路径段清洗：截断合法扩展名后的括注、剔除 CJK/空格/
+    # 标点为 _，保留 ASCII 标识符+扩展名与目录分隔。顶层目录白名单段保持不变。
+    rel = _sanitize_write_path(rel)
 
     try:
         from app.services.workspace_mediator import _workspace_mediator_for

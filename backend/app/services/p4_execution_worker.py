@@ -203,6 +203,13 @@ class P4ExecutionWorker:
         Raises ValueError (re-raised) when the mediator rejects the target
         (e.g. source/). The caller turns that into an honest blocked + Audit.
         """
+        # D-114: 与 fs_write_artifact 同口径清洗路径（治文件名中文/括注污染）——worker 直写
+        # 路径也过同一 sanitizer，避免绕过工具层写盘时留下非法文件名。
+        try:
+            from app.services.tool_registry import _sanitize_write_path
+            rel_path = _sanitize_write_path(rel_path)
+        except Exception:
+            pass
         try:
             target, risk = self.mediator.check_write(rel_path)
         except ValueError as e:
@@ -610,6 +617,12 @@ class P4ExecutionWorker:
             + (f"本节点绑定 {len(bound)} 个源定位：{', '.join(bound)}\n" if bound
                else "本节点未显式绑定具体源文件：请在 source/ 下按需检索定位应迁移的真实文件。\n")
             + f"产物输出目标目录：{out_dir}/\n"
+            + ("【单一目标工程】所有节点写入同一目标工程；本节点产物落在上述目标目录（工程内相对子路径）。"
+               "工程根/脚手架可能已由前置节点建好——先用 list_files 查 output_code/ 下已存在的工程结构，"
+               "复用同一工程名/命名空间在其内续写，切勿另起炉灶新建 Program.cs/.csproj/.sln。"
+               "文件名须为合法标识符+扩展名，禁止把中文描述写进文件名。\n"
+               if (out_target and "output_code/" in out_target and not out_target.startswith(f"output_code/{node_id}/"))
+               else "")
             + (f"验收标准：{'; '.join(str(c) for c in crit)}\n" if crit else "")
             + "步骤：①先按需读取真实源；②迁移/改造为上游裁决的目标技术栈（覆盖真实的方言/框架转换点）。\n"
             + ("③本工作包涉及【多个文件】（脚手架/多源文件）：请把该工作包需要产出的【每一个】目标文件"
@@ -918,8 +931,22 @@ class P4ExecutionWorker:
         # 2. determine write target — default output_code/, but honor an explicit
         #    output_target so a mis-planned "write back to source/" is caught by the
         #    mediator (negative path, D-099①).
+        # D-114 脚手架先行：output_target 承载【目标工程相对路径】。可为目录（output_code/{Project}/Services/，
+        # 以 / 结尾）或具体文件（output_code/{Project}/Program.cs）。目录形态 → single-file 补源文件名/slug；
+        # 缺失 → 回退 output_code/{node_id}/（向后兼容）。这样各节点写入同一目标工程树而非各自 node_id 目录。
         out_target = node.get("output_target")
-        if not out_target:
+        if out_target and out_target.strip():
+            # D-114: 剔除 LLM 可能写进 output_target 的中文括注/说明（如
+            # "output_code/MicroOA/ （仅写入…）"），只取纯路径前缀。
+            ot = out_target.split("（")[0].split("(")[0].strip()
+            ot = ot.split()[0] if ot.split() else ot   # 去尾随空格+描述
+            if ot.endswith("/") or "." not in Path(ot).name:
+                # 目录形态：补文件名（源文件名优先，否则 slug(title)）
+                fname = Path(source_ref).name if source_ref else f"{_slug(title)}.txt"
+                out_target = f"{ot.rstrip('/')}/{fname}"
+            else:
+                out_target = ot
+        else:
             if source_ref:
                 out_target = f"output_code/{node_id}/{Path(source_ref).name}"
             else:

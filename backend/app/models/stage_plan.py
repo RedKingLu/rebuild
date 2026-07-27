@@ -94,6 +94,10 @@ class TaskPlan(Base):
     validation_method: Mapped[str | None] = mapped_column(String(64), nullable=True)
     expected_artifacts: Mapped[list | None] = mapped_column(JSON, nullable=True)
     expected_evidence: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # D-114: 目标产出路径（目标工程相对路径，如 output_code/{Project}/Services/）。
+    # 支撑"脚手架先行+单一可构建目标工程"（R17.3-1 §8 P4-4/P4-10）；缺失时 worker 回退
+    # output_code/{node_id}/（向后兼容）。inputs 是源侧定位、expected_* 是描述性；本列是目标侧写入路径。
+    output_target: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # compat with existing schema (TaskPlanResponse.title / description)
     title: Mapped[str] = mapped_column(String(255), default="")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -1191,6 +1191,7 @@ class RealP3Handler:
                       "resource_refs": n.resource_refs or [],
                       "permission_boundary": n.permission_boundary,
                       "model_policy_override": n.model_policy_override,
+                      "output_target": getattr(n, "output_target", None),  # D-114
                       "task_plan_ref": getattr(n, "task_plan_ref", None)} for n in tns]
             return nodes, edges
         finally:
@@ -1354,6 +1355,7 @@ class RealP4Handler:
                       "title": n.title, "risk_level": n.risk_level,
                       "input_refs": n.input_refs or [],
                       "permission_boundary": n.permission_boundary or "workspace_read",
+                      "output_target": getattr(n, "output_target", None),  # D-114 目标工程相对写入路径
                       "stage": "p4"} for n in tns]
             return {"task_graph_id": tg.task_graph_id, "stage_plan_ref": tg.stage_plan_ref,
                     "graph_status": tg.graph_status, "edges": tg.edges or [],
@@ -1670,10 +1672,53 @@ class RealP4Handler:
                 "node_run_id": res.get("task_node_run_id"),
             })
 
+        # D-114 富语义 summary（对齐参考轨 + R17.3-1 §8）：从真实节点/证据派生源→目标 WP 映射、
+        # 待覆盖范围、安全复核指针、PoC/Production 分级——非二次 LLM，均从落盘事实结构化派生。
+        work_packages = []
+        for n in tg.get("nodes", []):
+            nid = n["node_id"]
+            res = (eng.node_results or {}).get(nid) or {}
+            node_outs = [e.get("output_code_ref") for e in (p4_evidence or [])
+                         if e.get("output_code_ref") and nid in (e.get("evidence_id") or "")]
+            node_patches = [e.get("patch_ref") for e in (p4_evidence or [])
+                            if e.get("patch_ref") and nid in (e.get("evidence_id") or "")]
+            src_refs = [r for r in (n.get("input_refs") or []) if str(r).startswith("source/")]
+            _st = res.get("node_status") or res.get("status")
+            if not _st:
+                _st = ("completed" if nid in eng.completed_nodes
+                       else "pending_user_review" if n.get("node_type") != "execution"
+                       else "unknown")
+            work_packages.append({
+                "node_id": nid, "name": n.get("title") or nid,
+                "node_type": n.get("node_type") or "execution",
+                "output_target": n.get("output_target"),
+                "source_refs": src_refs,
+                "output_code": list(dict.fromkeys([o for o in node_outs if o])),
+                "patches": list(dict.fromkeys([p for p in node_patches if p])),
+                "status": _st,
+            })
+        unresolved_scope = []
+        for n in tg.get("nodes", []):
+            if n.get("node_type") != "execution":
+                unresolved_scope.append(
+                    f"{n.get('node_type')} 节点待用户裁决/后续处理：{n.get('title')}")
+        for nid in eng.failed_nodes:
+            unresolved_scope.append(
+                f"节点未完成（failed）：{node_map.get(nid, {}).get('title', nid)}")
+        unresolved_scope.append(
+            "build/run 未执行（本环境无 dotnet SDK）→ 待 P5/本地环境验证（R17.3-1 build_verified 条件槽，诚实 evidence_gap）")
+        _sec_hints = ("auth", "登录", "login", "密码", "password", "ldap", "权限",
+                      "permission", "token", "会话", "session", "认证")
+        security_notes = [
+            f"涉安全节点，产物需安全复核（如口令比较/后门/域认证/会话）：{n.get('title')}"
+            for n in tg.get("nodes", [])
+            if any(h in (n.get("title") or "").lower() for h in _sec_hints)]
+
         summary = {
             "stage": "p4",
             "kind": "execution_summary",
             "generated_at": _now(),
+            "poc_or_production": "poc",   # R17.3-1 r2 §6.3：本轮为 PoC 级（最小可验证闭环，非全量 Production）
             "graph_id": tg.get("task_graph_id"),
             "graph_status": eng.graph_status,
             "run_id": getattr(eng, "run_id", ""),
@@ -1685,6 +1730,9 @@ class RealP4Handler:
             "blocked_node_count": (len(eng.node_results) - len(eng.completed_nodes)
                                    - len(eng.failed_nodes) - len(eng.gated_nodes)),
             "node_type_distribution": node_type_dist,
+            "work_packages": work_packages,          # D-114 源→目标 WP 映射
+            "unresolved_scope": unresolved_scope,    # D-114 诚实未覆盖/待验证
+            "security_notes": security_notes,        # D-114 安全复核指针
             "change_manifest": change_manifest,
             "patch_index": patch_index,
             "nodes": per_node,
