@@ -31,16 +31,28 @@ export function StagePageP6({ projectId, runId = '', stageStatus: _stageStatus, 
   const [gate, setGate] = useState<GateInfo>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // R17.5-P6-R4 REC：P5 未过时 /p6/package 返回 422 → 静默空态（不弹错误框）
+  const [notReady, setNotReady] = useState(false);
 
   const load = async () => {
     setLoading(true);
     setError(null);
+    setNotReady(false);
     try {
       const rid = runId || '';
       const pkgRes = rid ? fetch(`/api/projects/${projectId}/runs/${rid}/p6/package`) : Promise.resolve(null);
       const gateRes = fetch(`/api/projects/${projectId}/gates/active`);
       const [p, g] = await Promise.all([pkgRes, gateRes]);
-      if (p && p.ok) setPkg((await p.json()).data || (await p.json()));
+      if (p) {
+        if (p.ok) {
+          setPkg((await p.json()).data || null);
+        } else if (p.status === 422) {
+          // P5 尚未通过验证 / 交付暂被阻断 → 诚实静默空态，非错误
+          setNotReady(true);
+        } else {
+          setError(`HTTP ${p.status}`);
+        }
+      }
       if (g.ok) {
         const gd = (await g.json()).data || (await g.json());
         setGate(gd && gd.gate_id ? gd : null);
@@ -60,6 +72,32 @@ export function StagePageP6({ projectId, runId = '', stageStatus: _stageStatus, 
   const hashManifest = pkg?.hash_manifest || {};
   const deliveryReport = pkg?.p6_delivery_report || {};
   const desensitization = pkg?.desensitization || {};
+  // R17.5-P6-R3：许可 / 定级 / 验收档（确定性事实档，来自后端）
+  const licenseNotice = pkg?.license_notice || {};
+  const scopeLevel: string = pkg?.scope_level || '';
+  const acceptanceResult = pkg?.acceptance_result || {};
+  // R17.5-P6-R2：交付能力清单（capability-first，非门禁）
+  const deliveryCapabilities = pkg?.delivery_capabilities || null;
+  // R17.5-P6-R1：LLM 交付叙述 advisory（辅助分析，非门禁）
+  const deliveryAdvisory = pkg?.delivery_advisory || null;
+
+  // 中文标签映射（技术标识符字段值 → 中文，中文优先）
+  const SCOPE_LABEL: Record<string, string> = { poc: 'PoC 验证', production_candidate: '生产候选' };
+  const ACC_LABEL: Record<string, string> = {
+    accepted: '接受', accepted_with_warning: '接受但附警告',
+    rework_required: '需返工', blocked: '阻塞',
+  };
+  const ACC_COLOR: Record<string, string> = {
+    accepted: 'var(--green)', accepted_with_warning: 'var(--amber)',
+    rework_required: 'var(--amber)', blocked: 'var(--red)',
+  };
+  const LICENSE_LABEL: Record<string, string> = { clear: '清晰', unclear: '不清' };
+  const CAP_LABEL: Record<string, string> = {
+    available: '可用', evidence_gap: '证据待补（环境/设施未启用）', not_applicable: '不适用（无目标环境）',
+  };
+  const CAP_COLOR: Record<string, string> = {
+    available: 'var(--green)', evidence_gap: 'var(--amber)', not_applicable: 'var(--color-text-muted)',
+  };
 
   async function downloadFile(path: string) {
     try {
@@ -103,7 +141,12 @@ export function StagePageP6({ projectId, runId = '', stageStatus: _stageStatus, 
 
       {error && <div style={{ ...card, color: 'var(--red)' }}>加载失败：{error}</div>}
       {loading && <div style={{ ...card }}>加载中…</div>}
-      {!loading && !pkg && !error && (
+      {!loading && notReady && !error && (
+        <div style={{ ...card, color: 'var(--color-text-muted)' }}>
+          P5 尚未通过验证，暂无交付包。待 P5 验证通过后，P6 将在此展示可交付的产出。
+        </div>
+      )}
+      {!loading && !pkg && !notReady && !error && (
         <div style={{ ...card, color: 'var(--color-text-muted)' }}>
           P5 完成后，P6 将在此展示可交付的产出。
         </div>
@@ -111,6 +154,48 @@ export function StagePageP6({ projectId, runId = '', stageStatus: _stageStatus, 
 
       {pkg && (
         <>
+          {/* R17.5-P6-R3: 定级 / 验收档 / 许可（确定性事实档） */}
+          <div style={card}>
+            <div style={cardTitle}>
+              <Icon name="success" size={14} style={{ color: 'var(--color-primary)' }} />
+              交付定级与验收结论
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+              {scopeLevel && (
+                <div style={{ padding: '4px 10px', borderRadius: 6, background: 'var(--color-bg)', fontSize: 12 }}>
+                  交付定级：<strong>{SCOPE_LABEL[scopeLevel] || scopeLevel}</strong>
+                </div>
+              )}
+              {acceptanceResult.result && (
+                <div style={{ padding: '4px 10px', borderRadius: 6, background: 'var(--color-bg)', fontSize: 12 }}>
+                  验收结论：
+                  <strong style={{ color: ACC_COLOR[acceptanceResult.result] || 'var(--color-text)' }}>
+                    {ACC_LABEL[acceptanceResult.result] || acceptanceResult.result}
+                  </strong>
+                  {acceptanceResult.deterministic && (
+                    <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--color-text-muted)' }}>确定性判定</span>
+                  )}
+                </div>
+              )}
+              {licenseNotice.license_clarity && (
+                <div style={{ padding: '4px 10px', borderRadius: 6, background: 'var(--color-bg)', fontSize: 12 }}>
+                  许可：
+                  <strong style={{ color: licenseNotice.license_clarity === 'clear' ? 'var(--green)' : 'var(--amber)' }}>
+                    {LICENSE_LABEL[licenseNotice.license_clarity] || licenseNotice.license_clarity}
+                  </strong>
+                  {licenseNotice.distribution_flag && (
+                    <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--red)' }}>标记对外分发</span>
+                  )}
+                </div>
+              )}
+            </div>
+            {acceptanceResult.rationale && (
+              <div style={{ marginTop: 8, fontSize: 11, color: 'var(--color-text-muted)' }}>
+                {acceptanceResult.rationale}
+              </div>
+            )}
+          </div>
+
           {/* 1. 交付报告 */}
           <div style={card}>
             <div style={cardTitle}>
@@ -247,6 +332,76 @@ export function StagePageP6({ projectId, runId = '', stageStatus: _stageStatus, 
                 </div>
               )}
           </div>
+
+          {/* R17.5-P6-R2: 交付能力清单（capability-first，非门禁；环境缺失诚实降级） */}
+          {deliveryCapabilities && (deliveryCapabilities.capabilities || []).length > 0 && (
+            <div style={card}>
+              <div style={cardTitle}>
+                <Icon name="plug" size={14} style={{ color: 'var(--color-primary)' }} />
+                交付能力清单
+                <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--color-text-muted)', fontWeight: 400 }}>
+                  能力/环境事实，非门禁
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {(deliveryCapabilities.capabilities || []).map((c: any) => (
+                  <div key={c.capability} style={{ padding: '6px 8px', background: 'var(--color-bg)', borderRadius: 4 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                      <span style={{ flex: 1 }}>{c.capability}</span>
+                      <span style={{ fontSize: 10, padding: '1px 8px', borderRadius: 10,
+                        border: `1px solid ${CAP_COLOR[c.status] || 'var(--color-border)'}`,
+                        color: CAP_COLOR[c.status] || 'var(--color-text-muted)' }}>
+                        {CAP_LABEL[c.status] || c.status}
+                      </span>
+                    </div>
+                    {c.note && <div style={{ marginTop: 3, fontSize: 10, color: 'var(--color-text-muted)' }}>{c.note}</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* R17.5-P6-R1: LLM 交付叙述 / 部署运维回退 / 经验候选（辅助分析，非门禁） */}
+          {deliveryAdvisory && deliveryAdvisory.status === 'completed' &&
+            (Object.keys(deliveryAdvisory.operation_rollback_notes || {}).length > 0 ||
+             (deliveryAdvisory.experience_notes || []).length > 0 ||
+             (deliveryAdvisory.delivery_narrative && !deliveryAdvisory.delivery_narrative.parse_error)) && (
+            <div style={card}>
+              <div style={cardTitle}>
+                <Icon name="robot" size={14} style={{ color: 'var(--color-primary)' }} />
+                交付叙述与部署提示
+                <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--amber)', fontWeight: 400 }}>
+                  辅助分析，非门禁
+                </span>
+              </div>
+              {(() => {
+                const ops = deliveryAdvisory.operation_rollback_notes || {};
+                const groups: [string, any[]][] = [
+                  ['部署提示', ops.deploy_notes || []],
+                  ['运维提示', ops.operation_notes || []],
+                  ['回退提示', ops.rollback_notes || []],
+                ];
+                return groups.filter(([, arr]) => arr.length > 0).map(([label, arr]) => (
+                  <div key={label} style={{ marginBottom: 6 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600 }}>{label}</div>
+                    <ul style={{ margin: '2px 0 0', paddingLeft: 18, fontSize: 11, color: 'var(--color-text-muted)' }}>
+                      {arr.map((n: any, i: number) => <li key={i}>{typeof n === 'string' ? n : JSON.stringify(n)}</li>)}
+                    </ul>
+                  </div>
+                ));
+              })()}
+              {(deliveryAdvisory.experience_notes || []).length > 0 && (
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600 }}>迁移经验候选</div>
+                  <ul style={{ margin: '2px 0 0', paddingLeft: 18, fontSize: 11, color: 'var(--color-text-muted)' }}>
+                    {deliveryAdvisory.experience_notes.map((e: any, i: number) => (
+                      <li key={i}>{e.title || e.note || JSON.stringify(e)}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* 6. P6 最终 Gate */}
           <div style={card}>

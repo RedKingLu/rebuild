@@ -314,14 +314,17 @@ class _CapturingP6Service:
     def __init__(self):
         self.captured_p5_plan = None
 
-    def generate_delivery_package(self, project_id, run_id, p5_plan=None):
+    def generate_delivery_package(self, project_id, run_id, p5_plan=None, p5_report=None):
         self.captured_p5_plan = p5_plan
+        self.captured_p5_report = p5_report
         return SimpleNamespace(
             delivery_manifest={"contents": {"output_code_count": 1, "patch_count": 1}},
             risk_manifest={"risk_count": 0, "has_blocking": False, "blocking": False, "risks": []},
             hash_manifest={}, p6_delivery_report={},
             p5_validation_report={"evidence_refs": []},
-            indexes={}, desensitization_ok=True, desensitization_issues=[])
+            indexes={}, desensitization_ok=True, desensitization_issues=[],
+            license_notice={"license_clarity": "unclear"}, scope_level="poc",
+            acceptance_result={"result": "accepted_with_warning", "deterministic": True})
 
 
 class TestP6ReadsRealP5Plan:

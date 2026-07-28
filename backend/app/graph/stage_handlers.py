@@ -2330,10 +2330,13 @@ class RealP6Handler:
         "输出 accepted-ready 状态",
     ]
 
-    def __init__(self, tracer=None, auditor=None, p6_delivery_service=None):
+    def __init__(self, tracer=None, auditor=None, p6_delivery_service=None,
+                 p6_delivery_agent=None, p6_capability_service=None):
         self.tracer = tracer
         self.auditor = auditor
         self._p6_svc = p6_delivery_service
+        self._p6_agent = p6_delivery_agent
+        self._p6_capability = p6_capability_service
 
     def _services(self):
         from app.dependencies import get_services
@@ -2344,6 +2347,20 @@ class RealP6Handler:
             return self._p6_svc
         from app.services.p6_delivery_service import P6DeliveryService
         return P6DeliveryService(tracer=self.tracer, auditor=self.auditor)
+
+    def _p6_delivery_agent(self):
+        # R17.5-P6-R1 (GAP-P6-1): LLM 交付叙述/验收建议 advisory 层（对称 P5）。可注入（测试用 mock-LLM）。
+        if self._p6_agent is not None:
+            return self._p6_agent
+        from app.services.p6_delivery_agent import P6DeliveryAgent
+        return P6DeliveryAgent(tracer=self.tracer)
+
+    def _p6_capability_service(self):
+        # R17.5-P6-R2 (GAP-P6-4): 交付能力探测 + capability-first 诚实降级（对称 P5）。可注入（测试用 mock）。
+        if self._p6_capability is not None:
+            return self._p6_capability
+        from app.services.p6_capability_service import P6CapabilityService
+        return P6CapabilityService(tracer=self.tracer)
 
     @staticmethod
     def _check_p5_validation_passed(project_id: str, run_id: str) -> bool:
@@ -2365,6 +2382,33 @@ class RealP6Handler:
         except Exception as e:
             logger.warning("P6: P5 report load failed: %s", e, exc_info=True)
             return {}
+
+    def _gather_upstream_facts(self, project_id: str) -> dict:
+        """GAP-P6-5：确定性列举 P2/P3/P4 上游产物可用性（只读、非门禁）。
+
+        供 LLM 交付叙述层【接地】部署/运维/回退说明与经验沉淀——只记路径/存否（D-032：不读
+        密钥、不记内容）。缺来源 → available=false，LLM 据此如实标 evidence_gap，不臆造目标环境。
+        """
+        facts: dict = {}
+        try:
+            from app.services.workspace_service import workspace_path
+            ws = workspace_path(project_id)
+            for stage in ("p2", "p3", "p4"):
+                d = ws / "artifacts" / stage
+                found: list[str] = []
+                if d.exists() and d.is_dir():
+                    try:
+                        for p in sorted(d.rglob("*")):
+                            if len(found) >= 30:
+                                break
+                            if p.is_file():
+                                found.append(str(p.relative_to(ws)))
+                    except Exception:
+                        logger.warning("P6: upstream scan failed for %s", stage, exc_info=True)
+                facts[stage] = {"available": bool(found), "artifacts": found}
+        except Exception as e:
+            logger.warning("P6: gather upstream facts failed (non-blocking): %s", e, exc_info=True)
+        return facts
 
     async def execute(self, state: GraphState) -> dict:
         project_id = state["project_id"]
@@ -2401,7 +2445,8 @@ class RealP6Handler:
         # 现取持久化 p5_validation_report.json 的 validation_plan（十槽位真状态）传入。
         validation_plan = p5_report.get("validation_plan") or {}
         pkg = p6_svc.generate_delivery_package(project_id, run_id,
-                                                p5_plan=validation_plan)
+                                                p5_plan=validation_plan,
+                                                p5_report=p5_report)
 
         if pkg.risk_manifest.get("blocking"):
             return {"status": "blocked",
@@ -2435,10 +2480,35 @@ class RealP6Handler:
         # ③ 创建 P6 最终 Gate（用户最终授权，D-023）
         gate_id = self._create_p6_final_gate(project_id, run_id, pkg)
 
+        # ③a R17.5-P6-R2 (GAP-P6-4)：交付能力探测 + capability-first 诚实降级（对称 P5）。
+        # 在确定性交付内核 + 全部门禁（双向门禁 ①/脱敏硬门禁 ②/final gate ③，权威）之后运行——
+        # 确定性事实（有没有 zipfile/出网/gpg/目标信创运行时）；能力是否适用/达标由 skill/LLM 判断。
+        # 【非门禁】：不参与 status/blocked，不翻转任何门禁；环境/设施缺失能力诚实标 evidence_gap /
+        # not_applicable（+capability_ready，待需要时/环境启用），非阻断、绝不伪造 True/已交付。
+        try:
+            delivery_capabilities = self._p6_capability_service().probe_all(project_id)
+        except Exception as e:
+            logger.warning("P6: delivery capability probe failed (non-blocking): %s", e,
+                           exc_info=True)  # 公理3
+            delivery_capabilities = {"error": str(e), "capabilities": []}
+
+        # ③b R17.5-P6-R1 (GAP-P6-1)：LLM 交付叙述/验收建议 advisory 层（对称 P5 方向A）。
+        # 在确定性交付内核 + 全部门禁（双向门禁 ①/脱敏硬门禁 ②/final gate ③，权威）之后运行——
+        # 本层【只】组织交付叙述/部署运维回退框架/验收结论建议/经验候选，显式 analysis_only，
+        # 绝不改写交付事实或翻转任何门禁（can 交付/blocked/脱敏/final gate 均由确定性内核认定）。
+        # 无可用模型 Key / 任何异常 → 诚实缺席（status=skipped），非阻断，确定性结论照常。
+        advisory = await self._run_delivery_advisory(
+            project_id, run_id, pkg, p5_report, p4_input.p4_execution_summary, gate_id,
+            delivery_capabilities=delivery_capabilities)
+
         # NEW-05 (R17.3-6 WP-5): 持久化交付报告为可查询产物，使 artifacts 真实反映实际写入
         # （P6DeliveryService 原仅在内存/按需重算，construction 报告 produced_artifacts 空）。
         # 仅落交付元数据（清单/索引/脱敏结论），不含 source/ 与密钥明文（D-105③/AGENTS §8）。
-        delivery_report_ref = self._persist_p6_delivery_report(project_id, run_id, pkg)
+        # R17.5-P6-R1：并入 LLM advisory 分区（analysis_only，不改门禁认定）。
+        # R17.5-P6-R2：并入 delivery_capabilities 分区（capability-first，非门禁，不翻转门禁）。
+        delivery_report_ref = self._persist_p6_delivery_report(project_id, run_id, pkg,
+                                                               advisory=advisory,
+                                                               delivery_capabilities=delivery_capabilities)
 
         # ④ 组装输出
         return {
@@ -2460,14 +2530,94 @@ class RealP6Handler:
             "p5_evidence_refs": p4_input.evidence_refs,
             "artifacts": [delivery_report_ref] if delivery_report_ref else [],
             "evidence_refs": p4_input.evidence_refs or [],
+            # GAP-P6-2/3: 许可检测 / PoC-Production 定级 / 验收结论多档（确定性事实档，权威，
+            # 不翻转任何门禁；与下方 LLM advisory 的 acceptance_advice 并存不冲突）。
+            "license_notice": pkg.license_notice,
+            "scope_level": pkg.scope_level,
+            "acceptance_result": pkg.acceptance_result,
+            # GAP-P6-1: LLM 交付叙述/验收建议 advisory（analysis_only，不参与 status 判定、不翻转门禁）。
+            "delivery_advisory": advisory,
+            # GAP-P6-4: 交付能力清单（capability-first，非门禁事实，环境缺失诚实降级、不翻转门禁）。
+            "delivery_capabilities": delivery_capabilities,
         }
 
-    def _persist_p6_delivery_report(self, project_id: str, run_id: str, pkg) -> str | None:
-        """NEW-05 (R17.3-6 WP-5): 持久化 P6 交付报告到 artifacts/p6_delivery_report.json。
+    async def _run_delivery_advisory(self, project_id, run_id, pkg, p5_report,
+                                     p4_summary, gate_id, delivery_capabilities=None) -> dict:
+        """GAP-P6-1: 调 P6DeliveryAgent 产 LLM 交付叙述/验收建议/经验候选（advisory）。
+
+        本层【绝不】改写确定性交付事实或翻转任何门禁（双向门禁 / 脱敏门禁 / final gate）——
+        只喂真实交付事实 + P5 验证结论 + 交付能力清单（GAP-P6-4，非门禁事实）、取回叙述与建议。
+        任何异常/无模型 → 诚实 skipped（非阻断），确定性 P6 交付内核 + 门禁照常认定 completed/blocked。
+        """
+        try:
+            agent = self._p6_delivery_agent()
+            # D-108 skill-first：由 handler（X-4-5 白名单调用方）经 canonical assemble_context
+            # 装配 P6 主 stage skill 正文 + system_prompt，作参数传入 advisory agent（agent 是纯
+            # 消费者，不自碰 assemble_context —— 满足 X-4-5 单一事实源）。装配失败=advisory 降级，非阻断。
+            skill_body, system_prompt = "", ""
+            try:
+                from app.services.context_assembler import assemble_context
+                pkg_ctx = assemble_context(
+                    project_id, "p6",
+                    node_state={"node_task": "P6 交付：组织交付叙述、部署/运维/回退提示、验收结论建议（不替代确定性门禁）"},
+                    task_type="delivery", include_body=True, skill_disclosure="full")
+                bodies = [s.get("body") for s in (pkg_ctx.get("skills") or []) if s.get("body")]
+                skill_body = "\n\n".join(bodies)[:12000]
+                system_prompt = pkg_ctx.get("system_prompt", "") or ""
+            except Exception:
+                logger.warning("P6 advisory context assembly failed (advisory)", exc_info=True)  # 公理3
+            indexes = pkg.indexes or {}
+            facts = {
+                "project_id": project_id,
+                "p5_can_be_completed": bool((p5_report or {}).get("can_be_completed", False)),
+                "p5_summary": {
+                    "validation_plan": (p5_report or {}).get("validation_plan", {}),
+                    "reason": (p5_report or {}).get("blocked_reason"),
+                },
+                "delivery_manifest": pkg.delivery_manifest or {},
+                "risk_manifest": pkg.risk_manifest or {},
+                "hash_summary": {"file_count": len((pkg.hash_manifest or {}).get("files", []))
+                                 if isinstance(pkg.hash_manifest, dict) else 0},
+                "index_summary": {k: (len(v) if isinstance(v, list) else "present")
+                                  for k, v in indexes.items()},
+                "desensitization_ok": pkg.desensitization_ok,
+                "p4_summary": p4_summary or {},
+                "final_gate_id": gate_id,
+                # GAP-P6-5: 真实 P2/P3/P4 上游产物可用性（确定性只读事实）——供 LLM 的部署/运维/
+                # 回退叙述与经验沉淀【接地】；缺来源 → LLM 如实标 evidence_gap，不臆造目标环境。
+                "upstream_artifacts": self._gather_upstream_facts(project_id),
+                # GAP-P6-2/3: 确定性事实档（许可 / 定级 / 验收档）——供 LLM 叙述接地、不改写。
+                "license_notice": pkg.license_notice,
+                "scope_level": pkg.scope_level,
+                "acceptance_result": pkg.acceptance_result,
+                # GAP-P6-4: 交付能力清单（capability-first，非门禁事实）——供 LLM 在叙述中诚实反映
+                # 哪些交付能力待环境/设施启用（evidence_gap / not_applicable），不得渲染成"已完成"。
+                "delivery_capabilities": delivery_capabilities or {},
+            }
+            result = await agent.interpret(project_id, run_id=run_id, deterministic_facts=facts,
+                                           skill_body=skill_body, system_prompt=system_prompt)
+            return result.to_dict() if hasattr(result, "to_dict") else dict(result)
+        except Exception as e:
+            logger.warning("P6: LLM advisory layer failed (non-blocking): %s", e, exc_info=True)  # 公理3
+            return {"status": "skipped", "reason": f"advisory_error: {e}",
+                    "analysis_only": True, "evidence_gap": "llm_advisory_unavailable"}
+
+    def _persist_p6_delivery_report(self, project_id: str, run_id: str, pkg,
+                                    advisory: dict | None = None,
+                                    delivery_capabilities: dict | None = None) -> str | None:
+        """NEW-05 (R17.3-6 WP-5): 持久化 P6 交付报告到 artifacts/p6_delivery_report.json.
 
         参照 P5 `_persist_p5_validation_report` 范式，使 P6 handler 返回的 artifacts 真实
         反映实际写入（construction 报告 produced_artifacts 不欠报）。仅落交付元数据
         （delivery/risk/hash 清单 + AETA 索引 + 脱敏结论布尔），不含 source/ 与密钥明文。
+
+        R17.5-P6-R1 (GAP-P6-1)：可选 `advisory` = LLM 交付叙述/验收建议层输出，作独立分区
+        `delivery_advisory` 写入（analysis_only；不改交付事实 / 不翻转双向门禁 / 脱敏门禁 /
+        final gate——反伪造交付内核不受影响）。
+
+        R17.5-P6-R2 (GAP-P6-4)：可选 `delivery_capabilities` = 交付能力清单（capability-first），
+        作独立分区 `delivery_capabilities` 写入（【非门禁】确定性能力/环境事实；环境缺失能力诚实标
+        evidence_gap / not_applicable，不参与 completed/blocked、不翻转任何门禁、绝不伪造 True）。
         """
         try:
             report = {
@@ -2481,7 +2631,19 @@ class RealP6Handler:
                 "p6_delivery_report": pkg.p6_delivery_report,
                 "indexes": pkg.indexes,
                 "desensitization_ok": pkg.desensitization_ok,
+                # R17.5-P6-R3（GAP-P6-2/3）确定性事实档分区（权威，与 delivery_advisory /
+                # delivery_capabilities 并列；不翻转双向门禁 / 脱敏门禁 / final gate）。
+                "license_notice": pkg.license_notice,
+                "scope_level": pkg.scope_level,
+                "acceptance_result": pkg.acceptance_result,
             }
+            if advisory is not None:
+                # analysis_only advisory 分区：不参与任何门禁认定，仅辅助叙述/验收建议。
+                report["delivery_advisory"] = advisory
+            if delivery_capabilities is not None:
+                # capability-first 分区：交付能力清单 + 环境探测（确定性事实，非门禁）。
+                # 不参与 completed/blocked；环境/设施缺失能力诚实标 evidence_gap / not_applicable。
+                report["delivery_capabilities"] = delivery_capabilities
             ref = _mediated_write(project_id, "artifacts/p6_delivery_report.json",
                                   json.dumps(report, ensure_ascii=False, indent=2),
                                   auditor=self.auditor, stage="p6",

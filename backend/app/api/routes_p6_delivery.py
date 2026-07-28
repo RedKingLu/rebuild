@@ -70,6 +70,22 @@ async def get_p6_package(project_id: str, run_id: str):
 
     data = delivery_package_to_dict(pkg)
     data["desensitization_released"] = (not pkg.desensitization_ok)
+
+    # R17.5-P6-R4：delivery_package_to_dict 已含 R3 确定性事实档（license_notice / scope_level /
+    # acceptance_result）；R1(delivery_advisory) 与 R2(delivery_capabilities) 由 RealP6Handler 运行时
+    # 产出并落进持久化 artifacts/p6_delivery_report.json（advisory 需 LLM、能力需环境探测，不在只读
+    # GET 内重跑）。此处附上【真实 handler 产物】的这两分区供前端渲染——非 mock；handler 未跑过则缺席。
+    try:
+        report_path = workspace_path(project_id) / "artifacts" / "p6_delivery_report.json"
+        if report_path.exists():
+            import json as _json
+            persisted = _json.loads(report_path.read_text(encoding="utf-8"))
+            for section in ("delivery_advisory", "delivery_capabilities"):
+                if section in persisted:
+                    data[section] = persisted[section]
+    except Exception as e:  # 附加分区失败不影响交付包主体（公理3：发声不阻断）
+        logger.warning("P6: attach persisted advisory/capabilities failed (non-blocking): %s", e)
+
     return SuccessEnvelope(data=data, meta=Meta())
 
 

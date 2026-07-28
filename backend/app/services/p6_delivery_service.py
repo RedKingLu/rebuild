@@ -45,6 +45,30 @@ from app.services.p5_input_service import P5InputService
 logger = logging.getLogger(__name__)
 
 
+# ── R17.5-P6-R3 (GAP-P6-2) 许可确定性检测词表 ────────────────────────────────
+# 只做【确定性事实检测】：文件存否 / 声明片段命中的路径 + 模式名 / 分发标记。绝不做
+# "是 MIT 就通过 / 无 LICENSE 就 X" 的许可类型判断（那交 acceptance_result 映射 + LLM
+# advisory）。不硬编码具体许可类型；只记路径/模式名/计数，绝不写密钥或匹配到的明文内容。
+_LICENSE_FILENAMES = {
+    "license", "license.txt", "license.md", "licence", "licence.txt", "licence.md",
+    "copying", "copying.txt", "copying.md", "notice", "notice.txt", "unlicense",
+}
+_LICENSE_DECL_PATTERNS = [
+    ("spdx_identifier", re.compile(r"SPDX-License-Identifier", re.IGNORECASE)),
+    ("licensed_under", re.compile(r"licensed\s+under", re.IGNORECASE)),
+    ("copyright_notice", re.compile(r"\bcopyright\b", re.IGNORECASE)),
+    ("all_rights_reserved", re.compile(r"all\s+rights\s+reserved", re.IGNORECASE)),
+]
+_THIRD_PARTY_PATTERNS = [
+    ("spdx_identifier", re.compile(r"SPDX-License-Identifier", re.IGNORECASE)),
+    ("third_party_marker", re.compile(r"third[\s_-]?party|vendored|开源组件|来自开源", re.IGNORECASE)),
+]
+_DISTRIBUTION_MARKERS = [
+    ("external_distribution",
+     re.compile(r"external\s+distribution|redistribut|对外分发|对外发布|公开发布", re.IGNORECASE)),
+]
+
+
 # ── DTOs ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -68,6 +92,12 @@ class DeliveryPackage:
     desensitization_issues: list = field(default_factory=list)
     # 诚实标记
     source_included: bool = False
+    # R17.5-P6-R3（GAP-P6-2/3）确定性事实：许可检测 / PoC-Production 定级 / 验收结论多档映射。
+    # 均为【确定性事实与映射档】（进 p6_delivery_report，权威），与 LLM advisory 的
+    # acceptance_advice（analysis_only）并存不冲突；绝不翻转任何门禁。
+    license_notice: dict = field(default_factory=dict)
+    scope_level: str = ""            # poc / production_candidate（由 P5 证据完整度确定性推导）
+    acceptance_result: dict = field(default_factory=dict)  # accepted / accepted_with_warning / rework_required / blocked
 
 
 # ── 服务 ──────────────────────────────────────────────────────────────────
@@ -80,8 +110,14 @@ class P6DeliveryService:
         self.auditor = auditor
 
     def generate_delivery_package(self, project_id: str, run_id: str,
-                                   p5_plan: dict | None = None) -> DeliveryPackage:
-        """生成完整 P6 交付包。"""
+                                   p5_plan: dict | None = None,
+                                   p5_report: dict | None = None) -> DeliveryPackage:
+        """生成完整 P6 交付包。
+
+        R17.5-P6-R3：`p5_report`（持久化的 p5_validation_report.json 内容）用于确定性
+        推导 scope_level / acceptance_result（读 can_be_completed 等）；缺省时退化为从
+        validation_plan 推导，绝不因缺省而伪造 accepted/Production。
+        """
         ws = workspace_path(project_id)
         pkg = DeliveryPackage(project_id=project_id, run_id=run_id)
 
@@ -105,16 +141,26 @@ class P6DeliveryService:
         output_files = self._collect_files(ws, p4_input.output_code_refs)
         patch_files = self._collect_files(ws, p4_input.patch_refs)
 
+        # 2b. R17.5-P6-R3 (GAP-P6-2)：许可确定性检测（源只读 D-099）
+        pkg.license_notice = self._build_license_notice(ws, output_files, p4_input)
+
         # 3. 生成 manifest
         pkg.delivery_manifest = self._build_delivery_manifest(
             project_id, run_id, output_files, patch_files, p4_input)
-        pkg.risk_manifest = self._build_risk_manifest(p4_input, validation_plan)
+        pkg.risk_manifest = self._build_risk_manifest(
+            p4_input, validation_plan, license_notice=pkg.license_notice)
         pkg.hash_manifest = self._build_hash_manifest(output_files, patch_files)
+
+        # 3b. R17.5-P6-R3 (GAP-P6-3)：PoC/Production 定级 + ACCEPTANCE_RESULTS 多档（确定性映射）
+        pkg.scope_level, pkg.acceptance_result = self._derive_scope_and_acceptance(
+            p5_report, validation_plan, pkg.risk_manifest, pkg.license_notice)
 
         # 4. 生成报告
         pkg.p5_validation_report = self._build_p5_validation_report(p4_input, validation_plan)
         pkg.p6_delivery_report = self._build_p6_delivery_report(
-            project_id, run_id, output_files, patch_files, pkg.risk_manifest)
+            project_id, run_id, output_files, patch_files, pkg.risk_manifest,
+            license_notice=pkg.license_notice, scope_level=pkg.scope_level,
+            acceptance_result=pkg.acceptance_result)
 
         # 5. 生成 AETA 索引
         pkg.indexes = self._build_indexes(project_id, run_id, output_files, patch_files, p4_input)
@@ -158,7 +204,7 @@ class P6DeliveryService:
             "patches": [{"path": f["path"], "sha256": f["sha256"]} for f in patch_files],
         }
 
-    def _build_risk_manifest(self, p4_input, validation_plan: dict) -> dict:
+    def _build_risk_manifest(self, p4_input, validation_plan: dict, license_notice: dict | None = None) -> dict:
         """未通过项进入 risk_manifest。"""
         risks = []
 
@@ -183,12 +229,167 @@ class P6DeliveryService:
                         "blocking": slot.get("status") == "validation_failed",
                     })
 
+        # R17.5-P6-R3 (GAP-P6-2)：许可不清计入 risk_manifest（Q-P6-2 口径）。
+        # 默认【非阻断】（内部验证可继续）；仅当标记「对外分发」（distribution_flag=true）时升 blocking。
+        if license_notice and license_notice.get("license_clarity") == "unclear":
+            dist = bool(license_notice.get("distribution_flag"))
+            risks.append({
+                "type": "license_unclear",
+                "description": ("交付范围内未发现明确 LICENSE 文件 + 许可声明（许可不清）；"
+                                "默认内部验证可继续，对外分发前须核实许可（Q-P6-2）。"),
+                "distribution_flag": dist,
+                "blocking": dist,
+            })
+
         return {
             "generated_at": _now(),
             "risk_count": len(risks),
             "has_blocking": any(r.get("blocking") for r in risks),
             "risks": risks,
         }
+
+    # ── R17.5-P6-R3 (GAP-P6-2) 许可确定性检测 ──────────────────────────────
+
+    def _build_license_notice(self, ws: Path, output_files: list[dict], p4_input) -> dict:
+        """确定性许可检测——产 license_notice【事实】（非判断）。
+
+        扫描 output_code/ 与 source/（源只读 D-099，仅读不写）里的 LICENSE/COPYING 文件存否、
+        README/代码中的许可声明片段、第三方来源标记；产：
+          - license_files_found：命中的 LICENSE/COPYING 文件相对路径
+          - license_declarations / third_party_markers：命中片段的【路径 + 模式名】（D-032：不写内容）
+          - distribution_flag：是否标记「对外分发」（默认 false——无此标记不升级）
+          - license_clarity：clear/unclear（确定性推导：有明确 LICENSE 文件 + 有许可声明 → clear）
+        绝不做具体许可类型判断（是否达标交 acceptance_result 映射 + LLM advisory）。
+        """
+        license_files_found: list[str] = []
+        scan_scope: list[str] = []
+        for root_name in ("output_code", "source"):
+            root = ws / root_name
+            if not root.exists() or not root.is_dir():
+                continue
+            scan_scope.append(root_name)
+            try:
+                for p in root.rglob("*"):
+                    if len(license_files_found) >= 50:
+                        break
+                    if p.is_file() and p.name.lower() in _LICENSE_FILENAMES:
+                        license_files_found.append(str(p.relative_to(ws)))
+            except Exception:
+                logger.warning("P6: license file scan failed under %s", root_name, exc_info=True)
+
+        # 声明 / 第三方 / 分发标记：扫描交付范围文件 + output_code README/NOTICE
+        scan_targets: list[str] = [f["path"] for f in (output_files or [])]
+        oc = ws / "output_code"
+        if oc.exists():
+            for name in ("README", "README.md", "README.txt", "NOTICE", "NOTICE.md"):
+                rp = oc / name
+                if rp.is_file():
+                    rel = str(rp.relative_to(ws))
+                    if rel not in scan_targets:
+                        scan_targets.append(rel)
+
+        license_declarations: list[dict] = []
+        third_party_markers: list[dict] = []
+        distribution_flag = False
+        for rel in scan_targets[:200]:
+            p = ws / rel
+            try:
+                content = p.read_text(encoding="utf-8", errors="replace")[:20000]
+            except Exception:
+                continue
+            for name, pat in _LICENSE_DECL_PATTERNS:
+                if pat.search(content):
+                    license_declarations.append({"path": rel, "pattern": name})
+            for name, pat in _THIRD_PARTY_PATTERNS:
+                if pat.search(content):
+                    third_party_markers.append({"path": rel, "pattern": name})
+            for _name, pat in _DISTRIBUTION_MARKERS:
+                if pat.search(content):
+                    distribution_flag = True
+
+        clarity = "clear" if (license_files_found and license_declarations) else "unclear"
+        return {
+            "generated_at": _now(),
+            "scan_scope": scan_scope,
+            "license_files_found": license_files_found,
+            "license_files_count": len(license_files_found),
+            "license_declarations": license_declarations,   # path + pattern（无内容/无密钥）
+            "third_party_markers": third_party_markers,      # path + pattern（无内容/无密钥）
+            "distribution_flag": distribution_flag,
+            "license_clarity": clarity,
+        }
+
+    # ── R17.5-P6-R3 (GAP-P6-3) PoC/Production 定级 + ACCEPTANCE_RESULTS 多档 ──
+
+    def _derive_scope_and_acceptance(self, p5_report: dict | None, validation_plan: dict | None,
+                                     risk_manifest: dict, license_notice: dict) -> tuple[str, dict]:
+        """确定性映射——由 P5 证据完整度推导 scope_level + acceptance_result 四档【事实档】。
+
+        这是【确定性事实映射】（进 p6_delivery_report，权威），与 LLM 的 acceptance_advice
+        （advisory）并存不冲突。**绝不翻转 P5→P6 双向门禁/脱敏门禁/final gate**——status 仍由
+        handler 既有逻辑认定；本映射只在已过门禁后给"建议档"事实。绝不产 "Production accepted"
+        伪结论：PoC + evidence_gap + 许可不清 → 诚实 accepted_with_warning。
+        """
+        slots = (validation_plan or {}).get("slots", []) if isinstance(validation_plan, dict) else []
+        slot_status = {s.get("slot_id"): s.get("status") for s in slots if isinstance(s, dict)}
+
+        can_be_completed = bool((p5_report or {}).get(
+            "can_be_completed", (validation_plan or {}).get("can_be_completed", True)))
+        has_blocking = bool((risk_manifest or {}).get("has_blocking"))
+        gap_present = (
+            any(st == "evidence_gap" for st in slot_status.values())
+            or any(r.get("type") == "evidence_gap" for r in (risk_manifest or {}).get("risks", []))
+        )
+        # build/run 证据：build 必须 validated；run 命令-less 可 not_applicable
+        build_ok = slot_status.get("build_verified") == "validated"
+        run_ok = slot_status.get("run_verified") in ("validated", "not_applicable")
+        license_unclear = (license_notice or {}).get("license_clarity") == "unclear"
+        distribution = bool((license_notice or {}).get("distribution_flag"))
+
+        # scope_level：纯由 P5 证据完整度推导（PoC 绝不伪装 Production）
+        if can_be_completed and not gap_present and build_ok and run_ok:
+            scope_level = "production_candidate"
+        else:
+            scope_level = "poc"
+
+        # acceptance_result 四档（此映射不覆盖门禁，只给已过门禁后的建议档事实）
+        if not can_be_completed:
+            result, rationale = "blocked", "P5 验证未通过（can_be_completed=false）；不可交付。"
+        elif distribution and license_unclear:
+            result, rationale = "blocked", ("标记对外分发（distribution_flag=true）但许可不清；"
+                                            "对外分发前须核实许可（Q-P6-2 升 blocked）。")
+        elif has_blocking:
+            result, rationale = "rework_required", "存在阻断级风险项（validation_failed / 对外分发许可不清）；需返工后再交付。"
+        elif scope_level == "production_candidate" and not license_unclear and not gap_present:
+            result, rationale = "accepted", "P5 证据完整（硬必需全 validated + build/run + 无 evidence_gap）且许可清晰。"
+        else:
+            causes = []
+            if scope_level == "poc":
+                causes.append("PoC 范围（证据完整度未达 production_candidate）")
+            if gap_present:
+                causes.append("存在 evidence_gap")
+            if license_unclear:
+                causes.append("许可不清（默认内部验证可继续，对外分发前核实）")
+            result = "accepted_with_warning"
+            rationale = "存在非阻断但重要的缺口：" + "；".join(causes) if causes else \
+                "存在非阻断缺口，接受但附警告。"
+
+        acceptance_result = {
+            "result": result,
+            "rationale": rationale,
+            "deterministic": True,          # 确定性事实档（权威），非 LLM 建议
+            "note": "确定性映射档；与 LLM advisory acceptance_advice 并存，不翻转任何门禁。",
+            "inputs": {
+                "can_be_completed": can_be_completed,
+                "has_blocking_risk": has_blocking,
+                "evidence_gap_present": gap_present,
+                "build_verified": build_ok,
+                "run_verified_or_na": run_ok,
+                "license_clarity": (license_notice or {}).get("license_clarity", "unclear"),
+                "distribution_flag": distribution,
+            },
+        }
+        return scope_level, acceptance_result
 
     def _build_hash_manifest(self, output_files, patch_files) -> dict:
         all_files = output_files + patch_files
@@ -211,7 +412,9 @@ class P6DeliveryService:
             "validation_plan": validation_plan,
         }
 
-    def _build_p6_delivery_report(self, project_id, run_id, output_files, patch_files, risk_manifest) -> dict:
+    def _build_p6_delivery_report(self, project_id, run_id, output_files, patch_files, risk_manifest,
+                                  license_notice: dict | None = None, scope_level: str = "",
+                                  acceptance_result: dict | None = None) -> dict:
         return {
             "generated_at": _now(),
             "project_id": project_id,
@@ -223,10 +426,15 @@ class P6DeliveryService:
                 "risk_count": risk_manifest.get("risk_count", 0),
                 "has_blocking_risks": risk_manifest.get("has_blocking", False),
             },
+            # R17.5-P6-R3（GAP-P6-2/3）确定性事实档（权威，与 LLM advisory 并存）
+            "scope_level": scope_level,
+            "acceptance_result": acceptance_result or {},
+            "license_notice": license_notice or {},
             "notes": [
                 "交付包来源 = output_code + P5 passed evidence（D-105③）",
                 "未通过项在 risk_manifest 中，不混入通过交付",
                 "source/ 默认不包含（D-105③）",
+                "scope_level / acceptance_result / license_notice 为确定性事实档，不翻转任何门禁",
             ],
         }
 
@@ -450,4 +658,8 @@ def delivery_package_to_dict(pkg: DeliveryPackage) -> dict:
             "issues": pkg.desensitization_issues,
         },
         "source_included": pkg.source_included,
+        # R17.5-P6-R3（GAP-P6-2/3）确定性事实档（权威，非门禁翻转）
+        "license_notice": pkg.license_notice,
+        "scope_level": pkg.scope_level,
+        "acceptance_result": pkg.acceptance_result,
     }
