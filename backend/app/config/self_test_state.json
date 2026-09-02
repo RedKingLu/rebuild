@@ -16,5 +16,11 @@
     "capability_marker": "real_available",
     "last_checked_at": "2026-07-20T03:41:43.494034+00:00",
     "credential_status": "configured"
+  },
+  "美团": {
+    "status": "available",
+    "capability_marker": "real_available",
+    "last_checked_at": "2026-07-28T01:58:31.740218+00:00",
+    "credential_status": "configured"
   }
 }
