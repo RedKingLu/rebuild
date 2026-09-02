@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Protocol
@@ -36,6 +37,27 @@ DENY_SUBSTRINGS = [
     "/etc/passwd", "/etc/shadow", "/root/",
 ]
 
+# R18-1 P1-06（D-033 缺口）：子串匹配无法覆盖变体，实测漏报 3 条——fork bomb
+# `:(){ :|:&;}:;`、`chmod 777 /`、`chown -R root /`。改为"编译正则优先 + 子串兜底"。
+# 吸收自 rebuild-archive/V10/原始代码/backend/app/sandbox/gvisor.py:28-41 的 DENY_LIST_COMMANDS
+# 思路（正则化），但【只取本轮实测漏报的三条并适配收窄】，不整体复制：
+#   - chmod：V10 原式 `chmod\s+.*777\s+/` 会把 `chmod 777 /srv/app/main.py` 也升为 L5，
+#     与既有 L4 语义（test_r956_execution）冲突且属过度拦截 → 收窄为仅锚定根目录 `/`。
+#   - 未吸收 V10 的 DENY_LIST_PATTERNS（`(root|etc|proc|sys|dev)` 宽匹配 / `credentials`）：
+#     它会误杀 `npm run dev` 之类合法命令，属行为退化，见施工记录"吸收记录"。
+DENY_REGEXES: list[re.Pattern] = [
+    # fork bomb 及其变体：:(){ :|:&;}:;
+    re.compile(r":\(\)\s*\{.*:\|:&.*\};*:", re.IGNORECASE),
+    # 根目录整体放权：chmod [-R] 777 /（仅根，具体文件仍按 L4 处理）
+    re.compile(r"\bchmod\s+(?:-\S+\s+)*777\s+/(?=[\s;&|]|$)", re.IGNORECASE),
+    # 递归把绝对路径改归 root：chown -R root /...
+    re.compile(r"\bchown\s+(?:-\S+\s+)*-R\s+(?:-\S+\s+)*root(?::\S+)?\s+/", re.IGNORECASE),
+]
+
+# R18-1 P1-01：环境变量【值】中的内嵌凭据 scheme://user[:password]@host
+# （`[^/\s]+@` 贪婪到首个 `/` 之前的最后一个 `@`，避免口令自带 `@` 时残留片段）
+_URL_CREDENTIAL_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/\s]+@")
+
 ALLOWED_COMMANDS = ["python3", "python", "echo", "cat", "ls", "pwd", "which"]
 
 # Commands that are high-risk but not in DENY_SUBSTRINGS (L4 soft-block)
@@ -47,7 +69,29 @@ _L4_PATTERNS = [
 ]
 
 
+def _strip_url_credentials(value: str) -> str:
+    """R18-1 P1-01：剥离 URL 值中内嵌的 user[:password]@，保留 scheme/host/port/path。
+
+    `postgresql://user:口令@localhost:5432/db` → `postgresql://localhost:5432/db`
+    非 URL 的普通值原样返回（不误伤）。纯正则实现，不引 urlparse 异常分支
+    （避免为 parse 失败写静默 except，公理3）。
+    """
+    return _URL_CREDENTIAL_RE.sub(r"\1", value, count=1)
+
+
+def _match_deny_regex(code: str) -> str | None:
+    """R18-1 P1-06：编译正则 DENY 检查（覆盖子串匹配漏报的变体）。命中返回模式串。"""
+    for pat in DENY_REGEXES:
+        if pat.search(code):
+            return pat.pattern
+    return None
+
+
 def _check_dangerous(code: str) -> str | None:
+    # R18-1 P1-06：正则检查优先于子串检查（子串漏报 fork bomb / chmod 777 / / chown -R root /）
+    hit = _match_deny_regex(code)
+    if hit:
+        return f"Blocked dangerous pattern: {hit}"
     code_lower = code.lower()
     for pattern in DENY_SUBSTRINGS:
         if pattern.lower() in code_lower:
@@ -62,7 +106,9 @@ def _classify_risk(code: str, language: str = "exec") -> str:
     """
     code_lower = code.lower()
 
-    # L5: hard deny patterns (DENY_SUBSTRINGS)
+    # L5: hard deny patterns (DENY_REGEXES 正则 + DENY_SUBSTRINGS 子串)
+    if _match_deny_regex(code):
+        return "L5"
     for p in DENY_SUBSTRINGS:
         if p.lower() in code_lower:
             return "L5"
@@ -91,6 +137,10 @@ def _clean_env() -> dict:
     for key in list(env.keys()):
         if any(s in key.upper() for s in ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]):
             del env[key]
+        else:
+            # R18-1 P1-01：名不敏感的变量，其【值】里仍可能内嵌凭据
+            # （DATABASE_URL=postgresql://user:口令@host 会原样传给子进程）→ 剥离 user:pass。
+            env[key] = _strip_url_credentials(env[key])
     # WP-E (B-R17.2-P5-PATH): inherit the host PATH so installed toolchains
     # (sdkman java, nvm node, dotnet, go, mvn, npm …) are visible to P5 build/verify
     # commands. Previously PATH was pinned to /usr/local/bin:/usr/bin:/bin, which hid
@@ -147,6 +197,9 @@ class LocalSubprocessExecutionProvider:
                 "elapsed_ms": 0, "provider": "security_block",
                 "execution_mode": "local", "fallback": True, "blocked": True,
                 "risk_level": "L5", "audited": False,
+                # D-034（R18-1 P1-02）：L5 不再静默 block —— 上报 gate_required，
+                # 由调用侧（stage_handlers）创建可裁决的用户 Gate。
+                "gate_required": True,
             }
 
         risk = _classify_risk(code, language)
@@ -235,6 +288,7 @@ class ContainerExecutionProvider:
                 "elapsed_ms": 0, "provider": "security_block",
                 "execution_mode": "container", "fallback": False, "blocked": True,
                 "risk_level": "L5", "audited": False,
+                "gate_required": True,   # D-034（R18-1 P1-02）：L5 须可裁决，不静默 block
             }
 
         # Write code to a temp file that will be mounted into the container.
@@ -347,6 +401,7 @@ class WorkspaceLocalExecutionProvider:
                 "elapsed_ms": 0, "provider": "workspace_local_security_block",
                 "execution_mode": "workspace_local", "fallback": True, "blocked": True,
                 "risk_level": "L5", "audited": False,
+                "gate_required": True,   # D-034（R18-1 P1-02）：L5 须可裁决，不静默 block
             }
 
         risk = _classify_risk(code, language)

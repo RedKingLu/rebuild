@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,26 @@ TIMEOUT = 30
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+# R18-1 HIGH-01：导入落盘目录名清洗（路径穿越）。name/category 来自 Form 参数或社区包
+# manifest（均为不可信输入），直接拼进 settings.source_path 可穿越到 source/ 之外
+# （实测 name='../../pwned' 会在 source 的上级创建目录）。
+# 只保留 ASCII 标识符字符 + CJK 等 unicode 字（\w）与 . -：路径分隔符/控制字符/空格一律替换，
+# 避免把 CJK 名称整体打成下划线（那会让不同中文名塌缩成同一目录而互相覆盖）。
+_UNSAFE_NAME_RE = re.compile(r"[^\w.\-]", re.UNICODE)
+
+
+def _safe_name(raw: Optional[str], fallback: str = "imported") -> str:
+    """把不可信名称清洗为【单层】目录名：取末段 → 剔非法字符 → 去前导点 → 空则兜底。
+
+    'a/b' → 'b'；'../../pwned' → 'pwned'；'..' → fallback；'.ssh' → 'ssh'。
+    仅用于拼装落盘路径；资源展示名沿用原始输入（不做改写）。
+    """
+    if not raw:
+        return fallback
+    base = Path(str(raw).replace("\\", "/")).name.strip()
+    base = _UNSAFE_NAME_RE.sub("_", base).lstrip(".")
+    return base or fallback
 
 
 def _validate_url(url: str) -> str:
@@ -161,7 +182,9 @@ async def import_skill(
         _unzip_to(raw, tmp_dir)
         manifest_path = tmp_dir / "manifest.json"
         data = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-        dest = settings.source_path / "skills" / data.get("category", "other") / data.get("name", "imported")
+        dest = (settings.source_path / "skills"
+                / _safe_name(data.get("category"), "other")
+                / _safe_name(data.get("name")))
         if tmp_dir != dest:
             import shutil
             if dest.exists():
@@ -223,7 +246,7 @@ async def import_resource(
             manifest_path = tmp_dir / "manifest.json"
             data = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
             res_name = data.get("name", "imported")
-            dest = settings.source_path / "resources" / res_name
+            dest = settings.source_path / "resources" / _safe_name(res_name)
             if tmp_dir != dest:
                 import shutil
                 if dest.exists():
@@ -257,7 +280,7 @@ async def import_resource(
         content = await file.read()
         filename = file.filename or "upload"
         res_name = name or Path(filename).stem
-        dest_dir = settings.source_path / "resources" / res_name
+        dest_dir = settings.source_path / "resources" / _safe_name(res_name)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # Parse body for knowledge/cases
@@ -376,7 +399,7 @@ async def import_case(
             manifest_path = tmp_dir / "manifest.json"
             data = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
             res_name = data.get("name", "imported")
-            dest = settings.source_path / "cases" / res_name
+            dest = settings.source_path / "cases" / _safe_name(res_name)
             if tmp_dir != dest:
                 import shutil
                 if dest.exists():
@@ -408,7 +431,7 @@ async def import_case(
         content = await file.read()
         filename = file.filename or "upload"
         res_name = name or Path(filename).stem
-        dest_dir = settings.source_path / "cases" / res_name
+        dest_dir = settings.source_path / "cases" / _safe_name(res_name)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         body_text = ""

@@ -1808,6 +1808,53 @@ class RealP4Handler:
                             reviewer="p4_review_skill")
 
 
+def _create_l5_command_gates(project_id: str, run_id: str,
+                             conditional_details: list[dict]) -> list[str]:
+    """D-034（R18-1 P1-02）：L5 高风险命令 → 真实创建可裁决用户 Gate，返回 gate_id 列表。
+
+    - 只对 risk_level == "L5" 且 gate_required 的槽位建 Gate；**L4 不建**（D-034 原文
+      只规定 L5；L4 是否需 Gate 属扩展解释，本轮明确不做）。
+    - Gate 复用既有 GateService 内核（DB 持久化 + Audit），gate_type=l5_high_risk_command，
+      reason/summary 携带被拦命令原文与风险说明，供用户裁决。
+    - 诚实降级（红线：不得伪造 gate）：无可用 GateService 或建 Gate 失败 → 告警并返回空，
+      绝不编造 gate_id。
+    """
+    targets = [d for d in conditional_details
+               if d.get("gate_required") and d.get("risk_level") == "L5"]
+    if not targets:
+        return []
+    try:
+        from app.dependencies import get_services
+        gs = get_services().gate_service
+    except Exception as e:
+        logger.warning("P5: L5 命令需用户 Gate，但当前上下文无可用 GateService（%s）→ "
+                       "不伪造 Gate，命令保持 blocked", e)
+        return []
+
+    gate_ids: list[str] = []
+    for d in targets:
+        cmd = d.get("command") or ""
+        slot_id = d.get("slot_id") or "unknown_slot"
+        try:
+            gate = gs.create(
+                project_id=project_id, run_id=run_id or "", stage="p5",
+                gate_type="l5_high_risk_command", risk_level="L5",
+                reason=(f"P5 {slot_id} 命令风险级别 L5，已阻断执行，需用户裁决："
+                        f"{cmd}"),
+                summary=(f"高风险命令（L5）待裁决：{cmd}｜槽位 {slot_id}｜"
+                         f"命中平台 DENY 规则（可能造成不可逆破坏/凭据泄漏），"
+                         f"批准后方可执行，拒绝则该验证槽位保持未通过。"),
+                options=["approve", "reject"],
+            )
+        except Exception as e:
+            logger.warning("P5: l5_high_risk_command Gate 创建失败 slot=%s: %s",
+                           slot_id, e, exc_info=True)
+            continue
+        gate_ids.append(gate.gate_id)
+        d["l5_gate_id"] = gate.gate_id
+    return gate_ids
+
+
 class RealP5Handler:
     """P5 验证（R12-3-C3 骨架 + C4 硬必需真实验证 + R17.5-P5-R1 skill-first LLM 策略层）。
 
@@ -1976,6 +2023,12 @@ class RealP5Handler:
                 "gate_required": vr.details.get("gate_required", False),
             })
 
+        # ⑤a D-034（R18-1 P1-02）：L5 高风险命令须真实创建【可裁决】用户 Gate。
+        # 之前 Provider 命中 L5 只 blocked=True + 槽位 needs_user_input，无 Gate → 用户
+        # 无从裁决，与 D-034"L5 高风险动作全部强制用户 Gate"不一致。此处按 L5 建 Gate。
+        # L4 保持现状不建 Gate（D-034 原文只规定 L5，L4 属扩展解释，本轮明确不做）。
+        l5_gate_ids = _create_l5_command_gates(project_id, run_id, conditional_details)
+
         can_complete, reason = can_mark_completed(plan)
         plan.can_be_completed = can_complete
         plan.blocked_reason = None if can_complete else reason
@@ -2072,6 +2125,9 @@ class RealP5Handler:
                                 "status": vr.status, "issues": vr.issues}
                                for vr in verify_results],
             "conditional_results": conditional_details,
+            # D-034（R18-1 P1-02）：L5 命中命令真实创建的可裁决 Gate（空 = 无 L5 命中；
+            # 无可用 GateService 时诚实为空并已告警，绝不伪造 gate_id）。
+            "l5_command_gate_ids": l5_gate_ids,
             "evidence_gaps": p4_input.evidence_gaps,
             "artifacts": p5_produced,
             "evidence_refs": p4_input.evidence_refs,

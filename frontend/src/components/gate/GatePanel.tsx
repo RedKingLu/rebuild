@@ -109,13 +109,18 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
     // R17.3-6 WP-4（EG-WP4-1）：新增两类安全 Gate 的中文标签。
     : gate?.gate_type === 'desensitization_release' ? '脱敏放行 Gate（高风险）'
     : gate?.gate_type === 'action_approval' ? '高风险动作审批 Gate'
+    // R18-1（D-034）：L5 高风险命令 Gate —— 不是阶段晋级 Gate，走通用 Gate 决策端点。
+    : gate?.gate_type === 'l5_high_risk_command' ? '高风险命令审批 Gate（L5）'
     : (gate?.gate_type || 'Gate');
 
   // R17.3-6 WP-4（EG-WP4-1）：安全 Gate 走通用 Gate 决策端点、渲染专用风险面板，
   // 不复用阶段材料列表 / 阶段晋级端点（它们不是阶段晋级 Gate）。
   const isDesensGate = gate?.gate_type === 'desensitization_release';
   const isActionApproval = gate?.gate_type === 'action_approval';
-  const isSecurityGate = isDesensGate || isActionApproval;
+  // R18-1（D-034）：L5 高风险命令 Gate 与上两类同为安全 Gate（渲染风险面板 + 通用决策端点），
+  // 不得走阶段晋级端点（否则用户"批准"会误推进阶段）。
+  const isL5CommandGate = gate?.gate_type === 'l5_high_risk_command';
+  const isSecurityGate = isDesensGate || isActionApproval || isL5CommandGate;
 
   // Load material content when a material is selected
   const loadMaterial = useCallback(async (materialPath: string) => {
