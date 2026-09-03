@@ -10,19 +10,35 @@ No real LangGraph graph, model calls, agent execution, or Git operations.
 #    startup REBUILD_MASTER_KEY check read os.environ directly, so we
 #    pre-load the .env file here (skip keys already set in the shell).
 import os as _load_os
-_ENV_PATH = _load_os.path.join(_load_os.path.dirname(__file__), "..", ".env")
-if _load_os.path.exists(_ENV_PATH):
-    with open(_ENV_PATH, encoding="utf-8") as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if not _line or _line.startswith("#") or "=" not in _line:
+
+
+def _preload_env(path: str) -> None:
+    """把 path 中的 KEY=VALUE 注入 os.environ；已在 shell 中设置的键不覆盖。
+
+    路径不存在 / 文件为空 / 只有注释时静默跳过。用函数作用域隔离循环变量，
+    因此不再需要在守卫块外 `del` 循环变量 —— 原实现无条件
+    `del _f, _line, _key, _val`，而这些名字只在守卫块内绑定，导致无 .env、
+    空 .env 或全注释 .env 时抛 NameError，后端无法导入启动。
+    自行 import os，不依赖模块级别名，避免下方 del 之后失效。
+    """
+    import os
+
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
                 continue
-            _key, _, _val = _line.partition("=")
-            _key = _key.strip()
-            _val = _val.strip().strip('"').strip("'")
-            if _key not in _load_os.environ:
-                _load_os.environ[_key] = _val
-del _load_os, _ENV_PATH, _f, _line, _key, _val
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key not in os.environ:
+                os.environ[key] = val
+
+
+_preload_env(_load_os.path.join(_load_os.path.dirname(__file__), "..", ".env"))
+del _load_os
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
