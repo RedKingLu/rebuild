@@ -1,0 +1,8 @@
+#!/bin/sh
+# rebuild 运行时数据守护 —— 见 scripts/runtime_guard.py 顶部说明。
+# 被忽略的运行物（rebuild.db / graph_checkpoints.sqlite）可能被切换历史提交的
+# 操作静默覆盖或删除；此钩子在操作后立刻体检，异常则自动从仓库外快照回滚。
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$ROOT/scripts/runtime_guard.py" ] || exit 0
+python3 "$ROOT/scripts/runtime_guard.py" check --auto-restore || true
+exit 0

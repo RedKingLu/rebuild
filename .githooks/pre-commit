@@ -1,0 +1,7 @@
+#!/bin/sh
+# 提交前趁运行物健康留快照，供 post-checkout 等钩子回滚时使用。
+# --if-healthy 确保不会用坏数据覆盖好快照。
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$ROOT/scripts/runtime_guard.py" ] || exit 0
+python3 "$ROOT/scripts/runtime_guard.py" snapshot --if-healthy >/dev/null 2>&1 || true
+exit 0
