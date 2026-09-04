@@ -55,6 +55,25 @@ class StreamStallTimeout(TimeoutError):
             f"Streaming stalled: no data within {limit_seconds:.1f}s (phase={phase})")
 
 
+class CallHangTimeout(TimeoutError):
+    """非流式调用挂起保护触发（B-R19-1-COMPLETE-HANG）。
+
+    与 `StreamStallTimeout` 同一模式（TimeoutError 子类 + phase + limit_seconds），只是
+    口径为非流式，故消息不写 "streaming"。同样归入既有 "timeout" 错误分类 —— 不新造
+    error_category（否则重试白名单与 gateway 的 pre-token / 顺位回退判断会同时失效）。
+      request — 单次请求（建连 + 等完整响应体）超过硬边界。由 adapter 自己用
+                asyncio.wait_for 兜底，**不依赖 litellm 内部 timeout**（该链已实测
+                不可靠：服务端已关流、lastrcv≈497s 客户端仍阻塞在 socket read）
+      total   — 单次 complete() 调用的总时长硬上限，**覆盖全部重试 attempt**
+    """
+
+    def __init__(self, phase: str, limit_seconds: float):
+        self.phase = phase
+        self.limit_seconds = limit_seconds
+        super().__init__(
+            f"Model call hung: no response within {limit_seconds:.1f}s (phase={phase})")
+
+
 @dataclass
 class ModelCallResult:
     """Result of a model call through the adapter."""
@@ -76,7 +95,7 @@ class ModelCallResult:
 
 def _classify_litellm_error(e: Exception) -> tuple[str, str]:
     """Classify a litellm exception into error_category + redacted message."""
-    if isinstance(e, StreamStallTimeout):
+    if isinstance(e, (StreamStallTimeout, CallHangTimeout)):
         # 挂起保护：保留 timeout 分类（既有重试/回退语义不变），消息带上具体哪一层 + 阈值。
         return "timeout", str(e)
     error_str = str(e)
@@ -136,10 +155,34 @@ class LiteLLMAdapter:
         R11-7: `timeout` overrides the module default per call — slow domains (e.g. P3
         planning, single call 60-120s) need a longer request timeout than the fail-fast
         default so they don't time out on a live-but-slow provider (B-P3-NO-TASKPLANS).
+
+        B-R19-1-COMPLETE-HANG (外层超时兜底，与 stream_complete 同思路/同语义):
+        旧实现的唯一时间边界是下面交给 litellm 的 `timeout` kwarg —— 即完全依赖 litellm/
+        httpx 那条超时链，而该链已实测不可靠（服务端已关流、lastrcv≈497s 客户端仍阻塞在
+        socket read），且随 provider / SDK 路径而变。链一失效 `complete()` 即可永久挂起。
+        现补两层，**均在本层用 asyncio.wait_for 兜底，不依赖 litellm 内部 timeout**：
+        1. **单次请求超时** = 调用方 `timeout`，否则 `_REQUEST_TIMEOUT` —— 与交给 litellm
+           的那个值同源同语义（慢域显式声明更长等待）。
+        2. **总时长硬上限** = 上述值与 `_STREAM_TOTAL_TIMEOUT` 的较大者；`deadline` 在
+           **重试循环之外**计算，故上限覆盖整次调用含全部重试。若边界只落在单个 attempt
+           上（旧实现即如此），最坏耗时 = 上限 ×(_MAX_RETRIES+1) + 退避 ≈ 254s，再乘
+           gateway 顺位回退链长度与阶段轮次 —— 正是上一批实测的放大机制。预算不足时不再
+           空转重试。阈值全部复用既有配置变量，零新增环境变量。
+        超时按既有路径处理：抛 `CallHangTimeout` → `_classify_litellm_error` 归 "timeout"
+        → 返回 `status="failed"` 的结果。**不静默返回空结果、不伪造完成**（D-097/公理3）。
+        本方法对外仍不抛异常（gateway `call()` 依赖 `r.status` 逐个尝试 fallback，向外抛会
+        击穿那条链）。
         """
         call_id = f"call_{uuid.uuid4().hex[:12]}"
         t0 = time.monotonic()
         result = ModelCallResult(call_id=call_id, model_name=model)
+
+        # 单次请求超时：与下面交给 litellm 的值同源（双保险 —— litellm 那条链失效时本层兜住）。
+        per_attempt_timeout = float(timeout) if timeout is not None else _REQUEST_TIMEOUT
+        # 总上限：调用方声明的慢域上限与模块默认整体上限取大者；始终有限（兜底）。
+        total_timeout = max(per_attempt_timeout, _STREAM_TOTAL_TIMEOUT)
+        # deadline 在重试循环之外，故总上限覆盖整次调用（含全部 attempt 与退避），不被放大。
+        deadline = t0 + total_timeout
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -150,14 +193,23 @@ class LiteLLMAdapter:
             "api_base": api_base,
             "stream": stream,
             # R9-5-1: never hang on a dead provider; R11-7: per-call override for slow domains
-            "timeout": timeout if timeout is not None else _REQUEST_TIMEOUT,
+            "timeout": per_attempt_timeout,
         }
         if extra_params:
             kwargs.update(extra_params)
 
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                response = await litellm.acompletion(**kwargs)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CallHangTimeout("total", total_timeout)
+                # 外层硬边界：单次请求超时，且不得超过剩余总预算。
+                wait_budget = min(remaining, per_attempt_timeout)
+                try:
+                    response = await asyncio.wait_for(
+                        litellm.acompletion(**kwargs), timeout=wait_budget)
+                except (asyncio.TimeoutError, TimeoutError) as te:
+                    raise CallHangTimeout("request", wait_budget) from te
                 latency = (time.monotonic() - t0) * 1000
                 content = response.choices[0].message.content or ""
 
@@ -179,13 +231,21 @@ class LiteLLMAdapter:
 
             except Exception as e:
                 error_cat, error_msg = _classify_litellm_error(e)
-                if attempt < _MAX_RETRIES and error_cat in ("rate_limited", "timeout", "provider_unreachable"):
-                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                budget_left = deadline - time.monotonic()
+                # 仅在剩余预算还够发起一次有意义的尝试时才重试（不空转重试出一次必然
+                # 立刻超时的调用）；退避时长同样受剩余预算约束，不得越过总上限。
+                if (attempt < _MAX_RETRIES
+                        and error_cat in ("rate_limited", "timeout", "provider_unreachable")
+                        and budget_left > _MIN_RETRY_BUDGET_SECONDS):
+                    delay = min(_RETRY_BASE_DELAY * (2 ** attempt), budget_left)
                     logger.warning("litellm call retry %d/%d after %.1fs: %s", attempt + 1, _MAX_RETRIES, delay, error_cat)
                     await _async_sleep(delay)
                     continue
 
                 latency = (time.monotonic() - t0) * 1000
+                logger.warning(
+                    "litellm call failed attempt=%d budget_left=%.1fs: %s %s",
+                    attempt, budget_left, error_cat, error_msg)
                 result.status = "failed"
                 result.latency_ms = round(latency, 1)
                 result.error_category = error_cat
