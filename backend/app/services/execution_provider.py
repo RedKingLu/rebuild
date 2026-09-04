@@ -13,6 +13,12 @@ Modes (env `EXECUTION_MODE`, default "local"):
   - "container" → ContainerExecutionProvider: disposable, network-isolated container.
                   NEVER silently downgrades to host execution.
   - "remote"    → RemoteSSHExecutionProvider: paramiko SSH + SFTP (D-093).
+
+R19-1 (G1 容器真构建)：新增 "toolchain_container" → ToolchainContainerExecutionProvider。
+  与 ContainerExecutionProvider **并列而非替换**：后者的 untrusted_snippet 硬化基线
+  （network=none / read_only / cap_drop=ALL / 256m / uid 10002 / 纯 Python 沙箱镜像）
+  **一字不改**；新档用厂商官方 SDK 镜像跑真实项目构建，仅 3 处最小挂载，出网为
+  **如实标注的弱化项**（经用户批准的 C2 变更，Q-R19-1-1）。绝不挂 docker.sock。
 """
 
 from __future__ import annotations
@@ -277,9 +283,28 @@ class ContainerExecutionProvider:
     name = "container_sandbox"
 
     async def execute(self, code: str, language: str = "python",
-                      timeout: int = 30, model: str | None = None) -> dict:
+                      timeout: int = 30, model: str | None = None,
+                      cwd: str | None = None) -> dict:
+        """R19-1（Q-R19-1-4 用户批准）：补 `cwd` 形参以对齐 `ExecutionProvider` Protocol。
+
+        旧签名无 `cwd`，而 Protocol（:166-168）与调用点 `p5_command_service.execute_slot_command`
+        （传 `cwd=str(ws)`）都要求它 ⇒ 一旦 `P5_EXECUTION_MODE=container`，会抛 TypeError 并被
+        调用侧捕获成 `validation_failed`，把"能力未接线"表现成"构建失败"（伪失败，违反验收
+        §0.3 第 3 条方向性纪律）。记为 `B-P5-CONTAINER-CWD`。
+
+        本档是面向**不可信代码片段**的一次性强隔离沙箱：代码写入临时目录并以 **ro** 挂到
+        `/workspace`，工作目录固定在容器内，宿主 `cwd` 在此档**无意义**（挂宿主工作区会破坏
+        隔离基线）。故此处**接受并如实忽略** `cwd`，只消除签名不一致，
+        **不改本档任何硬化参数**（network=none / read_only / cap_drop / 256m / uid 10002）。
+        需要真实工作区构建请用 `toolchain_container` 档（ToolchainContainerExecutionProvider）。
+        """
         import time
         start = time.time()
+
+        if cwd:
+            logger.debug(
+                "ContainerExecutionProvider 忽略 cwd=%s：不可信片段档不挂宿主工作区（隔离基线），"
+                "真实项目构建请用 toolchain_container 档。", cwd)
 
         denial = _check_dangerous(code)
         if denial:
@@ -365,6 +390,236 @@ class ContainerExecutionProvider:
         }
 
 
+class ToolchainContainerExecutionProvider:
+    """R19-1 G1：`toolchain_build` 硬化档 —— 项目工具链构建专用一次性容器。
+
+    与 `ContainerExecutionProvider`（`untrusted_snippet` 档）**并列而非替换**：后者面向不可信
+    代码片段、镜像为纯 Python 沙箱、无网络、无写入位，架构上跑不了真实项目构建；本档面向
+    **平台内部可信的项目构建命令**，用厂商官方 SDK 镜像（引用来自
+    `backend/app/config/toolchain_images.yaml`，由项目事实映射得出，代码内不出现框架/镜像字面量）。
+
+    挂载（最小必要，R19-1-06）——只 3 处：
+      src            → ro   构建输入（构建不得篡改平台产物，也不往 output_code 落 obj/bin）
+      build          → rw   **唯一写入位**：HOME / CLI 状态 / 中间产物 / 输出 / 包源配置
+      package_cache  → rw   包缓存，跨轮复用
+
+    明确**不挂**：`/var/run/docker.sock`（挂它等于把宿主 Docker 控制权交给容器；本档架构上
+    不需要——Docker API 由宿主侧 backend 调用，容器内只跑构建命令）、`source/`（D-099）、
+    仓库根 / `.env*`、`~/.ssh`、`~/.nuget`（宿主包源配置可能带私有源凭据 ⇒ 用平台自管无凭据
+    配置）、其他项目工作区。
+
+    硬化项（保留/弱化，逐项如实标注，见 `hardening` 返回字段）：
+      保留：`cap_drop=ALL`、`no-new-privileges`、根 `read_only=True`（+ tmpfs /tmp）、
+            资源上限（mem/pids/cpu，来自 yaml）、**非 root**（显式传宿主 uid:gid）、
+            一次性容器（用完 force remove）、不发布任何端口（不触碰 §10-19 端口标准）、
+            DENY 安检与风险分级先行、`_clean_env` 不外传宿主环境。
+      **弱化（如实标注，不假称已白名单化）**：网络。`restore` 必须访问包源 ⇒ 本档
+            `network_mode` 由 yaml 给出（非 `none`）。docker 原生无法做精细 egress 白名单。
+            属经用户批准的 **C2 变更**（Q-R19-1-1 resolved，2026-09-04）：现有强隔离档一字不动、
+            弱化只发生在本新增档、且本档**仅用于工具链构建**。
+    """
+
+    name = "toolchain_container"
+
+    def __init__(self, *, image_ref: str, src_dir: str, build_dir: str,
+                 package_cache_dir: str,
+                 container_paths: dict | None = None,
+                 container_env: dict | None = None,
+                 package_config: dict | None = None,
+                 limits: dict | None = None,
+                 network_mode: str = "none",
+                 network_weakened: bool = False,
+                 network_note: str = "",
+                 image_digest: str = ""):
+        if not image_ref:
+            raise ValueError("ToolchainContainerExecutionProvider 需要 image_ref（不猜镜像）")
+        if not src_dir:
+            raise ValueError("ToolchainContainerExecutionProvider 需要 src_dir（构建输入）")
+        self.image_ref = image_ref
+        self.image_digest = image_digest
+        self.src_dir = str(Path(src_dir).resolve())
+        self.build_dir = str(Path(build_dir).resolve())
+        self.package_cache_dir = str(Path(package_cache_dir).resolve())
+        paths = container_paths or {}
+        self.c_src = paths.get("src") or "/src"
+        self.c_build = paths.get("build") or "/build"
+        self.c_cache = paths.get("package_cache") or "/cache"
+        self.container_env = dict(container_env or {})
+        self.package_config = dict(package_config or {})
+        self.limits = dict(limits or {})
+        self.network_mode = network_mode or "none"
+        self.network_weakened = bool(network_weakened)
+        self.network_note = network_note or ""
+
+    # ── 宿主侧准备（唯一写入位 + 无凭据包源配置）──────────────────────────
+    def _prepare_host_dirs(self) -> None:
+        """创建 rw 挂载目录。失败必须抛（公理 3：不静默吞、不降级）。"""
+        home = self.container_env.get("HOME", "")
+        Path(self.build_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.package_cache_dir).mkdir(parents=True, exist_ok=True)
+        if home.startswith(self.c_build + "/"):
+            # 容器内 HOME 落在 build 挂载内 → 宿主侧先建好，避免 read_only 根下无法创建
+            (Path(self.build_dir) / home[len(self.c_build) + 1:]).mkdir(parents=True, exist_ok=True)
+        filename = self.package_config.get("filename")
+        content = self.package_config.get("content")
+        if filename and content:
+            (Path(self.build_dir) / filename).write_text(content, encoding="utf-8")
+
+    def volumes(self) -> dict:
+        """挂载清单（写入证据，供 R19-1-06 逐条核对最小性）。"""
+        return {
+            self.src_dir: {"bind": self.c_src, "mode": "ro"},
+            self.build_dir: {"bind": self.c_build, "mode": "rw"},
+            self.package_cache_dir: {"bind": self.c_cache, "mode": "rw"},
+        }
+
+    def hardening(self) -> dict:
+        """硬化档如实自述：保留了什么、弱化了什么（禁止美化）。"""
+        return {
+            "profile": "toolchain_build",
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "read_only_rootfs": True,
+            "tmpfs": ["/tmp"],
+            "run_as_non_root": True,
+            "user": f"{os.getuid()}:{os.getgid()}",
+            "mem_limit": self.limits.get("mem_limit"),
+            "pids_limit": self.limits.get("pids_limit"),
+            "cpu_count": self.limits.get("cpu_count"),
+            "published_ports": [],
+            "docker_socket_mounted": False,
+            "network_mode": self.network_mode,
+            "network_weakened": self.network_weakened,
+            "network_note": self.network_note,
+            "weakened_items": (["network"] if self.network_weakened else []),
+        }
+
+    def _execution_meta(self) -> dict:
+        return {
+            "provider": self.name,
+            "execution_mode": self.name,
+            "image_ref": self.image_ref,
+            "image_digest": self.image_digest,
+            "container_workdir": self.c_src,
+            "mounts": [{"host": h, "container": v["bind"], "mode": v["mode"]}
+                       for h, v in self.volumes().items()],
+            "hardening": self.hardening(),
+        }
+
+    async def execute(self, code: str, language: str = "bash",
+                      timeout: int = 30, model: str | None = None,
+                      cwd: str | None = None) -> dict:
+        """在一次性构建容器内执行命令。
+
+        `cwd` 语义：命令的运行目录。本档把 `src_dir` 以 ro 挂到容器内 `container_paths.src`
+        并把它设为 `working_dir`，因此命令中的相对路径以构建根为基准。调用侧传入的宿主
+        `cwd` 若与 `src_dir` 不一致会被如实记录（不静默改语义）。
+        """
+        import time
+        start = time.time()
+        meta = self._execution_meta()
+
+        # ① DENY 安检先行（与既有档一致，不因换通道而放宽）
+        denial = _check_dangerous(code)
+        if denial:
+            return {
+                "exit_code": 1, "stdout": "", "stderr": denial,
+                "elapsed_ms": 0, "provider": "security_block",
+                "execution_mode": self.name, "fallback": False, "blocked": True,
+                "risk_level": "L5", "audited": False,
+                "gate_required": True,   # D-034：L5 须可裁决，不静默 block
+                **{k: v for k, v in meta.items() if k not in ("provider", "execution_mode")},
+            }
+
+        risk = _classify_risk(code, language)
+        cwd_mismatch = bool(cwd) and str(Path(cwd).resolve()) != self.src_dir
+        if cwd_mismatch:
+            logger.info("toolchain_container：调用侧 cwd=%s 与挂载构建根 %s 不一致，"
+                        "以构建根为容器工作目录（已记入证据）", cwd, self.src_dir)
+
+        try:
+            self._prepare_host_dirs()
+        except Exception as e:
+            # 公理 3：准备失败必须发声，且诚实报为不可用，不伪造构建结论。
+            logger.warning("toolchain_container 宿主目录准备失败：%s", e, exc_info=True)
+            return {
+                "exit_code": -1, "stdout": "",
+                "stderr": f"构建工作目录准备失败：{type(e).__name__}: {e}",
+                "elapsed_ms": int((time.time() - start) * 1000),
+                "fallback": False, "blocked": False, "risk_level": risk, "audited": False,
+                "toolchain_unavailable": True, **meta,
+            }
+
+        limits = self.limits
+        cpu_count = limits.get("cpu_count")
+        run_kwargs = dict(
+            image=self.image_ref,
+            command=["bash", "-lc", code],
+            volumes=self.volumes(),
+            working_dir=self.c_src,
+            environment=self.container_env,
+            network_mode=self.network_mode,
+            read_only=True,
+            tmpfs={"/tmp": "rw,size=256m"},
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges:true"],
+            mem_limit=limits.get("mem_limit") or "2g",
+            pids_limit=int(limits.get("pids_limit") or 512),
+            user=f"{os.getuid()}:{os.getgid()}",
+            detach=True,
+        )
+        if cpu_count:
+            run_kwargs["nano_cpus"] = int(float(cpu_count) * 1_000_000_000)
+
+        unavailable = False
+        try:
+            import docker
+            client = docker.from_env()
+            container = client.containers.run(**run_kwargs)
+            try:
+                result = container.wait(timeout=timeout)
+                exit_code = result.get("StatusCode", -1)
+                stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
+                stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
+            except Exception:
+                logger.warning("toolchain_container 执行超时/中断（%ss），已 kill 容器", timeout,
+                               exc_info=True)
+                try:
+                    container.kill()
+                except Exception:
+                    logger.debug("容器 kill 失败（best-effort）", exc_info=True)
+                exit_code = -1
+                stdout = ""
+                stderr = f"构建容器执行超时（{timeout}s）"
+            finally:
+                try:
+                    container.remove(force=True)   # 一次性容器
+                except Exception:
+                    logger.debug("容器清理 remove 失败（best-effort）", exc_info=True)
+        except Exception as e:
+            # 环境不可用（Docker 守护 / 镜像 / SDK）≠ 构建失败。标 toolchain_unavailable，
+            # 由上游落诚实 evidence_gap，**绝不**伪造 available/validated（§10-20 / D-097）。
+            logger.warning("toolchain_container 不可用：%s", e, exc_info=True)
+            unavailable = True
+            exit_code = -1
+            stdout = ""
+            stderr = f"工具链构建容器不可用：{type(e).__name__}: {e}"
+
+        return {
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "elapsed_ms": int((time.time() - start) * 1000),
+            "fallback": False,
+            "blocked": False,
+            "risk_level": risk,
+            "audited": False,
+            "toolchain_unavailable": unavailable,
+            "cwd_mismatch": cwd_mismatch,
+            **meta,
+        }
+
+
 class WorkspaceLocalExecutionProvider:
     """R12-8: Workspace-bound local execution for P5 verification commands.
 
@@ -420,23 +675,38 @@ def get_execution_provider(
     db=None,
     *,
     trust_on_first_use: bool = False,
+    provider_options: dict | None = None,
 ) -> "ExecutionProvider":
     """Return the execution provider for the given mode.
 
     Priority: explicit mode arg > EXECUTION_MODE env var > "local".
     Modes:
-      - "local"           → LocalSubprocessExecutionProvider (ALLOWED_COMMANDS whitelist)
-      - "workspace_local" → WorkspaceLocalExecutionProvider (workspace-bound, no whitelist, DENY check)
-      - "container"       → ContainerExecutionProvider (docker sandbox, read-only)
-      - "remote"          → RemoteSSHExecutionProvider (paramiko SSH + SFTP)
+      - "local"               → LocalSubprocessExecutionProvider (ALLOWED_COMMANDS whitelist)
+      - "workspace_local"     → WorkspaceLocalExecutionProvider (workspace-bound, no whitelist, DENY check)
+      - "container"           → ContainerExecutionProvider (untrusted_snippet 档：无网络/只读/256m)
+      - "toolchain_container" → ToolchainContainerExecutionProvider (R19-1 toolchain_build 档：
+                                官方 SDK 镜像 + 最小 3 处挂载 + 出网为如实标注的弱化项)
+      - "remote"              → RemoteSSHExecutionProvider (paramiko SSH + SFTP)
 
     trust_on_first_use: for the remote mode, accept unknown host keys on first
     connection and persist the fingerprint (TOFU, D-093).  Default False =
     reject unknown hosts.
+
+    provider_options: toolchain_container 档所需的镜像引用 / 挂载路径 / 上限等（由
+    `toolchain_resolver.probe_toolchain` 的真实探测结果给出）。缺必填项时**显式抛
+    ValueError**（不猜镜像、不静默降级）。
     """
     resolved_mode = (mode or os.environ.get("EXECUTION_MODE") or "local").strip().lower()
     if resolved_mode == "container":
         return ContainerExecutionProvider()
+    if resolved_mode == "toolchain_container":
+        opts = provider_options or {}
+        try:
+            return ToolchainContainerExecutionProvider(**opts)
+        except TypeError as e:
+            raise ValueError(
+                f"get_execution_provider(mode='toolchain_container') 的 provider_options 不合法：{e}"
+            ) from e
     if resolved_mode == "workspace_local":
         return WorkspaceLocalExecutionProvider()
     if resolved_mode == "remote":

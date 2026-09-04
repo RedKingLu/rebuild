@@ -2009,6 +2009,12 @@ class RealP5Handler:
                         slot.exit_code = vr.details.get("exit_code")
                         slot.command = vr.details.get("command")
                         slot.details.update(vr.details)
+                        slot.evidence_refs = list(slot.evidence_refs) + list(vr.evidence_refs)
+                        if vr.status == P5SlotStatus.EVIDENCE_GAP:
+                            # R19-1-04：环境不具备（Docker/镜像/SDK 缺失）的诚实原因必须落到
+                            # 报告里，且**绝不**写成 available/validated。
+                            slot.evidence_gap_reason = next(
+                                (i.get("detail") for i in vr.issues if i.get("detail")), None)
                         for issue in vr.issues:
                             slot.issues.append(issue)
             conditional_details.append({
@@ -2021,6 +2027,20 @@ class RealP5Handler:
                 "risk_level": vr.details.get("risk_level"),
                 "issues": [i.get("type") for i in vr.issues],
                 "gate_required": vr.details.get("gate_required", False),
+                # R19-1（修 B5）：前端 StagePageP5 早已在渲染 `gate_reason`，后端却从未提供
+                # ⇒ 安全拦截原因在前端恒为空。此处补上。
+                "gate_reason": vr.details.get("gate_reason"),
+                # R19-1（修 B4）：真实诊断/输出/执行环境/阶段明细/日志引用必须出到报告与前端，
+                # 否则 NU1101 与 CS 类明细无论如何都到不了 R19-1-03 要求的报告里。
+                "diagnostics": vr.details.get("diagnostics", []),
+                "diagnostics_summary": vr.details.get("diagnostics_summary", {}),
+                "stages": vr.details.get("stages", []),
+                "execution": vr.details.get("execution", {}),
+                "execution_channel": vr.details.get("execution_channel"),
+                "stdout_tail": vr.details.get("stdout_tail", ""),
+                "stderr_tail": vr.details.get("stderr_tail", ""),
+                "evidence_refs": list(vr.evidence_refs),
+                "issue_details": [i.get("detail") for i in vr.issues],
             })
 
         # ⑤a D-034（R18-1 P1-02）：L5 高风险命令须真实创建【可裁决】用户 Gate。

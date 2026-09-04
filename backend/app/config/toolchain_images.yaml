@@ -1,0 +1,90 @@
+# 工具链构建镜像映射表（R19-1 G1 容器真构建）
+#
+# 单一职责：把【项目事实】（如 csproj 的 <TargetFramework>）映射到【官方 SDK 镜像引用】。
+# 平台 Python 代码只读本表，**不出现任何具体框架字面量或镜像名**（AGENTS §10-26：
+# 样本实例值不得硬编码进 handler/schema/前端；通用可沉淀、样本随项目替换）。
+#
+# 扩展新语言/新框架 = 在本表新增一条映射（零代码改动，契合 AGENTS §10-27 精神）。
+# 无映射的目标框架 → 上游诚实 evidence_gap（不猜、不回退宿主、不伪造 available）。
+#
+# 安全：
+#   - `registries_allowed` 是镜像 host 白名单。不在表内的 host 一律拒绝。
+#   - 只接受本表中出现过的镜像引用；**绝不接受来自项目内容或 LLM 输出的镜像名**
+#     （否则等于任意镜像执行）。
+#   - `allow_runtime_pull` 默认 false：运行期缺镜像时诚实 evidence_gap，并提示预热命令。
+#     预热为 P5 之外的一次性显式 L4 动作（deploy/toolchain-images/pull.sh），
+#     以免把「等用户批准拉镜像」混淆成「构建结论待用户输入」（Q-R19-1-2 裁决 C）。
+#
+# 关联：产物/草稿/R19-1-容器构建方案.md §2.1、Q-R19-1-2 / Q-R19-1-6
+
+version: 1
+
+# 允许拉取/运行的镜像 registry host 白名单
+registries_allowed:
+  - mcr.microsoft.com
+  - docker.io
+
+# 运行期按需拉取（L4）。默认关闭：缺镜像 → evidence_gap + 预热提示。
+allow_runtime_pull: false
+pull_timeout_s: 1800
+
+toolchains:
+  dotnet:
+    # 构建对象发现（相对构建根递归匹配）
+    project_globs:
+      - "*.csproj"
+      - "*.vbproj"
+      - "*.fsproj"
+    solution_globs:
+      - "*.sln"
+    # 判定"这是测试工程"的工程文件标记（大小写不敏感子串）。用于只对真实测试工程跑测试命令，
+    # 不靠文件名猜测。放配置而非 Python，便于按语言/框架扩展。
+    test_project_markers:
+      - "<IsTestProject>true</IsTestProject>"
+      - "Microsoft.NET.Test.Sdk"
+    # 目标框架 → 官方 SDK 镜像（滚动 tag；运行时另记 RepoDigest 以保可复现，Q-R19-1-6）
+    target_framework_map:
+      "net6.0": "mcr.microsoft.com/dotnet/sdk:6.0"
+      "net7.0": "mcr.microsoft.com/dotnet/sdk:7.0"
+      "net8.0": "mcr.microsoft.com/dotnet/sdk:8.0"
+      "net9.0": "mcr.microsoft.com/dotnet/sdk:9.0"
+    # 无匹配时【不猜】：null ⇒ 诚实 evidence_gap
+    default_image: null
+    # 容器内挂载点（唯一写入位 = build / package_cache）
+    container_paths:
+      src: "/src"
+      build: "/build"
+      package_cache: "/nuget"
+    # 资源上限（toolchain_build 硬化档，见 execution_provider.ToolchainContainerExecutionProvider）
+    limits:
+      mem_limit: "2g"
+      pids_limit: 512
+      cpu_count: 2
+      timeout_s: 900
+    # 容器内环境变量：把 HOME / CLI 状态 / 包缓存全部指到可写挂载位，
+    # 使根文件系统可以保持 read_only。变量名属工具链层事实，故放配置而非 Python 代码。
+    container_env:
+      HOME: "/build/home"
+      DOTNET_CLI_HOME: "/build/home"
+      NUGET_PACKAGES: "/nuget"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+    # 平台自管的**无凭据**包源配置：只列公共源。
+    # 明确【不复用】宿主 ~/.nuget/NuGet.Config —— 宿主配置可能带私有源凭据（R19-1-06）。
+    package_config:
+      filename: "NuGet.Config"
+      content: |
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <packageSources>
+            <clear />
+            <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+          </packageSources>
+        </configuration>
+    # ⚠️ 网络：**经用户批准的 C2 变更**（Q-R19-1-1 resolved，2026-09-04）。
+    # 现有强隔离档 `untrusted_snippet`（network_mode=none）一字不动；仅本构建档出网。
+    # 如实标注：docker 原生无法做精细 egress 白名单 ⇒ 这是**弱化项**，
+    # **不得声称"已白名单化"**。仅出网、不发布任何端口。
+    network_mode: "bridge"
+    network_weakened: true
+    network_note: "构建需访问包源（restore）⇒ 该档允许出网；这是如实标注的弱化项，未做 egress 白名单。"

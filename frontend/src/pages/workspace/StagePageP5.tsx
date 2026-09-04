@@ -48,6 +48,19 @@ const cardTitle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 6,
 };
 const muted: React.CSSProperties = { fontSize: 12, color: 'var(--color-text-muted)' };
+const mono: React.CSSProperties = {
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize: 11,
+};
+
+/* ── R19-1 G1：诊断类别 → 中文标签。类别如实、不合并 ——
+      MSB/NETSDK 绝不并入「编译」冒充 CS 类明细（Q-R19-1-8 红线）。 ── */
+const DIAG_CATEGORY_LABEL: Record<string, string> = {
+  dependency: '依赖',
+  compile:    '编译',
+  sdk:        'SDK',
+  msbuild:    'MSBuild',
+  other:      '其他',
+};
 
 function SlotStatusIcon({ status }: { status: string }) {
   const s = SLOT_STATUS_STYLE[status] || SLOT_STATUS_STYLE.pending;
@@ -57,6 +70,129 @@ function SlotStatusIcon({ status }: { status: string }) {
 function SlotStatusLabel({ status }: { status: string }) {
   const s = SLOT_STATUS_STYLE[status] || SLOT_STATUS_STYLE.pending;
   return <span style={{ fontSize: 11, color: s.color, fontWeight: 500 }}>{s.label}</span>;
+}
+
+/* ── R19-1-05：执行环境（真实字段，全部来自后端 conditional_results[].execution）── */
+function ExecutionEnvRow({ execution }: { execution: any }) {
+  if (!execution || (!execution.execution_mode && !execution.image_ref)) return null;
+  const h = execution.hardening || {};
+  const weakened: string[] = h.weakened_items || [];
+  return (
+    <div style={{ marginTop: 6, padding: '6px 8px', background: 'var(--color-surface)',
+      borderRadius: 4, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+      <Icon name="workspace" size={12} style={{ color: 'var(--color-text-muted)' }} />
+      <span style={{ fontSize: 11 }}>执行环境</span>
+      {execution.execution_mode ? (
+        <code style={mono}>{execution.execution_mode}</code>
+      ) : null}
+      {execution.image_ref ? (
+        <span style={{ fontSize: 11 }}>镜像 <code style={mono}>{execution.image_ref}</code></span>
+      ) : null}
+      {h.user ? <span style={muted}>容器用户 {h.user}（非 root）</span> : null}
+      {h.network_mode ? (
+        <span style={{ fontSize: 11, color: weakened.includes('network') ? 'var(--amber)' : 'var(--color-text-muted)' }}>
+          网络 {h.network_mode}{weakened.includes('network') ? '（弱化项：未做 egress 白名单）' : ''}
+        </span>
+      ) : null}
+      {execution.image_digest ? (
+        <details style={{ flexBasis: '100%' }}>
+          <summary style={{ ...muted, cursor: 'pointer' }}>镜像 digest（可复现性）</summary>
+          <code style={{ ...mono, wordBreak: 'break-all' }}>{execution.image_digest}</code>
+        </details>
+      ) : null}
+      {Array.isArray(execution.mounts) && execution.mounts.length > 0 ? (
+        <details style={{ flexBasis: '100%' }}>
+          <summary style={{ ...muted, cursor: 'pointer' }}>
+            挂载清单（{execution.mounts.length} 处，最小必要）
+          </summary>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 }}>
+            {execution.mounts.map((m: any, i: number) => (
+              <code key={i} style={{ ...mono, wordBreak: 'break-all' }}>
+                {m.host} → {m.container} [{m.mode}]
+              </code>
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+/* ── R19-1-05：结构化诊断表（真实 NU / CS / MSB / NETSDK 明细）── */
+function DiagnosticsBlock({ diagnostics, summary }: { diagnostics: any[]; summary: any }) {
+  if (!Array.isArray(diagnostics) || diagnostics.length === 0) return null;
+  const byCategory: Record<string, number> = (summary && summary.by_category) || {};
+  const byCode: Record<string, number> = (summary && summary.by_code) || {};
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', marginBottom: 4 }}>
+        <Icon name="warning" size={12} style={{ color: 'var(--red)' }} />
+        <span style={{ fontSize: 11, fontWeight: 600 }}>诊断明细</span>
+        {Object.keys(byCategory).map((c) => (
+          <span key={c} style={{ fontSize: 10, padding: '1px 6px', borderRadius: 3,
+            background: 'var(--color-surface)', color: 'var(--color-text-muted)' }}>
+            {DIAG_CATEGORY_LABEL[c] || c} {byCategory[c]}
+          </span>
+        ))}
+        {Object.keys(byCode).map((c) => (
+          <code key={c} style={{ ...mono, background: '#fef2f2', color: 'var(--red)',
+            padding: '1px 4px', borderRadius: 3 }}>{c}×{byCode[c]}</code>
+        ))}
+      </div>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ borderCollapse: 'collapse', fontSize: 11, width: '100%' }}>
+          <thead>
+            <tr style={{ textAlign: 'left', color: 'var(--color-text-muted)' }}>
+              <th style={{ padding: '2px 6px' }}>错误码</th>
+              <th style={{ padding: '2px 6px' }}>类别</th>
+              <th style={{ padding: '2px 6px' }}>位置</th>
+              <th style={{ padding: '2px 6px' }}>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            {diagnostics.map((d: any, i: number) => (
+              <tr key={i} style={{ borderTop: '1px solid var(--color-border)' }}>
+                <td style={{ padding: '2px 6px' }}>
+                  <code style={{ ...mono, color: d.severity === 'error' ? 'var(--red)' : 'var(--amber)' }}>
+                    {d.code}
+                  </code>
+                </td>
+                <td style={{ padding: '2px 6px', color: 'var(--color-text-muted)' }}>
+                  {DIAG_CATEGORY_LABEL[d.category] || d.category}
+                </td>
+                <td style={{ padding: '2px 6px' }}>
+                  <code style={{ ...mono, wordBreak: 'break-all' }}>
+                    {d.file}{d.line ? `:${d.line}` : ''}{d.column ? `:${d.column}` : ''}
+                  </code>
+                </td>
+                <td style={{ padding: '2px 6px' }}>{d.message}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ── R19-1-05：多阶段（restore + build）逐阶段退出码 ── */
+function StagesBlock({ stages }: { stages: any[] }) {
+  if (!Array.isArray(stages) || stages.length === 0) return null;
+  return (
+    <details style={{ marginTop: 6 }}>
+      <summary style={{ ...muted, cursor: 'pointer' }}>构建阶段（{stages.length}）</summary>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 4 }}>
+        {stages.map((s: any, i: number) => (
+          <div key={i} style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
+            <span style={{ fontSize: 11, color: s.exit_code === 0 ? 'var(--green)' : 'var(--red)' }}>
+              exit={s.exit_code ?? '—'}
+            </span>
+            <code style={{ ...mono, wordBreak: 'break-all' }}>{s.command}</code>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
 }
 
 export function StagePageP5({ projectId, runId = '', stageStatus: _stageStatus, onReExecute: _onReExecute }: Props) {
@@ -104,6 +240,9 @@ export function StagePageP5({ projectId, runId = '', stageStatus: _stageStatus, 
   const slots: any[] = validationPlan?.slots || [];
   const verifyResults: any[] = p5Report?.verify_results || p5Input?.verify_results || [];
   const conditionalResults: any[] = p5Report?.conditional_results || p5Input?.conditional_results || [];
+  // R19-1-05：验证维度能力 + 环境探测（capability-first 分区，非门禁）。
+  // 环境不具备时展示【诚实原因 + 预热提示】，绝不显示"通过"。
+  const dimensionCaps: any[] = p5Report?.dimension_capabilities?.dimensions || [];
   const evidenceGaps: any[] = p5Input?.evidence_gaps || [];
   const reworkItems: any[] = verifyResults.filter((vr: any) => !vr.passed);
   const canComplete = validationPlan?.can_be_completed || false;
@@ -235,7 +374,9 @@ export function StagePageP5({ projectId, runId = '', stageStatus: _stageStatus, 
                     borderLeft: `3px solid ${cr.passed ? 'var(--green)' : cr.gate_required ? '#8b5cf6' : 'var(--red)'}`,
                   }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                      <SlotStatusIcon status={cr.status} />
                       <strong style={{ fontSize: 12 }}>{cr.slot_id}</strong>
+                      <SlotStatusLabel status={cr.status} />
                       <code style={{ fontSize: 10, background: 'var(--color-surface)', padding: '1px 4px' }}>
                         {cr.command || '—'}
                       </code>
@@ -256,14 +397,74 @@ export function StagePageP5({ projectId, runId = '', stageStatus: _stageStatus, 
                         问题：{cr.issues.join(', ')}
                       </div>
                     ) : null}
+                    {/* R19-1-05：以下全部是后端真实字段（非 mock、非占位）。
+                        字段缺失即不渲染，不造假数据。 */}
+                    {(cr.issue_details && cr.issue_details.length > 0) ? (
+                      <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
+                        {cr.issue_details.filter(Boolean).join('；')}
+                      </div>
+                    ) : null}
+                    <ExecutionEnvRow execution={cr.execution} />
+                    <DiagnosticsBlock diagnostics={cr.diagnostics} summary={cr.diagnostics_summary} />
+                    <StagesBlock stages={cr.stages} />
+                    {(cr.stdout_tail || cr.stderr_tail) ? (
+                      <details style={{ marginTop: 6 }}>
+                        <summary style={{ ...muted, cursor: 'pointer' }}>命令原始输出</summary>
+                        <pre style={{ ...mono, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                          maxHeight: 260, overflow: 'auto', background: 'var(--color-surface)',
+                          padding: 8, borderRadius: 4, marginTop: 4 }}>
+                          {cr.stdout_tail}{cr.stderr_tail ? `\n${cr.stderr_tail}` : ''}
+                        </pre>
+                      </details>
+                    ) : null}
+                    {(Array.isArray(cr.evidence_refs) && cr.evidence_refs.length > 0) ? (
+                      <div style={{ marginTop: 4 }}>
+                        <span style={muted}>完整构建日志：</span>
+                        {cr.evidence_refs.map((r: string) => (
+                          <code key={r} style={{ ...mono, marginLeft: 4, wordBreak: 'break-all' }}>{r}</code>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
                 ))}
               </div>
             </div>
           ) : null}
 
-          {/* 4. Evidence Gap 列表 */}
-          {evidenceGaps.length > 0 ? (
+          {/* 3b. 验证维度能力 + 环境探测（capability-first，非门禁） */}
+          {dimensionCaps.length > 0 ? (
+            <div style={card}>
+              <div style={cardTitle}>
+                <Icon name="plug" size={14} style={{ color: 'var(--color-primary)' }} />
+                验证维度能力与环境探测（非门禁）
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {dimensionCaps.map((d: any) => (
+                  <div key={d.dimension} style={{ padding: 8, background: 'var(--color-bg)',
+                    borderRadius: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <Icon name={d.status === 'available' ? 'success' : 'evidence'} size={12}
+                        style={{ color: d.status === 'available' ? 'var(--green)' : 'var(--amber)' }} />
+                      <strong style={{ fontSize: 12 }}>{d.dimension}</strong>
+                      <span style={{ fontSize: 11, color: d.status === 'available' ? 'var(--green)' : 'var(--amber)' }}>
+                        {d.status === 'available' ? '环境具备' : '证据缺失（能力已接线，待环境真验）'}
+                      </span>
+                    </div>
+                    {d.note ? <div style={muted}>{d.note}</div> : null}
+                    {d.probe && Object.keys(d.probe).length > 0 ? (
+                      <details>
+                        <summary style={{ ...muted, cursor: 'pointer' }}>探测明细</summary>
+                        <pre style={{ ...mono, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                          margin: '4px 0 0' }}>{JSON.stringify(d.probe, null, 2)}</pre>
+                      </details>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {/* 4. Evidence Gap 列表 */}          {evidenceGaps.length > 0 ? (
             <div style={{ ...card, borderColor: 'var(--amber)' }}>
               <div style={cardTitle}>
                 <Icon name="evidence" size={14} style={{ color: 'var(--amber)' }} />

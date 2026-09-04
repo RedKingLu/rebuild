@@ -459,10 +459,23 @@ class P5VerificationService:
                     "risk_level": er.risk_level,
                     "blocked": er.blocked,
                     "project_type": commands.project_type,
-                    "stdout_tail": er.stdout[-500:] if er.stdout else "",
-                    "stderr_tail": er.stderr[-500:] if er.stderr else "",
+                    # R19-1（修 B4）：尾巴上限自 500 提到 4000（原 500 字符导致 NU1101/CS
+                    # 文本根本到不了报告），并附结构化诊断 + 执行环境 + 阶段明细。
+                    "stdout_tail": er.stdout,
+                    "stderr_tail": er.stderr,
+                    "diagnostics": er.diagnostics,
+                    "diagnostics_summary": er.diagnostics_summary,
+                    "stages": er.stages,
+                    "execution": er.execution,
+                    "execution_channel": commands.execution_channel,
+                    "toolchain_unavailable": er.toolchain_unavailable,
                 },
             )
+            # R19-1：完整构建日志落盘，报告里只放摘要+诊断，全文由 evidence_refs 引用。
+            log_ref = self._persist_build_log(project_id, er)
+            if log_ref:
+                vr.evidence_refs.append(log_ref)
+                vr.details["log_ref"] = log_ref
             if er.failure_reason:
                 vr.issues.append({"type": f"{er.slot_id}_failed",
                                   "detail": er.failure_reason})
@@ -472,5 +485,39 @@ class P5VerificationService:
             slot_results.append(vr)
 
         return slot_results
+
+    @staticmethod
+    def _persist_build_log(project_id: str, er) -> Optional[str]:
+        """把命令的完整 stdout/stderr 落盘（过 D-032 脱敏），返回工作区相对路径。
+
+        经 WorkspaceMediator 单一写闸（D-099⑥），不绕过。写失败只告警不阻断（公理 3：
+        发声；日志是补充证据，不能因为写日志失败就把真实构建结论丢掉）。
+        """
+        if not er.executed and not er.stderr:
+            return None
+        try:
+            from datetime import datetime, timezone
+            from app.services.workspace_mediator import WorkspaceMediator
+            from app.services.workspace_service import workspace_path
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            slot_slug = str(er.slot_id).replace(":", "__").replace("/", "__")
+            rel = f"artifacts/p5/build/{slot_slug}-{ts}.log"
+            body = [f"# slot: {er.slot_id}", f"# command: {er.command}",
+                    f"# exit_code: {er.exit_code}", f"# elapsed_ms: {er.elapsed_ms}",
+                    f"# execution: {er.execution}", ""]
+            for st in (er.stages or []):
+                body += [f"===== stage {st.get('stage')} (exit={st.get('exit_code')}) =====",
+                         f"$ {st.get('command')}", st.get("stdout_tail") or "",
+                         st.get("stderr_tail") or ""]
+            if not er.stages:
+                body += ["===== stdout =====", er.stdout, "===== stderr =====", er.stderr]
+            mediator = WorkspaceMediator(str(workspace_path(project_id)))
+            target, _risk = mediator.check_write(rel)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("\n".join(body), encoding="utf-8")
+            return rel
+        except Exception as e:
+            logger.warning("P5 构建日志落盘失败（非阻断，构建结论不受影响）：%s", e, exc_info=True)
+            return None
 
 

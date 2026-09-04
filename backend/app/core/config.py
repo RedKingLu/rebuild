@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     # 端口标准：community-backend 8001（见 06-容器化部署与执行隔离规范 §1.1）。
     community_base_url: str = "http://localhost:8001"
 
+    # R19-1 G1 工具链容器构建（toolchain_build 档）。**不新增任何服务端口**（AGENTS §10-19）。
+    # toolchain_container_enabled：宿主无对应 SDK 时是否允许走工具链容器通道产真实构建事实。
+    #   关掉 = 回到"诚实 needs_user_input"的旧行为（kill switch，便于排障与离线环境）。
+    # toolchain_cache_dir：包缓存目录（跨轮复用）。**不复用宿主 ~/.nuget**（可能带私有源凭据）。
+    # toolchain_build_timeout_s：单个构建阶段（restore / build）的超时上限。
+    toolchain_container_enabled: bool = True
+    toolchain_cache_dir: str = "/home/king/rebuild/backend/.data/toolchain-cache"
+    toolchain_build_timeout_s: int = 900
+
     # R7 GitHub OAuth
     # redirect_uri 必须与 GitHub OAuth App 注册的回调一致，且在 dev/容器两套拓扑下不变：
     # 后端统一监听 8000 → 注册一次即可两套通用（端口标准见 06-容器化部署与执行隔离规范 §1.1）。

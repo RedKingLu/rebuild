@@ -118,8 +118,16 @@ class P5CapabilityService:
 
     # ── 维度探测（每个维度：能力已接线 + 环境探测 → available / evidence_gap）─
 
-    def probe_dotnet_build(self) -> DimensionCapability:
-        """GAP-P5-3：.NET build/test/static。SDK 在则条件槽走真实命令；不在则诚实待环境真验。"""
+    def probe_dotnet_build(self, project_id: Optional[str] = None) -> DimensionCapability:
+        """GAP-P5-3 / R19-1-04：.NET build/test/static 的**三态**探测。
+
+        三态（任何一态都不产 available 之外的乐观结论）：
+          ① 宿主有 dotnet SDK                                → available（旧行为，不变）
+          ② 宿主无 SDK，但工具链容器通道可用（Docker 可达 + 官方 SDK 镜像已在本地 +
+             构建对象已发现 + 目标框架有映射）                → available（记 image_ref + digest）
+          ③ 其余（Docker 不可达 / 镜像不在本地 / 无映射 / 无构建对象） → evidence_gap
+             并写明**具体原因**与预热命令提示，**绝不伪造 available**（D-097 / §10-20）。
+        """
         sdk = self._has_dotnet_sdk()
         cap = DimensionCapability(dimension="dotnet_build", sub_skill="")
         if sdk:
@@ -128,13 +136,49 @@ class P5CapabilityService:
             cap.probe = {"dotnet_sdk": "present"}
             cap.note = ("dotnet SDK 已就位：build/test/static 由条件槽 SDK-aware 命令补全经 "
                         "ExecutionProvider 真实执行产退出码事实。")
-        else:
-            cap.status = CAP_EVIDENCE_GAP
-            cap.probe = {"dotnet_sdk": "absent"}
-            cap.note = ("本地无 dotnet SDK：.NET build/test/static 能力已接线（条件槽 SDK-aware "
-                        "命令补全 + 可绑定远程执行主机），待具备 SDK / 远程主机的环境真验；"
-                        "当前诚实标 evidence_gap，非阻断、不伪造通过。")
+            return cap
+
+        # ── 宿主无 SDK → 探工具链容器通道（R19-1 新增按需拉取通道）──────────
+        probe: dict = {"dotnet_sdk": "absent"}
+        channel = self._probe_toolchain_container(project_id)
+        probe.update({f"toolchain_{k}": v for k, v in (channel.get("probe") or {}).items()})
+        probe["toolchain_container"] = "available" if channel.get("available") else "unavailable"
+        if channel.get("image_ref"):
+            probe["toolchain_image_ref"] = channel["image_ref"]
+        cap.probe = probe
+
+        if channel.get("available"):
+            cap.environment_available = True
+            cap.status = CAP_AVAILABLE
+            cap.note = ("宿主无 dotnet SDK，但工具链容器通道可用："
+                        f"官方 SDK 镜像 {channel.get('image_ref')} 已在本地"
+                        f"（digest {(channel.get('probe') or {}).get('image_digest') or '未知'}）⇒ "
+                        "build/test/static 在隔离容器内真实执行产退出码与诊断事实。"
+                        "网络为该构建档如实标注的弱化项（未做 egress 白名单）。")
+            return cap
+
+        cap.status = CAP_EVIDENCE_GAP
+        cap.note = ("本地无 dotnet SDK，且工具链容器通道不可用："
+                    f"{channel.get('reason') or '原因未知'}。"
+                    ".NET build/test/static 能力已接线（工具链容器通道 + SDK-aware 命令补全 + "
+                    "可绑定远程执行主机），待具备 SDK / SDK 镜像 / 远程主机的环境真验；"
+                    "当前诚实标 evidence_gap，非阻断、不伪造通过。")
         return cap
+
+    def _probe_toolchain_container(self, project_id: Optional[str]) -> dict:
+        """工具链容器通道探测（只读，不拉镜像）。无 project_id ⇒ 无法解析项目事实，诚实不可用。"""
+        if not project_id:
+            return {"available": False,
+                    "reason": "未提供 project_id：无法从工程文件解析目标框架（不猜镜像）",
+                    "probe": {}}
+        try:
+            from app.services.toolchain_resolver import probe_toolchain, DOTNET
+            from app.services.workspace_service import workspace_path
+            return probe_toolchain(workspace_path(project_id), DOTNET)
+        except Exception as e:
+            logger.warning("P5 capability: 工具链容器探测失败（非阻断）: %s", e, exc_info=True)
+            return {"available": False,
+                    "reason": f"工具链容器探测异常：{type(e).__name__}: {e}", "probe": {}}
 
     def probe_browser_qa(self) -> DimensionCapability:
         """浏览器 / E2E QA（P-browser-qa）：Playwright 真实走查 + 截图。"""
@@ -276,8 +320,9 @@ class P5CapabilityService:
                       "维度适用性由 P5 stage skill / LLM 判断，本工具只报能力与环境探测。"))
         fn = getattr(self, method)
         try:
-            # probe_dotnet_build / probe_browser_qa 不需 project_id
-            if method in ("probe_dotnet_build", "probe_browser_qa"):
+            # probe_browser_qa 不需 project_id；probe_dotnet_build 的 project_id 为选传
+            # （R19-1：解析目标框架 → 镜像映射需要工作区事实；无 project_id 时诚实不可用）。
+            if method == "probe_browser_qa":
                 return fn()
             return fn(project_id)
         except Exception as e:

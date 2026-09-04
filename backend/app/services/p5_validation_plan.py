@@ -323,6 +323,15 @@ def create_p5_validation_plan(project_id: str, run_id: str) -> P5ValidationPlan:
 # ── 序列化 ────────────────────────────────────────────────────────────────
 
 def slot_to_dict(slot: P5ValidationSlot) -> dict:
+    """R19-1（修 B4，最致命的一处）：旧实现**不序列化 `details`**。
+
+    `stdout_summary` / `stderr_summary` 两个字段虽然存在，却从来没有被任何写入方赋值
+    （verify 侧把输出放进 `slot.details["stdout_tail"]`）⇒ 真实的 NU1101 / CS 诊断文本
+    根本走不到 `artifacts/p5_validation_report.json`，也就到不了前端。
+    本轮补 `details` / `issues` / `artifacts` 序列化，并把 `stdout_summary`/`stderr_summary`
+    真实回填为 details 中的尾巴（不再是永远为 null 的死字段）。
+    """
+    details = slot.details or {}
     return {
         "slot_id": slot.slot_id,
         "slot_type": slot.slot_type,
@@ -332,9 +341,11 @@ def slot_to_dict(slot: P5ValidationSlot) -> dict:
         "command": slot.command,
         "command_available": slot.command_available,
         "exit_code": slot.exit_code,
-        "stdout_summary": slot.stdout_summary,
-        "stderr_summary": slot.stderr_summary,
-        "duration_ms": slot.duration_ms,
+        # 真实回填（旧实现恒 None）：来源 = 命令真实 stdout/stderr 尾巴
+        "stdout_summary": slot.stdout_summary or details.get("stdout_tail") or None,
+        "stderr_summary": slot.stderr_summary or details.get("stderr_tail") or None,
+        "duration_ms": slot.duration_ms if slot.duration_ms is not None
+                       else details.get("elapsed_ms"),
         "failure_reason": slot.failure_reason,
         "evidence_gap_reason": slot.evidence_gap_reason,
         "needs_user_input_prompt": slot.needs_user_input_prompt,
@@ -342,6 +353,11 @@ def slot_to_dict(slot: P5ValidationSlot) -> dict:
         "gate_id": slot.gate_id,
         "superseded_by": slot.superseded_by,
         "not_applicable_reason": slot.not_applicable_reason,
+        # R19-1（修 B4）：验证详情必须出到报告——含 diagnostics / diagnostics_summary /
+        # stages / execution（镜像引用+digest / 挂载清单 / 硬化档自述）/ log_ref。
+        "details": details,
+        "issues": slot.issues,
+        "artifacts": slot.artifacts,
     }
 
 
