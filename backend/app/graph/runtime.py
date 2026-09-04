@@ -26,14 +26,21 @@ from app.graph.graph import build_graph
 class FlowRuntime:
     def __init__(self):
         self._compiled = None
+        self._saver = None
         self._lock = asyncio.Lock()
 
     async def _graph(self):
-        if self._compiled is None:
+        # R19-4：编译图把 checkpointer 编了进去并长期缓存。get_checkpointer() 现在会在
+        # 健康检查失败时重建单例（例如 checkpoints 表被删、连接已死），此时旧编译图仍握着
+        # 那条已弃用的 saver —— checkpoint 层"恢复"了而生产调用方仍不可用，即假恢复。
+        # 故每次取图都比对 saver 身份，换了就重新编译（健康时 get_checkpointer 只多一次
+        # 亚毫秒级探针查询，返回的是同一对象，不触发重编译）。
+        saver = await get_checkpointer()
+        if self._compiled is None or self._saver is not saver:
             async with self._lock:
-                if self._compiled is None:
-                    saver = await get_checkpointer()
+                if self._compiled is None or self._saver is not saver:
                     self._compiled = build_graph().compile(checkpointer=saver)
+                    self._saver = saver
         return self._compiled
 
     def capability_status(self) -> str:
