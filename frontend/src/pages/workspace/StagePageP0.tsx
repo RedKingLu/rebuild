@@ -2,6 +2,7 @@
  *  Data from workspace aggregate: project, active_run, traces, audits, file_index.
  */
 import { useState, useEffect } from 'react';
+import { Icon } from '../../components/ui/Icon';
 
 interface Props {
   projectId: string;
@@ -18,20 +19,40 @@ export function StagePageP0({ projectId, project, run, traces, audits, fileIndex
   const [sourceIndex, setSourceIndex] = useState<any>(null);
   // R9-5-8 T4: core artifacts + REAL existence from the backend (not hardcoded)
   const [coreArtifacts, setCoreArtifacts] = useState<{ name: string; label: string; exists: boolean }[]>([]);
+  // R19-3-03：旧版两个 fetch 均以 .catch(() => {}) 静默吞错（违反公理3「异常必须发声」），
+  // 且无 loading 态 —— 请求失败与"后端真的没有产物"在界面上完全同形。补 loading + error 双态。
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const stageStatus = run?.stage_status?.p0 || 'pending';
   const isChangesRequested = stageStatus === 'changes_requested';
   const isBlocked = stageStatus === 'blocked';
 
   useEffect(() => {
-    fetch(`/api/projects/${projectId}/source-index`)
-      .then(r => r.json())
-      .then(d => setSourceIndex(d?.data || d))
-      .catch(() => {});
-    fetch(`/api/projects/${projectId}/stage-artifacts/p0`)
-      .then(r => r.json())
-      .then(d => setCoreArtifacts((d?.data || d)?.artifacts || []))
-      .catch(() => {});
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const [siRes, caRes] = await Promise.all([
+          fetch(`/api/projects/${projectId}/source-index`),
+          fetch(`/api/projects/${projectId}/stage-artifacts/p0`),
+        ]);
+        if (cancelled) return;
+        if (!siRes.ok) throw new Error(`读取源码索引失败（HTTP ${siRes.status}）`);
+        if (!caRes.ok) throw new Error(`读取核心产物清单失败（HTTP ${caRes.status}）`);
+        const sd = await siRes.json();
+        const cd = await caRes.json();
+        if (cancelled) return;
+        setSourceIndex(sd?.data ?? sd);
+        setCoreArtifacts((cd?.data ?? cd)?.artifacts || []);
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
   }, [projectId]);
 
   // Count files from file_index
@@ -62,6 +83,17 @@ export function StagePageP0({ projectId, project, run, traces, audits, fileIndex
           border: '1px solid var(--red)', borderRadius: 6, fontSize: 12, color: 'var(--red)',
         }}>
           阶段已被拒绝。请查看 Gate 决策原因，联系管理员或重新执行。
+        </div>
+      )}
+
+      {error && (
+        <div style={{
+          padding: '10px 14px', marginBottom: 12, background: 'var(--red-soft, #ffebee)',
+          border: '1px solid var(--red)', borderRadius: 6, fontSize: 12, color: 'var(--red)',
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          <Icon name="error" size={14} />
+          <span>加载 P0 数据失败：{error}</span>
         </div>
       )}
 
@@ -104,7 +136,9 @@ export function StagePageP0({ projectId, project, run, traces, audits, fileIndex
                   <div>关键文件: {sourceIndex.key_files.length} 个</div>}
               </>
             )}
-            {!sourceIndex && <div style={{ color: 'var(--color-text-muted)', fontStyle: 'italic' }}>source_index 尚未生成（需要完成 materialize）</div>}
+            {!sourceIndex && loading && <div style={{ fontStyle: 'italic' }}>加载中…</div>}
+            {!sourceIndex && !loading && error && <div style={{ color: 'var(--red)' }}>加载失败，无法判断索引状态</div>}
+            {!sourceIndex && !loading && !error && <div style={{ color: 'var(--color-text-muted)', fontStyle: 'italic' }}>source_index 尚未生成（需要完成 materialize）</div>}
           </div>
         </div>
 
@@ -116,13 +150,16 @@ export function StagePageP0({ projectId, project, run, traces, audits, fileIndex
             <div style={{ marginTop: 6 }}>
               <div style={{ fontWeight: 600, marginBottom: 4 }}>核心产物:</div>
               {coreArtifacts.length === 0 ? (
-                <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>加载中…</div>
+                <div style={{ fontSize: 11, color: loading ? 'var(--color-text-muted)' : error ? 'var(--red)' : 'var(--color-text-muted)' }}>
+                  {loading ? '加载中…' : error ? '加载失败，产物清单不可用' : '暂无核心产物'}
+                </div>
               ) : coreArtifacts.map(a => (
                 <div key={a.name} style={{ fontSize: 11, fontFamily: 'monospace', marginBottom: 2,
                   display: 'flex', justifyContent: 'space-between', gap: 8 }}>
                   <span>artifacts/{a.name}</span>
-                  <span style={{ color: a.exists ? 'var(--green)' : 'var(--color-text-muted)' }}>
-                    {a.exists ? '✅' : '未生成'}
+                  <span style={{ color: a.exists ? 'var(--green)' : 'var(--color-text-muted)',
+                    display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    {a.exists ? <><Icon name="success" size={12} />已生成</> : '未生成'}
                   </span>
                 </div>
               ))}

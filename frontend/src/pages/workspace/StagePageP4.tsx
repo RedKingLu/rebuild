@@ -67,29 +67,42 @@ export function StagePageP4({ projectId, runId = '', stageStatus, onReExecute }:
     try {
       // Always read the real taskgraph (independent of model availability) → honest: empty
       // nodes, no fabrication when no run exists.
-      const tgReq = runId || stageStatus
-        ? fetch(`/api/projects/${projectId}/runs/${runId || ''}/stages/p4/taskgraph`)
+      // R19-3-03：旧条件为 `runId || stageStatus`，当 runId 为空而 stageStatus 有值时会请求
+      // /runs//stages/p4/taskgraph（run_id 段为空）→ 必然 404。taskgraph 端点无 runId 无法定位，
+      // 故仅在 runId 非空时才发起；runId 为空属"尚未起 run"的诚实空态，不请求、不报错。
+      const tgReq = runId
+        ? fetch(`/api/projects/${projectId}/runs/${runId}/stages/p4/taskgraph`)
         : Promise.resolve(null);
       const gateReq = fetch(`/api/projects/${projectId}/gates/active`);
       // WP-6 (EG-WP6-1): 拉取 P4 模型中断产物（artifacts/p4_model_error.json），驱动 ModelUnavailableBanner。
       const modelReq = fetch(`/api/projects/${projectId}/p4-summary`);
       const [tgRes, gateRes, modelRes] = await Promise.all([tgReq, gateReq, modelReq]);
       let tg = null;
-      if (tgRes && tgRes.ok) tg = (await tgRes.json()).data || (await tgRes.json());
+      if (tgRes && tgRes.ok) {
+        // 双 .json() 修复（R19-3-03 同型，P5 已修）：Response.body 是一次性流，
+        // 第二次 await .json() 必抛 'body stream already read'，异常被 catch 吞成整页加载失败。
+        const body = await tgRes.json();
+        tg = body?.data ?? body;
+      }
       setTg(tg);
       // C7 summary only exists AFTER a P4 execution ran; only fetch when a run is present
       // to avoid a 404 console error in the (honest) not-yet-executed case.
       if (tg && tg.graph_run_id) {
         const smRes = await fetch(
           `/api/projects/${projectId}/file?path=${encodeURIComponent('artifacts/p4/p4_execution_summary.json')}`);
-        if (smRes.ok) setSummary((await smRes.json()).data || (await smRes.json()));
+        if (smRes.ok) {
+          const body = await smRes.json();
+          setSummary(body?.data ?? body);
+        }
       }
       if (gateRes.ok) {
-        const g = (await gateRes.json()).data || (await gateRes.json());
+        const gBody = await gateRes.json();
+        const g = gBody?.data ?? gBody;
         setGate(g && g.gate_id ? g : null);
       }
       if (modelRes.ok) {
-        const md = (await modelRes.json()).data || (await modelRes.json());
+        const mdBody = await modelRes.json();
+        const md = mdBody?.data ?? mdBody;
         setModelUnavailable(md?.model_unavailable || null);
       }
     } catch (e: any) {

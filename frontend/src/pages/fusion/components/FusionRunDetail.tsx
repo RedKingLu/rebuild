@@ -2,6 +2,7 @@
  * 展示 Panel 对比、Judge JSON 五字段、Synthesizer 输出、参与者可用性、degraded/Key 无效状态。 */
 import type { FusionRun } from '../../../services/fusionService';
 import { FusionJudgeResult } from './FusionJudgeResult';
+import { Icon } from '../../../components/ui/Icon';
 
 const STATUS_STYLE: Record<string, { label: string; color: string; bg: string }> = {
   completed: { label: '完成', color: '#fff', bg: 'var(--green,#22c55e)' },
@@ -56,7 +57,7 @@ export function FusionRunDetail({ run }: { run: FusionRun | undefined }) {
             {(md.panel_outputs as Record<string, unknown>[]).map((p, i) => (
               <div key={i} className="card" style={{ padding: 10 }}>
                 <div className="sub" style={{ fontSize: 12, fontWeight: 600 }}>
-                  📝 {(p.perspective as string) || `模型 ${i + 1}`}
+                  <Icon name="docs" size={12} /> {(p.perspective as string) || `模型 ${i + 1}`}
                   <span className="tag" style={{ fontSize: 10, marginLeft: 6 }}>
                     {(p.provider_id as string) || ''}/{(p.model as string) || ''}
                   </span>
@@ -86,7 +87,7 @@ export function FusionRunDetail({ run }: { run: FusionRun | undefined }) {
       {/* Trace 链接 */}
       {run.trace_refs?.length > 0 && (
         <div className="sub" style={{ fontSize: 11 }}>
-          🔗 Trace 引用：{run.trace_refs.length} 条
+          <Icon name="trace" size={12} /> Trace 引用：{run.trace_refs.length} 条
         </div>
       )}
     </div>

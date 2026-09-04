@@ -219,7 +219,8 @@ export function StagePageP6({ projectId, runId = '', stageStatus: _stageStatus, 
               </div>
               <div style={{ textAlign: 'center', padding: 8, background: 'var(--color-bg)', borderRadius: 6 }}>
                 <div style={{ fontSize: 20, fontWeight: 700, color: desensitization.ok ? 'var(--green)' : 'var(--amber)' }}>
-                  {desensitization.ok ? '✓' : '⚠'}
+                  <Icon name={desensitization.ok ? 'success' : 'warning'} size={13}
+                        style={{ color: desensitization.ok ? 'var(--green)' : 'var(--amber)' }} />
                 </div>
                 <div style={muted}>脱敏扫描</div>
               </div>
@@ -246,7 +247,8 @@ export function StagePageP6({ projectId, runId = '', stageStatus: _stageStatus, 
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               {/* output_code */}
-              <div style={{ fontWeight: 600, fontSize: 12, marginTop: 4 }}>📁 output_code/</div>
+              <div style={{ fontWeight: 600, fontSize: 12, marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Icon name="files" size={13} />output_code/</div>
               {(manifest.output_code || []).map((f: any) => (
                 <div key={f.path} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px',
                   background: 'var(--color-bg)', borderRadius: 4, fontSize: 11 }}>
@@ -259,7 +261,8 @@ export function StagePageP6({ projectId, runId = '', stageStatus: _stageStatus, 
                   </button>
                 </div>
               ))}
-              <div style={{ fontWeight: 600, fontSize: 12, marginTop: 8 }}>📁 patches/</div>
+              <div style={{ fontWeight: 600, fontSize: 12, marginTop: 8, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Icon name="files" size={13} />patches/</div>
               {(manifest.patches || []).map((f: any) => (
                 <div key={f.path} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px',
                   background: 'var(--color-bg)', borderRadius: 4, fontSize: 11 }}>

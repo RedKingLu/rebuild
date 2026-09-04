@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Icon } from '../../components/ui/Icon';
 import { useNavigate } from 'react-router-dom';
 import { STAGE_LABELS } from '../../types';
 import type { Project } from '../../types';
@@ -148,7 +149,14 @@ export function ProjectListPage() {
               <div className="row" style={{ fontSize: 12, color: 'var(--ink-2)', gap: 12 }}>
                 <span>来源: {p.source_type}</span>
                 <span>阶段: {p.current_stage ? STAGE_LABELS[p.current_stage as keyof typeof STAGE_LABELS] || p.current_stage : '未开始'}</span>
-                <span>状态: {p.workspace_status === 'importing' ? '⏳ 导入中…' : p.workspace_status === 'ready' ? '✅ 已就绪' : p.workspace_status || '—'}</span>
+                {/* R19-3-04：workspace 状态标识改 Icon.tsx */}
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>状态:
+                  {p.workspace_status === 'importing'
+                    ? <><Icon name="refresh" size={12} style={{ color: 'var(--amber)' }} />导入中…</>
+                    : p.workspace_status === 'ready'
+                      ? <><Icon name="success" size={12} style={{ color: 'var(--green)' }} />已就绪</>
+                      : (p.workspace_status || '—')}
+                </span>
                 <span>缺口: {p.evidence_gap_count}</span>
                 <span>更新: {p.updated_at?.slice(0, 10)}</span>
                 {p.active_gate && <span className="tag amber">⚠ Gate: {p.active_gate}</span>}
@@ -156,7 +164,10 @@ export function ProjectListPage() {
             </div>
             {/* Right: actions */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-              {p.workspace_status === 'importing' && <span className="tag amber">⏳ 导入中</span>}
+              {p.workspace_status === 'importing' && (
+                <span className="tag amber" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <Icon name="refresh" size={12} />导入中</span>
+              )}
               {!p.onboarding_done && p.workspace_status === 'ready' && <span className="tag amber">待引导</span>}
               <button className="btn sm ghost" onClick={() => nav(`/projects/${p.project_id}`)}>详情</button>
               <button className="btn sm ghost" onClick={() => openEdit(p)}>编辑</button>

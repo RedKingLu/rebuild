@@ -173,7 +173,8 @@ export function PlatformAssistant() {
               ))}
             </select>
             <button className="btn sm ghost" onClick={runSelfTest} disabled={testing || !profileId} title="连通性自测">
-              {testing ? '⏳' : <Icon name="plug" size={15} />}
+              {/* R19-3-04：同一图标位不再半 emoji 半 Icon */}
+              <Icon name={testing ? 'refresh' : 'plug'} size={15} />
             </button>
           </div>
 

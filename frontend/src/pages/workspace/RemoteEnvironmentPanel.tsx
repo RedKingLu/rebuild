@@ -7,6 +7,7 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
+import { Icon } from '../../components/ui/Icon';
 import {
   listRemoteHosts, type RemoteHostInfo,
 } from '../../services/integrationService';
@@ -99,7 +100,10 @@ export function RemoteEnvironmentPanel({ projectId }: { projectId: string }) {
       {/* Detection result */}
       {detectResult && (
         <div className="card" style={{ padding: 8, marginBottom: 12 }}>
-          <b>环境探测 {detectResult.ok ? '✅' : '❌'}</b>
+          <b style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>环境探测
+            <Icon name={detectResult.ok ? 'success' : 'error'} size={14}
+                  style={{ color: detectResult.ok ? 'var(--green)' : 'var(--red)' }} />
+            {detectResult.ok ? '通过' : '失败'}</b>
           {detectResult.ok ? (
             <div style={{ marginTop: 4 }}>
               <div>OS: {detectResult.os || '未知'}</div>

@@ -4,6 +4,7 @@
  */
 import { useState, useEffect } from 'react';
 import { Modal } from '../ui/Modal';
+import { Icon } from '../ui/Icon';
 import { fetchEnvironment, updateEnvironment, updateMode, type EnvironmentProfile } from '../../services/workspaceService';
 import { fetchModelGatewayStatus, type ModelGatewayStatus, listProfiles, type ModelProfileInfo } from '../../services/modelService';
 import { listGitAccounts, listAccountRepos, listCodingAgents,
@@ -239,7 +240,9 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
                     borderRadius: 6, background: envKind === k ? 'var(--color-primary-soft)' : 'transparent',
                     cursor: 'pointer', fontSize: 13, fontWeight: envKind === k ? 600 : 400,
                   }}>
-                    {k === 'local' ? '🏠 本地环境' : '🌐 远程环境'}
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      <Icon name={k === 'local' ? 'workspace' : 'remote'} size={14} />
+                      {k === 'local' ? '本地环境' : '远程环境'}</span>
                   </button>
                 ))}
               </div>
@@ -317,13 +320,13 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
                 border: `2px solid ${submissionKind === 'remote_git' ? 'var(--color-primary)' : 'var(--color-border)'}`,
                 background: submissionKind === 'remote_git' ? 'var(--color-primary-soft)' : 'transparent',
                 fontWeight: submissionKind === 'remote_git' ? 600 : 400,
-              }}>🌐 远端 Git</button>
+              }}><Icon name="remote" size={14} /> 远端 Git</button>
               <button type="button" onClick={() => setSubmissionKind('local_git')} style={{
                 flex: 1, padding: '10px', borderRadius: 6, cursor: 'pointer', fontSize: 13,
                 border: `2px solid ${submissionKind === 'local_git' ? 'var(--color-primary)' : 'var(--color-border)'}`,
                 background: submissionKind === 'local_git' ? 'var(--color-primary-soft)' : 'transparent',
                 fontWeight: submissionKind === 'local_git' ? 600 : 400,
-              }}>🗂 本地 Git</button>
+              }}><Icon name="files" size={14} /> 本地 Git</button>
             </div>
 
             {submissionKind === 'remote_git' ? (

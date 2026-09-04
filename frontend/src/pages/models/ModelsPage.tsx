@@ -215,7 +215,12 @@ export function ModelsPage() {
                 {p.last_checked_at && <div className="sub" style={{ fontSize: 11, marginTop: 2 }}>最近自测：{p.last_checked_at}</div>}
                 {tr && (
                   <div style={{ marginTop: 6, fontSize: 12 }}>
-                    {tr.status === 'reachable' ? '✅ 已连通' : `❌ ${tr.status}`}
+                    {/* R19-3-04：连通性标记改 Icon.tsx（06 §2 颜色+中文文字双通道） */}
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4,
+                      color: tr.status === 'reachable' ? 'var(--green)' : 'var(--red)' }}>
+                      <Icon name={tr.status === 'reachable' ? 'success' : 'error'} size={13} />
+                      {tr.status === 'reachable' ? '已连通' : tr.status}
+                    </span>
                     {tr.latency_ms > 0 && ` · ${tr.latency_ms}ms`}
                     {tr.error_message && <span className="err"> · {tr.error_message}</span>}
                   </div>

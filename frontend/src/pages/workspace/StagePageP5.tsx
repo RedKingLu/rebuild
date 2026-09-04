@@ -76,9 +76,16 @@ export function StagePageP5({ projectId, runId = '', stageStatus: _stageStatus, 
       const gateRes = fetch(`/api/projects/${projectId}/gates/active`);
 
       const [idx, g] = await Promise.all([idxRes, gateRes]);
-      if (idx && idx.ok) setP5Input((await idx.json()).data || (await idx.json()));
+      // R19-3-03：Response.json() 只能读一次。旧版写成 `(await r.json()).data || (await r.json())`,
+      // 当后端返回无 data 字段的裸对象时，第二次 json() 因 body 已消费而抛
+      // "body stream already read"，整页被 catch 吞成加载失败。改为读一次再取字段。
+      if (idx && idx.ok) {
+        const pd = await idx.json();
+        setP5Input(pd?.data ?? pd);
+      }
       if (g.ok) {
-        const gd = (await g.json()).data || (await g.json());
+        const gj = await g.json();
+        const gd = gj?.data ?? gj;
         setGate(gd && gd.gate_id ? gd : null);
       }
     } catch (e: any) {

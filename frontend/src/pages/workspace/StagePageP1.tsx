@@ -4,6 +4,7 @@
  *  (PROFILING_ITEMS single source + uncertainty_manifest), not a hardcoded list.
  */
 import { useState, useEffect } from 'react';
+import { Icon } from '../../components/ui/Icon';
 
 interface Props {
   projectId: string;
@@ -151,7 +152,10 @@ export function StagePageP1({ projectId, stageStatus, onReExecute }: Props) {
                   color: item.exists ? 'var(--green)' : 'var(--color-text-muted)',
                   fontWeight: item.exists ? 600 : 400,
                 }}>
-                  {item.exists ? '✅' : '待识别'}
+                  {item.exists
+                    ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--green)' }}>
+                        <Icon name="success" size={12} />已识别</span>
+                    : '待识别'}
                 </span>
               </div>
             ))}

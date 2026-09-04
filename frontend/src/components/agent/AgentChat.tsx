@@ -8,6 +8,7 @@ import { decideGate } from '../../services/gateService';
 import { getConversationMessages, type Conversation } from '../../services/conversationService';
 import { fetchFileContent } from '../../services/workspaceService';
 import { TaskOverview, type TaskOverviewStatus } from './TaskOverview';
+import { Icon } from '../ui/Icon';
 
 /** R9-5-7 T12: a controlled action parked behind a real action_approval Gate,
  *  surfaced by the backend `gate.request` SSE event. */
@@ -368,7 +369,9 @@ export function AgentChat({ projectId, stage, reviewEvents, systemMessages = [],
       borderLeft: `3px solid ${live ? 'var(--color-primary)' : 'var(--amber)'}`,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px' }}>
-        <span>{live ? '🔄' : '🔧'}</span>
+        {/* R19-3-04：工具调用状态图标改 Icon.tsx（原 emoji 当功能图标） */}
+        <Icon name={live ? 'run' : 'settings'} size={13}
+              style={{ color: live ? 'var(--color-primary)' : 'var(--amber)' }} />
         <code style={{ fontSize: 11, fontWeight: 600 }}>{t.tool}</code>
         <span style={{ fontSize: 10, color: 'var(--color-text-muted)', marginLeft: 'auto' }}>工具调用</span>
       </div>
@@ -425,7 +428,9 @@ export function AgentChat({ projectId, stage, reviewEvents, systemMessages = [],
                                    sm.ok === false ? 'var(--red)' : 'var(--color-primary)'}`,
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span>{sm.phase === 'complete' ? '✅' : sm.ok === false ? '❌' : '🔄'}</span>
+              {/* R19-3-04：阶段进度状态图标改 Icon.tsx */}
+              <Icon name={sm.phase === 'complete' ? 'success' : sm.ok === false ? 'error' : 'run'} size={13}
+                    style={{ color: sm.phase === 'complete' ? 'var(--green)' : sm.ok === false ? 'var(--red)' : 'var(--color-primary)' }} />
               <span style={{ fontWeight: 600 }}>{sm.message}</span>
             </div>
             <div style={{ fontSize: 10, color: 'var(--color-text-muted)', marginTop: 2 }}>
@@ -442,7 +447,8 @@ export function AgentChat({ projectId, stage, reviewEvents, systemMessages = [],
             background: 'var(--amber-soft, #fff8e1)',
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px' }}>
-              <span>📋</span>
+              {/* R19-3-04：返工要求区块图标改 Icon.tsx */}
+              <Icon name="audit" size={13} style={{ color: 'var(--amber)' }} />
               <span style={{ fontWeight: 600, color: 'var(--amber-text, #8d6e00)' }}>
                 返工要求（{reworkNotes.length} 次决策反馈）
               </span>

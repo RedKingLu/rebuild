@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { Icon } from '../../components/ui/Icon';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { createProject } from '../../services/projectService';
 import {
@@ -134,7 +135,12 @@ export function ProjectCreatePage() {
       <div>
         <h1>新建项目</h1>
         <div className="card" style={{ textAlign: 'center', padding: 32 }}>
-          <h2>{isReady ? '✅ 已就绪' : '⏳ 源码导入中…'}</h2>
+          {/* R19-3-04：就绪状态标识改 Icon.tsx */}
+          <h2 style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <Icon name={isReady ? 'success' : 'refresh'} size={18}
+                  style={{ color: isReady ? 'var(--green)' : 'var(--amber)' }} />
+            {isReady ? '已就绪' : '源码导入中…'}
+          </h2>
           <div className="banner info" style={{ margin: '12px 0' }}>
             <b>Project ID: {createdId}</b>
             {!isReady && <div style={{ marginTop: 4, fontSize: 12 }}>状态: {wsStatus || 'importing'}</div>}
@@ -177,13 +183,13 @@ export function ProjectCreatePage() {
           <div className={`card statcard`} style={{
             cursor: 'pointer', borderColor: mode === 'zip' ? 'var(--accent-ink)' : 'var(--line)',
           }} onClick={() => setMode('zip')}>
-            <b>📦 ZIP 上传</b>
+            <b style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="import" size={14} />ZIP 上传</b>
             <div className="hash" style={{ marginTop: 4 }}>上传本地项目源码包</div>
           </div>
           <div className={`card statcard`} style={{
             cursor: 'pointer', borderColor: mode === 'git' ? 'var(--accent-ink)' : 'var(--line)',
           }} onClick={() => setMode('git')}>
-            <b>🔀 Git 仓库</b>
+            <b style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="git" size={14} />Git 仓库</b>
             <div className="hash" style={{ marginTop: 4 }}>从已绑定的 Git 账号选择仓库</div>
           </div>
         </div>

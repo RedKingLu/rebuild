@@ -341,7 +341,7 @@ export function OverviewPage() {
               knowledgeItems.map((k, i) => (
                 <div key={i} className="listrow">
                   <div className="row" style={{ flexWrap: 'nowrap' }}>
-                    <div className="ic">📄</div>
+                    <div className="ic">{/* R19-3-04 */}<Icon name="docs" size={18} /></div>
                     <div>
                       <div className="ttl">{k.name}</div>
                       <div className="meta">{k.desc}</div>

@@ -427,7 +427,11 @@ export function IntegrationsPage() {
                   {a.config?.model && <div className="meta" style={{ marginTop: 4, fontSize: 12 }}>模型: {a.config.model}</div>}
                   {tr && (
                     <div className="hash" style={{ marginTop: 6, fontSize: 12, color: tr.available ? 'var(--green)' : 'var(--red)' }}>
-                      {tr.available ? `✅ 可用 (${tr.agent_type})` : `❌ 不可用 — CLI 未安装或不在 PATH 中`}
+                      {/* R19-3-04：能力可用性标记改 Icon.tsx（06 §2 颜色+中文文字双通道） */}
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                        <Icon name={tr.available ? 'success' : 'error'} size={13} />
+                        {tr.available ? `可用 (${tr.agent_type})` : '不可用 — CLI 未安装或不在 PATH 中'}
+                      </span>
                     </div>
                   )}
                 </div>

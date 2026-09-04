@@ -15,6 +15,7 @@
  * fabricate a task list. */
 
 import { useState, useEffect } from 'react';
+import { Icon, type IconKey } from '../ui/Icon';
 
 interface GraphNode {
   node_id: string;
@@ -31,16 +32,18 @@ interface TaskGraphData {
   nodes: GraphNode[];
 }
 
-const NODE_STATUS_STYLE: Record<string, { icon: string; color: string; label: string }> = {
-  completed: { icon: '✅', color: 'var(--green)', label: '完成' },
-  running: { icon: '🔄', color: 'var(--color-primary)', label: '执行中' },
-  in_progress: { icon: '🔄', color: 'var(--color-primary)', label: '执行中' },
-  waiting_gate: { icon: '⏸', color: 'var(--amber)', label: '待决策' },
-  blocked: { icon: '✕', color: 'var(--red)', label: '阻塞' },
-  failed: { icon: '❌', color: 'var(--red)', label: '失败' },
-  rework_required: { icon: '↺', color: 'var(--amber)', label: '需返工' },
-  pending: { icon: '○', color: 'var(--color-text-muted)', label: '待执行' },
-  skipped: { icon: '–', color: 'var(--color-text-muted)', label: '跳过' },
+// R19-3-04：状态图标改用 Icon.tsx 线性图标（原为 emoji 当功能图标，违反 Skill §4.4-6）。
+// 键与 StagePageP4 的 NODE_STATUS_STYLE 保持一致，同一状态全站同一图标。
+const NODE_STATUS_STYLE: Record<string, { icon: IconKey; color: string; label: string }> = {
+  completed: { icon: 'success', color: 'var(--green)', label: '完成' },
+  running: { icon: 'run', color: 'var(--color-primary)', label: '执行中' },
+  in_progress: { icon: 'run', color: 'var(--color-primary)', label: '执行中' },
+  waiting_gate: { icon: 'gate', color: 'var(--amber)', label: '待决策' },
+  blocked: { icon: 'blocked', color: 'var(--red)', label: '阻塞' },
+  failed: { icon: 'error', color: 'var(--red)', label: '失败' },
+  rework_required: { icon: 'refresh', color: 'var(--amber)', label: '需返工' },
+  pending: { icon: 'future', color: 'var(--color-text-muted)', label: '待执行' },
+  skipped: { icon: 'future', color: 'var(--color-text-muted)', label: '跳过' },
 };
 
 export interface TaskOverviewStatus {
@@ -95,13 +98,14 @@ export function TaskOverview({ projectId, runId, stage, agentRole, latestRequest
   const isPlanPresentationPending = activeGate?.gate_type === 'plan_presentation' && activeGate?.gate_status === 'waiting_decision';
 
   const statusLine = () => {
-    if (isPlanPresentationPending) return { icon: '⏸', text: '等待计划审核', color: 'var(--amber)' };
+    // R19-3-04：实时状态行图标同样改 Icon.tsx（原 emoji）。
+    if (isPlanPresentationPending) return { icon: 'gate' as IconKey, text: '等待计划审核', color: 'var(--amber)' };
     switch (status.phase) {
-      case 'thinking': return { icon: '💭', text: '思考中…', color: 'var(--color-primary)' };
-      case 'tool': return { icon: '🔧', text: `调用工具 ${status.toolName || ''}${status.toolTotal ? ` (${status.toolIndex}/${status.toolTotal})` : ''}`, color: 'var(--color-primary)' };
-      case 'gate': return { icon: '⏸', text: '等待 Gate 决策…', color: 'var(--amber)' };
-      case 'done': return { icon: '✅', text: '本轮完成', color: 'var(--green)' };
-      default: return { icon: '○', text: '空闲', color: 'var(--color-text-muted)' };
+      case 'thinking': return { icon: 'agent' as IconKey, text: '思考中…', color: 'var(--color-primary)' };
+      case 'tool': return { icon: 'settings' as IconKey, text: `调用工具 ${status.toolName || ''}${status.toolTotal ? ` (${status.toolIndex}/${status.toolTotal})` : ''}`, color: 'var(--color-primary)' };
+      case 'gate': return { icon: 'gate' as IconKey, text: '等待 Gate 决策…', color: 'var(--amber)' };
+      case 'done': return { icon: 'success' as IconKey, text: '本轮完成', color: 'var(--green)' };
+      default: return { icon: 'future' as IconKey, text: '空闲', color: 'var(--color-text-muted)' };
     }
   };
   const st = statusLine();
@@ -133,7 +137,7 @@ export function TaskOverview({ projectId, runId, stage, agentRole, latestRequest
               const ns = NODE_STATUS_STYLE[n.status] || NODE_STATUS_STYLE.pending;
               return (
                 <div key={n.node_id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
-                  <span style={{ fontSize: 11, flexShrink: 0 }}>{ns.icon}</span>
+                  <Icon name={ns.icon} size={12} style={{ color: ns.color, flexShrink: 0 }} />
                   <span style={{
                     color: ns.color, fontWeight: n.status === 'running' || n.status === 'in_progress' ? 600 : 400,
                     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1,
@@ -163,7 +167,7 @@ export function TaskOverview({ projectId, runId, stage, agentRole, latestRequest
           {latestRequest || (isPlanPresentationPending ? `${(activeGate?.stage || stage).toUpperCase()} 计划审核中…` : (hasGraph ? '执行任务清单' : '暂无进行中的任务'))}
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0, fontSize: 11, color: st.color }}>
-          <span>{st.icon}</span><span>{st.text}</span>
+          <Icon name={st.icon} size={12} style={{ color: st.color }} /><span>{st.text}</span>
         </span>
       </div>
     </div>
