@@ -99,9 +99,13 @@ class P6CapabilityService:
         """出网能力：轻量 socket 连通探测（快、异常安全、可 mock）。不做任何鉴权/取值。
 
         仅探测"能不能出网"这一确定性事实；不访问任何第三方 license 源、不携带凭据。
+        探测目标来自 settings.network_probe_host/port（R19-3-05：原硬编码 1.1.1.1:53）。
         """
+        from app.core.config import settings
         try:
-            with socket.create_connection(("1.1.1.1", 53), timeout=timeout):
+            with socket.create_connection(
+                (settings.network_probe_host, settings.network_probe_port), timeout=timeout
+            ):
                 return True
         except Exception:
             # 公理3：探测失败发声但不阻断——无网络是诚实事实，降级为 evidence_gap。

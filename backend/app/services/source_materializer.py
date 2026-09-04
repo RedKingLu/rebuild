@@ -600,13 +600,56 @@ class SourceMaterializer:
                 log.warning("Git materialize: %s", msg)
 
     @staticmethod
+    def _git_uncommitted_changes(target: Path) -> tuple[list[str], list[str], str | None]:
+        """R19-3-02: inspect the working tree before any ``reset --hard``.
+
+        Returns (tracked_changes, untracked_files, error). ``tracked_changes`` are the
+        entries ``reset --hard`` would silently destroy (modified / staged / deleted /
+        renamed / unmerged); ``untracked_files`` are reported but survive a reset.
+        ``error`` is non-None when status could not be read at all — treated as
+        "assume dirty" by the caller (公理3: unknown state is not a green light).
+        """
+        import subprocess
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(target), "status", "--porcelain"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception as e:
+            return [], [], f"git status 无法读取: {str(e)[:200]}"
+        if proc.returncode != 0:
+            return [], [], f"git status exit {proc.returncode}: {(proc.stderr or '')[:200].strip()}"
+        tracked, untracked = [], []
+        for line in (proc.stdout or "").splitlines():
+            if not line.strip():
+                continue
+            code, _, path = line[:2], line[2:3], line[3:]
+            (untracked if code == "??" else tracked).append(path or line)
+        return tracked, untracked, None
+
+    @staticmethod
     def _git_fetch_reset(target: Path, branch: str) -> tuple[bool, str]:
         """Reconcile a drifted working tree via real ``git fetch`` + reset --hard.
 
         Uses the origin remote already stored in the clone (git resolves the
         stored URL itself; we never read .git/config). Returns (ok, detail).
+
+        R19-3-02: ``reset --hard`` is destructive — it discards uncommitted tracked
+        changes without asking. So the working tree is inspected FIRST; when there are
+        uncommitted tracked modifications (or status cannot be read at all) the reset is
+        REFUSED and (False, reason) is returned, which makes the caller fall back to a
+        full re-clone instead of silently wiping the user's edits mid-flight.
+        Untracked files are reported in the detail but do not block: ``reset --hard``
+        leaves them in place, whereas forcing a full re-clone would remove them.
         """
         import subprocess
+        tracked, untracked, status_err = SourceMaterializer._git_uncommitted_changes(target)
+        if status_err:
+            return False, f"reset 前未提交修改检查失败，拒绝 reset --hard（{status_err}）"
+        if tracked:
+            preview = ", ".join(tracked[:5]) + (f" 等 {len(tracked)} 项" if len(tracked) > 5 else "")
+            return False, (f"检测到 {len(tracked)} 项未提交修改，拒绝 reset --hard"
+                           f"（避免静默丢弃改动）：{preview}")
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo"}
         ref = branch or "HEAD"
         try:
@@ -622,7 +665,10 @@ class SourceMaterializer:
             )
             if reset.returncode != 0:
                 return False, f"git reset exit {reset.returncode}: {(reset.stderr or '')[:200].strip()}"
-            return True, "fetch+reset --hard FETCH_HEAD"
+            detail = "fetch+reset --hard FETCH_HEAD（工作树无未提交修改）"
+            if untracked:
+                detail += f"；保留 {len(untracked)} 个未跟踪文件"
+            return True, detail
         except subprocess.TimeoutExpired:
             return False, "git fetch/reset timed out"
         except FileNotFoundError:

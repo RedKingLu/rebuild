@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.mcp_server import MCPServer
 
 logger = logging.getLogger("rebuild.mcp_service")
@@ -122,7 +123,7 @@ class MCPService:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "rebuild", "version": "V26.1.1"},
+                    "clientInfo": {"name": "rebuild", "version": settings.app_version},
                 },
             }) + "\n"
 
@@ -216,7 +217,7 @@ class MCPService:
                     "params": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {},
-                        "clientInfo": {"name": "rebuild", "version": "V26.1.1"},
+                        "clientInfo": {"name": "rebuild", "version": settings.app_version},
                     },
                 }
                 try:
@@ -323,7 +324,7 @@ class MCPService:
             # Handshake: initialize
             await _send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                          "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                                    "clientInfo": {"name": "rebuild", "version": "V26.1.1"}}})
+                                    "clientInfo": {"name": "rebuild", "version": settings.app_version}}})
             init_resp = await _recv(1)
             if not init_resp.get("result"):
                 err = init_resp.get("error", {})

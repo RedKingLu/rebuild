@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     # Workspace root — per-project isolated directories (D-050)
     workspace_dir: str = "/home/king/rebuild/工作区"
 
+    # R19-3-05 硬编码收敛：对外声明的平台版本号单一来源（MCP clientInfo 等协议握手复用）。
+    # main.py / routes_health.py 的版本号属 FastAPI/health 合理声明，按验收口径不动。
+    app_version: str = "V26.1.1"
+
+    # R19-3-05 硬编码收敛：P6 出网能力探测目标（原硬编码 1.1.1.1:53）。
+    # 内网/离线部署可经 env 改指内部可达地址；仅做 TCP 连通探测，不携带凭据。
+    network_probe_host: str = "1.1.1.1"
+    network_probe_port: int = 53
+
     # R17-2 V-R17-1B-1/P1-4：当前建设阶段（单一事实源，供 /api/health 与 /api/version 输出）。
     # 随 R 阶段推进手动更新；未知时返 "unknown"（不硬编码过期值）。
     r_stage: str = "R17"

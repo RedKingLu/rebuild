@@ -18,6 +18,7 @@ as seed-driven tools so capability is not lost when Registry is empty.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import Optional
@@ -34,6 +35,9 @@ _WRITE_TOP_DIRS = ("output_code", "artifacts", "patches", "source")
 _EXT_THEN_JUNK_RE = re.compile(r"^(.*?\.[A-Za-z0-9]{1,10})\s*[（(、，。：:].*$")
 # 保留的合法路径段字符（ASCII 标识符 + . - _ 空格→_）。
 _ILLEGAL_SEG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# R19-3-01：阶段产物目录前缀（p0…p6）。模型常写 `p1/tech_stack.json` 而漏掉 `artifacts/`
+# 顶层；旧版一律前缀成 output_code/，导致真跑 output_code 里混入 p0/p1 的 json（非代码产物）。
+_STAGE_DIR_RE = re.compile(r"^p[0-6]$")
 
 
 def _sanitize_segment(seg: str) -> str:
@@ -43,6 +47,16 @@ def _sanitize_segment(seg: str) -> str:
     m = _EXT_THEN_JUNK_RE.match(seg)          # 截断扩展名后的中文描述
     if m:
         seg = m.group(1)
+    # R19-3-01：先把扩展名摘出来再清洗主干。旧版直接对整段 sub + strip("._-")，
+    # 主干为纯 CJK 时会被削成只剩扩展名的文件 —— 真跑产物里出现了名为 `cs` 的文件
+    # （`集成测试.cs` → `_.cs` → `cs`）。主干清空时用原名摘要兜底，避免同目录多个
+    # 中文名文件互相静默覆盖。
+    stem, dot, ext = seg.rpartition(".")
+    if dot and stem and re.fullmatch(r"[A-Za-z0-9]{1,10}", ext):
+        cleaned_stem = _ILLEGAL_SEG_RE.sub("_", stem).strip("._-")
+        if not cleaned_stem:
+            cleaned_stem = "file_" + hashlib.md5(stem.encode("utf-8")).hexdigest()[:8]
+        return f"{cleaned_stem}.{ext}"
     seg = _ILLEGAL_SEG_RE.sub("_", seg).strip("._-")   # 剔除 CJK/空格/标点
     return seg
 
@@ -888,9 +902,15 @@ async def _execute_workspace_write(tool_name: str, args: dict, project_id: str, 
 
     first = rel.replace("\\", "/").split("/", 1)[0]
     if first not in ("output_code", "artifacts", "patches", "source"):
-        # Canonicalize bare/unknown paths into the new-code write area (source stays source/
-        # so the D-099① read-only rejection below still fires).
-        rel = f"output_code/{rel}"
+        if _STAGE_DIR_RE.match(first):
+            # R19-3-01：`p0/…` `p1/…` 是阶段产物（报告/清单 json），不是迁移代码。
+            # 旧版一律前缀 output_code/，真跑后 output_code 顶层混入 p0/ 与 p1/ 的 json。
+            # 按阶段目录形态归到 artifacts/，output_code/ 只留代码。
+            rel = f"artifacts/{rel}"
+        else:
+            # Canonicalize bare/unknown paths into the new-code write area (source stays source/
+            # so the D-099① read-only rejection below still fires).
+            rel = f"output_code/{rel}"
 
     # D-114 文件名清洗（治"中文描述污染文件名"）：模型常把描述写进 path（如
     # `output_code/x/MicroDBHelper.cs（QueryExcel 方法）` 或 `.../JS、Layui 面板）`），
