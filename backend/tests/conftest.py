@@ -4,10 +4,55 @@ import pytest
 import tempfile
 import os
 import asyncio
+import logging
 
 from app.core.config import Settings
 from app.dependencies import clear_services_cache, get_services
 from app.core.database import _engine, _SessionLocal
+
+
+# B-R19-CAPLOG-ALEMBIC：本项目 logger 命名空间根。`rebuild.*` 是服务层 logger 前缀
+# （logging.getLogger("rebuild.xxx")），`app.*` 是按模块名取的 logger（__name__）。
+_PROJECT_LOGGER_ROOTS = ("rebuild", "app")
+
+
+@pytest.fixture(autouse=True)
+def _reenable_project_loggers():
+    """B-R19-CAPLOG-ALEMBIC：每例前把本项目 logger 复位为「可发声」，让 caplog 断言稳定。
+
+    根因：`alembic/env.py:14` 的 `fileConfig(config.config_file_name)` 默认
+    `disable_existing_loggers=True`，会把**此前已导入**的 logger 全部置
+    `disabled=True`。因此任一迁移相关用例先跑过之后，项目 logger 就被禁言，后面用
+    `caplog` 断日志的用例抓不到任何 record —— 单跑通过、全量套件失败。
+    而 `caplog.at_level()` / `set_level()` **只调整级别**，既不会把 `disabled=True`
+    改回来，也不修 `propagate`，所以它救不了这个坑。
+
+    同一个坑已咬两次（`B-R17.2-SSE-TEST-LEAK` → `test_r17_2_sse_events.py:95-100`
+    就地打补丁；`test_r18_3_hookimpl_drift.py` 的 4 个 caplog 用例又打了一次），
+    且触发条件（"某个迁移用例恰好先跑过"）对新测试作者完全不可见 —— 靠约定必然再犯，
+    故在此统一根治。
+
+    只复位「能不能发声」（`disabled` / `propagate`），**不设级别** —— 级别由各用例的
+    `caplog.at_level()` 自行决定；此处强设会掩盖那些本该断言特定级别的用例。
+    不改任何生产代码，不动 `alembic/env.py`（fileConfig 是 alembic 的正常用法）。
+    """
+    def _reset():
+        for name, lg in list(logging.Logger.manager.loggerDict.items()):
+            if not isinstance(lg, logging.Logger):
+                continue  # PlaceHolder 无这些属性
+            root = name.split(".", 1)[0]
+            if root in _PROJECT_LOGGER_ROOTS:
+                lg.disabled = False
+                lg.propagate = True
+        for root in _PROJECT_LOGGER_ROOTS:
+            lg = logging.getLogger(root)
+            lg.disabled = False
+            lg.propagate = True
+
+    _reset()
+    yield
+    # 用例过程中若又触发了 fileConfig（迁移类用例），下一例的 setup 会再复位；
+    # 这里不做清理，避免把用例自己刻意设置的 logger 状态改掉。
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +128,9 @@ def isolated_data():
     tmp = tempfile.mkdtemp(prefix="rebuild-test-")
     db_url = f"sqlite:///{tmp}/rebuild.db"
     ws_tmp = os.path.join(tmp, "workspace")
-    settings = Settings(data_dir=tmp, debug=True, database_url=db_url, workspace_dir=ws_tmp)
+    src_tmp = os.path.join(tmp, "source")
+    settings = Settings(data_dir=tmp, debug=True, database_url=db_url, workspace_dir=ws_tmp,
+                        source_dir=src_tmp)
     # workspace_service / trace_writer / audit_writer AND database.get_engine()
     # all read the GLOBAL settings singleton directly (not the injected one), so
     # every isolated field must be redirected on the global too — otherwise tests
@@ -94,13 +141,30 @@ def isolated_data():
     # it BEFORE get_services() so no service can construct a real-DB engine that
     # then gets cached in db_mod._engine and drops the real DB at drop_all.
     # object.__setattr__ bypasses the frozen Settings.
+    # REC-4 (R19-3): source_dir was NOT overridden here, so routes_upload /
+    # routes_imports wrote skill/resource/case stubs into the REAL repo source/
+    # tree on every pytest run (reproduced: source/cases/Test_Case_Import/,
+    # source/resources/Imported_Security_Guide/). Same failure shape as
+    # B-DB-ISOLATION-1 — redirect it on the global singleton too.
     import app.core.config as cfg
     _orig_ws = cfg.settings.workspace_dir
     _orig_db = cfg.settings.database_url
     _orig_data = cfg.settings.data_dir
+    _orig_src = cfg.settings.source_dir
     object.__setattr__(cfg.settings, "workspace_dir", ws_tmp)
     object.__setattr__(cfg.settings, "database_url", db_url)
     object.__setattr__(cfg.settings, "data_dir", tmp)
+    object.__setattr__(cfg.settings, "source_dir", src_tmp)
+    # REC-4 后续修正：source_dir 承担了两种互相冲突的职责 —— `source/cases|resources/`
+    # 是测试【写】的目标（必须隔离到 tmp），而 `source/skills/` 是测试【真实读】的内容。
+    # 而 skill_loader.py:106-109 的 skill 根目录派生自 settings.source_path，一旦把
+    # source_dir 整体指向 tmp，skill 读盘就落到不存在的 <tmp>/source/skills，
+    # 导致 test_load_skills_for_stage_disk_fallback 与
+    # TestP5SkillWiring::test_p5_skill_file_exists_and_has_frontmatter 失败（全量实测）。
+    # 修法：用 skill_loader 本就留好的 SKILL_SOURCE_ROOT 覆盖口，把【读】指回真实 skills 目录，
+    # 【写】仍隔离在 tmp。这样两种职责各归其位，不必在 Settings 上再切分字段。
+    _orig_skill_root = os.environ.get("SKILL_SOURCE_ROOT")
+    os.environ["SKILL_SOURCE_ROOT"] = os.path.join(_orig_src, "skills")
     clear_services_cache()
     svc = get_services(settings)
     # R9-3A: Drop + recreate tables to pick up new columns (SQLite create_all
@@ -159,6 +223,12 @@ def isolated_data():
     object.__setattr__(cfg.settings, "workspace_dir", _orig_ws)
     object.__setattr__(cfg.settings, "database_url", _orig_db)
     object.__setattr__(cfg.settings, "data_dir", _orig_data)
+    object.__setattr__(cfg.settings, "source_dir", _orig_src)
+    # 还原 SKILL_SOURCE_ROOT，避免泄漏到后续用例/进程
+    if _orig_skill_root is None:
+        os.environ.pop("SKILL_SOURCE_ROOT", None)
+    else:
+        os.environ["SKILL_SOURCE_ROOT"] = _orig_skill_root
     clear_services_cache()
     # Reset globals again so next test uses a fresh DB
     db_mod._engine = None

@@ -156,6 +156,18 @@ R176_MOCK_LLM=1 uv run pytest -q
 - **测行为，不测实现**：校验构造函数正确赋值这类测试没有价值。
 - **写不了测试就说明原因**：例如"数据库调用与业务逻辑高度耦合，难以隔离"——这本身是有用信息，不要默默跳过。
 
+### 用 `caplog` 断日志：conftest 已统一处理，你不用管
+
+用 `caplog` 断言日志内容的测试，曾多次出现**单跑通过、全量套件失败**。原因是 `alembic/env.py` 的
+`fileConfig(...)` 默认 `disable_existing_loggers=True`，任一迁移相关用例跑过之后，此前已导入的
+项目 logger 会被置 `disabled=True`，`caplog` 便再也抓不到任何 record；而 `caplog.at_level()`
+**只调整级别**，不会把 `disabled` 改回来、也不修 `propagate`，所以它救不了这个坑。
+
+`backend/tests/conftest.py` 已有 autouse 夹具 `_reenable_project_loggers`，每个用例前把
+`rebuild.*` 与 `app.*` 命名空间下的 logger 复位为可发声（`disabled=False` / `propagate=True`）。
+**因此你写新测试时无需自行复位**，照常用 `caplog.at_level(...)` 指定级别即可——级别仍由你的用例
+决定，夹具不碰级别。
+
 ---
 
 ## 7. 端到端测试（e2e）

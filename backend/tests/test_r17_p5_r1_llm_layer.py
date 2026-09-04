@@ -252,9 +252,14 @@ class TestP5SkillWiring:
         assert STAGE_PRIMARY_SKILL.get("p5") == "P-migration-verification"
 
     def test_p5_skill_file_exists_and_has_frontmatter(self):
-        from app.core.config import settings
         from pathlib import Path
-        skill = (Path(settings.source_dir) / "skills" / "p5"
+        # 本用例断言的是【仓库资产】存在性，与运行时配置无关，故从仓库根定位而非
+        # 经 settings.source_dir 派生：conftest 的 isolated_data 夹具会把 source_dir
+        # 重定向到 tmp（REC-4 隔离，防测试写污染真实 source/cases|resources/），
+        # 那样派生出的路径必然不存在，会把"仓库缺文件"与"配置被隔离"两件事混为一谈。
+        # backend/tests/<本文件> → parents[2] = 仓库根。
+        repo_root = Path(__file__).resolve().parents[2]
+        skill = (repo_root / "source" / "skills" / "p5"
                  / "P-migration-verification" / "SKILL.md")
         assert skill.exists(), f"P5 stage skill 缺失: {skill}"
         text = skill.read_text(encoding="utf-8")

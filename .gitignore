@@ -22,6 +22,7 @@ __pycache__/
 .venv/
 venv/
 *.egg
+.pytest_cache/
 
 # === Node ===
 node_modules/
