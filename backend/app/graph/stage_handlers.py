@@ -1494,11 +1494,17 @@ class RealP4Handler:
         acceptance_results = [{"node_id": nid, **((r or {}).get("acceptance") or {})}
                               for nid, r in eng.node_results.items()]
 
+        # R19-2 G2：P4 尾部统一做依赖真实性校验（Q-R19-2-3 用户裁决 A：handler 尾部统一查，
+        # 保证锚点必达）。只读查询公共 registry，暴露不修复（R19-2-03），不参与门禁——本调用
+        # 的成功/失败都不改变本 handler 的 status/graph_status/criteria_met。
+        dep_check_ref, dep_check_doc, dep_evidence_id = await self._run_dependency_check(
+            project_id, run_id)
+
         # C7: write a structured P4 execution-summary report (change manifest + patch index +
         # per-node results) — the primary readable review material attached to the P4→P5 Gate.
         summary_ref = self._write_execution_summary(
             project_id, tg, exec_nodes, eng, p4_ev, patch_refs,
-            node_type_dist, acceptance_results)
+            node_type_dist, acceptance_results, dep_check_doc=dep_check_doc)
 
         # graph_status → handler status：completed→completed；其余（failed/waiting_gate/blocked/
         # rework_required）→ blocked（诚实非 completed，交 StageLoop 升级 Gate / 准备 P4→P5 Gate）。
@@ -1507,7 +1513,8 @@ class RealP4Handler:
         # D-107（R17.5 P4/T4.2）：P4 完成时产出 artifacts/p4/_stage_package.json 完成包清单
         # （products 从真实落盘 refs 动态收集，供 P5 按需加载），对齐 P0-P3 的 _write_pN_package。
         if status == "completed":
-            self._write_p4_package(project_id, artifacts, patch_refs, summary_ref, eng, tg)
+            self._write_p4_package(project_id, artifacts, patch_refs, summary_ref, eng, tg,
+                                   dep_check_ref=dep_check_ref)
 
         # WP-6 (Q-R17.3-6-2): 若有 execution 节点因模型全失败中断 → 汇总首个模型错误链路到
         # 阶段级，供 WorkAgent/前端显式报错（不静默降级）。
@@ -1545,8 +1552,9 @@ class RealP4Handler:
             "model_error_category": _p4_cat,
             "model_user_actions": _p4_actions,
             "artifacts": artifacts + ([summary_ref] if summary_ref else [])
-                        + ([review_ref] if review_ref else []),
-            "evidence_refs": evidence_refs,
+                        + ([review_ref] if review_ref else [])
+                        + ([dep_check_ref] if dep_check_ref else []),
+            "evidence_refs": evidence_refs + ([dep_evidence_id] if dep_evidence_id else []),
             "patch_refs": patch_refs,
             "code_source_map": code_source_map,
             "assembly_trace": assembly_trace,
@@ -1603,9 +1611,81 @@ class RealP4Handler:
                     ref, len(items))
         return ref
 
+    async def _run_dependency_check(self, project_id: str,
+                                    run_id: str) -> tuple[str | None, dict | None, str | None]:
+        """R19-2 G2 依赖真实性校验：P4 尾部统一对 output_code/ 下全部依赖清单向三类公共
+        registry（NuGet/npm/Maven）发起只读存在性/版本可解析性查询，产出独立主产物
+        artifacts/p4/p4_dependency_check.json + AET Evidence。
+
+        定位纪律（与 p5_capability_service 文件头红线同型）：本方法【不产 pass/通过 结论】，
+        【不参与门禁】——不读也不改 criteria_met/graph_status/status，失败即诚实降级为
+        (None, None, None)，绝不让依赖校验的异常影响 P4 本身的完成判定（R19-2-03：
+        暴露≠拦截）。
+
+        独立取证红线（§0.1）：本方法不 import 任何 p5_* 模块、不读
+        artifacts/p5_validation_report.json —— P4 的 registry 结论只能来自本次真实
+        HTTP 响应，不得读 P5 的 NU1101 反推（反之亦然，由 R19-1 P5 侧红线对称保证）。
+        """
+        try:
+            from app.services import dependency_registry_service as dep_svc
+            from app.services.workspace_service import workspace_path
+            doc = await dep_svc.run_dependency_check(project_id, workspace_path(project_id), run_id)
+        except Exception:
+            logger.warning("P4 依赖真实性校验执行失败（advisory，不影响 P4 完成判定）",
+                           exc_info=True)
+            return None, None, None
+        if doc is None:
+            # output_code/ 下无任何受支持依赖清单（非 .NET/npm/Maven 项目或纯测试夹具）——
+            # 没有可查的坐标，不产噪音产物/Evidence。
+            return None, None, None
+
+        ref = stage_artifact_ref("p4", "p4_dependency_check.json")
+        try:
+            _mediated_write(project_id, ref, json.dumps(doc, ensure_ascii=False, indent=2),
+                            auditor=self.auditor, stage="p4", action="write_dependency_check")
+        except Exception:
+            logger.warning("P4 依赖真实性校验产物写入失败（advisory）", exc_info=True)
+            return None, None, None
+
+        artifact_sha256 = hashlib.sha256(
+            json.dumps(doc, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        unresolvable_brief = [
+            f"{c['ecosystem']}:{c['id']}@{c['requested_version']} "
+            f"({c['registry_host']} {c['http_status']})"
+            for c in doc.get("coordinates", [])
+            if c.get("conclusion") in ("package_not_found", "version_not_found")
+        ]
+        counts = doc.get("counts", {})
+        evidence_id = f"ev-p4-depcheck-{(run_id or 'norun')[:8]}"
+        try:
+            aet = self._aet if self._aet is not None else self._services().aet_service
+            aet.write_evidence(
+                project_id,
+                evidence_id=evidence_id,
+                evidence_type="dependency_resolution",
+                status="candidate", source="p4", stage="p4",
+                claim=(f"P4 依赖真实性校验：{counts.get('coordinates', 0)} 个坐标中 "
+                      f"{counts.get('resolvable', 0)} 可解析、{counts.get('unresolvable', 0)} "
+                      f"不可解析、{counts.get('indeterminate', 0)} 不可判"),
+                extra={
+                    "run_id": run_id,  # 陷阱B：D-111 幽灵过滤要求 run_id 匹配，否则被静默剔除
+                    "artifact_ref": ref,
+                    "artifact_sha256": artifact_sha256,
+                    "counts": counts,
+                    "unresolvable_brief": unresolvable_brief,
+                    "evidence_basis": "real_registry_http_response",
+                    "evidence_gaps": doc.get("evidence_gaps", []),
+                })
+        except Exception:
+            logger.warning("P4 依赖真实性校验 Evidence 写入失败（advisory）", exc_info=True)
+            return ref, doc, None
+        logger.info("R19-2: wrote P4 dependency check %s (%d coordinates, %d unresolvable)",
+                    ref, counts.get("coordinates", 0), counts.get("unresolvable", 0))
+        return ref, doc, evidence_id
+
     def _write_execution_summary(self, project_id, tg, exec_nodes, eng, p4_evidence,
                                  patch_refs, node_type_dist,
-                                 acceptance_results) -> str | None:
+                                 acceptance_results, dep_check_doc: dict | None = None) -> str | None:
         """C7: persist a structured P4 execution summary to artifacts/p4/p4_execution_summary.json.
 
         Contains a change manifest (output_code files with real sha256/bytes), a patch index,
@@ -1707,6 +1787,33 @@ class RealP4Handler:
                 f"节点未完成（failed）：{node_map.get(nid, {}).get('title', nid)}")
         unresolved_scope.append(
             "build/run 未执行（本环境无 dotnet SDK）→ 待 P5/本地环境验证（R17.3-1 build_verified 条件槽，诚实 evidence_gap）")
+
+        # R19-2 G2：依赖真实性校验指针 + unresolved_scope 只读追加（不改变本函数早退语义、
+        # 不改变 P4 status/graph_status/criteria_met，§3.9.2）。主产物独立成文件
+        # artifacts/p4/p4_dependency_check.json（本函数只放指针+摘要，不放全量——早退时
+        # 该文件已在调用方独立写出，不受本函数早退影响）。
+        dependency_check_ptr = None
+        if dep_check_doc:
+            dc_counts = dep_check_doc.get("counts", {})
+            dc_unresolvable_brief = [
+                f"{c['ecosystem']}:{c['id']}@{c['requested_version']} "
+                f"({c['registry_host']} {c['http_status']})"
+                for c in dep_check_doc.get("coordinates", [])
+                if c.get("conclusion") in ("package_not_found", "version_not_found")
+            ]
+            dependency_check_ptr = {
+                "ref": stage_artifact_ref("p4", "p4_dependency_check.json"),
+                "status": dep_check_doc.get("status"),
+                "coordinates": dc_counts.get("coordinates", 0),
+                "resolvable": dc_counts.get("resolvable", 0),
+                "unresolvable": dc_counts.get("unresolvable", 0),
+                "indeterminate": dc_counts.get("indeterminate", 0),
+                "unresolvable_brief": dc_unresolvable_brief,
+            }
+            for brief in dc_unresolvable_brief:
+                unresolved_scope.append(
+                    f"依赖不可解析：{brief} → 待用户修复；平台只暴露不代改（R19-2-03）")
+
         _sec_hints = ("auth", "登录", "login", "密码", "password", "ldap", "权限",
                       "permission", "token", "会话", "session", "认证")
         security_notes = [
@@ -1738,6 +1845,8 @@ class RealP4Handler:
             "nodes": per_node,
             "evidence_refs": evidence_refs,
         }
+        if dependency_check_ptr:
+            summary["dependency_check"] = dependency_check_ptr
         out = out_dir / "p4_execution_summary.json"
         ref = _mediated_write(project_id, stage_artifact_ref("p4", out.name),
                               json.dumps(summary, ensure_ascii=False, indent=2),
@@ -1748,7 +1857,8 @@ class RealP4Handler:
         return ref
 
     def _write_p4_package(self, project_id: str, artifacts: list, patch_refs: list,
-                          summary_ref: str | None, eng, tg: dict) -> None:
+                          summary_ref: str | None, eng, tg: dict,
+                          dep_check_ref: str | None = None) -> None:
         """D-107（T4.2）：写 artifacts/p4/_stage_package.json（P4 完成包清单，供 P5 按需加载）。
 
         products 从真实落盘 refs 动态收集（execution_summary + output_code/ + patches/），非硬编码
@@ -1770,6 +1880,11 @@ class RealP4Handler:
         for ref in patches:
             products.append(product_entry(
                 ref, "patch", "迁移补丁/diff（真实落盘）", key_for_next=True))
+        if dep_check_ref:
+            products.append(product_entry(
+                dep_check_ref.split("/")[-1], "dependency_check",
+                "依赖真实性校验（三类 registry 只读查询结论，R19-2，只暴露不修复）",
+                key_for_next=False))
         try:
             write_stage_package(
                 project_id, "p4", products=products,

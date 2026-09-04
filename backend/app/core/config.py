@@ -59,6 +59,22 @@ class Settings(BaseSettings):
     toolchain_cache_dir: str = "/home/king/rebuild/backend/.data/toolchain-cache"
     toolchain_build_timeout_s: int = 900
 
+    # R19-2 G2 依赖真实性校验（dependency_registry_service.py）。只读查询公共 registry
+    # （nuget.org / npmjs.org / Maven Central），不新增服务端口，不新增第三方依赖。
+    # dependency_check_enabled：kill switch（关闭 = 结论一律 not_checked(skipped_by_config)，
+    #   P4 行为回到本轮施工前，运行期熔断不需要改代码，见方案 §3.18 回滚方案）。
+    # dependency_check_cache_ttl_s：只缓存确定结论（resolvable/package_not_found/
+    #   version_not_found）；indeterminate 一律不缓存（否则一次限流会被缓存并持续误报）。
+    # dependency_check_timeout_s：单次 HTTP 请求超时。
+    # dependency_check_budget_s：整轮依赖校验的墙钟总预算，超时未查完的坐标诚实
+    #   evidence_gap(budget_exhausted)，不默认通过。
+    # dependency_check_max_retries：429/5xx/超时类的最多重试次数（404 绝不重试）。
+    dependency_check_enabled: bool = True
+    dependency_check_cache_ttl_s: int = 900
+    dependency_check_timeout_s: float = 8.0
+    dependency_check_budget_s: float = 60.0
+    dependency_check_max_retries: int = 2
+
     # R7 GitHub OAuth
     # redirect_uri 必须与 GitHub OAuth App 注册的回调一致，且在 dev/容器两套拓扑下不变：
     # 后端统一监听 8000 → 注册一次即可两套通用（端口标准见 06-容器化部署与执行隔离规范 §1.1）。

@@ -334,6 +334,27 @@ _BUILTIN_SCHEMAS = [
         "_risk_level": "L2",
         "_write_scope": "none",
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "p4_dependency_facts",
+            "description": (
+                "读取本项目 P4 依赖真实性校验的【真实事实】（R19-2 G2）：output_code/ 下全部"
+                "依赖清单（csproj/packages.config/package.json/pom.xml）逐坐标向 NuGet/npm/"
+                "Maven 公共 registry 只读查询得到的存在性/版本可解析性结论——来源="
+                "已落盘的 artifacts/p4/p4_dependency_check.json（确定性只读查询产出，非模型"
+                "自报）。供你在迁移过程中提前自查依赖是否臆造（满足目标驱动，AGENTS §2.3）："
+                "但本工具【只报事实、不产\"通过\"结论、不改写清单、不推荐替代包】——"
+                "该换成什么包属你/用户的判断，不由本工具或其调用方决定；也不参与门禁，"
+                "不改 P4 的 criteria_met/status（暴露≠拦截，R19-2-03）。"
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+        "_source": "builtin",
+        "_tool_id": "builtin:p4_dependency_facts",
+        "_risk_level": "L0",
+        "_write_scope": "none",
+    },
 ]
 
 # Risk levels that require gate review (T2.3 / S3 note: full HITL接线→R9-5-7)
@@ -751,6 +772,32 @@ async def _execute_builtin(tool_name: str, args: dict, project_id: str, stage: s
         except Exception as e:
             logger.warning("p5_verify_dimension failed (non-blocking): %s", e, exc_info=True)
             return {"error": str(e)}
+    elif tool_name == "p4_dependency_facts":
+        # R19-2 G2：暴露 P4 依赖真实性校验的真实事实（读已落盘产物，只读 L0）。供 Agent 在
+        # 迁移过程中提前自查（AGENTS §2.3 目标驱动）；不得改写、不产通过结论、不参与门禁。
+        try:
+            from app.services.workspace_service import workspace_path
+            fp = workspace_path(project_id) / "artifacts" / "p4" / "p4_dependency_check.json"
+            if not fp.exists():
+                return {"available": False,
+                        "error": "P4 依赖真实性校验尚未执行（本项目暂无该产物）"}
+            import json as _json
+            doc = _json.loads(fp.read_text("utf-8", errors="replace"))
+            return {
+                "available": True,
+                "source": "artifacts/p4/p4_dependency_check.json (real registry HTTP response)",
+                "status": doc.get("status"),
+                "counts": doc.get("counts", {}),
+                "coordinates": doc.get("coordinates", []),
+                "evidence_gaps": doc.get("evidence_gaps", []),
+                "private_source_signals": doc.get("private_source_signals", []),
+                "boundary_note": doc.get("boundary_note", ""),
+                "note": ("以上为确定性 registry 查询铁证，只可解读，不可改写；"
+                         "本工具不产通过结论、不改 P4 的 criteria_met/status"),
+            }
+        except Exception as e:
+            logger.warning("p4_dependency_facts failed (non-blocking): %s", e, exc_info=True)
+            return {"available": False, "error": str(e)}
     if tool_name == "introduce_community_resource":
         from app.services.community_introduction import introduce
         from app.core.database import get_session
