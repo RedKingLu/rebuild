@@ -71,6 +71,15 @@ async def lifespan(app: FastAPI):
             import logging
             logging.getLogger("uvicorn").info(
                 f"R6 seed data: {counts}, model_catalog: {catalog_n}, eval: {eval_n}")
+        # B-R18-3: honest startup self-check on the REAL DB — can every registered hook row
+        # bind to a built-in implementation body? Hook rows live in the persistent DB while
+        # their bodies live in code, and seed_all never backfills existing rows, so a row
+        # written by an older seed can drift out of sync forever while tmp-DB tests (fresh
+        # seed each run) stay green — that is exactly how the D-032 write-time secret
+        # interception ended up inert on the real DB. Runs AFTER seed so a freshly seeded
+        # DB is judged on its final state. Non-fatal, never silent (公理3).
+        from app.services.hook_engine import verify_security_hooks_on_startup
+        verify_security_hooks_on_startup(db)
     finally:
         db.close()
     get_services(settings)
