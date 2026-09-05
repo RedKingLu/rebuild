@@ -257,3 +257,7 @@ app.include_router(eval_router, prefix="/api")
 # R15-4-C11: OfficialSource empty seam (returns not_connected; no real API)
 from app.api.routes_official_sources import official_router
 app.include_router(official_router, prefix="/api")
+
+# R20-3: 场景包只读 API（场景包发现来自文件系统，无 DB 注册；写操作走文件系统）
+from app.api.routes_scenarios import router as scenarios_router
+app.include_router(scenarios_router, prefix="/api")

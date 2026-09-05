@@ -1,0 +1,7 @@
+# 兜底场景包元数据。刻意不声明 tier —— 兜底包不是"典型场景"，tier 按 open 处理。
+display_name: 通用重构（无专用场景知识）
+summary: 兜底场景包 —— 只提供与场景无关的通用重构方法论，不预设任何目标技术栈
+selection_candidates: []
+related_skills:
+  - P-coding-standards
+related_resources: []
