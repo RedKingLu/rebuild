@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/architecture-decision-records (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-architecture-decision-records（架构决策记录 ADR）
 
@@ -47,7 +48,7 @@ metadata:
 - 编号唯一、索引同步、状态（提议 / 已接受 / 已废弃）准确。
 - 重大不可逆决策的 ADR 经用户 Gate 确认后方为「已接受」。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 
 - 选库 ADR 必须比对兼容模式：达梦 DM 的 Oracle 兼容模式 vs openGauss/GaussDB 的 A 兼容模式，对 PL/SQL、存储过程、函数改写量的影响要量化进后果段。
 - 中间件替换 ADR（WebLogic→东方通 / WebSphere→宝兰德）须记录 JDK 版本、数据源、JMS、类加载差异带来的改造范围。

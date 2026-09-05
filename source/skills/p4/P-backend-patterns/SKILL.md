@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/backend-patterns (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-backend-patterns（迁移后后端架构模式）
 
@@ -43,7 +44,7 @@ metadata:
 - 连接池配置不超目标 DB 限制，压测无连接耗尽。
 - 缓存有明确失效策略，无脏读越界。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 信创 DB 优化器与索引策略和 Oracle/MSSQL 不同：旧库高效的 SQL 在达梦/GaussDB 可能走全表扫，必须以目标库真实执行计划为准重新优化。
 - 国产 DB 驱动的连接池/超时/隔离级别默认值与原生不同，需显式配置并压测验证。
 - 分页（`ROWNUM` vs `LIMIT/OFFSET`）、空串/NULL、大小写折叠差异会改变查询结果与计划，repository 层须适配。

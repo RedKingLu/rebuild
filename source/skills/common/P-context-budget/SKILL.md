@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/context-budget (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-context-budget（上下文预算控制）
 
@@ -42,7 +43,7 @@ metadata:
 - 每条裁剪建议附影响评估，不盲目压缩。
 - 审计后上下文低于配置预算上限，或给出无法达成时的明确说明。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 遗留代码体量大（.NET/Java/Oracle/MSSQL 工程动辄数十万行），整库内联必爆预算——须按文件/符号按需检索。
 - 迁移规范与映射表（SQL 方言映射、API 兼容矩阵）属 sometimes-needed，按当前任务分片加载。
 - 多 Agent 交接信息（P0→P6）须保留关键决策摘要，丢弃逐字历史。

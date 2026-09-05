@@ -9,6 +9,7 @@ metadata:
   source: rebuild_self
   license: rebuild-internal
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-tech-selection（技术路线选型红线）
 

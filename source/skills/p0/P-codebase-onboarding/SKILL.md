@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/codebase-onboarding (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-codebase-onboarding（代码仓接入与初识）
 
@@ -48,7 +49,7 @@ metadata:
 - 「未知项清单」非空即合格信号——空清单往往意味着臆测，需复核。
 - 未对源仓库做任何写操作（git 工作区干净）。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 
 - .NET Framework 4.x 与 .NET Core/5+ 接入判断截然不同：前者大概率需重写（System.Web / WCF / WebForms 在麒麟 / 统信上不可用），后者多为适配。务必区分。
 - Oracle/MSSQL 连接串、专有驱动（System.Data.OracleClient、Oracle.DataAccess）须标记为「目标栈需替换为达梦 DM / openGauss / GaussDB 驱动」。

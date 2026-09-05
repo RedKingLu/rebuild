@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/dynamic-workflow-mode (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-dynamic-workflow-mode（动态执行模式与控制面规划）
 
@@ -43,7 +44,7 @@ metadata:
 - checkpoint 与平台 run-state 一一映射，支持暂停/恢复。
 - 模式切换条件可判定（有阈值或明确信号），非主观。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 触及生产 Oracle/MSSQL 源库或目标 达梦/GaussDB 写入的批次一律 Manual + Gate，禁止 Auto。
 - 涉及麒麟/统信 OS 上中间件（东方通/宝兰德）重配置、服务重启的动作通常 ≥L4，强制 Plan/Manual。
 - 纯只读评估、确定性方言转换可 Auto，提升吞吐。

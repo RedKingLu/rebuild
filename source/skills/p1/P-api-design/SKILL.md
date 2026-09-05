@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/api-design (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-api-design（API 契约分析与设计）
 
@@ -47,7 +48,7 @@ metadata:
 - P4 目标设计通过 REST 规范自检（命名 / 方法 / 状态码 / 错误体 / 版本一致）。
 - 契约差异对照可追溯到具体接口。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 
 - WCF / .asmx (SOAP) 在 .NET Core 与国产中间件上无对等实现，须规划改为 REST/gRPC，契约语义须 1:1 映射，P1 即记录原 WSDL 语义。
 - 接口若直接拼 Oracle/MSSQL 方言 SQL 或返回数据库专有类型（如 Oracle DATE 精度），迁移到达梦 DM / openGauss / GaussDB 后行为可能变化，须在契约档案中标注数据类型与精度约定。

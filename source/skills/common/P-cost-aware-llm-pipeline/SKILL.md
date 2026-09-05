@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/cost-aware-llm-pipeline (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-cost-aware-llm-pipeline（成本感知模型流水线）
 
@@ -43,7 +44,7 @@ metadata:
 - 仅瞬时错误重试，逻辑错误不重试。
 - 预算超限不静默继续，须经 Gate。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 批量 SQL 方言转换、注释/日志翻译等机械任务优先低档模型，留强模型给存储过程/触发器等复杂语义改写。
 - 国产栈兼容性判断（达梦/openGauss/GaussDB 特性差异）属高复杂度，不降档。
 - 内网/离线部署若模型可用档位有限，路由策略据实调整并声明约束。

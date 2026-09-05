@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/fastapi-patterns (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-fastapi-patterns（FastAPI 施工模式）
 
@@ -45,7 +46,7 @@ P4 执行阶段。**仅当**迁移目标技术栈明确选定 Python/FastAPI 时
 - 无明文密钥/连接串，密钥经环境或密钥管理注入
 - pytest 全绿，覆盖核心业务路径
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 达梦/openGauss 与 PostgreSQL 在 SQL 方言、分页、序列、大小写、字符集上有差异，repository 层 SQL 需按目标 DB 适配，不能照搬源 MSSQL/Oracle。
 - 部署目标为麒麟 on-prem，须确认目标 OS 上 Python 版本与 C 扩展（dmPython 等）可编译安装，离线环境需预置 wheel。
 - 源系统事务隔离级别与锁行为须在目标 DB 复现，避免迁移后并发语义偏移。

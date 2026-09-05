@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/canary-watch (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-canary-watch（灰度观测）
 
@@ -44,7 +45,7 @@ metadata:
 - 回滚建议附触发条件命中证据，未经用户 Gate 不得执行回滚。
 - 阈值来源于 P5 基线且被引用，而非本阶段临时设定。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 内网受限：多数项目无公网探针、无第三方监控 SaaS，监控指标据实采集，缺失即标缺失。
 - 国产栈健康项：达梦/openGauss/GaussDB 连接池存活、国产中间件（如东方通 TongWeb / 金蝶 Apusic）心跳、麒麟/统信 OS 服务状态须纳入采样。
 - 字符集/时区/locale 回归易在国产 OS 上暴露，须纳入关键接口响应正确性校验。

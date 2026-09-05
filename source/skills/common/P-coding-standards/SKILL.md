@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/coding-standards (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-coding-standards（编码规范基线）
 
@@ -43,7 +44,7 @@ metadata:
 - 报告区分「已自动修复」与「待人工判断」。
 - 引用真实工具输出作为证据，而非仅凭模型判断。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 遗留 .NET/Java 代码迁移后须保持领域命名与原系统一致，避免业务语义漂移。
 - 目标栈若为国产框架/中间件，遵循其官方约定，不强行套用开源主流框架习惯。
 - 字符集、编码声明、日期/数字 locale 处理在国产 OS 上须规范统一（UTF-8、显式时区）。

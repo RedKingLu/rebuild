@@ -9,6 +9,7 @@ metadata:
   source: rebuild R17.5-P5-R1（D-108；GAP-P5-2 skill-first + LLM 验证策略/失败解读层；吸收参考轨 2A/2B P5 + 规范 R17.4 L219-228 + 文档 08-测试与验收/02·04）
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-migration-verification（迁移验证工作流）
 
@@ -71,7 +72,7 @@ metadata:
 - 失败维度产**回 P4 rework 的可执行建议**；P5 不直接改代码。
 - 只准备 P5→P6 Gate，不发明新 artifact/Gate/槽位。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 目标库/运行时/中间件（麒麟/统信 + 达梦/人大金仓/openGauss + TongWeb/宝兰德等）以 P0-P2 落定为准，P5 按其验证，不越权重判。
 - 国产环境不具备真实执行时标 evidence_gap（如"达梦真实连接需远程环境，本轮未执行，能力已接线待环境真验"），不臆测"已兼容/已通过"。
 - 高风险验证命令（L4/L5 写/命令）走既有 L0-L5 分级 + action_approval Gate；本 skill 不放宽风险门。

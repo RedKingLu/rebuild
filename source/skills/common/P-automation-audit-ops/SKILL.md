@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/automation-audit-ops (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-automation-audit-ops（自动化审计盘点）
 
@@ -42,7 +43,7 @@ metadata:
 - missing 项（遗留有、迁移后无）必须显式列出，不得遗漏。
 - 生产侧变更建议附风险，未经 Gate 不执行。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 遗留 Windows 计划任务/Oracle DBMS_SCHEDULER 作业迁到国产 OS/达梦/openGauss/GaussDB 时调度语义不同，须逐项重映射并验证。
 - 字符集/时区差异会使迁移后批作业产出与遗留不一致，纳入存活与正确性判定。
 - 国产中间件的触发/连接器（消息、ESB）与原栈不一致，redundant/broken 判定须基于目标栈实测。

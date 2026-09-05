@@ -1,6 +1,6 @@
 ---
 name: P-database-migrations
-description: P4执行 — 信创数据库迁移(Oracle→达梦/GaussDB、MSSQL→openGauss)：schema/对象/数据迁移、expand-contract、分批与校验
+description: P4执行 — 数据库迁移（含信创国产库：Oracle→达梦/GaussDB、MSSQL→openGauss）：schema/对象/数据迁移、expand-contract、分批与校验
 metadata:
   series: P
   phase: P4
@@ -9,8 +9,9 @@ metadata:
   source: ECC skills/database-migrations (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
-# P-database-migrations（信创数据库迁移执行）
+# P-database-migrations（数据库迁移执行）
 
 ## 适用阶段与触发条件
 - 阶段：P4 执行（迁移设计已在 P3 排程，含验收判据与回滚预案）。
@@ -43,7 +44,7 @@ metadata:
 - 存储过程/触发器/序列在目标库逻辑等价（eval 验证）。
 - 迁移过程未对源库产生写操作；目标服务在麒麟/统信 OS 启动冒烟通过。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 达梦对 Oracle 语法兼容度高但非 100%（如某些系统包、`ROWNUM` 分页与 hint 差异），逐一验证不臆断。
 - openGauss/GaussDB 走 PG 系，`MERGE`、序列、大小写折叠、`||` 拼接、空串与 NULL 语义与 Oracle/MSSQL 不同，须专门覆盖。
 - 字符集与排序规则（如 GBK 旧库→UTF-8）需显式处理，避免中文乱码与排序差异。
