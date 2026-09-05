@@ -233,8 +233,10 @@ class NodeLoop:
                 return {"uncertain_input": [f"context_fn error: {e}"]}
         try:
             from app.services.context_assembler import assemble_context
+            from app.services.project_service import ProjectService
             return assemble_context(
                 spec.project_id, spec.stage,
+                project=ProjectService.build_project_context_dict(spec.project_id),
                 node_state={"node_task": spec.task_plan.get("objective", ""),
                             "node_id": spec.node_id},
                 task_type=spec.task_plan.get("task_type", "default"),

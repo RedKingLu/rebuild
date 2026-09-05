@@ -456,6 +456,26 @@ class ValidationAgent:
                   + "\n".join(f"- {c}" for c in claims))
         return self._run_semantic_call(gw, prompt)
 
+    def _project_scenario_block(self) -> str:
+        """R20-2-04（Q-R20-2-3 方案 B′）：读取 project.scenario，经与 C1 层共用的渲染器产出
+        场景块，供不经 context_assembler 装配的 P4 独立验收 prompt 使用（DRY，避免第二份措辞）。
+        缺失/异常 → 渲染器自身对 None 的诚实回落（"未提供场景信息"），不在此另写分支。"""
+        scenario = None
+        try:
+            from app.core.database import get_session
+            from app.models.project import Project
+            db = get_session()
+            try:
+                proj = db.get(Project, self.project_id)
+                scenario = getattr(proj, "scenario", None) if proj else None
+            finally:
+                db.close()
+        except Exception:
+            logger.debug("validation_agent 读取 project.scenario 失败（advisory）", exc_info=True)
+        from app.services.context_layers import render_scenario_block
+        from app.services.scenario_loader import resolve_scenario_pack
+        return render_scenario_block(resolve_scenario_pack(scenario))
+
     def _llm_semantic_check_p4(self, gw) -> dict:
         """T3.1：P4 内容保真语义验收——给源根路径 + 迁移产物路径，读真实产出内容与其引用的真实
         源片段，判「真实源的真实迁移 / 内部自洽 / 遵守上游裁决路线」。该 Agent 无工具循环范式
@@ -468,15 +488,18 @@ class ValidationAgent:
                                "（疑空壳/臆造，No Evidence No Completed）")}
         prod_blocks, src_blocks = self._p4_read_products_and_sources(products)
         route = self._p4_route_summary()
+        scenario_block = self._project_scenario_block()
         prompt = (
             "你是 rebuild 软件重构平台 P4 执行阶段的【独立验收 Agent】。只依据下面提供的真实内容"
             "判定，不得脑补或臆测未提供的信息。判定迁移产物是否达标，须同时判三点：\n"
             "① 真实源的真实迁移：产物是否可追溯到 source/ 的真实文件与真实结构，而非与源无关的"
             "通用臆造样例（例如凭空的通用 EMPLOYEE 表、与源栈无关的 Vue3/Java 样板）；\n"
             "② 内部自洽：产物自身是否一致、无自相矛盾；\n"
-            "③ 遵守上游裁决路线：是否迁移到上游裁决的目标技术栈/库（见【上游裁决路线】）。\n"
+            "③ 遵守上游裁决路线：是否迁移到上游裁决的目标技术栈/库（见【上游裁决路线】），"
+            "并参考项目场景包的目标态与验收锚点（见【场景层】）。\n"
             "任一不满足（脱离真实源臆造 / 违反目标路线 / 不自洽）→ verdict=rework，且 grounded=false。\n"
             "仅输出 JSON：{\"verdict\":\"accepted|rework\",\"grounded\":true|false,\"reason\":\"...\"}\n\n"
+            f"【场景层】\n{scenario_block}\n\n"
             f"【源根路径】source/（真实文件样本清单）：\n{self._p4_source_manifest()}\n\n"
             f"【上游裁决路线（目标栈/库）】\n{route}\n\n"
             f"【迁移产物内容（output_code/ 与 patches/，路径已标注）】\n{prod_blocks}\n\n"

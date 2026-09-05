@@ -103,6 +103,20 @@ _SCENARIO_FOOTER = (
 )
 
 
+def render_scenario_block(pack: Optional[dict]) -> str:
+    """把 scenario_loader 的 manifest 渲染为【场景层】文本块（R20-2-04, Q-R20-2-3 方案 B′）。
+
+    公开面：`tech_selection_service.select()`（P1 选型）与 `validation_agent`（P4 独立验收）
+    不经 context_assembler 装配（各自拼自己的领域 prompt），但两者都需要场景知识送达。为避免
+    场景文本出现第二/第三份措辞（DRY，与 R20-3 ③§7.1「所有 prompt 文案集中在 context_layers」
+    一致），把原私有 `_render_scenario_block` 提升为公开函数，供三处消费者共用同一渲染器。
+
+    真注入三份文本内容（skill_body / anchors_text / risks_text），缺失与截断均显式标注
+    （公理3：信息丢失须发声）。不含任何场景值字面量，不做任何以场景值为条件的分支。
+    """
+    return _render_scenario_block(pack)
+
+
 def _render_scenario_block(pack: Optional[dict]) -> str:
     """把 scenario_loader 的 manifest 渲染为 C1 的【场景层】文本块。
 

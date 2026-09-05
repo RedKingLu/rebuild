@@ -118,9 +118,16 @@ class TechSelectionService:
         run_id: Optional[str] = None,
         stage: str = "p1",
         strategy_id: str = "system-default",
+        scenario: Optional[str] = None,
     ) -> TechSelectionResult:
         """产出技术路线选型建议。identification=P1 建档识别（tech_stack/dependency/entry_points/
-        config/infra），upstream=P0 识别结论，migration_target=目标 CPU/OS 红线。无 Key → blocked。"""
+        config/infra），upstream=P0 识别结论，migration_target=目标 CPU/OS 红线。无 Key → blocked。
+
+        scenario（R20-2-04, Q-R20-2-3 方案 B′）：项目重构场景 id，带默认值的关键字参数 ——
+        既有调用零改动仍合法。本服务不经 context_assembler 装配（自建 skill-first 编排提示词），
+        故场景知识经 render_scenario_block(resolve_scenario_pack(scenario)) 独立注入，
+        与 C1 层共用同一渲染器，避免出现第二份场景文本措辞。
+        """
         gw = self._get_gateway()
 
         readiness = gw.stage_model_readiness(strategy_id=strategy_id, project_id=project_id,
@@ -136,8 +143,12 @@ class TechSelectionService:
                 model_user_actions=readiness.get("user_actions", []))
 
         skill_body = self._skill_body()
+        from app.services.context_layers import render_scenario_block
+        from app.services.scenario_loader import resolve_scenario_pack
+        scenario_block = render_scenario_block(resolve_scenario_pack(scenario))
         system_content = ((skill_body.strip() + "\n\n---\n\n" + _SYSTEM_PROMPT)
                           if skill_body.strip() else _SYSTEM_PROMPT)
+        system_content = system_content + "\n\n---\n\n" + scenario_block
 
         from app.services.stage_agent_loop import run_stage_tool_loop
         loop = await run_stage_tool_loop(

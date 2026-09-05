@@ -98,7 +98,11 @@ class AgentLoop:
         # instead of the former hardcoded _build_prompt string concatenation.
         try:
             from app.services.context_assembler import build_system_prompt
-            project_dict = {"name": project_name}
+            from app.services.project_service import ProjectService
+            # R20-2-04（本轮新发现的第 15 处断链，§5.2）：此前只传 {"name": project_name}
+            # 1 键，scenario 到不了 Workspace 对话路径。build_project_context_dict 失败/项目
+            # 不存在时退化为原 1 键 dict（诚实降级，行为不劣于此前现状）。
+            project_dict = ProjectService.build_project_context_dict(project_id) or {"name": project_name}
             run_dict = {"execution_mode": mode} if mode else None
             node_state = {}
             if profiling_summary:

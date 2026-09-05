@@ -226,6 +226,7 @@ async def create_project_with_zip(
     name: str = Form(..., min_length=1, max_length=200),
     description: str = Form(""),
     file: UploadFile = File(...),
+    scenario: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
     """Create a project with a ZIP file upload as source.
@@ -240,7 +241,9 @@ async def create_project_with_zip(
     svc = ProjectService(db)
     from app.schemas.project import ProjectCreate
     req = ProjectCreate(name=name, description=description, source_type="zip",
-                        source_config={"original_filename": file.filename})
+                        source_config={"original_filename": file.filename},
+                        # R20-2-03: ZIP 上传路径与 JSON 创建路径对齐，同样可选择场景。
+                        scenario=(scenario.strip() or None) if scenario else None)
     project = svc.create(req)
 
     # Extract ZIP to managed directory
@@ -468,6 +471,9 @@ class OnboardingCompleteRequest(_BaseModel):
     target_os: str | None = None
     target_os_label: str | None = None
     target_env_note: str | None = None
+    # R20-2-01 (D-117③/D-118②)：项目重构场景 id（自由文本，开放可扩展，非封闭枚举）。
+    # 与 target_cpu_arch 等同组：用户输入采集（非识别逻辑），落库成为项目级目标态约束之一。
+    scenario: str | None = None
 
 
 @router.post("/{project_id}/onboarding/complete")
@@ -517,6 +523,10 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
             "source": "user_onboarding",
             "note": (req.target_env_note or ""),
         }
+    # R20-2-01/06 (D-117③)：引导向导可补选/改选场景（"后填覆盖先填"——若创建时已选，此处
+    # 再填会覆盖）。只在用户真填了才写；空串归一为 None，不写入空场景（诚实，不编造 R20-2-06）。
+    if req.scenario is not None:
+        updates["scenario"] = req.scenario.strip() or None
     # R9-5-7 T1/T2: persist remote-Git submission choice into source_config so the
     # materializer (step 5b) clones the chosen repo. Honest deferred if no creds.
     if req.submission_kind == "remote_git" and req.git_remote_url:

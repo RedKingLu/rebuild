@@ -102,6 +102,21 @@ class Project(Base):
     #    "key_arch_decisions": [{...}], "status": "approved", "decided_at": str, "source": str}
     # 选型由 LLM 基于真实源码事实推荐、用户拍板；样本值随项目生成，不硬编码维度枚举（§2.3）。
     tech_selection: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    # R20-2-01：项目的【重构场景 id】（自由文本）。
+    # ⚠️ 刻意【不用】SAEnum / Python Enum / Literal —— 理由：D-117③ + AGENTS §10-27。
+    #   场景体系分「典型场景 + 开放扩展」两层，"包括但不限于"；新增一个场景 = 新增一个
+    #   source/skills/scenarios/<id>/ 目录，【零 Python 与前端改动】。做成枚举会使新增场景
+    #   必须同时改 Enum + Alembic 迁移 + schema 三处，直接违反该裁决（R20-3-01 判 rework）。
+    #   本文件的 source_type（SAEnum）与 schemas/project.py 的 Literal 是【不可照搬的先例】：
+    #   那些取值集合由平台封闭定义，而场景的取值集合由【磁盘目录】决定。
+    # 取值合法性不由枚举校验，而由 scenario_loader 的【形状白名单】把门
+    #   （^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$，见 scenario_loader.py:87，兼路径安全）；
+    #   非法 / 目录不存在 → 诚实回落 _generic 并上报 (code, message)，绝不猜场景（R20-2-06）。
+    # 长度 64 = 上述形状白名单的字符上限（1 + 63）逐字对齐，不是拍脑袋的数。
+    #   注意（如实标注）：当前库为 SQLite，VARCHAR 长度【不在库层强制】；该声明是意图文档
+    #   与未来迁 PostgreSQL 时的真实约束，不得对外表述为"长度已在库层校验"。
+    # NULL = 用户尚未选择场景（≠ 选了空场景）；空串在写入侧归一为 NULL（project_service.create）。
+    scenario: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

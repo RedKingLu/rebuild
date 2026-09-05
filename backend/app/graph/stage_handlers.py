@@ -181,6 +181,17 @@ def _build_p0_migration_target(project_id: str) -> dict | None:
         return None
 
 
+def _build_project_context(project_id: str) -> dict | None:
+    """R20-2-04：Project → context_assembler 的 project= dict（B-R20-SCENARIO-NOT-WIRED）。
+
+    实现放在 project_service（services 层）而非本文件，供 work_agent.py / node_loop.py 等
+    services 层的断链调用点也能直接复用而不产生 services→graph 反向依赖（DRY，见
+    project_service.build_project_context_dict 的注释）。此处只是薄封装，供本文件既有
+    "_build_p0_migration_target 范式"风格的调用点统一调用。"""
+    from app.services.project_service import ProjectService
+    return ProjectService.build_project_context_dict(project_id)
+
+
 def _build_project_tech_selection(project_id: str) -> dict | None:
     """D-109：读取 Project 级技术路线选型红线（P1→P2 gate 用户批准后落库）。
     项目红线（非识别）；缺失（未到 P1 或未批准）则 None（诚实，不编造）。供 P2/P4 上下文注入。"""
@@ -323,13 +334,14 @@ class RealP0Handler:
             node_state["upstream_output"] = {"migration_target": migration_target}
         try:
             from app.services.context_assembler import assemble_context, build_system_prompt
+            _proj = _build_project_context(project_id)
             context_package = assemble_context(
-                project_id, "p0", node_state=node_state,
+                project_id, "p0", project=_proj, node_state=node_state,
                 task_type="onboarding", include_body=True, skill_disclosure="full")
             bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
             skill_body = "\n\n".join(bodies)[:12000]
             system_prompt = build_system_prompt(
-                project_id, "p0", node_state=node_state,
+                project_id, "p0", project=_proj, node_state=node_state,
                 task_type="onboarding", skill_disclosure="metadata")
         except Exception:
             logger.warning("P0 上下文装配失败（advisory，识别照常以事实包推理）", exc_info=True)
@@ -565,13 +577,14 @@ class RealP1Handler:
             node_state["upstream_output"] = {"migration_target": upstream["migration_target"]}
         try:
             from app.services.context_assembler import assemble_context, build_system_prompt
+            _proj = _build_project_context(project_id)
             context_package = assemble_context(
-                project_id, "p1", node_state=node_state, task_type="profiling",
+                project_id, "p1", project=_proj, node_state=node_state, task_type="profiling",
                 include_body=True, skill_disclosure="full")
             bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
             skill_body = "\n\n".join(bodies)[:12000]
             system_prompt = build_system_prompt(
-                project_id, "p1", node_state=node_state, task_type="profiling",
+                project_id, "p1", project=_proj, node_state=node_state, task_type="profiling",
                 skill_disclosure="metadata")
         except Exception:
             logger.warning("P1 上下文装配失败（advisory，识别照常以事实包推理）", exc_info=True)
@@ -675,9 +688,11 @@ class RealP1Handler:
         migration_target = upstream.get("migration_target") or _build_p0_migration_target(project_id)
         try:
             svc = self._tech_selection_svc()
+            _proj = _build_project_context(project_id)
             result = await svc.select(
                 project_id, identification=identification, upstream=upstream,
-                migration_target=migration_target, run_id=run_id, stage="p1")
+                migration_target=migration_target, run_id=run_id, stage="p1",
+                scenario=(_proj or {}).get("scenario"))
         except Exception as e:  # honest: surface, never fake a selection (公理3)
             logger.warning("P1 tech_selection 生成异常（advisory，写诚实 failed 产物）", exc_info=True)
             self._write_json(project_id, "tech_selection.json", {
@@ -887,13 +902,14 @@ class RealP2Handler:
                 node_state["upstream_output"] = _redlines
             # D-108: 加载 P2 评估 stage skill 正文（P-migration-assessment），评估需求随 skill 走，
             # 提示词瘦身、给 Agent 灵活度（skill-first，仿 P0/P1 include_body + skill_disclosure=full）。
+            _proj = _build_project_context(project_id)
             context_package = assemble_context(
-                project_id, "p2", node_state=node_state,
+                project_id, "p2", project=_proj, node_state=node_state,
                 task_type="assessment", include_body=True, skill_disclosure="full")
             bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
             skill_body = "\n\n".join(bodies)[:12000]
             system_prompt = build_system_prompt(
-                project_id, "p2", node_state=node_state,
+                project_id, "p2", project=_proj, node_state=node_state,
                 task_type="assessment", skill_disclosure="metadata")
         except Exception:
             logger.warning("P2 context assembly failed (advisory, domain work proceeds)",
@@ -1069,11 +1085,12 @@ class RealP3Handler:
             from app.services.context_assembler import assemble_context, build_system_prompt
             node_state = {"node_task": "P3 规划：生成 Stage Plan / Task Plan / TaskGraph（必生）",
                           "task": "迁移方案与任务图规划"}
+            _proj = _build_project_context(project_id)
             context_package = assemble_context(
-                project_id, "p3", node_state=node_state,
+                project_id, "p3", project=_proj, node_state=node_state,
                 task_type="planning", skill_disclosure="metadata")
             system_prompt = build_system_prompt(
-                project_id, "p3", node_state=node_state,
+                project_id, "p3", project=_proj, node_state=node_state,
                 task_type="planning", skill_disclosure="metadata")
         except Exception:
             logger.warning("P3 context assembly failed (advisory, domain work proceeds)",
@@ -1374,7 +1391,7 @@ class RealP4Handler:
         try:
             from app.services.context_assembler import assemble_context
             context_package = assemble_context(
-                project_id, "p4",
+                project_id, "p4", project=_build_project_context(project_id),
                 node_state={"node_task": "P4 执行：按 P3 TaskGraph 执行 execution 节点"},
                 task_type="execution", include_body=True, skill_disclosure="full")
             bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
@@ -2368,14 +2385,24 @@ class RealP5Handler:
             # 消费者，不自碰 assemble_context —— 满足 X-4-5 单一事实源）。装配失败=advisory 降级，非阻断。
             skill_body, system_prompt = "", ""
             try:
-                from app.services.context_assembler import assemble_context
+                from app.services.context_assembler import assemble_context, build_system_prompt
+                _proj = _build_project_context(project_id)
+                _p5_node_state = {"node_task": "P5 验证：规划验证策略、解读失败、提修复建议（不替代真实测试）"}
                 pkg = assemble_context(
-                    project_id, "p5",
-                    node_state={"node_task": "P5 验证：规划验证策略、解读失败、提修复建议（不替代真实测试）"},
+                    project_id, "p5", project=_proj,
+                    node_state=_p5_node_state,
                     task_type="verification", include_body=True, skill_disclosure="full")
                 bodies = [s.get("body") for s in (pkg.get("skills") or []) if s.get("body")]
                 skill_body = "\n\n".join(bodies)[:12000]
-                system_prompt = pkg.get("system_prompt", "") or ""
+                # R20-2-04 §7.6 方案 A：assemble_context 从不返回 "system_prompt" 键（§5.7/§16 J-6
+                # 已实证 has system_prompt key? False）——此前的旧写法恒读到空串（pkg 字典里根本
+                # 没有这个键），P5 advisory agent 从未真收到过 system_prompt/scenario_line
+                # （AGENTS §10-17 反模式）。改为再调一次公开 API build_system_prompt（仍走
+                # X-4-5 单一装配入口，不绕过）。
+                system_prompt = build_system_prompt(
+                    project_id, "p5", project=_proj,
+                    node_state=_p5_node_state,
+                    task_type="verification", skill_disclosure="metadata")
             except Exception:
                 logger.warning("P5 advisory context assembly failed (advisory)", exc_info=True)  # 公理3
             facts = {
@@ -2747,14 +2774,21 @@ class RealP6Handler:
             # 消费者，不自碰 assemble_context —— 满足 X-4-5 单一事实源）。装配失败=advisory 降级，非阻断。
             skill_body, system_prompt = "", ""
             try:
-                from app.services.context_assembler import assemble_context
+                from app.services.context_assembler import assemble_context, build_system_prompt
+                _proj = _build_project_context(project_id)
+                _p6_node_state = {"node_task": "P6 交付：组织交付叙述、部署/运维/回退提示、验收结论建议（不替代确定性门禁）"}
                 pkg_ctx = assemble_context(
-                    project_id, "p6",
-                    node_state={"node_task": "P6 交付：组织交付叙述、部署/运维/回退提示、验收结论建议（不替代确定性门禁）"},
+                    project_id, "p6", project=_proj,
+                    node_state=_p6_node_state,
                     task_type="delivery", include_body=True, skill_disclosure="full")
                 bodies = [s.get("body") for s in (pkg_ctx.get("skills") or []) if s.get("body")]
                 skill_body = "\n\n".join(bodies)[:12000]
-                system_prompt = pkg_ctx.get("system_prompt", "") or ""
+                # R20-2-04 §7.6 方案 A（同 P5 :2395-2402 的修法）：assemble_context 从不返回
+                # "system_prompt" 键，此前恒空，P6 advisory agent 从未真收到过 scenario_line。
+                system_prompt = build_system_prompt(
+                    project_id, "p6", project=_proj,
+                    node_state=_p6_node_state,
+                    task_type="delivery", skill_disclosure="metadata")
             except Exception:
                 logger.warning("P6 advisory context assembly failed (advisory)", exc_info=True)  # 公理3
             indexes = pkg.indexes or {}

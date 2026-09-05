@@ -682,6 +682,9 @@ async def get_context(project_id: str, stage: str | None = None):
             "workspace_status": project.workspace_status,
             "onboarding_done": project.onboarding_done,
             "coding_agent_ref": project.coding_agent_ref,
+            # R20-2-04: 此前该 dict 缺 scenario 键 —— 传了 project= 但 scenario 到不了下游
+            # （§5.2 实证：scenario_source 与完全不传 project= 时相同，均为 "absent"）。
+            "scenario": project.scenario,
         },
         run={"run_id": project.current_run_id} if project.current_run_id else None,
         include_skills=True,

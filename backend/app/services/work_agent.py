@@ -212,9 +212,11 @@ class WorkAgent:
     def _assemble(self, state: dict) -> dict:
         try:
             from app.services.context_assembler import assemble_context
+            from app.services.project_service import ProjectService
             node_task = f"{self.stage.upper()} {('建档：全量识别项目结构/技术栈/依赖/配置' if self.stage=='p1' else '阶段主任务')}"
             return assemble_context(
                 self.project_id, self.stage,
+                project=ProjectService.build_project_context_dict(self.project_id),
                 node_state={"node_task": node_task},
                 task_type=self._task_type(),
                 include_body=True, skill_disclosure="full",
