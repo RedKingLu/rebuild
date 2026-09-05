@@ -492,7 +492,7 @@ class P4ExecutionWorker:
             sys_content = self.skill_body.strip()
         else:
             sys_content = (
-                "你是信创迁移平台 P4 执行阶段的执行器。按需读取真实源代码后，将其迁移/改造为"
+                "你是 rebuild 软件重构平台 P4 执行阶段的执行器。按需读取真实源代码后，将其迁移/改造为"
                 "上游裁决的目标技术栈。禁止照节点标题臆造通用样例；无法定位/读取真实源时诚实"
                 "说明而不臆造。")
         # WP-B: prepend C6 retrieved case/knowledge reference so migration cases inform

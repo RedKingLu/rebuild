@@ -33,9 +33,10 @@ TECH_SELECTION_KEYS = [
 ]
 
 # 瘦身编排提示词（skill-first）：只声明身份 + 锚点键 + 接地/服从目标环境/脱敏的硬约束。
-# 详细选型维度/原则/信创替代清单等一律走 skill 正文（P-tech-selection SKILL.md），此处不复制。
+# 详细选型维度/原则/场景目标态与选型候选等一律走 skill 正文（P-tech-selection SKILL.md）
+# 与项目场景包（source/skills/scenarios/<scenario>/），此处不复制。
 _SYSTEM_PROMPT = (
-    "你是 rebuild 信创迁移平台的【P1→P2 技术路线选型 Agent】（Node Worker Agent）。平台已用确定性"
+    "你是 rebuild 软件重构平台的【P1→P2 技术路线选型 Agent】（Node Worker Agent）。平台已用确定性"
     "工具采集并由上游 LLM 识别了目标项目的真实源码事实（技术栈/依赖/入口/配置/基础设施线索），并"
     "提供了项目【目标运行环境 migration_target】（目标 CPU 架构 + 目标 OS，引导期用户点选的硬约束）。\n"
     "你的职责：基于【真实源码事实 + 目标运行环境 + 约束】综合推荐迁移的目标技术路线，供用户裁决。\n"
@@ -45,7 +46,8 @@ _SYSTEM_PROMPT = (
     "key_arch_decisions（数组 [{decision, recommendation, reasoning, alternatives}]）、"
     "overall_rationale（字符串）、open_questions（数组[字符串]）。\n"
     "硬约束：①每项 reasoning 必须援引输入事实中【真实存在】的信号，禁止输出与源无关的通用模板；"
-    "②选型必须能在 migration_target 的 CPU/OS 上运行（信创优先国产化替代但以真实源+目标环境为准）；"
+    "②选型必须能在 migration_target 的 CPU/OS 上运行（优先遵循项目场景包的目标态词表与选型候选，"
+    "并以真实源+目标环境为准）；"
     "③证据不足项在 reasoning 标注不确定性并列入 open_questions，不臆造确定性；④连接串/密钥/口令值"
     "一律不输出。详细选型维度与原则见随附的选型 skill 正文，遵循之。"
 )
@@ -175,7 +177,7 @@ class TechSelectionService:
               if upstream.get(k) is not None}
         up_blob = json.dumps(up, ensure_ascii=False, default=str)
         mt_blob = json.dumps(migration_target, ensure_ascii=False, default=str) if migration_target \
-            else "（未采集到 migration_target；请在 reasoning/open_questions 中声明目标环境未定，并给出与常见信创目标环境兼容的稳妥推荐）"
+            else "（未采集到 migration_target；请在 reasoning/open_questions 中声明目标环境未定，并依项目场景包的目标态词表给出稳妥推荐；无场景包时诚实说明无场景知识、不臆造目标栈）"
         return (
             "以下是平台采集并由上游 LLM 识别的目标项目【真实源码事实】、上游 P0 识别结论，以及项目"
             "【目标运行环境 migration_target】。请据此产出迁移的目标技术路线选型建议（严格输出契约 JSON）。\n\n"

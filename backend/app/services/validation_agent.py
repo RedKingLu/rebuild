@@ -469,7 +469,7 @@ class ValidationAgent:
         prod_blocks, src_blocks = self._p4_read_products_and_sources(products)
         route = self._p4_route_summary()
         prompt = (
-            "你是 rebuild 信创迁移平台 P4 执行阶段的【独立验收 Agent】。只依据下面提供的真实内容"
+            "你是 rebuild 软件重构平台 P4 执行阶段的【独立验收 Agent】。只依据下面提供的真实内容"
             "判定，不得脑补或臆测未提供的信息。判定迁移产物是否达标，须同时判三点：\n"
             "① 真实源的真实迁移：产物是否可追溯到 source/ 的真实文件与真实结构，而非与源无关的"
             "通用臆造样例（例如凭空的通用 EMPLOYEE 表、与源栈无关的 Vue3/Java 样板）；\n"

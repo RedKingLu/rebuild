@@ -24,6 +24,7 @@ from app.services.context_layers import (
     assemble_c4, assemble_c5, assemble_c6,
     build_system_prompt_from_layers,
 )
+from app.services.scenario_loader import resolve_scenario_pack
 from app.services.workspace_service import workspace_path
 
 logger = logging.getLogger("rebuild.context_assembler")
@@ -95,6 +96,8 @@ def assemble_context(
             "workspace_status": project.get("workspace_status", ""),
             "onboarding_done": project.get("onboarding_done", False),
             "coding_agent_ref": project.get("coding_agent_ref"),
+            # R20-3: 场景值必须进白名单，否则它到不了下游（C1 场景块 / 身份句 / trace）。
+            "scenario": project.get("scenario") or "",
         }
     if run:
         ctx["run"] = {
@@ -169,11 +172,16 @@ def assemble_context(
     # ── Assemble C0-C6 layers ──────────────────────────────────────────────
     layers: dict[str, dict] = {}
 
+    # R20-3: 解析项目场景包（每次真读盘，无缓存 —— 用户改写后下次装配即生效）。
+    # 场景值只做两件事：拼路径（loader 内已做形状 + 归属校验）与原样进 prompt 文本；
+    # 此处没有、也不得有任何以场景值为条件的分支。
+    scenario_pack = resolve_scenario_pack((project or {}).get("scenario"))
+
     if "C0" in active_layers:
         layers["C0"] = assemble_c0(agent.get("forbidden", "") if agent else "")
 
     if "C1" in active_layers:
-        layers["C1"] = assemble_c1()
+        layers["C1"] = assemble_c1(scenario_pack=scenario_pack)
 
     if "C2" in active_layers:
         layers["C2"] = assemble_c2()
@@ -246,7 +254,31 @@ def assemble_context(
         "total_layer_chars": sum(v.get("chars", 0) for v in layers.values()),
         "case_count": len(cases),
         "knowledge_count": len(knowledge),
+        # R20-3: 把"场景没接上"从隐性失败变成显性字段。assemble_context 有多个调用方各自构造
+        # project dict；缺 scenario 键时该阶段会静默拿不到场景，症状是"场景没生效"而非报错。
+        # scenario_source 让这种漏接线在 /context 响应里直接可见。
+        # trace 只记标识/状态/字符数，【不写入】SKILL.md / 锚点 / 风险的正文原文（体积 + 脱敏）。
+        "scenario": scenario_pack.get("scenario_id", ""),
+        "scenario_status": (scenario_pack.get("fallback") or {}).get("code", "ok"),
+        "scenario_source": "project_dict" if "scenario" in (project or {}) else "absent",
+        "scenario_tier": scenario_pack.get("tier", ""),
+        "scenario_chars": {
+            "skill_body": len(scenario_pack.get("skill_body", "")),
+            "anchors": len(scenario_pack.get("anchors_text", "")),
+            "risks": len(scenario_pack.get("risks_text", "")),
+        },
+        "scenario_truncated": {
+            "skill_body": bool(scenario_pack.get("skill_body_truncated")),
+            "anchors": bool(scenario_pack.get("anchors_truncated")),
+            "risks": bool(scenario_pack.get("risks_truncated")),
+        },
+        "scenario_notices": [
+            {"code": n.get("code", ""), "message": n.get("message", "")}
+            for n in (scenario_pack.get("notices") or [])
+        ],
     }
+    # 供 build_system_prompt 生成身份句附加语（不含正文，故可安全出现在 /context 响应）
+    ctx["scenario_line"] = _scenario_line(scenario_pack)
 
     return ctx
 
@@ -281,7 +313,24 @@ def build_system_prompt(
     )
     agent_name = (ctx.get("selected_agent") or {}).get("name", "AI 助手")
     layers = ctx.get("layers", {})
-    return build_system_prompt_from_layers(layers, current_stage, agent_name, user_message)
+    return build_system_prompt_from_layers(layers, current_stage, agent_name, user_message,
+                                           scenario_line=ctx.get("scenario_line", ""))
+
+
+def _scenario_line(pack: dict) -> str:
+    """依场景 manifest 生成身份句的场景附加语（R20-3）。
+
+    分支只看"是否发生了回落"（`fallback` 字段是否存在），**不看场景值本身** —— 故不构成
+    以场景值为条件的分派面（R20-2-05）。场景名一律取自 manifest，代码内无任何场景值字面量。
+    """
+    if not pack:
+        return "当前项目尚未选择重构场景，请勿假设目标技术栈。"
+    if pack.get("fallback"):
+        return "当前项目尚未选择可用的重构场景包，请勿假设目标技术栈。"
+    name = pack.get("display_name") or pack.get("scenario_id") or ""
+    if not name:
+        return "当前项目尚未选择重构场景，请勿假设目标技术栈。"
+    return f"当前协助用户完成【{name}】重构项目。"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
