@@ -22,7 +22,7 @@ BACKEND = Path(__file__).resolve().parents[1]
 
 # Reference revisions. _HEAD is ALSO asserted dynamically (test_head_is_read_dynamically)
 # so this file does not become a second source of truth for the head value.
-_HEAD = "c2d4f5a6b7c8"        # migration chain head (R17.5-P4-FOLLOWUP D-114: task_plan/task_node output_target)
+_HEAD = "a2b4c6d8e0f2"        # migration chain head (R20-2-01 D-117③: project.scenario)
 _PREV_HEAD = "b1c2d3e4f5a6"   # down_revision of head (R17.5-P4-FIX 批4 D-111) — used to manufacture drift
 
 
