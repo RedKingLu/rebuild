@@ -229,7 +229,8 @@ class AgentLoop:
                         if authz["decision"] == "require_confirmation":
                             # Park the action behind a REAL Gate; surface via gate.request.
                             gate_id = self._create_action_gate(
-                                project_id, run_id, stage, fn_name, risk, authz["reason"])
+                                project_id, run_id, stage, fn_name, risk, authz["reason"],
+                                fn_args)
                             yield ("event: gate.request\ndata: " + json.dumps({
                                 "gate_id": gate_id, "action": fn_name, "risk_level": risk,
                                 "mode": mode,
@@ -288,20 +289,28 @@ class AgentLoop:
         yield f"event: done\ndata: {json.dumps({'done': True, 'summary': full_response[:300]}, ensure_ascii=False)}\n\n"
 
     def _create_action_gate(self, project_id: str, run_id: str, stage: str,
-                            fn_name: str, risk: str, reason: str) -> str:
+                            fn_name: str, risk: str, reason: str,
+                            args: dict | None = None) -> str:
         """Create a real action_approval Gate for a parked controlled action (T10).
 
         Reuses GateService.create — the same DB-persisted + audited Gate kernel as
         stage_promotion (公理6). action_approval Gates do NOT drive stage promotion.
+
+        `args`（B-R20-GATE-NO-PAYLOAD，用户 2026-09-06 批准）：工具入参经
+        `tool_registry._redacted_action_payload` **脱敏后**写入 summary，使审批者可知情决策。
+        与 `tool_registry._create_risk_gate` 共用同一个脱敏渲染器（单一事实源，避免两处措辞漂移）。
         """
         try:
             from app.dependencies import get_services
+            from app.services.tool_registry import _redacted_action_payload
+            payload = _redacted_action_payload(fn_name, args)
             gate = get_services().gate_service.create(
                 project_id=project_id, run_id=run_id or "", stage=stage,
                 gate_type="action_approval",
                 reason=reason or f"Manual/HITL 授权：Agent 拟执行 {fn_name}",
                 risk_level=risk,
-                summary=f"Agent 拟执行受控动作 {fn_name}",
+                summary=(f"Agent 拟执行受控动作 {fn_name}（{risk}）。"
+                         f"\n待执行入参（已脱敏）：{payload}"),
                 options=["approve", "reject"],
             )
             return gate.gate_id

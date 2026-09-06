@@ -579,7 +579,7 @@ async def execute_tool(
                                 f"action_approval Gate（{gate_id}），审批通过后方可执行。"),
                 }
             else:
-                result = _create_risk_gate(project_id, run_id, stage, tool_name, risk)
+                result = _create_risk_gate(project_id, run_id, stage, tool_name, risk, args)
             _write_trace(tracer, project_id, tool_name, args, result)
             return result
         # approved → fall through to real execution (re-dispatch). Remember the gate id
@@ -1227,8 +1227,43 @@ def _resolve_action_gate(project_id: str, run_id: str, tool_name: str) -> tuple[
 
 
 
+def _redacted_action_payload(tool_name: str, args: dict | None, max_chars: int = 600) -> str:
+    """把工具入参渲染为可供人工审批阅读的一行摘要，**必过密钥脱敏**。
+
+    B-R20-GATE-NO-PAYLOAD（用户 2026-09-06 批准修法）：此前 action_approval Gate 只写
+    工具名、不写入参，决策者无从知道 Agent 究竟要执行什么，D-034「L4 须用户确认」在实践中
+    被降级为形式 —— 只能在闭眼授权与一律拒绝之间二选一（R20-4 信创回归真跑中主窗口即因此
+    拒绝了 gate-ec10a8）。
+
+    两条硬约束同时成立才可落地（用户批准语明确要求）：
+      1. 入参须进入 Gate，使审批可知情；
+      2. **须过密钥脱敏** —— 命令行/参数极可能含凭据（如 `--password=`、连接串、token），
+         Gate 与其审计记录都会持久化，原样落盘等于把凭据写进审计（违 AGENTS §8 / D-032）。
+
+    复用既有 `security_authorization.redact_secrets()`，**不另造脱敏实现**（单一事实源）。
+    """
+    if not args:
+        return "（无入参）"
+    try:
+        import json as _json
+        raw = _json.dumps(args, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        raw = str(args)
+    try:
+        from app.services.security_authorization import redact_secrets
+        raw = redact_secrets(raw)
+    except Exception:
+        # 脱敏不可用时 fail-closed：宁可不展示入参，也不得原样落盘（公理3：发声而非静默放行）
+        logger.warning("redact_secrets 不可用，action_approval Gate 不展示入参（fail-closed）",
+                       exc_info=True)
+        return "（入参未展示：脱敏组件不可用，为避免凭据落盘已省略）"
+    if len(raw) > max_chars:
+        raw = raw[:max_chars] + f"…［已截断，原长 {len(raw)} 字符］"
+    return raw
+
+
 def _create_risk_gate(project_id: str, run_id: str, stage: str,
-                      tool_name: str, risk: str) -> dict:
+                      tool_name: str, risk: str, args: dict | None = None) -> dict:
     """OD-06: an L3+ tool requires human approval before it runs. Create a real
     action_approval Gate through the existing GateService kernel (DB-persisted +
     audited — the same kernel as agent_loop._create_action_gate). action_approval
@@ -1237,7 +1272,11 @@ def _create_risk_gate(project_id: str, run_id: str, stage: str,
     Honest degradation (红线：不得伪造 gate)：when no GateService is available in the
     current runtime context, return an explicit risk_flagged status explaining why —
     never fabricate a gate_id / awaiting_approval.
+
+    `args`（B-R20-GATE-NO-PAYLOAD，用户 2026-09-06 批准）：工具入参经 `_redacted_action_payload`
+    脱敏后写入 Gate 的 summary，使审批者能在知情前提下决策。
     """
+    payload = _redacted_action_payload(tool_name, args)
     try:
         from app.dependencies import get_services
         gs = get_services().gate_service
@@ -1246,6 +1285,7 @@ def _create_risk_gate(project_id: str, run_id: str, stage: str,
             "status": "risk_flagged",
             "risk_level": risk,
             "tool_name": tool_name,
+            "action_payload": payload,
             "message": (f"工具风险等级 {risk} ≥ {_GATE_RISK_THRESHOLD}，需人工审批；"
                         f"但当前运行上下文无可用 Gate 服务（{e}），未创建审批门。"),
         }
@@ -1254,7 +1294,8 @@ def _create_risk_gate(project_id: str, run_id: str, stage: str,
             project_id=project_id, run_id=run_id or "", stage=stage,
             gate_type="action_approval", risk_level=risk,
             reason=f"高风险工具 {tool_name}（风险 {risk}）执行前需人工审批",
-            summary=f"Agent 拟执行高风险工具 {tool_name}（{risk}），请审批",
+            summary=(f"Agent 拟执行高风险工具 {tool_name}（{risk}），请审批。"
+                     f"\n待执行入参（已脱敏）：{payload}"),
             options=["approve", "reject"],
         )
     except Exception as e:

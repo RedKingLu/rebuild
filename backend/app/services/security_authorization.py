@@ -49,7 +49,27 @@ _SECRET_PATTERNS = [
     re.compile(r"sk-[a-z0-9]{20,}", re.IGNORECASE),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*[\"']?([^\s\"']{8,})"),
+    # URL 内嵌凭据 scheme://user:pass@host（2026-09-06 补，B-R20-GATE-NO-PAYLOAD 施工时实测发现）
+    #
+    # 发现过程：为把工具入参写进 action_approval Gate（用户批准的修法），主窗口先对
+    # redact_secrets 做对抗性用例验证，实测 `--password=xxx` 被正确脱敏、但
+    # `postgresql://user:Pa55w0rd@host:5432/db` **完全漏过** —— 上面三条模式都不覆盖
+    # URL 内嵌凭据形态。
+    #
+    # 这是**既有缺口而非本次引入**，且与已登记的 `Q-R18-1-3`（`_strip_url_credentials`
+    # 以 `^scheme://` 锚定、无 scheme 的值不被剥离）属同一家族：凭据在 URL 里的形态
+    # 一直是本仓脱敏的薄弱面。
+    #
+    # 必须先补这条再落 Gate：否则"把命令行写进 Gate + 审计"这个改动会把连接串里的
+    # 口令持久化进 p_gate 表与审计记录（违 AGENTS §8 / D-032）。**明知有洞不得先灌数据。**
+    #
+    # 只替换口令段、保留 scheme/user/host —— 审批者仍需看出"连的是哪个库、用哪个账号"
+    # 才能做知情决策；把整个 URL 打掉会重新回到"看不见内容无法审批"的老问题。
+    re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):([^\s/@]+)@"),
 ]
+
+# 上面最后一条用捕获组保留 scheme://user 与 @，故其替换需专用 repl（见 redact_secrets）
+_URL_CRED_PATTERN = _SECRET_PATTERNS[-1]
 
 
 def redact_secrets(text: str) -> str:
@@ -58,7 +78,11 @@ def redact_secrets(text: str) -> str:
         return text
     out = text
     for pat in _SECRET_PATTERNS:
-        out = pat.sub("[REDACTED]", out)
+        if pat is _URL_CRED_PATTERN:
+            # 保留 scheme://user 与 @host，只打掉口令段 —— 审批者仍需看出"连哪个库、用哪个账号"
+            out = pat.sub(r"\1:[REDACTED]@", out)
+        else:
+            out = pat.sub("[REDACTED]", out)
     return out
 
 
