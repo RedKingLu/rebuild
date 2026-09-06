@@ -35,6 +35,24 @@ def _restore_settings():
     clear_services_cache()
 
 
+def _expected_catalog_size() -> int:
+    """期望 catalog 条目数 = model_profiles.yaml 中的模型总数（provider/model 去重后）。
+
+    原断言把条目数钉成常量 9（"3 providers, 9 models"）。provider 侧模型清单是**运行期
+    可变事实**——本轮实测即新增 6 个模型并移除已下线的 qwen3.5，常量随即过期。把 9 换成
+    15 只会在下次清单变动时再坏一次，因此改为从配置动态派生并断言真正的**不变量**：
+    seed_model_catalog 逐条读 yaml 建条目 ⇒ catalog 条目数 == yaml 中模型总数。
+    """
+    import yaml
+    cfg_path = Path(__file__).resolve().parents[1] / "app" / "config" / "model_profiles.yaml"
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    return len({
+        f"{prov.get('provider_id', '')}/{m['model_name']}"
+        for prov in data.get("providers", [])
+        for m in prov.get("models", []) if m.get("model_name")
+    })
+
+
 def _setup(monkeypatch, tmp_path):
     import app.core.config as cfg
     import app.core.database as db_mod
@@ -99,11 +117,12 @@ def test_seeder_populates_from_yaml(tmp_path, monkeypatch):
     db = get_session()
     try:
         from app.seed import seed_model_catalog
+        expected = _expected_catalog_size()  # 动态派生，见 _expected_catalog_size docstring
         n = seed_model_catalog(db)
-        assert n == 9, f"expected 9 catalog entries, got {n}"  # 3 providers, 9 models
+        assert n == expected, f"expected {expected} catalog entries (= yaml 模型总数), got {n}"
         assert seed_model_catalog(db) == 0  # idempotent
         from app.models.model_catalog import ModelCatalogEntry
-        assert db.query(ModelCatalogEntry).count() == 9
+        assert db.query(ModelCatalogEntry).count() == expected
     finally:
         db.close()
 
@@ -122,7 +141,7 @@ def test_list_api_and_filters(tmp_path, monkeypatch):
     r = client.get("/api/model-catalog")
     assert r.status_code == 200, r.text
     data = r.json()["data"]
-    assert data["total"] == 9
+    assert data["total"] == _expected_catalog_size()  # 动态派生，勿钉常量
     r2 = client.get("/api/model-catalog?provider=deepseek-official")
     assert r2.status_code == 200
     assert r2.json()["data"]["total"] >= 1

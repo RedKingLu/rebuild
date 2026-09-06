@@ -21,6 +21,36 @@ if backend_dir not in sys.path:
 # asyncio_mode=auto（pyproject）→ 无需模块级 mark；async 测试自动异步执行，同步测试不受影响。
 
 
+def _credential_env_vars() -> tuple[str, ...]:
+    """从【模型配置】动态派生"须清空的凭据环境变量"清单（不手工列举）。
+
+    为何动态派生：provider 清单是【可变事实】——用户可随时经 BYOK 导入新 provider，
+    出厂配置也会增删。手工钉成常量只能修好今天：本清单曾漏 `AGNES_API_KEY`，删除某
+    BYOK provider 后候选链走到 agnes-ai → 它凭 .env 真值判为 configured → 三个
+    "所有模型都不可用"用例（D-097 抗伪造判据）的前提被破坏而失败。本轮已多次因
+    "把可变事实钉成常量"返工，故此处按配置派生。
+
+    派生规则（与生产解析一致）：
+      1. `model_profiles.yaml` + `user_providers.yaml` 中所有 provider 的 `env_key_var`；
+      2. 未声明 `env_key_var` 的 provider，按 `set_credential` 的派生命名补齐
+         （`{PROVIDER_ID}_API_KEY`，provider_registry.py:462）；
+      3. 并上通用回退 `LLM_API_KEY`——`_resolve_api_key` 无论哪个 provider 都会读它
+         （provider_registry.py:109），留着就等于所有 provider 都"已配置"。
+    """
+    import yaml
+    from app.providers.provider_registry import _CONFIG_PATH, _USER_CONFIG_PATH
+
+    names = {"LLM_API_KEY"}  # 通用回退，必须删
+    for path in (_CONFIG_PATH, _USER_CONFIG_PATH):
+        if not path.exists():
+            continue
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for p in raw.get("providers", []) or []:
+            pid = p.get("provider_id", "")
+            names.add(p.get("env_key_var") or f"{pid.upper().replace('-', '_')}_API_KEY")
+    return tuple(sorted(n for n in names if n))
+
+
 @pytest.fixture(autouse=True)
 def _isolate_credential_and_strategy_pollution():
     """R17.5: 隔离本文件对【共享全局状态】的污染，防止跨测试泄漏。
@@ -39,7 +69,7 @@ def _isolate_credential_and_strategy_pollution():
     """
     from pathlib import Path
     from app.providers.provider_registry import _USER_STRATEGY_PATH
-    _cred_vars = ("LLM_API_KEY", "DEEPSEEK_API_KEY", "MAAS_API_KEY", "OPENAI_API_KEY")
+    _cred_vars = _credential_env_vars()
     _strategy_path = Path(_USER_STRATEGY_PATH)
     _strategy_before = _strategy_path.read_text(encoding="utf-8") if _strategy_path.exists() else None
     _providers_path = _strategy_path.parent / "user_providers.yaml"
@@ -73,7 +103,7 @@ def _isolate_credential_and_strategy_pollution():
 
 def _fresh_registry_no_keys(monkeypatch):
     """真实 ProviderRegistry，确保无任何可用凭据（删环境 Key，不设 credential）。"""
-    for var in ("LLM_API_KEY", "DEEPSEEK_API_KEY", "MAAS_API_KEY", "OPENAI_API_KEY"):
+    for var in _credential_env_vars():
         monkeypatch.delenv(var, raising=False)
     from app.providers.provider_registry import ProviderRegistry
     r = ProviderRegistry()
