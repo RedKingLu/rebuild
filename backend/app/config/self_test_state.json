@@ -16,11 +16,5 @@
     "capability_marker": "real_available",
     "last_checked_at": "2026-09-05T06:07:11.503649+00:00",
     "credential_status": "configured"
-  },
-  "美团": {
-    "status": "not_connected",
-    "capability_marker": "not_connected",
-    "last_checked_at": "2026-09-05T06:10:00.827330+00:00",
-    "credential_status": "configured"
   }
 }

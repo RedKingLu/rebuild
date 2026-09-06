@@ -167,14 +167,31 @@ class TestStrategyResolution:
     """Tests for model resolution with strategy priority."""
 
     def test_resolve_returns_default(self):
-        """With no override, should return strategy default."""
+        """With no override, should return strategy default.
+
+        判据为**结构性**而非硬编码具体 provider（2026-09-06 改）：原写法把
+        `fallback:maas-icompify/deepseek-v4-flash` 钉成常量，一旦 provider 清单变化
+        （本轮按用户指令删除美团 BYOK provider 后 fallback 顺序即改变，实际落到
+        `fallback:deepseek-official/deepseek-v4-flash`）测试就假失败。
+        该用例的真实意图是"resolve 必须给出一个合理且可解释的选择理由"，
+        与"落在哪个具体 provider"无关 —— 后者本就随环境配置变化。
+        与 `test_r14_6_migrated_integration` / `test_r17_2_migration_drift` 硬编码
+        Alembic head 属同一类维护点：**把可变的运行期结果钉成常量**。
+        """
         from app.providers.provider_registry import get_provider_registry
 
         registry = get_provider_registry()
         profile, reason, provider = registry.resolve_model()
         # May return None if no keys configured, but in test env there may be keys
         if profile:
-            assert reason in ("strategy_default", "fallback:maas-icompify/deepseek-v4-flash", "first_available")
+            assert reason in ("strategy_default", "first_available") or \
+                reason.startswith("fallback:"), \
+                f"resolve 理由须为已知类别之一，实际={reason!r}"
+            if reason.startswith("fallback:"):
+                # fallback 必须指向一个真实存在的 provider/model，不得是空壳
+                assert "/" in reason.split("fallback:", 1)[1], \
+                    f"fallback 理由须含 provider/model，实际={reason!r}"
+                assert provider, "fallback 时 provider 不得为空"
 
     def test_resolve_user_override_preferred(self):
         """User override should take priority over default."""
