@@ -28,6 +28,18 @@ providers:
         is_fusion_capable: true
         context_window_note: "1M tokens"
         recommended_use: "复杂分析、架构决策、Fusion 评审"
+      # ── 2026-09-06 用户提供的官方清单更新 + 主窗口实测 GET /models 确认（共 3 个）──
+      - model_name: "deepseek-v4-flash-vision-exp"
+        display_name: "DeepSeek V4 Flash Vision (实验)"
+        capability_tags: ["chat", "streaming", "coding", "vision"]
+        cost_tier: "low"
+        supports_streaming: true
+        # 实测 2026-09-06：工具调用 907ms 成功发起；文本 1130ms/81tok（**三者中最快**）
+        supports_tool_calling: true
+        context_window_note: "1M tokens（未经实测确认，沿用同系列声明）"
+        # ⚠ 名称含 -exp（experimental）：provider 可能随时变更或下线，不宜作为 P 阶段主力
+        #   依赖对象；vision（多模态）能力本轮**未实测**（本平台当前无图像输入场景）
+        recommended_use: "实验性：多模态场景探索；因 -exp 标记不建议作为生产主力"
 
   - provider_id: "maas-icompify"
     provider_name: "MaaS (icompify)"
@@ -35,8 +47,36 @@ providers:
     api_format: "openai"
     endpoint_openai: "https://api.icompify.com/v1"
     endpoint_anthropic: "https://api.icompify.com/anthropic"
+    # Codex Responses 通道（2026-09-06 用户提供的更新接口规范）。
+    # 注意：当前 ModelGateway 只按 api_format ∈ {openai, anthropic} 选 endpoint
+    #（model_gateway.py:890/:959），**尚未接线 responses 通道** —— 此处先如实登记
+    # endpoint，接线归口后续轮（见 02-阻塞项 B-R20-NO-RESPONSES-CHANNEL）。
+    # 不写成"已支持"，避免 §10-17（定义存在但无入口调用却当作能力）。
+    endpoint_responses: "https://api.icompify.com/v1/responses"
     env_key_var: "LLM_API_KEY"
+    # ── 模型清单同步自 provider 实测（2026-09-06，GET /v1/models 返 11 个）──
+    # 实测方法与全量数据见 证据/进度追踪/05-验收与证据索引.md「icompify 模型实测」。
+    # 移除：qwen3.5（provider 侧已下线，实测 /v1/models 无此 id）。
     models:
+      # ── 推荐主力（实测最快且输出干净）──
+      - model_name: "qwen3.8-27b"
+        display_name: "Qwen 3.8 27B (MaaS)"
+        capability_tags: ["chat", "streaming", "coding", "review"]
+        cost_tier: "low"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "128K tokens"
+        # 实测 2026-09-06：文本 955ms/123tok 直出正文；工具调用 406ms（**全场最快**）
+        recommended_use: "推荐默认：日常编码、快速评审、工具调用密集场景"
+      - model_name: "deepseek-v4-flash"
+        display_name: "DeepSeek V4 Flash (MaaS)"
+        capability_tags: ["chat", "streaming", "coding", "review"]
+        cost_tier: "low"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "1M tokens"
+        # 实测 2026-09-06：文本 468ms/111tok 直出；工具 816ms。R20-4 真跑中稳定
+        recommended_use: "推荐默认：日常编码、快速评审（大上下文场景优先）"
       - model_name: "deepseek-v4-pro"
         display_name: "DeepSeek V4 Pro (MaaS)"
         capability_tags: ["chat", "streaming", "coding", "review", "fusion"]
@@ -45,15 +85,47 @@ providers:
         supports_tool_calling: true
         is_fusion_capable: true
         context_window_note: "1M tokens"
+        # 实测 2026-09-06：文本 3165ms/180tok；工具 1468ms。R20-4 真跑主力（276 次调用全程稳定）
         recommended_use: "复杂分析、架构决策、Fusion 评审"
-      - model_name: "deepseek-v4-flash"
-        display_name: "DeepSeek V4 Flash (MaaS)"
-        capability_tags: ["chat", "streaming", "coding", "review"]
+      - model_name: "minimax-m3"
+        display_name: "MiniMax M3 (MaaS)"
+        capability_tags: ["chat", "streaming", "coding"]
+        cost_tier: "low"
+        supports_streaming: true
+        # 实测 2026-09-06 更正：**支持工具调用**（原配置记 false，实测 475ms 成功发起 get_stack）
+        supports_tool_calling: true
+        context_window_note: "32K tokens"
+        recommended_use: "轻量对话、快速问答"
+      # ── 推理型（thinking 固定开销约 400-500 tok，max_tokens 须留足余量）──
+      - model_name: "glm-5.3-flash"
+        display_name: "GLM 5.3 Flash (MaaS)"
+        capability_tags: ["chat", "streaming", "long_context", "reasoning"]
         cost_tier: "low"
         supports_streaming: true
         supports_tool_calling: true
-        context_window_note: "1M tokens"
-        recommended_use: "日常编码、快速评审"
+        context_window_note: "128K tokens"
+        # ⚠ 实测 2026-09-06：max_tokens=400 时 400tok 全被 thinking 吃掉、content 为空；
+        #   max_tokens=1500 时 535tok 正常出 142 字正文。**调用方须给 ≥1500**
+        recommended_use: "长文本理解；调用时 max_tokens 须 ≥1500（thinking 开销）"
+      - model_name: "glm-5.2"
+        display_name: "GLM 5.2 (MaaS)"
+        capability_tags: ["chat", "streaming", "long_context", "reasoning"]
+        cost_tier: "medium"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "128K tokens"
+        # ⚠ 同 glm-5.3-flash：400→content 空；1500→582tok 出 80 字正文
+        recommended_use: "长文本理解、知识密集型；max_tokens 须 ≥1500"
+      - model_name: "glm-5.1"
+        display_name: "GLM 5.1 (MaaS)"
+        capability_tags: ["chat", "streaming", "long_context", "reasoning"]
+        cost_tier: "medium"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "128K tokens"
+        # ⚠ 实测 2026-09-06：文本 23.9-32.5s（**慢**）+ 同样的 thinking 吃配额行为
+        recommended_use: "不建议用于长链路（实测 24-33s）；仅在需要 5.1 特定行为时选用"
+      # ── 长上下文型（实测偏慢，长链路慎用）──
       - model_name: "kimi-k2.6"
         display_name: "Kimi K2.6 (MaaS)"
         capability_tags: ["chat", "streaming", "coding", "long_context"]
@@ -61,31 +133,40 @@ providers:
         supports_streaming: true
         supports_tool_calling: true
         context_window_note: "128K+ tokens"
-        recommended_use: "长上下文分析、代码审查"
-      - model_name: "minimax-m3"
-        display_name: "MiniMax M3 (MaaS)"
-        capability_tags: ["chat", "streaming"]
-        cost_tier: "low"
+        # ⚠ 实测 2026-09-06：文本 20.1s、工具 4.9s
+        recommended_use: "长上下文分析；不建议用于多轮工具循环（实测 20s+）"
+      - model_name: "kimi-k3"
+        display_name: "Kimi K3 (MaaS)"
+        capability_tags: ["chat", "streaming", "coding", "long_context"]
+        cost_tier: "medium"
         supports_streaming: true
-        supports_tool_calling: false
-        context_window_note: "32K tokens"
-        recommended_use: "轻量对话、快速问答"
-      - model_name: "qwen3.5"
-        display_name: "Qwen 3.5 (MaaS)"
+        supports_tool_calling: true
+        context_window_note: "256K+ tokens"
+        # ❌ 实测 2026-09-06：文本 38.9s、**工具调用 44.2s** —— 逼近/超过 R19 的
+        #    LLM_REQUEST_TIMEOUT=60s chunk 间读超时，多轮工具循环极易触发 StreamStallTimeout。
+        #    **不得用于 P 阶段工具循环**（run_stage_tool_loop 最多 6 轮、P4 worker 14 轮）
+        recommended_use: "仅超长上下文单次分析；禁用于 P 阶段工具循环（实测 44s）"
+      - model_name: "qwen3.8"
+        display_name: "Qwen 3.8 (MaaS)"
         capability_tags: ["chat", "streaming", "coding"]
         cost_tier: "low"
         supports_streaming: true
         supports_tool_calling: true
         context_window_note: "128K tokens"
+        # 实测 2026-09-06：文本 3006ms/125tok 直出；工具 1404ms
         recommended_use: "通用编码、文档生成"
-      - model_name: "glm-5.2"
-        display_name: "GLM 5.2 (MaaS)"
-        capability_tags: ["chat", "streaming", "long_context"]
+      # ── provider 侧聚合模型（与本平台 rebuild-fusion 虚拟服务商是两回事）──
+      - model_name: "fusion"
+        display_name: "Fusion 聚合 (MaaS 侧)"
+        capability_tags: ["chat", "streaming", "review"]
         cost_tier: "medium"
         supports_streaming: true
         supports_tool_calling: true
-        context_window_note: "128K tokens"
-        recommended_use: "长文本理解、知识密集型任务"
+        context_window_note: "未知（provider 未声明）"
+        # 实测 2026-09-06：文本 1662ms/460tok（prompt 开销 690tok，明显高于其他模型
+        #   → 推断 provider 侧自带聚合前置 prompt）；工具 2872ms
+        # ⚠ 命名易与本平台 provider_id=rebuild-fusion 混淆，二者无关
+        recommended_use: "provider 侧聚合评审；注意与平台 rebuild-fusion 区分"
 
   - provider_id: "agnes-ai"
     provider_name: "AgnesAI"
