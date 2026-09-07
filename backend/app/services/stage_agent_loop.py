@@ -29,6 +29,7 @@ Design invariants:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -37,6 +38,26 @@ from typing import Any, Optional
 logger = logging.getLogger("rebuild.stage_agent_loop")
 
 _MAX_TOOL_ROUNDS = 6  # bounded tool-calling rounds (mirror p4 worker / agent_loop)
+
+# R21 dsh 范式吸收「循环卫生」①：同一 (工具名+参数) 组合连续调用达到此轮数时，
+# 提醒模型换方法或收尾 —— 只提醒，不拦截（本次调用仍照常执行）。阈值与文案均为
+# 平台通用能力，不含任何项目/场景特定内容。
+_REPEAT_TOOL_CALL_THRESHOLD = 3
+_REPEAT_TOOL_CALL_REMINDER_TEMPLATE = (
+    "系统提醒：你已连续 {n} 次调用完全相同的工具（工具名与参数完全一致）。"
+    "如果这个方法没有取得新的进展，请改变方法，或者基于已获得的信息直接给出结论。"
+)
+
+
+def _tool_call_signature(fn_name: str, fn_args: dict) -> str:
+    """稳定的 (工具名, 参数) 签名：参数排序后 json 序列化再取 sha256，用于跨轮比较是否
+    为"完全相同"的调用（R21 循环卫生①）。序列化失败（不可序列化对象）时退化为 repr，
+    不静默丢弃比较能力（公理3）。"""
+    try:
+        args_repr = json.dumps(fn_args, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        args_repr = repr(fn_args)
+    return hashlib.sha256(f"{fn_name}:{args_repr}".encode("utf-8")).hexdigest()
 
 
 def extract_json_object(content: str) -> Optional[dict]:
@@ -141,6 +162,9 @@ async def run_stage_tool_loop(
     model_used: Optional[str] = None
     tools_invoked: list[str] = []
     rounds_used = 0
+    # R21 循环卫生①：跨轮追踪每个 (工具名+参数) 签名的"连续调用轮数"。
+    prev_round_signatures: set[str] = set()
+    repeat_streaks: dict[str, int] = {}
     try:
         for _round in range(max_rounds):
             rounds_used = _round + 1
@@ -175,6 +199,7 @@ async def run_stage_tool_loop(
             # Execute tool calls (L0-L5 enforced inside execute_tool) and feed results back.
             messages.append({"role": "assistant", "content": round_text or None,
                              "tool_calls": round_tool_calls})
+            current_signatures: set[str] = set()
             for tc in round_tool_calls:
                 if not tc.get("id"):
                     continue
@@ -185,9 +210,24 @@ async def run_stage_tool_loop(
                                if tc["function"]["arguments"].strip() else {})
                 except json.JSONDecodeError:
                     fn_args = {}
+                current_signatures.add(_tool_call_signature(fn_name, fn_args))
                 result = await _run_tool(fn_name, fn_args, project_id, stage, run_id, tracer)
                 messages.append({"role": "tool", "tool_call_id": tc["id"],
                                  "content": json.dumps(result, ensure_ascii=False, default=str)})
+
+            # R21 循环卫生①：连续同签名调用达阈值 → 下一轮消息里注入通用提醒（不拦截本次调用）。
+            next_streaks: dict[str, int] = {}
+            max_streak = 0
+            for sig in current_signatures:
+                streak = repeat_streaks.get(sig, 0) + 1 if sig in prev_round_signatures else 1
+                next_streaks[sig] = streak
+                max_streak = max(max_streak, streak)
+            repeat_streaks = next_streaks
+            prev_round_signatures = current_signatures
+            if max_streak >= _REPEAT_TOOL_CALL_THRESHOLD:
+                messages.append({"role": "user",
+                                 "content": _REPEAT_TOOL_CALL_REMINDER_TEMPLATE.format(n=max_streak)})
+
         else:
             # Round budget spent while still calling tools → force ONE final synthesis
             # (tools disabled) so the model MUST produce the structured answer from the

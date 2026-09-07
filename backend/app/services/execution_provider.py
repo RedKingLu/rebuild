@@ -206,6 +206,9 @@ class LocalSubprocessExecutionProvider:
                 # D-034（R18-1 P1-02）：L5 不再静默 block —— 上报 gate_required，
                 # 由调用侧（stage_handlers）创建可裁决的用户 Gate。
                 "gate_required": True,
+                # R21 循环卫生②：timed_out/signal 独立于 exit_code 真实上报——安检拒绝
+                # 不是超时，也没有进程可归因信号。
+                "timed_out": False, "signal": None,
             }
 
         risk = _classify_risk(code, language)
@@ -238,6 +241,7 @@ async def _run_subprocess(code: str, language: str, timeout: int,
                     "exit_code": 1, "stdout": "",
                     "stderr": f"命令不在允许列表中: {first_word}",
                     "provider": "local_subprocess", "fallback": False, "blocked": True,
+                    "timed_out": False, "signal": None,
                 }
         cmd = ["bash", "-c", code]
     else:
@@ -252,23 +256,35 @@ async def _run_subprocess(code: str, language: str, timeout: int,
             cwd=cwd,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        returncode = proc.returncode or 0
+        # R21 循环卫生②：timed_out / exit_code / signal 三个事实各自独立上报，不嵌套
+        # 依赖——signal 从 POSIX returncode 约定（负数 -N = 被信号 N 终止）派生，不猜测；
+        # 正常退出（returncode>=0）则 signal 诚实报 None（没有信号可归因）。
+        signal_num = -returncode if returncode < 0 else None
         return {
-            "exit_code": proc.returncode or 0,
+            "exit_code": returncode,
             "stdout": stdout.decode("utf-8", errors="replace")[:65536],
             "stderr": stderr.decode("utf-8", errors="replace")[:65536],
             "provider": "local_subprocess",
             "fallback": False,
             "blocked": False,
+            "timed_out": False,
+            "signal": signal_num,
         }
     except asyncio.TimeoutError:
+        # 超时分支：timed_out 必须独立、真实报 True，不因为超时就整体跳过 exit_code/
+        # signal 的填充。此处进程未被主动终止（未 kill），故没有可归因的真实信号 → None；
+        # exit_code 保留既有 -1 语义（不知道真实退出码，不是 0 也不是某个信号退出码）。
         return {
             "exit_code": -1, "stdout": "", "stderr": f"Timeout after {timeout}s",
             "provider": "local_subprocess", "fallback": False, "blocked": False,
+            "timed_out": True, "signal": None,
         }
     except Exception as e:
         return {
             "exit_code": -1, "stdout": "", "stderr": str(e),
             "provider": "local_subprocess", "fallback": False, "blocked": False,
+            "timed_out": False, "signal": None,
         }
 
 
@@ -314,6 +330,7 @@ class ContainerExecutionProvider:
                 "execution_mode": "container", "fallback": False, "blocked": True,
                 "risk_level": "L5", "audited": False,
                 "gate_required": True,   # D-034（R18-1 P1-02）：L5 须可裁决，不静默 block
+                "timed_out": False, "signal": None,
             }
 
         # Write code to a temp file that will be mounted into the container.
@@ -328,6 +345,9 @@ class ContainerExecutionProvider:
         is_python = language in ("python", "python3")
         cmd = ["python3", "/workspace/code.py"] if is_python else ["bash", "/workspace/script.sh"]
 
+        # R21 循环卫生②：timed_out/signal 独立于 exit_code 上报，不嵌套依赖。
+        timed_out = False
+        signal_num = None
         try:
             import docker
             client = docker.from_env()
@@ -352,7 +372,9 @@ class ContainerExecutionProvider:
                 stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")[-8000:]
                 stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")[-4000:]
             except Exception:
+                timed_out = True
                 container.kill()
+                signal_num = 9  # docker kill 默认发 SIGKILL——kill() 未抛异常即真实发生
                 exit_code = -1
                 stdout = ""
                 stderr = f"Container execution timed out after {timeout}s"
@@ -387,6 +409,8 @@ class ContainerExecutionProvider:
             "blocked": False,
             "risk_level": risk,
             "audited": False,
+            "timed_out": timed_out,
+            "signal": signal_num,
         }
 
 
@@ -528,6 +552,7 @@ class ToolchainContainerExecutionProvider:
                 "execution_mode": self.name, "fallback": False, "blocked": True,
                 "risk_level": "L5", "audited": False,
                 "gate_required": True,   # D-034：L5 须可裁决，不静默 block
+                "timed_out": False, "signal": None,
                 **{k: v for k, v in meta.items() if k not in ("provider", "execution_mode")},
             }
 
@@ -547,7 +572,7 @@ class ToolchainContainerExecutionProvider:
                 "stderr": f"构建工作目录准备失败：{type(e).__name__}: {e}",
                 "elapsed_ms": int((time.time() - start) * 1000),
                 "fallback": False, "blocked": False, "risk_level": risk, "audited": False,
-                "toolchain_unavailable": True, **meta,
+                "toolchain_unavailable": True, "timed_out": False, "signal": None, **meta,
             }
 
         limits = self.limits
@@ -572,6 +597,9 @@ class ToolchainContainerExecutionProvider:
             run_kwargs["nano_cpus"] = int(float(cpu_count) * 1_000_000_000)
 
         unavailable = False
+        # R21 循环卫生②：timed_out/signal 独立于 exit_code 上报，不嵌套依赖。
+        timed_out = False
+        signal_num = None
         try:
             import docker
             client = docker.from_env()
@@ -584,8 +612,10 @@ class ToolchainContainerExecutionProvider:
             except Exception:
                 logger.warning("toolchain_container 执行超时/中断（%ss），已 kill 容器", timeout,
                                exc_info=True)
+                timed_out = True
                 try:
                     container.kill()
+                    signal_num = 9  # docker kill 默认发 SIGKILL——kill() 未抛异常即真实发生
                 except Exception:
                     logger.debug("容器 kill 失败（best-effort）", exc_info=True)
                 exit_code = -1
@@ -616,6 +646,8 @@ class ToolchainContainerExecutionProvider:
             "audited": False,
             "toolchain_unavailable": unavailable,
             "cwd_mismatch": cwd_mismatch,
+            "timed_out": timed_out,
+            "signal": signal_num,
             **meta,
         }
 
@@ -657,6 +689,7 @@ class WorkspaceLocalExecutionProvider:
                 "execution_mode": "workspace_local", "fallback": True, "blocked": True,
                 "risk_level": "L5", "audited": False,
                 "gate_required": True,   # D-034（R18-1 P1-02）：L5 须可裁决，不静默 block
+                "timed_out": False, "signal": None,
             }
 
         risk = _classify_risk(code, language)
