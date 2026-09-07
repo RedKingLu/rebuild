@@ -588,6 +588,46 @@ async def execute_tool(
         if not confirmed and gate_state == "approved":
             approved_gate_id = gate_id
 
+    # Code-layer D-032/D-099① enforcement — UNCONDITIONAL, not Registry-gated
+    # (B-R21-HOOK-DISABLE-BYPASS). `run_hooks()` below only dispatches a hook whose
+    # `ResourceEntry.enabled` is True; `PATCH /resources/{id}/disable` can flip that flag
+    # (for most resources, with zero risk-gating of its own — see routes_registry). Without
+    # this call, disabling the single `"pre-write Policy check"` row would silently switch
+    # off the ONLY content-level D-032 secret-write detector, with no audit trail. This
+    # calls `hook_engine.enforce_pre_write_policy()`, which delegates to the exact same
+    # check body the Registry-driven hook uses (`_impl_pre_write_policy`), so the two call
+    # sites can never behaviorally drift apart — but this call always runs.
+    hook_ctx = {"project_id": project_id, "tool_name": tool_name,
+                "write_scope": write_scope, "args": args, "stage": stage}
+    try:
+        from app.services.hook_engine import enforce_pre_write_policy
+        hard_action, hard_reason = enforce_pre_write_policy(hook_ctx)
+    except Exception:
+        # 发声：强制检查本体异常必须可见；但引擎自身故障不应 fail-open 放行（安全关键路径，
+        # 与下方 Registry 驱动 hook 的"引擎故障 fail-open"策略不同——这是不可关闭的最后一道防线）。
+        logger.error("tool_registry: 代码层 pre-write 强制检查异常 tool=%s", tool_name, exc_info=True)
+        hard_action, hard_reason = "block", "pre-write 强制检查执行异常，按安全优先拦截（fail-closed）"
+    if hard_action == "block":
+        result = {
+            "status": "blocked_by_hook",
+            "tool_name": tool_name,
+            "hook_point": "PreToolUse",
+            "reason": hard_reason,
+            "hooks_run": ["pre_write_policy(code-layer，不受 ResourceEntry.enabled 影响)"],
+        }
+        _write_trace(tracer, project_id, tool_name, args, result)
+        try:
+            from app.dependencies import get_services
+            get_services().audit_writer.write(
+                audit_type="hook_block", risk_level="L3",
+                action=f"PreToolUse:{tool_name}", decision="blocked",
+                reason=hard_reason[:300], project_id=project_id,
+            )
+        except Exception:
+            logger.warning("tool_registry: 代码层强制检查的 audit 写入失败 tool=%s",
+                           tool_name, exc_info=True)
+        return result
+
     # PreToolUse hooks (WP-4 / GAP-SEC-2): run the Registry-registered PreToolUse hooks
     # before the real dispatch. A block-mode hook returning "block" (e.g. pre-write policy
     # rejecting a source/ write or secret-bearing content) stops execution — the tool does
@@ -603,8 +643,7 @@ async def execute_tool(
             _svc_wr = None
         pre = run_hooks(
             "PreToolUse",
-            {"project_id": project_id, "tool_name": tool_name,
-             "write_scope": write_scope, "args": args, "stage": stage},
+            hook_ctx,
             db,
             tracer=tracer or (getattr(_svc_wr, "trace_writer", None) if _svc_wr else None),
             auditor=(getattr(_svc_wr, "audit_writer", None) if _svc_wr else None),

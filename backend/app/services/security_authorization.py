@@ -112,6 +112,23 @@ def redact_secrets(text: str) -> str:
     return out
 
 
+def contains_secret(text: str | None) -> bool:
+    """True iff `text` contains any secret-looking substring (D-032).
+
+    Single source of truth for "does this text carry a secret". `hook_engine`'s
+    pre-write policy hook (`_impl_pre_write_policy`) used to keep its own private
+    3-pattern copy of `_SECRET_PATTERNS` that predated the URL-embedded-credential
+    pattern added above (2026-09-06/07) — so the two implementations silently drifted
+    apart and the `block`-mode D-032 hook let `postgresql://user:pass@host` /
+    `redis://:pass@host` style content through undetected (B-R20-REDACT-THREE-IMPLS).
+    `hook_engine` now calls this function instead of maintaining a second pattern list,
+    so the two call sites can never drift apart again.
+    """
+    if not text:
+        return False
+    return any(pat.search(text) for pat in _SECRET_PATTERNS)
+
+
 def _restrictiveness(decision: str) -> int:
     try:
         return _DECISION_RESTRICTIVENESS.index(decision)

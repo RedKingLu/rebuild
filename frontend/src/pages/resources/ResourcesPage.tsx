@@ -572,7 +572,11 @@ export function ResourcesPage() {
     await deleteResource(r.resource_id); fetchResPg(resPg);
   };
   const handleToggleResource = async (r: ResourceEntry) => {
-    await toggleResource(r.resource_id); fetchResPg(resPg);
+    const res = await toggleResource(r.resource_id);
+    if (res?.data?.status === 'awaiting_approval') {
+      alert(res.data.message || '该资源是安全关键资源，禁用需人工审批，已创建审批请求。');
+    }
+    fetchResPg(resPg);
   };
 
   const handleImportFromUrl = async (url: string) => {
