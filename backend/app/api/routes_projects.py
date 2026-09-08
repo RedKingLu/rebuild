@@ -219,6 +219,32 @@ async def archive_project(
     )
 
 
+# ── R21 长时任务心跳（B-R20-NO-LONGTASK-MONITOR）: 只读发现挂起，不做自动接管 ──
+
+@router.get("/{project_id}/heartbeat")
+async def get_project_heartbeat(
+    project_id: str,
+    run_id: str | None = Query(None, description="若指定，仅认可该 run 的心跳；不匹配→unknown"),
+    db: Session = Depends(get_db),
+):
+    """Read the current long-running-task heartbeat status for a project.
+
+    Read-only discovery endpoint (D-037: no retry/resume triggered here). Status is
+    always one of alive / stalled / unknown — "unknown" (never a default "alive")
+    when no heartbeat has ever been recorded, or when `run_id` does not match the
+    heartbeat currently on record.
+    """
+    svc = ProjectService(db)
+    if svc.get(project_id) is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    from app.services.heartbeat_service import read_heartbeat_status
+    status = read_heartbeat_status(project_id, run_id=run_id)
+    return SuccessEnvelope(
+        data={"project_id": project_id, "run_id": run_id, **status},
+        meta=Meta(),
+    )
+
+
 # ── ZIP upload: create project + upload source ──────────────────────
 
 @router.post("/upload")

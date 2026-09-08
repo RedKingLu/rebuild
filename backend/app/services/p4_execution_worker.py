@@ -34,6 +34,7 @@ from typing import Any, Optional
 
 from app.services.workspace_service import workspace_path
 from app.services.workspace_mediator import WorkspaceMediator
+from app.services.heartbeat_service import write_heartbeat
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
 
 logger = logging.getLogger(__name__)
@@ -877,7 +878,25 @@ class P4ExecutionWorker:
 
         Never fabricates completed: unreadable input / no model / rejected write
         all yield an honest blocked package.
+
+        R21 / B-R20-NO-LONGTASK-MONITOR: this is the actual per-node unit of progress
+        for BOTH call paths — the simple run() loop below and the real driving path
+        (RealP4Handler → TaskGraphEngine → NodeLoop, which calls execute_node directly
+        per node, never run()). A heartbeat is recorded here, after every node — completed,
+        blocked, resumed, or delegated alike — so a stuck multi-round tool loop inside one
+        node still updates the heartbeat's current_node/timestamp on the NEXT node it
+        reaches, and (once wired into node-internal progress in a later batch, out of
+        scope here) so the registry always reflects the most recent unit of real progress.
+        This call is advisory-only bookkeeping: no retry/resume/reschedule (D-037).
         """
+        try:
+            return await self._execute_node_impl(node, run_id=run_id)
+        finally:
+            if run_id:
+                write_heartbeat(self.project_id, run_id, "p4_execution",
+                                current_node=node.get("node_id"))
+
+    async def _execute_node_impl(self, node: dict, run_id: str = "") -> dict:
         node_id = node.get("node_id") or "node"
         title = node.get("title") or node_id
         risk_level = node.get("risk_level") or "L0"

@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     dependency_check_budget_s: float = 60.0
     dependency_check_max_retries: int = 2
 
+    # R21 长时任务心跳监视（B-R20-NO-LONGTASK-MONITOR）。最小心跳注册表：只发现挂起并诚实
+    # 标记，不做自动重试/自动接管（D-037 硬约束：LangGraph 仍是唯一编排）。不新建任务队列/DB
+    # 表（D-065 NIH）；心跳落 workspace artifacts/ 文件，经现有 WorkspaceMediator 写盘中介
+    # （D-099）。此阈值判定"心跳距今多久算 stalled"，可经 env 覆盖，不在各处散落魔法数字。
+    p4_heartbeat_stall_threshold_s: float = 300.0
+
     # R7 GitHub OAuth
     # redirect_uri 必须与 GitHub OAuth App 注册的回调一致，且在 dev/容器两套拓扑下不变：
     # 后端统一监听 8000 → 注册一次即可两套通用（端口标准见 06-容器化部署与执行隔离规范 §1.1）。
