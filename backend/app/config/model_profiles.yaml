@@ -47,12 +47,13 @@ providers:
     api_format: "openai"
     endpoint_openai: "https://api.icompify.com/v1"
     endpoint_anthropic: "https://api.icompify.com/anthropic"
-    # Codex Responses 通道（2026-09-06 用户提供的更新接口规范）。
-    # 注意：当前 ModelGateway 只按 api_format ∈ {openai, anthropic} 选 endpoint
-    #（model_gateway.py:890/:959），**尚未接线 responses 通道** —— 此处先如实登记
-    # endpoint，接线归口后续轮（见 02-阻塞项 B-R20-NO-RESPONSES-CHANNEL）。
-    # 不写成"已支持"，避免 §10-17（定义存在但无入口调用却当作能力）。
-    endpoint_responses: "https://api.icompify.com/v1/responses"
+    # Codex Responses 通道（2026-09-06 用户提供的更新接口规范；2026-09-08 接线并真实调用
+    # 验证，见 B-R20-NO-RESPONSES-CHANNEL 交付报告）。
+    # 注意：这里存的是"base URL"（与 endpoint_openai 同一约定），不带 "/responses" 路径
+    # 后缀 —— litellm.aresponses() 会自动拼接该后缀发往「实际路径 /v1/responses」；若这里
+    # 存带后缀的完整路径会变成 ".../responses/responses" 触发 404（真实调用实测确认，此前
+    # 版本误存了带后缀的完整路径，已修正）。
+    endpoint_responses: "https://api.icompify.com/v1"
     env_key_var: "LLM_API_KEY"
     # ── 模型清单同步自 provider 实测（2026-09-06，GET /v1/models 返 11 个）──
     # 实测方法与全量数据见 证据/进度追踪/05-验收与证据索引.md「icompify 模型实测」。
@@ -167,6 +168,26 @@ providers:
         #   → 推断 provider 侧自带聚合前置 prompt）；工具 2872ms
         # ⚠ 命名易与本平台 provider_id=rebuild-fusion 混淆，二者无关
         recommended_use: "provider 侧聚合评审；注意与平台 rebuild-fusion 区分"
+      # ── Responses 通道验证 profile（B-R20-NO-RESPONSES-CHANNEL，2026-09-08 接线）──
+      # 与上面 qwen3.8-27b（openai chat completions 通道）是【同一个底层模型】，只是换一条
+      # 调用通道 —— 用不同 model_name 只是为了让 profile_id（= provider_id/model_name）
+      # 不与上面那条撞键；真实发往 provider 的模型名由 api_model_name 指定为原始 id。
+      # api_format_override="responses" 只影响这一个 profile，不影响本 provider 其余
+      # profile（仍走 openai chat completions，包括 system-default 策略的 fallback 链）。
+      # 实测 2026-09-08：真实调用成功，见交付报告；获得结构化 reasoning（thinking）字段。
+      - model_name: "qwen3.8-27b-responses"
+        api_model_name: "openai/qwen3.8-27b"
+        api_format_override: "responses"
+        display_name: "Qwen 3.8 27B (MaaS, Codex Responses 通道)"
+        capability_tags: ["chat", "responses", "reasoning"]
+        cost_tier: "low"
+        supports_streaming: true
+        # 工具调用未验证：Responses API 的 tool 参数形状与 chat completions 不同，adapter
+        # 当前未实现转换（stream_via_responses/complete_via_responses 均不透传 tools），
+        # 如实标 false，避免平台把需要工具调用的阶段路由到这里却静默拿不到工具。
+        supports_tool_calling: false
+        context_window_note: "128K tokens（沿用 qwen3.8-27b 声明，Responses 通道下未单独实测）"
+        recommended_use: "验证/使用 Responses 通道以获取结构化 reasoning（thinking）字段"
 
   - provider_id: "agnes-ai"
     provider_name: "AgnesAI"

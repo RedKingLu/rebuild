@@ -83,6 +83,10 @@ class ModelCallResult:
     model_name: str = ""  # litellm-normalized name (e.g. openai/deepseek-v4-flash)
     status: str = "unknown"  # completed / failed / blocked
     content: str = ""
+    # B-R20-NO-RESPONSES-CHANNEL: Responses API 通道单独暴露的结构化 reasoning/thinking
+    # 文本（与 content 分开，不混入正文）。仅 Responses 通道会填充；chat completions
+    # 通道留空字符串（现有调用方无需处理新字段，向后兼容）。
+    reasoning_content: str = ""
     latency_ms: float = 0.0
     error_category: str = ""
     error_message: str = ""  # redacted — never contains Key
@@ -113,6 +117,62 @@ def _classify_litellm_error(e: Exception) -> tuple[str, str]:
     if "ContextWindowExceededError" in type(e).__name__:
         return "context_exceeded", "Input exceeds model context window"
     return "model_call_failed", "Model call failed"
+
+
+# ── B-R20-NO-RESPONSES-CHANNEL: Codex/OpenAI Responses API 通道 helpers ──────
+# 响应体形状实测（2026-09-08，真实 maas-icompify 调用，见交付报告的真实调用证据）：
+# response.output = [ {type: "reasoning", content: [{type: "reasoning_text", text: "..."}]},
+#                      {type: "message",  content: [{type: "output_text",   text: "..."}], role: "assistant"} ]
+# response.usage = {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N,
+#                    "reasoning_tokens": N, "prompt_tokens_details": None}  # flat dict
+# 实测中 output 的每个 item / content part 都是**plain dict**（非 pydantic 对象），但防御性
+# 地同时支持 attribute 访问，以防其它 litellm 版本或 provider 返回 typed 子对象。
+
+
+def _get(obj, key: str, default=None):
+    """Dict-or-attribute getter（见上方实测说明的二态防御）。"""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _extract_responses_output(response) -> tuple[str, str]:
+    """从 Responses API 响应的 `output` 列表拆出 (正文 content, 推理 reasoning_content)。
+
+    type=="message"（或 part.type=="output_text"）的文本拼成正文；
+    type=="reasoning"（或 part.type=="reasoning_text"）的文本拼成 reasoning ——
+    两者严格分开，不混入 content（任务要求：thinking 单独暴露，不污染正文）。
+    """
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for item in (_get(response, "output", None) or []):
+        item_type = _get(item, "type", "")
+        for part in (_get(item, "content", None) or []):
+            text = _get(part, "text", "") or ""
+            if not text:
+                continue
+            part_type = _get(part, "type", "")
+            if item_type == "reasoning" or part_type == "reasoning_text":
+                reasoning_parts.append(text)
+            elif item_type == "message" or part_type == "output_text":
+                content_parts.append(text)
+    return "".join(content_parts), "".join(reasoning_parts)
+
+
+def _extract_responses_usage(usage_raw) -> dict:
+    """Responses API 的 usage 实测为 flat dict，键名与 chat completions 的
+    `usage.prompt_tokens/completion_tokens/total_tokens` 一致，额外带 reasoning_tokens
+    （非 chat completions 惯用的 `completion_tokens_details.reasoning_tokens` 嵌套形状）。
+    统一拍平成 adapter 既有 usage_summary 的标准三键 + 可选 reasoning_tokens。"""
+    usage = {
+        "prompt_tokens": _get(usage_raw, "prompt_tokens", 0) or 0,
+        "completion_tokens": _get(usage_raw, "completion_tokens", 0) or 0,
+        "total_tokens": _get(usage_raw, "total_tokens", 0) or 0,
+    }
+    reasoning_tokens = _get(usage_raw, "reasoning_tokens", None)
+    if reasoning_tokens:
+        usage["reasoning_tokens"] = reasoning_tokens
+    return usage
 
 
 class LiteLLMAdapter:
@@ -259,6 +319,177 @@ class LiteLLMAdapter:
         result.error_message = "Max retries exceeded"
         result.retry_count = _MAX_RETRIES
         return result
+
+    # ── Responses API call (B-R20-NO-RESPONSES-CHANNEL) ─────────────────
+
+    async def complete_via_responses(
+        self,
+        *,
+        model: str,  # litellm-normalized, e.g. "openai/qwen3.8-27b"
+        messages: list[dict],
+        api_base: str,
+        api_key: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        timeout: Optional[float] = None,
+    ) -> ModelCallResult:
+        """Execute a completion call via litellm.aresponses() — Codex/OpenAI Responses API
+        通道（D-065: 复用 litellm 现成的 aresponses()，不自造 HTTP 客户端）。
+
+        与 complete() 参数解析共性一致（model/messages/api_base/api_key 均由调用方按同一套
+        _resolve_key / resolve_api_model_name 解析出，见 ModelGateway.call()），但协议形状
+        不同：
+        - `messages` 直接作为 Responses API 的 `input` 传入 —— 已用真实 maas-icompify
+          Responses 端点验证，litellm 接受与 chat completions 相同的 [{role, content}, ...]
+          消息列表，无需额外转换（见交付报告真实调用证据）。
+        - 响应体 `output` 是一组结构化 item（message / reasoning 等类型），用
+          `_extract_responses_output` 拆出正文与 reasoning（分开返回，不混入 content）。
+        - `usage` 是 flat dict（非 chat completions 的 `.usage` 属性对象），用
+          `_extract_responses_usage` 统一拍平。
+
+        如实上报的范围限定：本方法只做「单次请求超时 + 有限重试」，未移植 complete() 里
+        B-R19-1-COMPLETE-HANG 那套「总时长跨重试预算」双层 CallHangTimeout 保护 —— 该保护
+        是针对 complete()/stream_complete() 实测过的"服务端已关流、客户端仍阻塞"现象专门
+        加的，Responses 通道目前只有 maas-icompify 一个真实 provider 验证过、未观测到同类
+        现象。若后续实测该通道也会挂起，需要补齐同等力度的保护（当前已知缺口）。
+        """
+        call_id = f"call_{uuid.uuid4().hex[:12]}"
+        t0 = time.monotonic()
+        result = ModelCallResult(call_id=call_id, model_name=model)
+        per_attempt_timeout = float(timeout) if timeout is not None else _REQUEST_TIMEOUT
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "input": messages,
+            "api_key": api_key,
+            "api_base": api_base,
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+            "timeout": per_attempt_timeout,
+        }
+
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                try:
+                    response = await asyncio.wait_for(
+                        litellm.aresponses(**kwargs), timeout=per_attempt_timeout)
+                except (asyncio.TimeoutError, TimeoutError) as te:
+                    raise CallHangTimeout("request", per_attempt_timeout) from te
+
+                latency = (time.monotonic() - t0) * 1000
+                content, reasoning = _extract_responses_output(response)
+                usage = _extract_responses_usage(_get(response, "usage", None) or {})
+
+                result.status = "completed"
+                result.content = content
+                result.reasoning_content = reasoning
+                result.latency_ms = round(latency, 1)
+                result.usage_summary = usage
+                result.retry_count = attempt
+                return result
+
+            except Exception as e:
+                error_cat, error_msg = _classify_litellm_error(e)
+                if (attempt < _MAX_RETRIES
+                        and error_cat in ("rate_limited", "timeout", "provider_unreachable")):
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "litellm aresponses retry %d/%d after %.1fs: %s",
+                        attempt + 1, _MAX_RETRIES, delay, error_cat)
+                    await _async_sleep(delay)
+                    continue
+
+                latency = (time.monotonic() - t0) * 1000
+                logger.warning("litellm aresponses failed attempt=%d: %s %s",
+                               attempt, error_cat, error_msg)
+                result.status = "failed"
+                result.latency_ms = round(latency, 1)
+                result.error_category = error_cat
+                result.error_message = error_msg
+                result.retry_count = attempt
+                return result
+
+        result.status = "failed"
+        result.error_category = "max_retries_exceeded"
+        result.error_message = "Max retries exceeded"
+        result.retry_count = _MAX_RETRIES
+        return result
+
+    async def stream_via_responses(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        api_base: str,
+        api_key: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        timeout: Optional[float] = None,
+    ):
+        """流式 Responses 通道（B-R20-NO-RESPONSES-CHANNEL）。解析 litellm
+        aresponses(stream=True) 的原生 SSE 事件——真实 maas-icompify 调用实测事件序列：
+        response.created → response.in_progress →
+        response.output_item.added/done（reasoning 项先行，累积进 reasoning） →
+        response.output_item.added（message 项）→ response.content_part.added →
+        response.output_text.delta（×N，正文分片，逐个 yield token 帧）→
+        response.output_text.done → response.content_part.done →
+        response.output_item.done（message 项）→ response.completed（含最终 usage）。
+
+        帧契约与 stream_complete() 保持一致（{"type": "token"/"done"/"error", ...}），
+        额外在最终 "done" 帧上附 "reasoning_content" 键（累积的 reasoning 文本，不混入
+        token 正文；上层可选读取，不读取也不影响既有帧处理逻辑，向后兼容）。
+
+        如实上报的范围限定：与 stream_complete() 不同，本方法未移植 B-R18-1-STREAM-HANG
+        的三层挂起保护（inter_chunk / first_token / total 超时 + pre-token 重试）—— 只对
+        "建立流"这一步做了单次请求超时兜底，一旦进入 `async for` 迭代就没有 per-chunk
+        超时边界。原因与 complete_via_responses 相同：该通道只有一个真实 provider 验证过，
+        未观测到 stream_complete() 文档描述的挂起现象；若后续实测该通道也会挂起，需要补齐
+        同等力度的保护（当前已知缺口）。同样未实现 tools（工具调用）参数透传 —— Responses
+        API 的 tool 参数形状与 chat completions 不同，尚未验证，调用方若传了 tools 会被
+        本方法忽略（不转换、不报错），这是另一个已知缺口。
+        """
+        call_id = f"scall_{uuid.uuid4().hex[:12]}"
+        per_attempt_timeout = float(timeout) if timeout is not None else _REQUEST_TIMEOUT
+        reasoning_buf = ""
+        usage: dict = {}
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "input": messages,
+            "api_key": api_key,
+            "api_base": api_base,
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+            "timeout": per_attempt_timeout,
+            "stream": True,
+        }
+        try:
+            stream = await asyncio.wait_for(
+                litellm.aresponses(**kwargs), timeout=per_attempt_timeout)
+            async for ev in stream:
+                ev_type_raw = getattr(ev, "type", "")
+                ev_type = getattr(ev_type_raw, "value", None) or str(ev_type_raw)
+                if ev_type == "response.output_text.delta":
+                    delta = getattr(ev, "delta", "") or ""
+                    if delta:
+                        yield {"type": "token", "content": delta, "call_id": call_id}
+                elif ev_type == "response.output_item.done":
+                    item = getattr(ev, "item", None)
+                    if _get(item, "type", "") == "reasoning":
+                        for part in (_get(item, "content", None) or []):
+                            reasoning_buf += _get(part, "text", "") or ""
+                elif ev_type == "response.completed":
+                    resp = getattr(ev, "response", None)
+                    usage = _extract_responses_usage(_get(resp, "usage", None) or {})
+            done_frame = {"type": "done", "usage": usage, "call_id": call_id}
+            if reasoning_buf:
+                done_frame["reasoning_content"] = reasoning_buf
+            yield done_frame
+        except Exception as e:
+            error_cat, error_msg = _classify_litellm_error(e)
+            logger.warning("stream_via_responses error: %s %s", error_cat, error_msg)
+            yield {"type": "error", "error_category": error_cat,
+                   "error_message": error_msg, "call_id": call_id}
 
     # ── Streaming call ────────────────────────────────────────────────
 
@@ -460,7 +691,20 @@ class LiteLLMAdapter:
         api_key: str,
         api_format: str = "openai",
     ) -> ModelCallResult:
-        """Minimal connectivity test with fixed safe prompt."""
+        """Minimal connectivity test with fixed safe prompt.
+
+        B-R20-NO-RESPONSES-CHANNEL: api_format=="responses" 走 complete_via_responses()
+        （不同协议形状，不能复用 complete()）。
+        """
+        if api_format == "responses":
+            return await self.complete_via_responses(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                api_base=api_base,
+                api_key=api_key,
+                max_tokens=10,
+                temperature=0.0,
+            )
         return await self.complete(
             model=model,
             messages=[{"role": "user", "content": "Hi"}],
