@@ -13,8 +13,12 @@ source_priority (裁剪超 budget 时保留顺序): C0 > C1 > C2 > C3 > C4 > C5 
 
 from __future__ import annotations
 
+import logging
+import re
 from enum import Enum
 from typing import Any, Optional
+
+logger = logging.getLogger("rebuild.context_layers")
 
 
 class ContextLayer(str, Enum):
@@ -54,6 +58,96 @@ DEFAULT_CONTEXT_RECIPE = {
 SCENARIO_SKILL_MAX_CHARS = 4000
 SCENARIO_ANCHORS_MAX_CHARS = 1500
 SCENARIO_RISKS_MAX_CHARS = 1500
+
+# ── R21: max_context_budget 估算 + 预算裁剪（首次真正接线，此前只是声明字段）───────
+#
+# 局限性诚实声明：本仓不引入 tiktoken 等真实分词依赖，所以这里没有、也不冒充有真实
+# token 计数。下面的估算只是"声明的 token 数 × 固定字符/token 系数"的粗略近似——真实
+# 分词器对中文/英文/代码混排的字符-token 比差异很大（英文常见 ~4 字符/token，中文常见
+# ~1.5-2 字符/token）。系数取偏保守的低值，让裁剪"宁可提前裁一点"而不是"实际已超预算
+# 却因为估算过于宽松而不知道"。如需精确计数，应换成真实 tokenizer，而不是调大这个系数。
+CHARS_PER_TOKEN_ESTIMATE = 2.0
+
+# 解析失败（配置写坏/单位认不出）时的保守回落，对齐 DEFAULT_CONTEXT_RECIPE 的默认声明值。
+_DEFAULT_TOKEN_BUDGET_FALLBACK = 100_000
+
+_TOKEN_BUDGET_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kKmM]?)\s*(?:tokens?|tok)?\s*$")
+_BUDGET_UNIT_MULTIPLIER = {"": 1, "k": 1_000, "K": 1_000, "m": 1_000_000, "M": 1_000_000}
+
+
+def parse_token_budget(spec: "str | int | float | None") -> int:
+    """把 ``max_context_budget`` 的原始声明解析为 token 数上限。
+
+    支持形态："100k tokens" / "100K" / "50000 tok" / 纯数字字符串 / int / float。
+    解析失败不抛异常（公理3：advisory 降级须可见而非中断主流程）——记录 warning 并
+    回落到 `_DEFAULT_TOKEN_BUDGET_FALLBACK`，避免一条写坏的配置打断整条装配链路。
+    """
+    if isinstance(spec, (int, float)):
+        return int(spec)
+    if not spec:
+        return _DEFAULT_TOKEN_BUDGET_FALLBACK
+    m = _TOKEN_BUDGET_RE.match(str(spec))
+    if not m:
+        logger.warning(
+            "max_context_budget 无法解析：%r，回落默认 %d tokens",
+            spec, _DEFAULT_TOKEN_BUDGET_FALLBACK,
+        )
+        return _DEFAULT_TOKEN_BUDGET_FALLBACK
+    number = float(m.group(1))
+    multiplier = _BUDGET_UNIT_MULTIPLIER.get(m.group(2), 1)
+    return int(number * multiplier)
+
+
+def estimate_char_budget(spec: "str | int | float | None") -> int:
+    """把 token 预算声明换算成字符数上限，供裁剪逐层比较用。
+
+    独立、可替换：只依赖 `parse_token_budget` + `CHARS_PER_TOKEN_ESTIMATE`，不内联进
+    `build_system_prompt_from_layers`，换真实 tokenizer 时只需替换这一处。
+    """
+    tokens = parse_token_budget(spec)
+    return int(tokens * CHARS_PER_TOKEN_ESTIMATE)
+
+
+# 治理/产品/架构层是硬约束：不管预算多紧都不裁剪；即便保留它们仍超预算，也照样超预算。
+PROTECTED_LAYERS = frozenset({
+    ContextLayer.C0_GOVERNANCE, ContextLayer.C1_PRODUCT, ContextLayer.C2_ARCHITECTURE,
+})
+
+
+def plan_budget_trim(layers: dict[str, dict], max_chars: int) -> list[dict]:
+    """按 `LAYER_PRIORITY` 反序规划预算裁剪：从 C6 开始丢整层，直到总字符数 <= max_chars。
+
+    - C0/C1/C2 永远不裁剪（PROTECTED_LAYERS）。
+    - 只在总字符数超预算时才裁剪；不超预算时全部保留（与改动前行为一致）。
+    - 只覆盖 ``layers`` 中已实际装配的层；未装配的层不出现在返回列表里。
+
+    返回按 `LAYER_PRIORITY` 顺序排列的清单：
+      [{"layer": "C0", "chars": 123, "dropped_by_budget": False}, ...]
+    纯函数、无副作用——不修改传入的 ``layers``，调用方按需据此过滤。
+    """
+    total = sum((v or {}).get("chars", 0) for v in layers.values())
+    dropped: set[str] = set()
+    if total > max_chars:
+        for layer in reversed(LAYER_PRIORITY):
+            if layer in PROTECTED_LAYERS:
+                continue
+            key = layer.value
+            if key not in layers:
+                continue
+            if total <= max_chars:
+                break
+            total -= (layers[key] or {}).get("chars", 0)
+            dropped.add(key)
+    return [
+        {
+            "layer": layer.value,
+            "chars": (layers[layer.value] or {}).get("chars", 0),
+            "dropped_by_budget": layer.value in dropped,
+        }
+        for layer in LAYER_PRIORITY
+        if layer.value in layers
+    ]
+
 
 # ── Static layer content (C0-C2 are platform-level constants) ────────────────
 
@@ -315,7 +409,8 @@ def assemble_c6(cases: Optional[list[dict]] = None,
 def build_system_prompt_from_layers(layers: dict[str, dict], stage: str,
                                     agent_name: str = "Node Worker Agent",
                                     user_message: str = "",
-                                    scenario_line: str = "") -> str:
+                                    scenario_line: str = "",
+                                    max_context_budget: "str | int | float | None" = None) -> str:
     """Combine assembled layers into a single system prompt string.
 
     Priority order for content: C0 > C1 > C2 > C3 > C4 > C5 > C6.
@@ -324,13 +419,25 @@ def build_system_prompt_from_layers(layers: dict[str, dict], stage: str,
     ``scenario_line``（R20-3）由 context_assembler 依场景 manifest 生成并附在身份句之后；
     身份句本身**不得承载任何场景限定**。新参数带默认值且置于末位，故既有位置参数调用
     ``(layers, stage, agent_name, user_message)`` 零改动仍合法。
+
+    ``max_context_budget``（R21）：真正读取 `max_context_budget` 声明做预算裁剪 ——
+    未传时回落 `DEFAULT_CONTEXT_RECIPE["max_context_budget"]`（"100k tokens"）。裁剪按
+    `plan_budget_trim`（反序丢整层，C0/C1/C2 永不裁剪）执行；正常项目上下文远小于该预算，
+    不会触发裁剪，行为与改动前一致。
     """
     identity = f"你是 rebuild 平台的 {agent_name}。"
     if scenario_line:
         identity += scenario_line
     parts = [identity + "\n"]
+    budget_spec = (max_context_budget if max_context_budget is not None
+                   else DEFAULT_CONTEXT_RECIPE["max_context_budget"])
+    max_chars = estimate_char_budget(budget_spec)
+    trim_plan = plan_budget_trim(layers, max_chars)
+    dropped_keys = {entry["layer"] for entry in trim_plan if entry["dropped_by_budget"]}
     for layer in LAYER_PRIORITY:
         key = layer.value
+        if key in dropped_keys:
+            continue
         if key in layers and layers[key].get("content"):
             parts.append(layers[key]["content"])
             parts.append("")  # blank line between layers

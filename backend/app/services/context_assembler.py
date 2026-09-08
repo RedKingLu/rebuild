@@ -19,10 +19,11 @@ import logging
 from typing import Optional
 
 from app.services.context_layers import (
-    ContextLayer, DEFAULT_CONTEXT_RECIPE,
+    ContextLayer, DEFAULT_CONTEXT_RECIPE, LAYER_PRIORITY,
     assemble_c0, assemble_c1, assemble_c2, assemble_c3,
     assemble_c4, assemble_c5, assemble_c6,
     build_system_prompt_from_layers,
+    estimate_char_budget, plan_budget_trim,
 )
 from app.services.scenario_loader import resolve_scenario_pack
 from app.services.workspace_service import workspace_path
@@ -243,9 +244,51 @@ def assemble_context(
     if "C6" in active_layers:
         layers["C6"] = assemble_c6(cases, knowledge)
 
+    # ── R21: 装配清单（layers_manifest）——本次装配了哪些层/每层字符数/是否截断/
+    # 是否因预算裁剪未纳入。清单只含元数据（层名/整数/布尔/skill 名单），不含任何层的
+    # 正文原文（体积 + 脱敏，测试 test_assemble_context_carries_scenario_into_prompt_and_trace
+    # 钉住"trace 不得携带正文原文"），故无需过 redact_secrets（无自由文本字段可能夹带 Key）。
+    max_context_budget = recipe.get("max_context_budget", DEFAULT_CONTEXT_RECIPE["max_context_budget"])
+    max_chars_budget = estimate_char_budget(max_context_budget)
+    trim_plan = plan_budget_trim(layers, max_chars_budget)
+    dropped_by_budget = {entry["layer"] for entry in trim_plan if entry["dropped_by_budget"]}
+    skill_names_hit = [s.get("name") or s.get("skill_id") or "" for s in skills_with_body]
+
+    layers_manifest: list[dict] = []
+    for layer in LAYER_PRIORITY:
+        key = layer.value
+        entry = layers.get(key)
+        item = {
+            "layer": key,
+            "assembled": entry is not None,
+            "chars": entry.get("chars", 0) if entry else 0,
+            "dropped_by_budget": key in dropped_by_budget,
+        }
+        if key == "C3":
+            # 复用 skill_loader 已有的 body_truncated 标记（不新造截断判定）。
+            item["truncated"] = any(s.get("body_truncated") for s in skills_with_body)
+            item["skills_hit"] = skill_names_hit
+        elif key == "C1":
+            # 复用场景块已有的三份 truncated 标记（skill_body/anchors/risks）。
+            item["truncated"] = any(scenario_pack.get(k) for k in
+                                    ("skill_body_truncated", "anchors_truncated", "risks_truncated"))
+        else:
+            # 该层目前没有可复用的既有截断标记（如 C5 的 [:1000]/[:500] 是硬字符切片，
+            # 未落标记）——如实标 None（未跟踪），不假称 False（公理3：不冒充精确）。
+            item["truncated"] = None
+        layers_manifest.append(item)
+
     # Assembly trace stats (for Trace writing + Evidence)
     ctx["assembly_trace"] = {
         "layers_assembled": list(layers.keys()),
+        "layers_manifest": layers_manifest,
+        "budget": {
+            "spec": max_context_budget,
+            "estimated_max_chars": max_chars_budget,
+            "total_chars_before_trim": sum(v.get("chars", 0) for v in layers.values()),
+            "trimmed": bool(dropped_by_budget),
+            "dropped_layers": sorted(dropped_by_budget),
+        },
         "skill_count": len(skills_with_body),
         "skills_with_body": sum(1 for s in skills_with_body if s.get("body")),
         "skills_not_connected": sum(1 for s in skills_with_body if s.get("capability_status") == "not_connected"),
@@ -313,8 +356,12 @@ def build_system_prompt(
     )
     agent_name = (ctx.get("selected_agent") or {}).get("name", "AI 助手")
     layers = ctx.get("layers", {})
-    return build_system_prompt_from_layers(layers, current_stage, agent_name, user_message,
-                                           scenario_line=ctx.get("scenario_line", ""))
+    recipe = ctx.get("context_recipe", {}) or {}
+    return build_system_prompt_from_layers(
+        layers, current_stage, agent_name, user_message,
+        scenario_line=ctx.get("scenario_line", ""),
+        max_context_budget=recipe.get("max_context_budget"),
+    )
 
 
 def _scenario_line(pack: dict) -> str:
