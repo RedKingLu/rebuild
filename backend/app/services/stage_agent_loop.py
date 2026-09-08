@@ -48,6 +48,18 @@ _REPEAT_TOOL_CALL_REMINDER_TEMPLATE = (
     "如果这个方法没有取得新的进展，请改变方法，或者基于已获得的信息直接给出结论。"
 )
 
+# R21 dsh 范式吸收「目标状态与推进权分离」②：一个"目标"这一轮是否还能继续跑，和
+# "这一轮为什么能继续"应该分开记录，而不是只有一个隐式的轮次上限常量。下面把
+# run_stage_tool_loop 里真实存在的两条推进路径（读代码确认，未臆造第三种）落成
+# 显式取值，写入 Trace 的 advancement_basis 字段：
+#   - within_round_budget：仍在 max_rounds 预算内，本轮正常进入
+#   - round_budget_exhausted：轮次预算耗尽（for-else 分支），强制中止工具调用并做
+#     一次性收尾合成
+# 取值故意不跨模块 import（仅 2 个字符串常量，review_pass.py 有同名对应常量，取值
+# 必须保持字面一致）——为 2 个字符串新增模块耦合没有必要（YAGNI）。
+ADVANCE_WITHIN_ROUND_BUDGET = "within_round_budget"
+ADVANCE_ROUND_BUDGET_EXHAUSTED = "round_budget_exhausted"
+
 
 def _tool_call_signature(fn_name: str, fn_args: dict) -> str:
     """稳定的 (工具名, 参数) 签名：参数排序后 json 序列化再取 sha256，用于跨轮比较是否
@@ -102,6 +114,22 @@ def extract_json_object(content: str) -> Optional[dict]:
     return None
 
 
+def _trace_round_advance(tracer, *, project_id: str, run_id: str, stage: str,
+                         round_no: int, max_rounds: int, basis: str, summary: str) -> None:
+    """把"这一轮为什么能继续"写入既有 Trace 机制（R21 ②）：只追加一条记录，不新建
+    Trace 通道，也不参与/影响是否推进的决定——LangGraph/本循环仍是唯一的推进者，这里
+    只是在已有的推进点旁边补一条可回答"谁/为何推进本轮"的记录。advisory：写入失败不
+    影响循环本身（与 node_loop._trace 的静默失败记录方式一致）。"""
+    if tracer is None:
+        return
+    try:
+        tracer.write("stage_tool_loop", action=basis, summary=summary,
+                     project_id=project_id, run_id=run_id or None, stage=stage,
+                     round=round_no, max_rounds=max_rounds, advancement_basis=basis)
+    except Exception:
+        logger.debug("stage_tool_loop trace 写入失败（advisory）", exc_info=True)
+
+
 async def run_stage_tool_loop(
     gateway,
     *,
@@ -118,6 +146,10 @@ async def run_stage_tool_loop(
     max_rounds: int = _MAX_TOOL_ROUNDS,
 ) -> dict:
     """Run a bounded multi-round tool-calling loop for a P-stage agent.
+
+    `max_rounds` defaults to `_MAX_TOOL_ROUNDS` (6) but MAY be overridden per call/run
+    by the caller — an explicit optional parameter, not a global config knob (R21).
+    Callers that omit it keep today's behaviour unchanged.
 
     Returns a dict:
       {"status": "completed"|"failed", "content": str, "model_used": str|None,
@@ -168,6 +200,11 @@ async def run_stage_tool_loop(
     try:
         for _round in range(max_rounds):
             rounds_used = _round + 1
+            _trace_round_advance(
+                tracer, project_id=project_id, run_id=run_id, stage=stage,
+                round_no=rounds_used, max_rounds=max_rounds,
+                basis=ADVANCE_WITHIN_ROUND_BUDGET,
+                summary=f"stage tool-loop round {rounds_used}/{max_rounds} for {stage}（预算内推进）")
             round_tool_calls: list[dict] = []
             round_text = ""
             async for frame in gateway.call_stream(
@@ -232,6 +269,11 @@ async def run_stage_tool_loop(
             # Round budget spent while still calling tools → force ONE final synthesis
             # (tools disabled) so the model MUST produce the structured answer from the
             # accumulated real tool results (mirror p4 worker / agent_loop forced-final).
+            _trace_round_advance(
+                tracer, project_id=project_id, run_id=run_id, stage=stage,
+                round_no=rounds_used, max_rounds=max_rounds,
+                basis=ADVANCE_ROUND_BUDGET_EXHAUSTED,
+                summary=f"stage tool-loop 达到 {max_rounds} 轮上限（{stage}），强制中止工具调用并收尾合成")
             messages.append({"role": "user",
                              "content": "请立即基于以上工具读取到的真实信息，直接输出本阶段要求的最终 JSON 产物，不要再调用工具。"})
             async for frame in gateway.call_stream(

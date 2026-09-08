@@ -13,6 +13,17 @@ from __future__ import annotations
 
 from typing import Optional, Callable
 
+# R21 dsh 范式吸收「目标状态与推进权分离」②：记录"这一轮为什么能继续"。ReviewPass 是
+# NodeLoop（及 StageLoop）实际驱动的"执行循环"内核（node_loop.py Step5+6 直接
+# new 一个 ReviewPass(max_rounds=self.max_rounds, ...)），真实存在的推进路径（读代码
+# 确认，未臆造）只有两种：
+#   - within_round_budget：round_num 仍 <= max_rounds，本轮正常进入（含首轮）
+#   - round_budget_exhausted：全部轮次跑完仍未通过 review → 强制 escalate 到 Gate
+# 取值必须与 stage_agent_loop.py 顶部的同名字符串保持字面一致；未跨模块 import 只是
+# 为了不为 2 个字符串常量新增模块耦合（YAGNI），不是取值上的分歧。
+_ADVANCE_WITHIN_ROUND_BUDGET = "within_round_budget"
+_ADVANCE_ROUND_BUDGET_EXHAUSTED = "round_budget_exhausted"
+
 
 class ReviewResult:
     """Standard review output from any review pass."""
@@ -81,7 +92,8 @@ class ReviewPass:
             if self.tracer:
                 self.tracer.write("review_pass", action="round_start",
                     summary=f"Review pass round {round_num}/{self.max_rounds} for {stage}",
-                    project_id=project_id, run_id=self.run_id or None, stage=stage)
+                    project_id=project_id, run_id=self.run_id or None, stage=stage,
+                    advancement_basis=_ADVANCE_WITHIN_ROUND_BUDGET)
 
             try:
                 result = await execute_fn() if hasattr(execute_fn, '__call__') and _is_async(execute_fn) else execute_fn()
@@ -120,6 +132,13 @@ class ReviewPass:
 
     def _escalate(self, project_id: str, stage: str, reason: str) -> dict:
         """Escalate to human Gate after max rounds exhausted."""
+        if self.tracer:
+            # R21 ②：轮次预算耗尽是这一轮"为什么不能再继续"的真实终止原因，记入 Trace
+            # （与既有 round_start/round_end 用同一 tracer.write 机制，不新建通道）。
+            self.tracer.write("review_pass", action="round_budget_exhausted",
+                summary=f"轮次预算耗尽（{self.max_rounds} 轮）：{reason}",
+                project_id=project_id, run_id=self.run_id or None, stage=stage,
+                advancement_basis=_ADVANCE_ROUND_BUDGET_EXHAUSTED)
         if self.auditor:
             self.auditor.write(
                 audit_type="review_escalation", action="escalate_to_gate",

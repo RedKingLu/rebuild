@@ -52,6 +52,11 @@ STEP_ROUTE = "route_decided"
 SPLIT_STRATEGIES = ("inline", "serial", "parallel", "hybrid", "nested_loop")
 _HIGH_RISK = {"L4", "L5"}
 
+# R21: the ReviewPass round budget stays an EXPLICIT, overridable constructor default
+# (not a hardcoded literal, not a global config file) — a caller may pass a different
+# max_rounds per run; omitting it keeps today's default (=2) unchanged.
+_DEFAULT_MAX_ROUNDS = 2
+
 # Acceptance result → (node_status, edge-strategy route hint) — Step 9 routing table
 _ROUTE_MAP = {
     "accepted": ("completed", "next"),
@@ -118,7 +123,7 @@ class NodeLoop:
 
     def __init__(self, *, db=None, tracer=None, auditor=None,
                  acceptance_service: Optional[AcceptanceService] = None,
-                 max_rounds: int = 2):
+                 max_rounds: int = _DEFAULT_MAX_ROUNDS):
         self.db = db
         self.tracer = tracer
         self.auditor = auditor
