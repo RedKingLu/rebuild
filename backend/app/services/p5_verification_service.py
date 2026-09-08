@@ -261,10 +261,22 @@ class P5VerificationService:
         missing = []
         invalid_basis = []
         verified = []
+        superseded = []
         for eid in ev_refs:
             ev = ev_map.get(eid)
             if ev is None:
                 missing.append(eid)
+                continue
+            # R21 / B-R20-EVIDENCE-SHA-STALE: 一个文件在 P4 多节点执行中被后续
+            # 节点合法覆写是正常行为——早先写入的 Evidence 记录的 sha256 只反映
+            # 它写入当时的文件版本，文件被覆写后自然与"现在"的内容不一致。这不是
+            # 证据基准被篡改，是 aet_service.write_evidence() 在检测到同一
+            # output_code_ref 被新 Evidence 覆盖式引用时打上的 superseded_by 标记。
+            # 跳过这些历史记录，只用未被标记（即最新）的记录做 sha256 校验——
+            # 真正的篡改（最新记录 sha256 与文件不一致）仍然会被下面的校验判失败，
+            # 不会因为"存在历史记录"而被绕过。
+            if ev.get("superseded_by"):
+                superseded.append(eid)
                 continue
             # Evidence basis 真实性：检查 output_code_ref 的 sha256 是否与文件一致
             sha_ok = self._check_evidence_sha256(ws, ev)
@@ -276,6 +288,7 @@ class P5VerificationService:
         result.details["verified"] = verified
         result.details["missing"] = missing
         result.details["invalid_basis"] = invalid_basis
+        result.details["superseded"] = superseded
 
         if missing:
             result.issues.append({"type": "evidence_missing",
