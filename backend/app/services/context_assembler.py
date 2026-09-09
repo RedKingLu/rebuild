@@ -383,10 +383,33 @@ def _scenario_line(pack: dict) -> str:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _resolve_recipe(agent: Optional[dict]) -> dict:
-    """Get the effective context_recipe, falling back to DEFAULT_CONTEXT_RECIPE."""
+    """Get the effective context_recipe, falling back to DEFAULT_CONTEXT_RECIPE.
+
+    公理3（R21 卫生）：Agent 定义里 `context_recipe` 的**未知键必须发声**。下游只逐个
+    `.get()` 少数已知键（`required_context_layers` / `optional_layers` /
+    `max_chars_per_skill` / `max_context_budget` …），而 `update()` 会把任意键合并进来 ⇒
+    键名拼错或写了个不存在的配置项时，配置"看起来生效了"但实际完全没作用，且没有任何提示。
+
+    已知键集合**从 `DEFAULT_CONTEXT_RECIPE` 的键派生**（单一事实源；不在此处另抄一份会
+    随时间漂移的键名清单）。
+
+    只发 warning，**不抛异常、不硬失败**：存量 DB 的 Agent 定义可能已带历史遗留的未知键，
+    改成报错会让这些 Agent 直接加载失败（真实爆炸半径）。返回值行为保持不变 —— 未知键
+    仍原样合并进结果，本次改动只多一条警告。
+    """
     if agent and agent.get("context_recipe"):
+        overrides = agent["context_recipe"]
         recipe = dict(DEFAULT_CONTEXT_RECIPE)
-        recipe.update(agent["context_recipe"])
+        recipe.update(overrides)
+        unknown = sorted(k for k in overrides if k not in DEFAULT_CONTEXT_RECIPE) \
+            if isinstance(overrides, dict) else []
+        if unknown:
+            logger.warning(
+                "context_recipe 含未被识别的键，这些键不会生效（下游只消费已知键）："
+                "agent=%s(%s) unknown_keys=%s known_keys=%s",
+                agent.get("name") or "?", agent.get("agent_id") or "?",
+                unknown, sorted(DEFAULT_CONTEXT_RECIPE),
+            )
         return recipe
     return dict(DEFAULT_CONTEXT_RECIPE)
 
