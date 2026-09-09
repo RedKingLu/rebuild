@@ -19,17 +19,23 @@ R19-1 (G1 容器真构建)：新增 "toolchain_container" → ToolchainContainer
   （network=none / read_only / cap_drop=ALL / 256m / uid 10002 / 纯 Python 沙箱镜像）
   **一字不改**；新档用厂商官方 SDK 镜像跑真实项目构建，仅 3 处最小挂载，出网为
   **如实标注的弱化项**（经用户批准的 C2 变更，Q-R19-1-1）。绝不挂 docker.sock。
+
+R21：子进程生命周期原语（起/等/超时终止/收尾）已抽到 `subprocess_runner.py` ——
+  `git_service.run_git_command` 有同一个孤儿进程缺陷，两处必须共用**一份**清理实现
+  （`B-R20-REDACT-THREE-IMPLS` 的教训），同时让本文件回到 800 行上限内。
+  本文件保留的是**安全策略**（DENY 名单 / 白名单 / 环境清洗 / 风险分级）与 provider 接线。
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
 import tempfile
 from pathlib import Path
 from typing import Protocol
+
+from app.services.subprocess_runner import run_subprocess_command
 
 logger = logging.getLogger("rebuild.execution_provider")
 
@@ -228,6 +234,11 @@ async def _run_subprocess(code: str, language: str, timeout: int,
     R9-3A: Accepts optional cwd to bind execution to project workspace (WP-A1.1).
     R12-10: enforce_whitelist=False allows platform-internal P5 commands
     (mvn/go/npm/cargo/make/cmake) while keeping DENY_SUBSTRINGS L5 check.
+    R21: 超时/异常/取消三条退出路径都**真正终止子进程并等它停稳**，不再留下孤儿进程。
+    该清理机制已抽到 `subprocess_runner.run_subprocess_command`（与
+    `git_service.run_git_command` 共用同一份实现，避免第二份副本悄悄漂移）；本函数
+    只保留**安全策略**：语言 → argv 映射、ALLOWED_COMMANDS 白名单、`_clean_env`
+    环境清洗，以及 provider/fallback/blocked 这几个既有返回字段。
     """
     clean_env = _clean_env()
 
@@ -248,44 +259,30 @@ async def _run_subprocess(code: str, language: str, timeout: int,
         cmd = ["python3", "-c", code]
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=clean_env,
-            cwd=cwd,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        returncode = proc.returncode or 0
-        # R21 循环卫生②：timed_out / exit_code / signal 三个事实各自独立上报，不嵌套
-        # 依赖——signal 从 POSIX returncode 约定（负数 -N = 被信号 N 终止）派生，不猜测；
-        # 正常退出（returncode>=0）则 signal 诚实报 None（没有信号可归因）。
-        signal_num = -returncode if returncode < 0 else None
-        return {
-            "exit_code": returncode,
-            "stdout": stdout.decode("utf-8", errors="replace")[:65536],
-            "stderr": stderr.decode("utf-8", errors="replace")[:65536],
-            "provider": "local_subprocess",
-            "fallback": False,
-            "blocked": False,
-            "timed_out": False,
-            "signal": signal_num,
-        }
-    except asyncio.TimeoutError:
-        # 超时分支：timed_out 必须独立、真实报 True，不因为超时就整体跳过 exit_code/
-        # signal 的填充。此处进程未被主动终止（未 kill），故没有可归因的真实信号 → None；
-        # exit_code 保留既有 -1 语义（不知道真实退出码，不是 0 也不是某个信号退出码）。
-        return {
-            "exit_code": -1, "stdout": "", "stderr": f"Timeout after {timeout}s",
-            "provider": "local_subprocess", "fallback": False, "blocked": False,
-            "timed_out": True, "signal": None,
-        }
+        outcome = await run_subprocess_command(cmd, timeout=timeout, cwd=cwd, env=clean_env)
     except Exception as e:
+        # 起不来（命令不存在 / cwd 不存在 …）：没有进程需要清理。
+        # 注：CancelledError 在 py3.8+ 继承 BaseException，不会被这里吞掉 ——
+        # 取消语义由 run_subprocess_command 处理（SIGKILL 后继续向上传播）。
         return {
             "exit_code": -1, "stdout": "", "stderr": str(e),
             "provider": "local_subprocess", "fallback": False, "blocked": False,
             "timed_out": False, "signal": None,
         }
+
+    # R21 循环卫生②：timed_out / exit_code / signal 三个事实各自独立上报，不嵌套
+    # 依赖——signal 从 POSIX returncode 约定（负数 -N = 被信号 N 终止）派生，不猜测；
+    # 正常退出（returncode>=0）则 signal 诚实报 None（没有信号可归因）。
+    return {
+        "exit_code": outcome.exit_code,
+        "stdout": outcome.stdout,
+        "stderr": outcome.stderr,
+        "provider": "local_subprocess",
+        "fallback": False,
+        "blocked": False,
+        "timed_out": outcome.timed_out,
+        "signal": outcome.signal,
+    }
 
 
 class ContainerExecutionProvider:

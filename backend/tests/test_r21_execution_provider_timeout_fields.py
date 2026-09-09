@@ -43,7 +43,12 @@ class TestLocalSubprocessTimeoutFields:
         # 被整体跳过。
         assert result["exit_code"] == -1
         assert "signal" in result
-        assert result["signal"] is None  # 未主动 kill，没有可归因信号
+        # R21 实质缺陷修复后更新：超时分支现在会**真正终止子进程并等它停稳**（原实现
+        # 只取消 communicate()，子进程继续跑成孤儿）。因此"未主动 kill ⇒ signal is None"
+        # 这条断言锁定的是已经过时的行为；现在 signal 如实反映真实归因：sleep 中的 python
+        # 被 SIGTERM 杀掉 ⇒ returncode -15 ⇒ 15。（SIGTERM 无效时升级 SIGKILL→9 的路径，
+        # 见 tests/test_r21_subprocess_timeout_orphan_kill.py。）
+        assert result["signal"] == 15
         assert result["blocked"] is False
         assert result["fallback"] is False
 
@@ -79,7 +84,9 @@ class TestWorkspaceLocalTimeoutFields:
 
         assert result["timed_out"] is True
         assert result["exit_code"] == -1
-        assert result["signal"] is None
+        # R21 实质缺陷修复后更新（同上）：超时后子进程被真正终止 ⇒ `sleep` 被 SIGTERM
+        # 杀掉，signal 如实报 15，而不再是"没杀 ⇒ None"。
+        assert result["signal"] == 15
 
     def test_real_success_reports_timed_out_false_and_signal_none(self, tmp_path):
         provider = WorkspaceLocalExecutionProvider()
