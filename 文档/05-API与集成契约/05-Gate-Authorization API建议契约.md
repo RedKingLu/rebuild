@@ -3,7 +3,7 @@
 > 文档路径：`文档/05-API与集成契约/05-Gate-Authorization API建议契约.md`
 > 文档状态：**accepted**
 > 平台名称：rebuild
-> 当前版本：V26.1.1
+> 当前版本：V26.2
 > 来源草稿：`产物/草稿/05-Gate-Authorization API建议契约.md`（v0.1）
 > 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程
 > 最后更新时间：2026-06-24（R2 去重：§13 三模式定义收敛为引用详述源 D-025+02术语表）

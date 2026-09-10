@@ -1,218 +1,222 @@
 # rebuild
 
-**软件重构平台** —— 用目标驱动的 AI Agent 编排，把"把一套已有软件改造成另一套形态"这件事做成可追踪、可验证、有证据的工程流程。
+> **Language / 语言**: English (this page, a translation) · [中文](./README.zh.md)
+> The **Chinese version is authoritative** for this repository's public documentation. This English page is a translation of it; where the two disagree, **the Chinese version governs**.
+> See [`.i18n.yaml`](./.i18n.yaml) for the language-variant manifest. Links on this page point to the English variants.
 
-当前版本 `V26.1.1`（在建基线 `V26.2`）· 许可 [MIT](./LICENSE) · 语言：本 README 目前仅提供中文版
+**A software rebuilding platform** — it uses goal-driven AI agent orchestration to turn "convert an existing piece of software into another form" into a traceable, verifiable, evidence-backed engineering process.
+
+Current version `V26.2` · License [MIT](./LICENSE) · Language: English (this page, a translation) / [中文](./README.zh.md) (authoritative)
 
 ---
 
-## 这是什么
+## What this is
 
-rebuild 接收一份**真实存在的源代码**，围绕一个**可判定的目标态**（换技术栈、换数据库、换运行环境、升级框架、拆分模块……），驱动一组 Agent 完成从接入、建档、评估、规划、执行、验证到交付的全过程，并在每一步留下可复查的证据。
+rebuild takes in a body of **source code that actually exists**, and — around a **decidable target state** (change the tech stack, change the database, change the runtime environment, upgrade a framework, split modules, …) — drives a set of agents through the whole course from intake, fact-basing, assessment, planning, execution and verification to delivery, leaving reviewable evidence at every step.
 
-它**不是**：
+What it is **not**:
 
-- 不是聊天式代码助手 —— 它以项目为单位推进阶段，而不是以对话轮次为单位答题
-- 不是无人值守的一键迁移黑箱 —— 关键节点必须由人裁决（见下文「用户 Gate」）
-- 不是通用 Agent 市场 / 泛 AI 办公工具 —— 没有源代码、没有可验证产出物的任务不在范围内
+- Not a chat-style coding assistant — it advances stage by stage per project, not answer by answer per conversational turn
+- Not an unattended one-click migration black box — the critical junctures must be adjudicated by a human (see "user gates" below)
+- Not a general-purpose agent marketplace or general AI office tool — tasks without source code and without machine-verifiable output are out of scope
 
-## 能做什么
+## What it can do
 
-### 典型场景（平台重点支持，配套资源相对更丰富）
+### Typical scenarios (the platform's focus, with comparatively richer supporting resources)
 
-| 场景 | 标识 | 说明 |
+| Scenario | Identifier | Description |
 |---|---|---|
-| 信创切换 | `xinchuang_switch` | 迁移到国产化软硬件与数据库栈 |
-| 软件现代化 | `modernization` | 老旧技术栈升级、架构现代化改造 |
-| 软件移植 | `porting` | 跨平台、跨运行时、跨语言的移植 |
+| Domestic-stack switchover | `xinchuang_switch` | Migration to domestic hardware, software and database stacks |
+| Software modernization | `modernization` | Upgrading legacy tech stacks, modernizing architecture |
+| Software porting | `porting` | Porting across platforms, runtimes and languages |
 
-### 开放扩展
+### Open extension
 
-场景体系是**开放的**。上述典型场景是平台重点投入的方向，而**不是全部** —— 平台支持"**包括但不限于**"这三类的场景，允许你**自行修改现有场景包或新增自定义场景包**。新增场景的目标形态是"新增一个场景包目录即可生效"，而不是改代码里的枚举。
+The scenario system is **open**. The typical scenarios above are the directions the platform invests in most heavily, and they are **not the whole set** — the platform supports scenarios "**including but not limited to**" these three, and lets you **modify existing scenario packs or add your own custom ones**. The intended shape for adding a scenario is "drop in one scenario-pack directory and it takes effect", not editing an enumeration in the code.
 
-### 场景准入三判据
+### The three admission criteria for a scenario
 
-任何场景（无论典型还是自定义）要进入流程，需同时满足：
+For any scenario (typical or custom) to enter the pipeline, all of the following must hold at once:
 
-1. **有源代码** —— 存在可获取、可读取的真实代码
-2. **有可判定的目标态** —— 说得清"改成什么样才算成功"
-3. **产出物可机器验证** —— 结果能被编译、测试、diff 或等价性检查所检验
+1. **There is source code** — real code that can be obtained and read
+2. **There is a decidable target state** — you can state clearly "what counts as success"
+3. **The output is machine-verifiable** — the result can be checked by compilation, tests, diff, or equivalence checking
 
-三条中缺任一条，平台会明确告诉你"这不适合用 rebuild 做"，而不是硬着头皮跑一遍给你一份看起来很像样的报告。
+If any one of the three is missing, the platform will tell you plainly that "this is not a good fit for rebuild", rather than pushing through a run anyway and handing you a report that merely looks presentable.
 
-## 工作流程
+## Workflow
 
-项目按 P0–P6 七个可裁剪阶段推进：
+A project advances through seven trimmable stages, P0–P6:
 
 ```
-P0 接入  →  P1 建档  →  P2 评估  →  P3 规划  →  P4 执行  →  P5 验证  →  P6 交付
+P0 Intake  →  P1 Fact-base  →  P2 Assess  →  P3 Plan  →  P4 Execute  →  P5 Verify  →  P6 Deliver
 ```
 
-- **P0 接入**：本地目录 / Git 仓库 / ZIP 包 / GitHub 仓库导入源码
-- **P1 建档**：建立项目事实源（结构、技术栈、依赖、构建与运行方式、配置、风险线索）
-- **P2 评估**：多维度评估迁移与重构风险，产出评估报告、风险清单、待决策项
-- **P3 规划**：形成方案与任务图（TaskGraph）
-- **P4 执行**：按任务图逐节点执行真实改造，产出代码与补丁
-- **P5 验证**：编译 / 测试 / diff / 等价性检查等确定性验证
-- **P6 交付**：汇总产物与证据
+- **P0 Intake**: import source code from a local directory / Git repository / ZIP archive / GitHub repository
+- **P1 Fact-base**: establish the project's source of facts (structure, tech stack, dependencies, build and run procedures, configuration, risk leads)
+- **P2 Assess**: assess migration and rebuilding risk along multiple dimensions; produce an assessment report, a risk list, and open decision items
+- **P3 Plan**: form a plan and a task graph (TaskGraph)
+- **P4 Execute**: carry out the real modifications node by node along the task graph, producing code and patches
+- **P5 Verify**: deterministic verification — compilation / tests / diff / equivalence checking
+- **P6 Deliver**: consolidate artifacts and evidence
 
-流程可裁剪 —— 例如只做评估：`P0 → P1 → P2 → P6`。
+The pipeline is trimmable — for an assessment only, for instance: `P0 → P1 → P2 → P6`.
 
-## 核心设计取向
+## Core design commitments
 
-这几点是 rebuild 与"看起来能跑就行"的自动化脚本的根本区别：
+These are what separate rebuild from an automation script built on "it seems to run, ship it":
 
-**1. capability-first：能力不够就诚实报告，不伪造成功**
+**1. capability-first: when a capability falls short, report it honestly; never fake success**
 
-平台会显式区分"做到了"与"做不到"。缺少有效模型凭据、缺少可绑定的源码、环境不具备、证据不足时，它会返回 **`blocked`** 或 **`evidence_gap`**，而**不会**退化成占位内容、mock 数据或规则模板来冒充完成。宁可交出一个"这里我没做到，原因是 X"的诚实结论，也不交出一份无法追溯的漂亮产物。
+The platform explicitly distinguishes "done" from "cannot do". When valid model credentials are missing, when there is no bindable source code, when the environment is not in place, or when evidence is insufficient, it returns **`blocked`** or **`evidence_gap`** — it will **not** degrade into placeholder content, mock data, or rule templates to pass itself off as finished. An honest conclusion saying "I did not manage this, because X" is preferable to a pretty artifact that cannot be traced.
 
-**2. 关键节点有用户 Gate（人工裁决）**
+**2. Critical junctures have user gates (human adjudication)**
 
-阶段晋级和高风险动作设有 Gate，需要人查看证据后授权。这是**设计选择**，不是尚未做完的自动化 —— 代码改造的责任不应由模型独自承担。
+Stage promotion and high-risk actions are gated: a human must review the evidence and authorize. This is a **design choice**, not automation that has yet to be finished — responsibility for modifying code should not rest with a model alone.
 
 **3. No Evidence No Completed**
 
-任何"已完成"都必须挂得上证据。产物、验证记录、执行轨迹（Trace）可回查。
+Every "completed" must have evidence hanging off it. Artifacts, verification records and execution traces (Trace) can be reviewed after the fact.
 
-**4. 推理归 LLM，采集与验证归确定性代码**
+**4. Reasoning belongs to the LLM; collection and verification belong to deterministic code**
 
-识别、理解、规划、风险研判交给 Agent 推理；克隆代码、列文件、跑命令、计数、编译、跑测试、做 diff 交给确定性工具。两者不互相冒充。
+Recognition, comprehension, planning and risk judgement go to agent reasoning; cloning code, listing files, running commands, counting, compiling, running tests and producing diffs go to deterministic tools. Neither impersonates the other.
 
-**5. BYOK（自带模型凭据）**
+**5. BYOK (bring your own model credentials)**
 
-模型 API Key 由你自己提供，只从环境变量读取，加密存储，接口只返回凭据状态而不回显明文。
+You supply the model API keys yourself; they are read from environment variables only and stored encrypted, and the API returns only credential status, never echoing the plaintext.
 
-## 当前成熟度（诚实标注）
+## Current maturity (stated honestly)
 
-**rebuild 目前处于可运行、可端到端跑通、但仍在积极建设中的阶段。它不是一个开箱即用的全自动迁移平台。**
+**rebuild is currently at the stage of being runnable and able to complete an end-to-end run, but still under active construction. It is not a turnkey, fully automatic migration platform.**
 
-已经可用：
+Already usable:
 
-- 前后端可本地启动，项目可创建并按 P0–P6 推进
-- 阶段编排、Gate、证据与 Trace、任务图、模型网关、工作区隔离与执行沙箱、代码托管集成等主干链路已实现并有自验证据
-- 后端测试套件完整、可全量运行
+- Backend and frontend start locally; projects can be created and advanced through P0–P6
+- The trunk paths — stage orchestration, gates, evidence and Trace, task graph, model gateway, workspace isolation and the execution sandbox, code-hosting integration — are implemented and have self-verification evidence
+- The backend test suite is complete and can be run in full
 
-**需要你有心理准备的部分（这些是现状，不是免责声明）：**
+**Things to be mentally prepared for (these are the current state of affairs, not a disclaimer):**
 
-| 事项 | 现状 |
+| Item | Current state |
 |---|---|
-| **必须人工介入** | 阶段晋级需用户 Gate 授权；改造产物需人工复核后再采纳。不存在"提交仓库地址后回来收货"的用法 |
-| **必须自备模型凭据** | 无有效 Key 时相关能力诚实 `blocked`，平台不提供内置模型，也不会降级为规则引擎假装完成 |
-| **机器验证 ≠ 业务等价保证** | 编译通过、测试通过、diff 可读，不等于业务语义完全等价。语义等价仍需你的领域知识把关 |
-| **部分能力为不完整状态** | 少量能力仍标记为部分实现或规划中，界面上会以明确的能力状态标记呈现，不以完成态示人 |
-| **场景包的开放扩展仍在建设** | 典型场景的支持较成熟；"零代码改动新增自定义场景包"是既定方向，尚在推进中 |
-| **无多用户与权限体系** | 当前面向**单机单用户**本地使用，没有登录、账号与租户隔离。**不要直接把服务暴露到公网** |
-| **容器内执行默认关闭** | 容器化执行需显式 opt-in 并挂载 Docker socket（等同交出宿主 Docker 控制权），仅建议在可信单机环境启用 |
-| **无预构建发行物** | 尚未发布 PyPI 包、npm 包或公共镜像，需按下文从源码本地构建 |
+| **Human intervention is required** | Stage promotion requires user-gate authorization; modified artifacts require human review before adoption. There is no "submit a repository URL and come back to collect the goods" usage |
+| **You must supply your own model credentials** | With no valid key, the affected capabilities honestly report `blocked`. The platform provides no built-in model, and it will not degrade into a rule engine to pretend it finished |
+| **Machine verification ≠ a guarantee of business equivalence** | Compilation passing, tests passing and a readable diff do not amount to fully equivalent business semantics. Semantic equivalence still needs your domain knowledge to vouch for it |
+| **Some capabilities are in an incomplete state** | A small number of capabilities are still marked partially implemented or planned; the interface presents them with explicit capability-status markers and does not show them as complete |
+| **Open extension of scenario packs is still being built** | Support for the typical scenarios is comparatively mature; "adding a custom scenario pack with zero code changes" is the settled direction and is still being worked toward |
+| **No multi-user or permission system** | Currently intended for **single-machine, single-user** local use: there is no login, no accounts, no tenant isolation. **Do not expose the service directly to the public internet** |
+| **In-container execution is off by default** | Containerized execution requires an explicit opt-in and mounting the Docker socket (equivalent to handing over control of the host's Docker), and is recommended only in a trusted single-machine environment |
+| **No prebuilt distributions** | No PyPI package, npm package or public image has been published yet; build locally from source as described below |
 
-## 快速开始
+## Quick start
 
-### 环境要求
+### Requirements
 
-| 组件 | 要求 |
+| Component | Requirement |
 |---|---|
 | Python | >= 3.12 |
-| 包管理 | [uv](https://github.com/astral-sh/uv) |
-| Node.js | 建议 20 LTS 及以上 |
-| 数据库 | 默认 SQLite，开箱即用（可选 PostgreSQL） |
+| Package manager | [uv](https://github.com/astral-sh/uv) |
+| Node.js | 20 LTS or above recommended |
+| Database | SQLite by default, works out of the box (PostgreSQL optional) |
 
-### 后端
+### Backend
 
 ```bash
 cd backend
-cp .env.example .env        # 按注释填写；密钥只填在本机 .env，该文件不会被提交
+cp .env.example .env        # fill in per the comments; keys go only into the local .env, which is never committed
 uv sync --dev
-uv run uvicorn app.main:app # 默认监听 8000
+uv run uvicorn app.main:app # listens on 8000 by default
 ```
 
-首次启动会自动建表并写入种子数据，无需手动执行数据库迁移；若实际库落后于迁移版本，启动时会以 ERROR 明确报出而不静默处理。
+The first startup creates tables and writes seed data automatically — no manual database migration needed. If the actual database lags behind the migration revision, startup reports it explicitly at ERROR level instead of handling it silently.
 
-健康检查：
+Health check:
 
 ```bash
 curl http://localhost:8000/api/health
 ```
 
-> 接口统一挂在 `/api` 前缀下，健康检查是 `/api/health`（不是 `/health`）。
+> All endpoints are mounted under the `/api` prefix; the health check is `/api/health` (not `/health`).
 
-### 前端
+### Frontend
 
 ```bash
 cd frontend
 npm install
-npm run dev                 # 开发服务器 5173
+npm run dev                 # dev server on 5173
 ```
 
-打开 http://localhost:5173 。
+Open http://localhost:5173 .
 
-### 容器方式（可选）
+### Container mode (optional)
 
 ```bash
-cp .env.example .env        # 供 docker compose 的 env_file 使用
+cp .env.example .env        # used by docker compose's env_file
 docker compose up --build
 ```
 
-前端 http://localhost:8080 ，后端 http://localhost:8000/api/health 。
+Frontend at http://localhost:8080 , backend at http://localhost:8000/api/health .
 
-### 端口约定
+### Port convention
 
-| 服务 | 端口 |
+| Service | Port |
 |---|---|
-| 后端 | **8000**（开发与容器一致） |
-| 前端（开发） | **5173** |
-| 前端（容器） | **8080** |
+| Backend | **8000** (same for development and containers) |
+| Frontend (development) | **5173** |
+| Frontend (container) | **8080** |
 
-请勿另设端口 —— 端口在代码、配置、脚本与容器编排间保持单一口径。
+Please do not introduce other ports — ports are kept to a single convention across code, configuration, scripts and container orchestration.
 
-## 配置
+## Configuration
 
-两份示例文件列出了全部可配置项，**仅含变量名与说明，不含任何真实值**：
+Two example files list every configurable item, **containing variable names and explanations only, never any real values**:
 
-| 文件 | 用途 |
+| File | Purpose |
 |---|---|
-| `.env.example` → `.env` | 供 `docker compose` 的 `env_file` 注入（容器化部署） |
-| `backend/.env.example` → `backend/.env` | 本地开发（pydantic-settings 读取，前缀 `REBUILD_`） |
+| `.env.example` → `.env` | Injected via `docker compose`'s `env_file` (containerized deployment) |
+| `backend/.env.example` → `backend/.env` | Local development (read by pydantic-settings, prefix `REBUILD_`) |
 
-要点：
+Key points:
 
-- **`REBUILD_MASTER_KEY`**：凭据加密主密钥。要使用凭据（BYOK）功能必须设置。生成方式：
+- **`REBUILD_MASTER_KEY`**: the master key for credential encryption. It must be set to use the credential (BYOK) feature. To generate one:
   ```bash
   python -c "import secrets; print(secrets.token_hex(32))"
   ```
-- 模型 Key 走 `{PROVIDER}_API_KEY` 或通用 `LLM_API_KEY`，**只放在本机 `.env`**。`.env` 已被 `.gitignore` 保护。
-- 请勿把任何 Key / Token / Secret 写进代码、配置文件、日志、issue 或提交记录。
+- Model keys go through `{PROVIDER}_API_KEY` or the generic `LLM_API_KEY`, and belong **only in the local `.env`**. `.env` is already protected by `.gitignore`.
+- Never write any key / token / secret into code, configuration files, logs, issues or commit records.
 
-## 技术栈
+## Tech stack
 
-| 层 | 选型 |
+| Layer | Choice |
 |---|---|
-| 后端 | Python 3.12 · FastAPI · uv · SQLAlchemy 2.0 · Alembic |
-| Agent 编排 | **LangGraph**（主编排底座，含 checkpoint / interrupt / resume） |
-| 模型接入 | 统一 ModelGateway → LiteLLM 适配层（不直连 Provider、不硬编码模型名与 endpoint） |
-| 前端 | React · Vite · TypeScript |
-| 存储 | SQLite（默认）/ PostgreSQL（可选） |
-| 部署 | Docker Compose（含受控执行沙箱镜像） |
+| Backend | Python 3.12 · FastAPI · uv · SQLAlchemy 2.0 · Alembic |
+| Agent orchestration | **LangGraph** (the single orchestration substrate, with checkpoint / interrupt / resume) |
+| Model access | A unified ModelGateway → LiteLLM adapter layer (no direct provider connections, no hard-coded model names or endpoints) |
+| Frontend | React · Vite · TypeScript |
+| Storage | SQLite (default) / PostgreSQL (optional) |
+| Deployment | Docker Compose (including the controlled execution-sandbox image) |
 
-## 代码结构
+## Code layout
 
 ```
-backend/     FastAPI 服务、Agent 编排、模型网关、数据模型与迁移
-frontend/    React + Vite 前端
-source/      平台运行期资源（Skill / 案例 / 资源清单）
-deploy/      部署与执行沙箱构建上下文
-scripts/     运维与维护脚本
+backend/     FastAPI service, agent orchestration, model gateway, data models and migrations
+frontend/    React + Vite frontend
+source/      platform runtime resources (skills / cases / resource manifests)
+deploy/      deployment and execution-sandbox build contexts
+scripts/     operations and maintenance scripts
 ```
 
-## 参与贡献
+## Contributing
 
-欢迎参与。请先阅读：
+Contributions are welcome. Please read first:
 
-- [CONTRIBUTING.md](./CONTRIBUTING.md) —— 开发环境搭建、测试要求、提交规范
-- [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) —— 社区行为准则
-- [SECURITY.md](./SECURITY.md) —— **安全漏洞请按此文件的私密渠道上报，不要开公开 issue**
+- [CONTRIBUTING.md](./CONTRIBUTING.md) — development environment setup, testing requirements, commit conventions
+- [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) — community code of conduct
+- [SECURITY.md](./SECURITY.md) — **report security vulnerabilities through the private channel described in that file; do not open a public issue**
 
-提交前请确认：无硬编码密钥、后端测试通过、前端可构建。
+Before submitting, please confirm: no hard-coded secrets, backend tests passing, frontend builds.
 
-## 许可
+## License
 
 [MIT](./LICENSE)

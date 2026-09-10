@@ -1,0 +1,182 @@
+# Language-variant manifest for rebuild's public documentation
+# rebuild 对外文档语言变体清单
+#
+# WHAT THIS IS / 这是什么
+#   A declarative manifest of the language variants of the repository's public
+#   documents, and of which variant is authoritative.
+#   仅声明仓库对外文档的语言变体，以及哪一份是权威版本。
+#
+# WHAT THIS IS NOT / 这不是什么
+#   Not a framework config. Nothing loads this file at runtime; no i18n package,
+#   no build step, and no runtime dependency is introduced by it. It is read by
+#   humans and by whoever maintains the documents.
+#   不是框架配置。运行期没有任何代码加载本文件；不引入任何 i18n 包、构建步骤或运行时依赖。
+#   它供人阅读，供维护文档的人使用。
+#
+#   Scope is the repository root's public documents ONLY. User-visible text inside
+#   the platform's frontend remains Chinese-first and is out of scope here.
+#   适用范围仅限仓库根的对外文档。平台内前端用户可见文案仍中文优先，不在本清单范围内。
+#
+# DETAILED SOURCE / 详述源
+#   文档/00-项目治理/01-决策记录.md（文档双语轻量方案的决策条目）
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Authority / 权威性
+#
+# Chinese is the authoritative language for every document below.
+# 中文是下列每一份文档的权威版本。
+#
+# Reason: the content is authored in Chinese. These documents deliberately state
+# what the platform CANNOT do, what it does NOT promise, and where human review is
+# required; the wording of those boundaries is finely calibrated in Chinese. An
+# English translation may lose a qualifier, so it must never be treated as the
+# governing text.
+# 理由：内容以中文原生撰写。这些文档刻意写明平台"做不到什么""不承诺什么""何处需人工介入"，
+# 这些边界表述的分寸是在中文里定下的。英文翻译可能丢失限定词，因此不得作为准据文本。
+# ---------------------------------------------------------------------------
+authority:
+  language: zh
+  rule_en: >-
+    The Chinese variant (.zh.md) is authoritative. The English variant (.md) is a
+    translation of it. Where the two disagree in any way, the Chinese variant governs.
+  rule_zh: >-
+    中文变体（.zh.md）为权威版本，英文变体（.md）是它的翻译。
+    两版出现任何不一致时，以中文变体为准。
+
+defaults:
+  source_language: zh          # the language content is authored in / 内容原生撰写语言
+  authoritative_language: zh   # the language that governs on conflict / 冲突时的准据语言
+  default_display_language: en # what `<name>.md` renders as by default on GitHub
+  translation_direction: zh -> en
+
+# ---------------------------------------------------------------------------
+# Documents / 文档
+#
+# Per document:
+#   default_entry  the canonical repository path, i.e. what a hosting platform
+#                  renders by default. Holds the English variant.
+#                  仓库规范路径，即代码托管平台默认渲染的入口，承载英文变体。
+#   source_language  the language the content was authored in / 内容原生语言
+#   authoritative    the ONE file that governs on conflict / 冲突时以此文件为准
+#   variants         every language variant file / 全部语言变体文件
+# ---------------------------------------------------------------------------
+documents:
+  - id: readme
+    title_en: Project entry point, quick start, current maturity
+    title_zh: 项目入口、快速开始、当前成熟度
+    default_entry: README.md
+    source_language: zh
+    authoritative: README.zh.md
+    variants:
+      zh:
+        file: README.zh.md
+        role: authoritative_source
+      en:
+        file: README.md
+        role: translation_of_zh
+
+  - id: vision
+    title_en: Why it exists, whose problem it solves, what it explicitly cannot do
+    title_zh: 为什么存在、解决谁的什么问题、明确做不到什么
+    default_entry: VISION.md
+    source_language: zh
+    authoritative: VISION.zh.md
+    variants:
+      zh:
+        file: VISION.zh.md
+        role: authoritative_source
+      en:
+        file: VISION.md
+        role: translation_of_zh
+
+  - id: roadmap
+    title_en: Priority directions, what is not promised, community activation conditions
+    title_zh: 优先方向、不承诺什么、社区启用条件
+    default_entry: ROADMAP.md
+    source_language: zh
+    authoritative: ROADMAP.zh.md
+    variants:
+      zh:
+        file: ROADMAP.zh.md
+        role: authoritative_source
+      en:
+        file: ROADMAP.md
+        role: translation_of_zh
+
+  - id: architecture
+    title_en: How it is implemented, and the implementation boundary of each mechanism
+    title_zh: 怎么实现的、每条机制的实现边界
+    default_entry: ARCHITECTURE.md
+    source_language: zh
+    authoritative: ARCHITECTURE.zh.md
+    variants:
+      zh:
+        file: ARCHITECTURE.zh.md
+        role: authoritative_source
+      en:
+        file: ARCHITECTURE.md
+        role: translation_of_zh
+
+# Public documents that are single-language and therefore have no variants here.
+# 单语言、因此本清单不为其登记变体的对外文档。
+single_language_documents:
+  language: zh
+  files:
+    - CONTRIBUTING.md
+    - CODE_OF_CONDUCT.md
+    - SECURITY.md
+  note_en: >-
+    Listed so that a reader can tell "no variant exists yet" apart from "the manifest
+    forgot it". Adding a variant means adding an entry under `documents` above.
+  note_zh: >-
+    列在此处，使读者能区分"尚无变体"与"清单漏登记"。要新增变体，在上方 documents 增加条目。
+
+# ---------------------------------------------------------------------------
+# Maintenance rules / 维护规则
+# ---------------------------------------------------------------------------
+maintenance:
+  edit_order_en: >-
+    Edit the Chinese variant first, then bring the English variant in line. Never the
+    reverse: an English-only edit silently makes the authoritative text stale.
+  edit_order_zh: >-
+    先改中文变体，再同步英文变体。不得反向：只改英文会让权威版本静默过期。
+
+  cross_link_rule_en: >-
+    Cross-references stay within one language. Links in a .zh.md point at .zh.md files;
+    links in a .md point at .md files. Documents with no variant (LICENSE,
+    CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md) are linked identically from both.
+  cross_link_rule_zh: >-
+    交叉引用必须同语言闭环：.zh.md 里的链接指向 .zh.md，.md 里的链接指向 .md。
+    无变体的文档（LICENSE、CONTRIBUTING.md、CODE_OF_CONDUCT.md、SECURITY.md）两边链接相同。
+
+  # The single most important rule when translating these particular documents.
+  # 翻译这几份文档时最重要的一条规则。
+  no_optimism_drift_en: >-
+    A translation must never read as more confident than the source. These documents
+    are full of qualifiers - "not yet", "does not", "only", "off by default", "cannot
+    claim", "including but not limited to", "is not the same as". Dropping or softening
+    one of those turns an honest boundary into an overclaim, which is a defect. After
+    any translation pass, check every boundary / limitation / non-promise statement in
+    the Chinese text against the English text one by one, and confirm that no English
+    sentence is more optimistic than its Chinese counterpart.
+  no_optimism_drift_zh: >-
+    译文绝不得读起来比原文更有底气。这些文档充满限定词——"尚未""不会""只有""默认关闭"
+    "无法声称""包括但不限于""不等于"。丢掉或弱化其中任何一个，都会把一条诚实的边界变成
+    夸大声称，属缺陷。每次翻译后，须把中文里每一条"边界 / 限制 / 不承诺"陈述与英文逐条对照，
+    确认英文没有任何一句比中文更乐观。
+
+  closed_enumeration_rule_en: >-
+    Scenario coverage must stay open in every language. Keep "typical scenarios,
+    including but not limited to"; never write a closed form such as "supports three
+    scenarios".
+  closed_enumeration_rule_zh: >-
+    场景口径在任何语言下都必须保持开放：保留"典型场景，包括但不限于"；
+    严禁写成"支持三种场景"这类封闭表述。
+
+  no_stub_translation_en: >-
+    A variant must carry the substance of the document. A page that only says "see the
+    Chinese version" does not count as a variant.
+  no_stub_translation_zh: >-
+    变体必须承载文档实质内容。只写一句"见中文版"的页面不算变体。

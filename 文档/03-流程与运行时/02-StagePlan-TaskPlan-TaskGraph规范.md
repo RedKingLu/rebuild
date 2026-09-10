@@ -3,7 +3,7 @@
 > 文档路径：`文档/03-流程与运行时/02-StagePlan-TaskPlan-TaskGraph规范.md`
 > 文档状态：**accepted**
 > 平台名称：rebuild
-> 当前版本：V26.1.1
+> 当前版本：V26.2
 > 来源草稿：`产物/草稿/02-StagePlan-TaskPlan-TaskGraph规范.md`（v0.1，~1059 行；去重 ~55%，主要移除 ~150 个字段建议 + 执行模式/Gate 复述）
 > 本次处理人 / Agent：Claude (deepseek-v4-pro) / R2
 > 最后更新时间：2026-06-24
