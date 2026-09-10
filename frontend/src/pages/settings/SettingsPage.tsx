@@ -185,7 +185,12 @@ export function SettingsPage() {
 
       <div className="card" style={{ marginTop: 14 }}>
         <b>关于</b>
-        <div className="hash" style={{ marginTop: 6 }}>平台：rebuild · 版本：V26.1.1 · 当前阶段：R7 概览/项目/集成真实化</div>
+        {/* R22 批次六（R22-07）：原文案写死「版本：V26.1.1 · 当前阶段：R7 概览/项目/集成真实化」，
+            两者都已过期。版本与阶段的事实源在后端（settings.app_version / settings.r_stage，
+            经 /api/health 输出）；本页当前无任何 health/version 调用，按 YAGNI 不为一行文案
+            新增 API 调用，故只保留不会过期的平台名。将来若本页确有版本展示需求，
+            应改为读后端 /api/health，不得再在前端写死版本号。 */}
+        <div className="hash" style={{ marginTop: 6 }}>平台：rebuild</div>
         <span className="tag violet" style={{ marginTop: 4 }}>凭证据·可审计</span>
       </div>
     </div>

@@ -34,8 +34,15 @@ class Settings(BaseSettings):
     workspace_dir: str = "/home/king/rebuild/工作区"
 
     # R19-3-05 硬编码收敛：对外声明的平台版本号单一来源（MCP clientInfo 等协议握手复用）。
-    # main.py / routes_health.py 的版本号属 FastAPI/health 合理声明，按验收口径不动。
-    app_version: str = "V26.1.1"
+    #
+    # R22 批次六（R22-07）**有意推翻 R19-3-05 的取舍**，此处记录理由以免后人误判为无意改动：
+    #   R19-3-05 原注释写的是「main.py / routes_health.py 的版本号属 FastAPI/health 合理声明，
+    #   按验收口径不动」——即当时刻意保留了那三处字面量。但到发布冻结节点该取舍已不自洽：
+    #   文档侧已切 V26.2，而运行期实测 GET /api/health 仍自报 {"version":"V26.1.1"}，
+    #   FastAPI 应用元数据同样停在 V26.1.1。"合理自声明"在实践中等于"必然漏改的第二事实源"。
+    #   故本轮把 main.py / routes_health.py 全部改为读本字段，版本号在后端只出现这一次。
+    #   配套：测试不再断言版本字面量，改为断言等于本字段（否则每次升版都要改测试）。
+    app_version: str = "V26.2"
 
     # R19-3-05 硬编码收敛：P6 出网能力探测目标（原硬编码 1.1.1.1:53）。
     # 内网/离线部署可经 env 改指内部可达地址；仅做 TCP 连通探测，不携带凭据。
@@ -44,7 +51,9 @@ class Settings(BaseSettings):
 
     # R17-2 V-R17-1B-1/P1-4：当前建设阶段（单一事实源，供 /api/health 与 /api/version 输出）。
     # 随 R 阶段推进手动更新；未知时返 "unknown"（不硬编码过期值）。
-    r_stage: str = "R17"
+    # R22 批次六：此前停在 "R17"，而实际已推进到 R22（阶段权威源 文档/00-项目治理/
+    # 06-R阶段总计划.md §R0-R22）→ 校正为 R22。取值须落在 core/status.py 的 R_STAGES 枚举内。
+    r_stage: str = "R22"
 
     # R15-4 Community Connector：独立社区服务 base URL（可切换本地/未来远程官方社区）。
     # 端口标准：community-backend 8001（见 06-容器化部署与执行隔离规范 §1.1）。
