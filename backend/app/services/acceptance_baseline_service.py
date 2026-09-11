@@ -18,10 +18,31 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger("rebuild.acceptance_baseline_service")
+
+# D-06（V26.2 总验收真实规模真跑，2026-09-10）：真实项目（1018 文件 / 197,447 行）上本调用的
+# completion **触顶原硬编码 max_tokens=6144**（call_log `call_5aa2351f4c19` completion_tokens=6144
+# = 上限），静态基线 JSON 中途截断 → `_parse` 的 json.loads 报
+# `Unterminated string starting at: line 131 column 15 (char 7513)` → 静态基线退化为空壳。
+# 与 R11-7（B-P3-NO-TASKPLANS）的 max_tokens 截断根因**同族**，R11-7 只覆盖了 planning。
+# 这里**复用 planning 已建立的 env 可调范式**（`_PLANNING_MAX_TOKENS`/`_PLANNING_TIMEOUT` 经
+# ModelGateway.call → LiteLLMAdapter.complete 的 timeout 形参透传），不新造机制。
+#
+# 默认值依据（实测，非拍脑袋）：
+#   · 16384 = 触顶值 6144 的 2.67 倍。本项目一次**完整**产出的静态基线约 6.7K 字符
+#     （≈3.6K token，含 5 test_assertions / 10 missing_test_paths / 7 characterization_specs），
+#     故 16384 对该规模留约 4 倍余量；同时与同阶段 P1 兄弟调用（profiling / tech_selection /
+#     assessment / intake 均 16384）口径一致，不另立门户。**不设无上限**：本产物是有界清单
+#     （测试断言 + 缺测路径 + 特征化规格），比 P3 task_plans 小得多，故取 planning 的 32768 的一半。
+#   · 240s 与 planning 同值。原路径无 timeout 形参 → 落到 adapter 的 fail-fast 默认 60s，而
+#     真实规模下本调用为单次非流式大 JSON 生成（实测同项目 P3 单次调用 60-120s），60s 明显偏紧。
+# 二者**只调请求超时与输出预算，不涉及模型/endpoint 选择**（策略仍由 ModelGateway 解析，D-098）。
+_BASELINE_MAX_TOKENS = int(os.environ.get("P1_BASELINE_MAX_TOKENS", "16384"))
+_BASELINE_TIMEOUT = float(os.environ.get("P1_BASELINE_TIMEOUT", "240"))
 
 _STATIC_SYSTEM_PROMPT = (
     "你是 rebuild 平台的 P1 原始验收基准捕获 Agent（Node Worker Agent，D-106）。平台已采集了目标项目的"
@@ -95,13 +116,14 @@ class AcceptanceBaselineService:
             {"role": "user", "content": self._build_user_prompt(facts, upstream or {})},
         ]
         result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=6144, temperature=0.3, source="api",
+                               max_tokens=_BASELINE_MAX_TOKENS, temperature=0.3, source="api",
+                               timeout=_BASELINE_TIMEOUT,
                                project_id=project_id, run_id=run_id, stage=stage)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"
             return BaselineResult(status="failed", reason=str(reason), model_used=result.get("model"))
 
-        static_baseline = self._parse(result.get("content", ""))
+        static_baseline = self._parse(result.get("content", ""), model_used=result.get("model"))
         model_used = result.get("model")
 
         # ── 动态黄金输出捕获（确定性 verify 层：真跑或诚实 needs_env） ──────────
@@ -127,6 +149,9 @@ class AcceptanceBaselineService:
         }
         if static_baseline.get("parse_error"):
             baseline["static_parse_error"] = True
+            # D-06：把可诊断信息一并落进产物——只有日志会随进程滚走，读产物的人同样需要能
+            # 分辨"被截断"还是"输出非法 JSON"（标注须有消费方）。
+            baseline["static_parse_diagnosis"] = static_baseline.get("parse_diagnosis", {})
         self._trace("P1 acceptance baseline captured", project_id, run_id, stage)
         return BaselineResult(status="completed", baseline=baseline, model_used=model_used)
 
@@ -205,7 +230,60 @@ class AcceptanceBaselineService:
         return ("以下是采集的测试/依赖/技术栈事实（含测试文件脱敏原文候选）与上游 P0 结论。请产出原始验收基准的"
                 "静态部分并规划动态黄金捕获命令。严格输出上述 JSON。\n\n" + blob)
 
-    def _parse(self, content: str) -> dict:
+    @staticmethod
+    def _scan_json_shape(text: str) -> tuple[int, bool]:
+        """扫描 JSON 文本的结构收敛状态，返回 (未闭合的括号深度, 是否停在字符串内部)。
+
+        纯诊断用：**不做任何 JSON 修补，也不放宽解析严格性**——只用来区分
+        「输出被截断（结构未闭合）」与「输出完整但非法（如键名/引号写错）」这两种
+        处置完全不同的失败（前者要加输出预算，后者要改 prompt 契约）。
+        """
+        depth = 0
+        in_string = False
+        escaped = False
+        for ch in text:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+        return depth, in_string
+
+    def _diagnose_parse_failure(self, text: str, err: Exception) -> dict:
+        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 预算取值。"""
+        depth, in_string = self._scan_json_shape(text)
+        signals: list[str] = []
+        if not text:
+            # 空响应也是预算问题的已知形态（R17.5-P4-FIX 批2.8 实测：推理链耗尽 max_tokens 后
+            # 最终文本为空）；归入"疑似截断"以给出同一个可操作结论=加预算，措辞保留不确定性。
+            signals.append("empty_content: 响应为空（可能推理链耗尽输出预算后无最终文本）")
+        if in_string:
+            signals.append("unclosed_string: 文本末尾停在未闭合的字符串内")
+        if depth > 0:
+            signals.append(f"unbalanced_depth={depth}: 有 {depth} 层 {{/[ 未闭合")
+        if text and not text.rstrip().endswith(("}", "]")):
+            signals.append("tail_not_closed: 末尾字符不是 } 或 ]")
+        return {
+            "content_len": len(text),
+            "suspected_truncation": bool(signals),
+            "truncation_signals": signals,
+            "decode_error": f"{type(err).__name__}: {err}",
+            "tail_snippet": text[-80:] if text else "",
+            "max_tokens": _BASELINE_MAX_TOKENS,
+            "timeout_s": _BASELINE_TIMEOUT,
+            "env_knobs": "P1_BASELINE_MAX_TOKENS / P1_BASELINE_TIMEOUT",
+        }
+
+    def _parse(self, content: str, *, model_used: Optional[str] = None) -> dict:
         text = (content or "").strip()
         if text.startswith("```"):
             text = text.strip("`")
@@ -215,9 +293,37 @@ class AcceptanceBaselineService:
             data = json.loads(text)
             if isinstance(data, dict):
                 return data
-        except Exception:
-            logger.warning("P1 baseline: LLM 输出无法解析为 JSON", exc_info=True)
-        return {"parse_error": True, "raw": text[:2000],
+            diagnosis = {"content_len": len(text), "suspected_truncation": False,
+                         "truncation_signals": [], "decode_error": f"not_a_json_object: {type(data).__name__}",
+                         "tail_snippet": text[-80:], "max_tokens": _BASELINE_MAX_TOKENS,
+                         "timeout_s": _BASELINE_TIMEOUT,
+                         "env_knobs": "P1_BASELINE_MAX_TOKENS / P1_BASELINE_TIMEOUT"}
+            logger.warning(
+                "P1 baseline: LLM 输出是合法 JSON 但不是对象（契约不符，非截断）—— "
+                "响应长度=%d 字符, model=%s, 诊断=%s",
+                diagnosis["content_len"], model_used, diagnosis)
+        except Exception as e:  # noqa: BLE001 — 公理3：不静默，下面按失败模式分级发声
+            diagnosis = self._diagnose_parse_failure(text, e)
+            if diagnosis["suspected_truncation"]:
+                # 截断：可操作结论是「提高输出预算」，不是改 prompt。故用 error 级并直接给出旋钮。
+                logger.error(
+                    "P1 baseline: LLM 输出**疑似被截断**导致 JSON 解析失败（D-06 同族）—— "
+                    "响应长度=%d 字符, 截断信号=%s, 尾部=%r, model=%s, "
+                    "本次预算 max_tokens=%s / timeout=%ss（可经 %s 调整）, 解析错误=%s",
+                    diagnosis["content_len"], diagnosis["truncation_signals"],
+                    diagnosis["tail_snippet"], model_used, diagnosis["max_tokens"],
+                    diagnosis["timeout_s"], diagnosis["env_knobs"], diagnosis["decode_error"])
+            else:
+                # 非截断：结构已收敛却仍解析失败 ⇒ 模型输出了非法 JSON，可操作结论是改 prompt 契约。
+                logger.warning(
+                    "P1 baseline: LLM 输出**结构已收敛但非法 JSON**（非截断，需修 prompt 契约）—— "
+                    "响应长度=%d 字符, 尾部=%r, model=%s, 本次预算 max_tokens=%s / timeout=%ss, "
+                    "解析错误=%s",
+                    diagnosis["content_len"], diagnosis["tail_snippet"], model_used,
+                    diagnosis["max_tokens"], diagnosis["timeout_s"], diagnosis["decode_error"],
+                    exc_info=True)
+        # 诚实失败：只回可诊断的空基线壳 + parse_error 标记，绝不伪造断言/规格（D-097/公理3）。
+        return {"parse_error": True, "raw": text[:2000], "parse_diagnosis": diagnosis,
                 "test_assertions": [], "missing_test_paths": [], "characterization_specs": [],
                 "dynamic_golden_plan": {"runnable_on_platform": False,
                                         "needs_env": {"kind": "parse_error"},
