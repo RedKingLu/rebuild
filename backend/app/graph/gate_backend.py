@@ -73,22 +73,41 @@ class RealGateBackend:
             summary = f"{stage.upper()} 接入计划已生成，请审阅后决定是否执行。"
             retry_action = None
         else:
-            # R17.3-6 WP-2 (AGT-02/D-101): 若 artifact_refs 含真实 Gate Brief 落盘报告，
-            # 读其 what_happened / validation_verdict 合成真实 summary/reason（替换硬编码模板）。
-            brief = _read_gate_brief(project_id, artifact_refs)
-            if brief:
-                what = brief.get("what_happened") or f"{stage} 阶段已完成"
-                vv = brief.get("validation_verdict") or {}
-                verdict_txt = ""
-                if vv:
-                    verdict_txt = f"（独立验收：{vv.get('verdict','')}，{vv.get('issues_count',0)} 项问题）"
-                notes = brief.get("honest_notes") or ""
-                reason = f"{stage} 阶段已完成并通过独立验收，请求阶段晋级{verdict_txt}"
-                summary = what + (f" {notes}" if notes else "")
+            # V26.2 返工修复第 8 项：这个 Gate 若携带"判定需要返工"的显式 metadata
+            # （nodes.py 的 make_work_node 只在 P5FailureRouter.route().p4_rework_required
+            # ==True 时才会设置 metadata["rework_target_stage"]，不是从 verdict/文案反推），
+            # 文案必须诚实写"需要返工"，不能落进下面"正常晋级"或"找不到 brief 的兜底罐头
+            # 话"这两支——gate-401a97 的问题正是文案说"已完成并请求晋级"，而真实语义是
+            # "验证失败、批准将退回 P4"，字面意思与实际后果完全矛盾。这是与 A 部分
+            # （_read_gate_brief 命中率修复）同批但不同的改动点：A 部分保证这里能读到
+            # 真实 brief 内容；这里保证"是否要用返工文案"这一判断本身也是显式的。
+            _rework_target = (metadata or {}).get("rework_target_stage")
+            if _rework_target:
+                brief = _read_gate_brief(project_id, artifact_refs)
+                _real_reason = (metadata or {}).get("rework_reason") or "P5 验证未通过"
+                _what = (brief.get("what_happened") if brief else "") or f"{stage} 阶段未完成"
+                reason = (f"{stage} 判定需要返工：{_real_reason}。{_what}"
+                         f"批准将把项目退回 {_rework_target.upper()} 重新执行相关节点。")
+                summary = (f"{stage} 判定需要返工（{_real_reason}），"
+                          f"批准后将退回 {_rework_target.upper()} 重新执行，不会晋级到下一阶段。")
+                retry_action = None
             else:
-                reason = f"{stage} 小循环通过，请求阶段晋级"
-                summary = f"{stage} 阶段已完成并产出三类审核报告，请审阅后决策。"
-            retry_action = None
+                # R17.3-6 WP-2 (AGT-02/D-101): 若 artifact_refs 含真实 Gate Brief 落盘报告，
+                # 读其 what_happened / validation_verdict 合成真实 summary/reason（替换硬编码模板）。
+                brief = _read_gate_brief(project_id, artifact_refs)
+                if brief:
+                    what = brief.get("what_happened") or f"{stage} 阶段已完成"
+                    vv = brief.get("validation_verdict") or {}
+                    verdict_txt = ""
+                    if vv:
+                        verdict_txt = f"（独立验收：{vv.get('verdict','')}，{vv.get('issues_count',0)} 项问题）"
+                    notes = brief.get("honest_notes") or ""
+                    reason = f"{stage} 阶段已完成并通过独立验收，请求阶段晋级{verdict_txt}"
+                    summary = what + (f" {notes}" if notes else "")
+                else:
+                    reason = f"{stage} 小循环通过，请求阶段晋级"
+                    summary = f"{stage} 阶段已完成并产出三类审核报告，请审阅后决策。"
+                retry_action = None
         gate = gs.create(
             project_id=project_id, run_id=run_id or "", stage=stage,
             gate_type=gate_type,

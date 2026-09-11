@@ -2325,7 +2325,21 @@ class RealP5Handler:
             result["plan_delta_reason"] = route.plan_delta_reason
 
         # 构建 review issues（含返工建议）
-        issues = [{"type": f"p5_{failure_type}", "detail": route.action}]
+        # V26.2 返工修复第 8 项：P5FailureRouter 已判定 p4_rework_required/plan_delta_type/
+        # plan_delta_reason（见上方③④两段），但这几个字段只写进本方法局部变量 result——
+        # ValidationAgent.validate() 调用本方法时喂入的是磁盘重读的 disk_view（r3 约束 3），
+        # 不是这份 result，所以写进 result 的字段实际到不了任何消费方（这正是本轮要修的
+        # "算了却没人消费"）。issues 列表里的 dict 是唯一一条能原样穿过 ValidationAgent
+        # 聚合、活到 StageLoopResult.rounds 的通道（validation_agent.py 逐项 append 原
+        # dict，不重新构造）。因此把这几个显式字段直接放进这条 issue dict——nodes.py 的
+        # make_work_node 据此（且仅据此显式字段，不从 verdict/failure_type 文本反推）
+        # 判断是否要落"P5 返工"标记、创建 PlanDelta、路由回 P4（Q-RW-4）。
+        issue_entry = {"type": f"p5_{failure_type}", "detail": route.action}
+        if route.p4_rework_required:
+            issue_entry["p4_rework_required"] = True
+            issue_entry["plan_delta_type"] = route.plan_delta_type
+            issue_entry["plan_delta_reason"] = route.plan_delta_reason
+        issues = [issue_entry]
         recommendations = []
         if route.retry_allowed:
             recommendations.append(f"P5 有界重试（第 {route.retry_count} 次）")

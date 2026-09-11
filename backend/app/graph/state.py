@@ -60,6 +60,13 @@ class GraphState(TypedDict, total=False):
     # R17-X: plan_presentation 两阶段流程标记。True 表示接入计划已在 plan_presentation
     # gate 通过，work 节点应执行完整 StageLoop（而非 plan_only 模式）。
     plan_approved: Optional[bool]
+    # V26.2 返工修复第 8 项（Q-RW-4）：P5 判定 rework_required 且用户批准该 promotion
+    # Gate 时，make_router("p5") 据此路由回 "{rework_target_stage}_work" 而非正常晋级。
+    # 标量、last-write-wins：由 {p5}_gate 节点在读到落盘的返工标记（gate_id 精确匹配，
+    # 见 gate_service.read_p5_rework_marker）时显式写入；未匹配到时显式写 None（不能
+    # 不写——否则会残留上一轮的旧值，误伤本轮真正通过的晋级判断）。只有 P5 的
+    # gate()/router 读写这个字段，其它阶段完全不touch，不影响既有晋级路径。
+    rework_target_stage: Optional[str]
 
     # --- capability / mode (scalar; real values, not placeholders) ---
     transition_mode: Literal["langgraph", "manual"]
