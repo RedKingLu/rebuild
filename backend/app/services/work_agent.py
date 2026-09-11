@@ -82,6 +82,44 @@ _STAGE_UPSTREAM_ARTIFACTS = {
 }
 
 
+# ── D-09（批次 C）：P2 结构化清单产物槽位 ────────────────────────────────────
+# tool_result 键 → (产物文件名, artifact_type, 中文清单名)。真跑实测：评估报告识别到问题，
+# 四类清单却全是 `items: []`——空数组会被下游与用户读成"已检查且无风险"，属虚假事实断言
+# （公理3 / D-097）。WorkAgent 编排层据此对账：能派生则派生，派生不出则诚实标注。
+_P2_LIST_ARTIFACTS = {
+    "risk_list": ("p2_risk_list.json", "risk_assessment", "风险项"),
+    "blocker_list": ("p2_blocker_list.json", "blocker_list", "阻塞项"),
+    "validation_gap_list": ("p2_validation_gaps.json", "validation_gap", "验证缺口"),
+    "resource_needs": ("p2_resource_needs.json", "resource_needs", "资源需求"),
+}
+
+# 派生只做【结构化搬运】：LLM 把清单写进 assessment_report 子对象而非顶层锚点键时，按【键名】
+# 把同类清单搬上来。绝不做语义研判——"某段描述算不算风险"归 LLM（AGENTS §2.3 / §10-25），
+# 确定性只搬运。
+_P2_DERIVE_KEY_HINTS = {
+    "risk_list": ("risk_list", "risks", "risk_items"),
+    "blocker_list": ("blocker_list", "blockers"),
+    "validation_gap_list": ("validation_gap_list", "validation_gaps", "verification_gaps"),
+    "resource_needs": ("resource_needs", "resource_requirements", "resources_needed"),
+}
+_P2_DERIVE_MAX_DEPTH = 3
+
+
+def _lift_lists_by_key(node, hints: tuple, *, path: str = "", depth: int = 0) -> list:
+    """在 dict 树里按【键名】提取同类清单（结构化搬运，非语义研判）。返回 [(字段路径, 原始列表)]。"""
+    out: list = []
+    if depth > _P2_DERIVE_MAX_DEPTH or not isinstance(node, dict):
+        return out
+    for k, v in node.items():
+        cur = f"{path}.{k}" if path else str(k)
+        if isinstance(v, list):
+            if v and str(k).lower() in hints:
+                out.append((cur, v))
+        elif isinstance(v, dict):
+            out.extend(_lift_lists_by_key(v, hints, path=cur, depth=depth + 1))
+    return out
+
+
 @dataclass
 class WorkAgentResult:
     """WorkAgent 执行输出契约（落盘 + 返回给 StageLoop）。
@@ -291,14 +329,33 @@ class WorkAgent:
             "build_files": sorted(set(build_files))[:20],
         }
 
+    # ── D-08：候选栈文案渲染口径（单一入口，禁取首位当权威） ────────────────
+    # `detected_stack` 是按【原始文件计数】排序的候选栈（见 _scan_project_facts，非权威识别）。
+    # 真实规模真跑实测：256 个第三方前端 .js（layuiadmin/fullcalendar/layfly）压过 84 个 .cs，
+    # 取首位会把 ASP.NET WebForms 系统的工作计划写成「候选栈为 JavaScript」，误导读计划的人。
+    # 故文案一律列前 N 类 + 显式标注口径，不渲染为单一权威主栈；权威技术栈/主语言由 P0/P1
+    # LLM 识别与 P2 技术选型（tech_selection）承载。采集与排序逻辑不因文案而改动。
+    _STACK_TEXT_TOP_N = 3
+
+    @classmethod
+    def _candidate_stack_text(cls, facts: dict) -> str:
+        """把候选栈渲染为不误导的文案（D-08）。无候选栈 → 空串（调用方决定兜底措辞）。"""
+        stack = [s for s in (facts.get("detected_stack") or []) if s]
+        if not stack:
+            return ""
+        shown = stack[:cls._STACK_TEXT_TOP_N]
+        more = f" 等 {len(stack)} 类" if len(stack) > len(shown) else ""
+        return f"按文件计数的候选栈（非权威识别）：{'/'.join(shown)}{more}"
+
     # ── 动态工作计划（确定性合成，Q-WP2-4） ─────────────────────────────
     def _plan_body_p1(self, facts: dict) -> tuple[str, list, list, list]:
         """P1 建档动态计划体（R17.5：采集→LLM 识别→原始验收基准捕获）。"""
+        stack_txt = self._candidate_stack_text(facts)
         planned_actions = [
             {"action": "采集项目事实包（结构/依赖/配置/测试原文，大小写不敏感、脱敏）",
              "tool": "full_stack_profiler.collect_facts",
              "rationale": (f"采集到 {facts['file_count']} 个源文件"
-                           + (f"，候选栈 {', '.join(facts['detected_stack'])}" if facts["detected_stack"] else "，源码待物化/为空"))},
+                           + (f"，{stack_txt}" if stack_txt else "，源码待物化/为空"))},
             {"action": "复用 P0 接入识别（primary_language/环境/DB）+ LLM 深化建档识别",
              "tool": "p1_handler.execute→profiling_service(LLM)",
              "rationale": "识别归 LLM（AGENTS §2.3），复用 P0 结论不重算（解 P1-ARCH-1）"},
@@ -312,10 +369,9 @@ class WorkAgent:
             {"action": "捕获原始验收基准 acceptance_baseline.json（静态 LLM + 动态黄金真跑，D-106）",
              "tool": "acceptance_baseline_service",
              "rationale": "为下游 P5 行为等价/回归对比提供原始基准（不可跑栈诚实 needs_env）"})
-        goal = ("P1 建档：对"
-                + (f"候选栈为 {facts['detected_stack'][0]} 的项目" if facts["detected_stack"]
-                   else "该项目")
-                + f"（{facts['file_count']} 源文件）复用 P0 识别深化建档 + 捕获原始验收基准")
+        goal = (f"P1 建档：对该项目（{facts['file_count']} 源文件"
+                + (f"；{stack_txt}" if stack_txt else "；源码待物化或为空")
+                + "）复用 P0 识别深化建档 + 捕获原始验收基准")
         criteria = [
             "复用 P0 上游识别（不重算/推翻）",
             "产出建档识别产物（LLM）",
@@ -334,7 +390,7 @@ class WorkAgent:
         handler = self._get_handler()
         base_goal = getattr(handler, "goal", f"{self.stage.upper()} 阶段主任务") if handler else \
             f"{self.stage.upper()} 阶段主任务"
-        stack_txt = (f"候选栈 {facts['detected_stack'][0]}" if facts["detected_stack"] else "结构待识别")
+        stack_txt = self._candidate_stack_text(facts) or "结构待识别"
         goal = f"{base_goal}（当前项目：{facts['file_count']} 源文件，{stack_txt}）"
         upstream_present = [r for r in _STAGE_UPSTREAM_ARTIFACTS.get(self.stage, [])
                             if self._exists_rel(r)]
@@ -360,6 +416,129 @@ class WorkAgent:
 
     def _exists_rel(self, rel: str) -> bool:
         return (self._ws_root() / rel.split("#")[0]).exists()
+
+    # ── D-09：P2 结构化清单与评估报告对账（派生 or 诚实标注，禁 items: []） ───
+    def _reconcile_p2_lists(self, tool_result: dict) -> dict:
+        """让 P2 四类清单产物与评估报告一致（D-09，批次 C）。
+
+        ① 清单非空 → 不动（handler 已落盘真实项）；
+        ② 清单为空但评估报告里有【同名键】的清单 → 结构化搬运并重写产物（标 derivation_note）；
+        ③ 仍为空 → 把产物重写为诚实标注（identification_note，**不留 `items: []`**）。空数组会被
+           下游按清单消费的环节与用户读成"已检查且无风险"，属虚假事实断言（公理3 / D-097）；
+           与本仓既有做法一致（stage_handlers 对 LLM 未产出的键写 identification_note，
+           context_assembler 对未跟踪项标 None 而非 False）。
+
+        只对账【已真实落盘】的产物：handler 未完成时不落盘，既无需对账，也不新造产物。
+        返回需合并进 tool_result 的派生清单（不原地改入参，保持不可变）。
+        """
+        report = tool_result.get("assessment_report")
+        report = report if isinstance(report, dict) else {}
+        parse_error = bool(report.get("parse_error"))
+        derived_out: dict = {}
+        for key, (fname, art_type, cn) in _P2_LIST_ARTIFACTS.items():
+            rel = f"artifacts/p2/{fname}"
+            if not self._exists_rel(rel):
+                continue
+            if tool_result.get(key):
+                continue
+            lifted = _lift_lists_by_key(report, _P2_DERIVE_KEY_HINTS[key])
+            derived_items: list = []
+            for src_path, raw in lifted:
+                for it in raw:
+                    entry = dict(it) if isinstance(it, dict) else {"title": str(it)[:200]}
+                    entry["derived_from"] = (
+                        f"artifacts/p2/p2_assessment_report.json#report.{src_path}")
+                    derived_items.append(entry)
+            if derived_items:
+                payload = {
+                    "artifact_type": art_type,
+                    "items": derived_items,
+                    "derivation_note": (
+                        f"{cn}清单由评估报告结构化字段派生（LLM 未在顶层锚点键 {key} 产出）；"
+                        f"派生只按键名搬运，未新增任何风险判断"),
+                    "derived_from_fields": [p for p, _ in lifted],
+                }
+                derived_out[key] = derived_items
+            else:
+                payload = {
+                    "artifact_type": art_type,
+                    # 有意不写 items 键：无 items 即表示【未取得清单】，而非"清单为空"。
+                    "items_status": "not_produced",
+                    "identification_note": (
+                        f"LLM 未产出结构化 {key}（诚实标注，未伪造）；本产物无 items 字段即表示"
+                        f"【未取得{cn}清单】，不得读作「已检查且无{cn}」"),
+                    "derivation_attempted": {
+                        "source_ref": "artifacts/p2/p2_assessment_report.json",
+                        "matched_fields": [],
+                        "assessment_report_parse_error": parse_error,
+                    },
+                }
+            self._write_p2_list_artifact(rel, payload)
+        return derived_out
+
+    def _write_p2_list_artifact(self, rel: str, payload: dict) -> None:
+        """重写 P2 清单产物（经单一写门 WorkspaceMediator，D-099⑥ + Audit）。
+
+        复用 stage_package 的 mediated 写实现（不另造第二个写门；stage_handlers 亦为同语义）。
+        写盘失败发声（公理3：不静默 except），但不影响阶段主返回。
+        """
+        try:
+            from app.services.stage_package import _mediated_write
+            body = {"project_id": self.project_id, "stage": "p2", "generated_at": _now(),
+                    "reconciled_by": "work_agent", **payload}
+            _mediated_write(self.project_id, rel,
+                            json.dumps(body, ensure_ascii=False, indent=2),
+                            auditor=self.auditor, stage="p2",
+                            action="reconcile_p2_list_artifact")
+        except Exception:
+            logger.warning("WorkAgent[p2] 清单一致性重写失败 rel=%s（advisory，不静默）",
+                           rel, exc_info=True)
+
+    # ── D-10：独立验收结论单一来源（Gate Brief 不再硬传 None） ────────────────
+    def _validation_verdict(self) -> dict:
+        """取本阶段独立验收（ValidationAgent）真实落盘结论，供 Gate Brief 单一取值（D-10）。
+
+        实测缺陷：WorkAgent 硬传 `validation_verdict=None`，导致面向用户的 `p5_gate_brief.json`
+        为 null，而同阶段 `p5_validation.json` 的 verdict 是 `rework_required`——同一结论两处
+        不一致，且空的那个恰是用户看的。
+
+        取值口径（诚实）：WorkAgent 侧 Gate Brief 先于本轮 ValidationAgent 执行，故这里取到的是
+        【最近一次落盘】的独立验收结论（rework 轮即上一轮结论）；本轮若通过，
+        nodes._finalize_agent_gate_material 会以本轮 verdict 覆写同一份 gate_brief。读不到 →
+        诚实标注"尚未取得"，不写 null。
+        """
+        rel = f"artifacts/{self.stage}/{self.stage}_validation.json"
+        p = self._ws_root() / rel
+        if p.exists():
+            try:
+                v = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(v, dict):
+                    return {
+                        "verdict": v.get("verdict"),
+                        "passed": v.get("passed"),
+                        "issues_count": len(v.get("issues") or []),
+                        "agent_id": v.get("agent_id"),
+                        "source_ref": rel,
+                        "validated_at": v.get("validated_at"),
+                        "verdict_scope": "last_persisted_validation",
+                        "verdict_note": (
+                            "取自落盘独立验收结论（单一来源，D-10）；WorkAgent 侧 Gate Brief 先于"
+                            "本轮独立验收执行，本轮通过时由 nodes 侧以本轮 verdict 覆写"),
+                    }
+                logger.warning("WorkAgent[%s] 独立验收结论格式非对象 rel=%s（按未取得标注）",
+                               self.stage, rel)
+            except Exception:
+                logger.warning("WorkAgent[%s] 读取独立验收结论失败 rel=%s（advisory，按未取得标注）",
+                               self.stage, rel, exc_info=True)
+        return {
+            "verdict": "尚未取得",
+            "passed": None,
+            "issues_count": "未统计",
+            "source_ref": None,
+            "verdict_scope": "not_yet_validated",
+            "verdict_note": ("独立验收尚未产出落盘结论（WorkAgent 侧 Gate Brief 先于 ValidationAgent"
+                             "执行）；诚实标注，未假称通过或无问题"),
+        }
 
     def _write_model_error_artifact(self, tool_result: dict) -> None:
         """WP-6：把模型全失败强制中断的结构化信息落盘为 {stage}_model_error.json。
@@ -494,6 +673,13 @@ class WorkAgent:
         # 领域产物 refs（NEW-05：反映真实写入；make_work_node 据此汇集 domain artifacts）
         refs = [str(a) for a in (tool_result.get("artifacts") or [])]
 
+        # D-09：P2 结构化清单与评估报告对账（可派生则派生，派生不出写诚实标注；禁 items: []
+        # 被读成"无风险"）。只在真正完成时对账——未完成不落盘清单产物。
+        if self.stage == "p2" and declared == "completed":
+            derived_lists = self._reconcile_p2_lists(tool_result)
+            if derived_lists:
+                tool_result = {**tool_result, **derived_lists}
+
         # ⑦ evidence map（LLM 阶段 claim / 确定性阶段 fact）
         llm = self._is_llm_stage()
         cem_ref, evidence_refs, entries, evidence_gap = self._build_generic_evidence_map(
@@ -595,7 +781,8 @@ class WorkAgent:
         }
         from app.graph.stage_reports import StageReports
         reports = StageReports(self.project_id, self.stage)
-        ref = reports.gate_brief(**partial, validation_verdict=None,
+        # D-10：validation_verdict 从真实落盘的独立验收结论取值（不再硬传 None）。
+        ref = reports.gate_brief(**partial, validation_verdict=self._validation_verdict(),
                                  claim_evidence_summary={"total": len(entries)})
         return partial, ref
 
@@ -699,6 +886,18 @@ class WorkAgent:
                             "statement": f"验证缺口：{g.get('title') or str(g)[:80]}",
                             "artifact_ref": f"artifacts/p2/p2_validation_gaps.json#item[{i}]", "detail": {},
                             "cited_refs": (g.get("evidence_refs") or []) if isinstance(g, dict) else []})
+            if not out:
+                # D-09：四类结构化清单全空（含派生后仍为空）→ 不留 entries: []（会被读成"无结论/
+                # 无风险"）。绑定真实落盘的评估报告，并如实说明清单未取得（公理3）。
+                _rep = tool_result.get("assessment_report")
+                out.append({"key": "assessment_report",
+                            "statement": ("P2 评估报告已产出，但未取得任何结构化清单项（风险/阻塞/"
+                                          "验证缺口/资源需求）——诚实标注，非「无风险」"),
+                            "artifact_ref": "artifacts/p2/p2_assessment_report.json",
+                            "detail": {"structured_lists_present": False,
+                                       "assessment_report_parse_error": bool(
+                                           _rep.get("parse_error") if isinstance(_rep, dict) else False)},
+                            "cited_refs": []})
         elif st == "p3":
             # C1: P3 计划类结论内联引用其所依据的上游 P2 产物（stage plan basis_refs /
             # task batch task_basis_refs），由主任务 LLM 输出携带，非二遍归因。
