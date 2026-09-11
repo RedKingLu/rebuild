@@ -35,9 +35,32 @@ _WRITE_TOP_DIRS = ("output_code", "artifacts", "patches", "source")
 _EXT_THEN_JUNK_RE = re.compile(r"^(.*?\.[A-Za-z0-9]{1,10})\s*[（(、，。：:].*$")
 # 保留的合法路径段字符（ASCII 标识符 + . - _ 空格→_）。
 _ILLEGAL_SEG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# D-02：两端的非法字符整段丢弃（不留 `_` 残渣），只有**中间**的非法串才压成 `_`。
+_ILLEGAL_LEAD_RE = re.compile(r"^[^A-Za-z0-9._-]+")
+_ILLEGAL_TAIL_RE = re.compile(r"[^A-Za-z0-9._-]+$")
 # R19-3-01：阶段产物目录前缀（p0…p6）。模型常写 `p1/tech_stack.json` 而漏掉 `artifacts/`
 # 顶层；旧版一律前缀成 output_code/，导致真跑 output_code 里混入 p0/p1 的 json（非代码产物）。
 _STAGE_DIR_RE = re.compile(r"^p[0-6]$")
+
+
+def _clean_seg_chars(text: str) -> str:
+    """清洗一段文本里的非法字符：两端非法串**整段丢弃**，中间非法串压成单个 `_`。
+
+    D-02：旧版做 `sub("_", …).strip("._-")`，尾部 strip 连**原名自带**的前导/尾部下划线一并
+    剥掉，把多语言强约定文件名改废：`_ViewStart.cshtml` / `_ViewImports.cshtml` /
+    `_Layout.cshtml`（ASP.NET Core Razor 强制约定名，改名即失效）、`__init__.py`（改名即静默
+    失去 Python 包结构）、`_partial.html`、`_variables.scss`。
+    改为"只丢弃清洗过程中**本就非法**的两端字符"后：原名自带的 `_` / `.` 原样保留，而
+    D-114 要治的"中文描述污染"仍被剔净（尾部 `_` 残渣不会留下），两者互不牺牲。
+    """
+    text = _ILLEGAL_LEAD_RE.sub("", text)
+    text = _ILLEGAL_TAIL_RE.sub("", text)
+    text = _ILLEGAL_SEG_RE.sub("_", text)
+    # 退化段（清洗后不含任何字母数字，如 `_` / `...`）按旧行为丢弃：调用方据此走兜底
+    # 文件名或丢段，避免产出 `...` 这类纯标点路径段。
+    if not any(ch.isalnum() and ord(ch) < 128 for ch in text):
+        return ""
+    return text
 
 
 def _sanitize_segment(seg: str) -> str:
@@ -53,11 +76,11 @@ def _sanitize_segment(seg: str) -> str:
     # 中文名文件互相静默覆盖。
     stem, dot, ext = seg.rpartition(".")
     if dot and stem and re.fullmatch(r"[A-Za-z0-9]{1,10}", ext):
-        cleaned_stem = _ILLEGAL_SEG_RE.sub("_", stem).strip("._-")
+        cleaned_stem = _clean_seg_chars(stem)
         if not cleaned_stem:
             cleaned_stem = "file_" + hashlib.md5(stem.encode("utf-8")).hexdigest()[:8]
         return f"{cleaned_stem}.{ext}"
-    seg = _ILLEGAL_SEG_RE.sub("_", seg).strip("._-")   # 剔除 CJK/空格/标点
+    seg = _clean_seg_chars(seg)               # 剔除 CJK/空格/标点
     return seg
 
 
@@ -1014,9 +1037,36 @@ async def _execute_workspace_write(tool_name: str, args: dict, project_id: str, 
     except Exception as e:
         return {"error": f"workspace 写入解析失败: {e}"}
 
+    data = content if isinstance(content, str) else str(content)
+
+    # D-P0-01 内容合法性硬拦（落盘之前，连目录都不创建）：真跑实测 5 个 output_code 文件的
+    # 内容是模型 function-call 协议原文而非代码，而节点仍报 completed —— 因为写盘路径此前
+    # 只校验路径合法性、零校验内容合法性。此处只拦确定性协议哨兵（判据与零误伤设计见
+    # content_validity 模块 docstring），命中即拒写并发声，不降级为"写了打个标记"。
+    from app.services.content_validity import (
+        PROTOCOL_LEAK_REASON_CODE,
+        detect_protocol_leak,
+    )
+    leaked_marker = detect_protocol_leak(data)
+    if leaked_marker:
+        logger.warning(
+            "tool_registry: 拒写——待写入内容含模型工具协议标记（D-P0-01） "
+            "tool=%s path=%s marker=%r bytes=%d",
+            tool_name, rel, leaked_marker, len(data.encode("utf-8")),
+        )
+        return {
+            "status": "rejected",
+            "tool_name": tool_name,
+            "path": rel,
+            "reason_code": PROTOCOL_LEAK_REASON_CODE,
+            "error": (
+                f"拒写：待写入内容是模型工具调用协议原文而非文件内容（命中标记 {leaked_marker!r}）。"
+                "请重新输出该文件的真实内容后再写盘。"
+            ),
+        }
+
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        data = content if isinstance(content, str) else str(content)
         target.write_text(data, encoding="utf-8")
     except Exception as e:
         return {"error": f"workspace 写入失败: {e}"}
@@ -1066,6 +1116,33 @@ async def _execute_generate_patch(tool_name: str, args: dict, project_id: str, e
         return {"status": "rejected", "tool_name": tool_name, "path": patch_rel, "error": str(e)}
     except Exception as e:
         return {"error": f"patch 草案路径解析失败: {e}"}
+
+    # D-P0-01 内容合法性硬拦（漏网入口①，落盘之前）：真实规模真跑实测 11 个 patches/ 草稿
+    # 命中同一污染（如 `patches/tn-c2e7271a.diff` 含 `<｜｜DSML｜｜ …>`）——generate_patch 把模型
+    # 给的 diff 原样封装写进 patches/，此前未过 _execute_workspace_write 已接的同一检查。
+    # 复用同一 detect_protocol_leak（不抄第二份，B-R20-REDACT-THREE-IMPLS 的教训），返回形态
+    # 与 _execute_workspace_write 的拒写分支一致（同带 reason_code）。
+    from app.services.content_validity import (
+        PROTOCOL_LEAK_REASON_CODE,
+        detect_protocol_leak,
+    )
+    leaked_marker = detect_protocol_leak(diff)
+    if leaked_marker:
+        logger.warning(
+            "tool_registry: 拒写——patch 草案内容含模型工具协议标记（D-P0-01） "
+            "tool=%s path=%s marker=%r bytes=%d",
+            tool_name, patch_rel, leaked_marker, len(diff.encode("utf-8")),
+        )
+        return {
+            "status": "rejected",
+            "tool_name": tool_name,
+            "path": patch_rel,
+            "reason_code": PROTOCOL_LEAK_REASON_CODE,
+            "error": (
+                f"拒写：待写入 diff 是模型工具调用协议原文而非补丁内容（命中标记 {leaked_marker!r}）。"
+                "请重新输出该文件的真实 diff/内容后再生成补丁。"
+            ),
+        }
 
     import json as _json
     envelope = {
@@ -1182,6 +1259,34 @@ async def _execute_apply_patch(tool_name: str, args: dict, project_id: str, entr
         apply_mode = "full_content"
         final_content = new_content
         note = "补丁草案为整文件内容，已整体写入 output_code/（source/ 始终只读，D-099①）。"
+
+    # D-P0-01 内容合法性硬拦（漏网入口②，落盘之前）：apply_patch 把 patch 草案内容写进
+    # output_code/ 之前，此前未过 _execute_workspace_write 已接的同一检查——无论 unified diff
+    # 应用结果还是整文件内容，只要落盘前最终文本含模型工具协议标记即拒写。复用同一
+    # detect_protocol_leak（不抄第二份），返回形态与 _execute_workspace_write 拒写分支一致。
+    from app.services.content_validity import (
+        PROTOCOL_LEAK_REASON_CODE,
+        detect_protocol_leak,
+    )
+    leaked_marker = detect_protocol_leak(final_content)
+    if leaked_marker:
+        logger.warning(
+            "tool_registry: 拒写——待应用到 output_code/ 的补丁内容含模型工具协议标记（D-P0-01） "
+            "tool=%s path=%s marker=%r bytes=%d",
+            tool_name, out_rel, leaked_marker, len(final_content.encode("utf-8")),
+        )
+        return {
+            "status": "rejected",
+            "tool_name": tool_name,
+            "patch_ref": patch_ref,
+            "path": out_rel,
+            "apply_mode": apply_mode,
+            "reason_code": PROTOCOL_LEAK_REASON_CODE,
+            "error": (
+                f"拒写：待写入 output_code/ 的补丁应用结果是模型工具调用协议原文而非文件内容"
+                f"（命中标记 {leaked_marker!r}）。请重新输出该文件的真实内容后再应用补丁。"
+            ),
+        }
 
     try:
         out_target.parent.mkdir(parents=True, exist_ok=True)
