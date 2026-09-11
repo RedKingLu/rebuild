@@ -25,12 +25,36 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger("rebuild.profiling_service")
 
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+
+# D-06（V26.2 总验收真实规模真跑，2026-09-11，批次B）：真实项目（1018 文件 / 197,447 行）上
+# 本调用的 completion **恰好 4 次触顶原硬编码 max_tokens=16384**（存档响应头部为
+# `{"tech_stack": {"primary_language": "C#"…` 即被砍断）→ 建档识别 JSON 中途截断解析失败 →
+# 8 个识别键全部落为 None → stage_handlers 写成"LLM 未产出 xxx（诚实标注）"占位——这正是
+# D-05（P1 8/23 域产物为空、独立验收仍判 accepted/0 问题）的真正根因。
+# 复用 acceptance_baseline_service 刚建立的 env 可调范式（不新造机制）。
+#
+# 默认值依据（实测，非拍脑袋）：
+#   · 32768 = 触顶值 16384 的 2 倍。acceptance_baseline_service 同批已把静态基线（3 个数组
+#     字段）的预算提到 16384（触顶值 6144 的 2.67 倍）；profiling 一次要产出 8 个键
+#     （tech_stack/dependency_draft/entry_points/config_inventory/infra_clues/test_inventory/
+#     module_structure/uncertainty_manifest），其中 dependency_draft 真实规模下要覆盖 49 个
+#     依赖包（D-13 实测计数），内容体量与 R11-7 为 P3 task_plans 设的预算同级，而非
+#     acceptance_baseline 的小体量清单，故直接复用平台已有的更高一档（32768），不再另立一个
+#     居中的新数字。
+#   · 300s：本调用走 run_stage_tool_loop（多轮工具循环，可按需 list_files/fs_read/code_grep
+#     探读真实源，不是单次 non-stream 调用），且预算翻倍后单轮生成耗时也会拉长；
+#     acceptance_baseline_service 对 16384 预算、单次调用取 240s（依据实测 60-120s 延迟 ×2
+#     余量）；profiling 预算是其 2 倍且为多轮工具循环，300s 留出更合理的余量。
+# 二者只调请求超时与输出预算，不涉及模型/endpoint 选择（策略仍由 ModelGateway 解析，D-098）。
+_PROFILING_MAX_TOKENS = int(os.environ.get("P1_PROFILING_MAX_TOKENS", "32768"))
+_PROFILING_TIMEOUT = float(os.environ.get("P1_PROFILING_TIMEOUT", "300"))
 
 # LLM-produced 建档 identification fields (通用锚点，样本值由 LLM 生成)。file_index /
 # source_structure / cicd / doc 等由采集提供，不在此列。
@@ -160,7 +184,8 @@ class ProfilingService:
             gw, system_content=system_content,
             user_content=self._build_user_prompt(facts, upstream or {}),
             project_id=project_id, run_id=run_id or "", stage=stage,
-            strategy_id=strategy_id, max_tokens=16384, temperature=0.3, tracer=self.tracer)
+            strategy_id=strategy_id, max_tokens=_PROFILING_MAX_TOKENS, temperature=0.3,
+            timeout=_PROFILING_TIMEOUT, tracer=self.tracer)
         if loop["status"] != "completed":
             reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P1 profiling model call not completed: {reason}", project_id, run_id, stage)
@@ -170,7 +195,7 @@ class ProfilingService:
                                    model_error_category=loop.get("error_category", "model_unavailable"),
                                    model_user_actions=_MODEL_USER_ACTIONS)
 
-        parsed = self._parse(loop.get("content", ""))
+        parsed = self._parse(loop.get("content", ""), model_used=loop.get("model_used"))
         self._trace("P1 profiling completed (LLM identification)", project_id, run_id, stage)
         return ProfilingResult(
             status="completed", identification=parsed, model_used=loop.get("model_used"),
@@ -206,13 +231,78 @@ class ProfilingService:
             "uncertainty_manifest 中发声识别盲区与任何与 P0 的冲突。严格输出上述 JSON。"
         )
 
-    def _parse(self, content: str) -> dict:
+    @staticmethod
+    def _scan_json_shape(text: str) -> tuple[int, bool]:
+        """扫描 JSON 文本的结构收敛状态：返回 (未闭合的括号深度, 是否停在字符串内部)。
+
+        纯诊断用，不做任何修补（同 acceptance_baseline_service 范式，D-06 同族）——只用来区分
+        「输出被截断（结构未闭合）」与「输出完整但非法」这两种处置完全不同的失败。
+        """
+        depth = 0
+        in_string = False
+        escaped = False
+        for ch in text:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+        return depth, in_string
+
+    def _diagnose_parse_failure(self, text: str) -> dict:
+        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 本次预算取值。让"解析失败"
+        不再只是一句 parse_error——读产物/日志的人能分辨是「被截断」还是「输出非法 JSON」。"""
+        depth, in_string = self._scan_json_shape(text)
+        signals: list[str] = []
+        if not text:
+            signals.append("empty_content: 响应为空（可能推理链耗尽输出预算后无最终文本）")
+        if in_string:
+            signals.append("unclosed_string: 文本末尾停在未闭合的字符串内")
+        if depth > 0:
+            signals.append(f"unbalanced_depth={depth}: 有 {depth} 层 {{/[ 未闭合")
+        if text and not text.rstrip().endswith(("}", "]")):
+            signals.append("tail_not_closed: 末尾字符不是 } 或 ]")
+        return {
+            "content_len": len(text),
+            "suspected_truncation": bool(signals),
+            "truncation_signals": signals,
+            "tail_snippet": text[-80:] if text else "",
+            "max_tokens": _PROFILING_MAX_TOKENS,
+            "timeout_s": _PROFILING_TIMEOUT,
+            "env_knobs": "P1_PROFILING_MAX_TOKENS / P1_PROFILING_TIMEOUT",
+        }
+
+    def _parse(self, content: str, *, model_used: Optional[str] = None) -> dict:
         from app.services.stage_agent_loop import extract_json_object
         data = extract_json_object(content)
         if data is not None:
             return data
-        logger.warning("P1 profiling: LLM 输出无法解析为 JSON（返工重试结构化输出）")
-        return {"parse_error": True, "raw": (content or "").strip()[:2000]}
+        text = (content or "").strip()
+        diagnosis = self._diagnose_parse_failure(text)
+        if diagnosis["suspected_truncation"]:
+            # 截断：可操作结论是「提高输出预算」，用 error 级并直接给出旋钮（D-06）。
+            logger.error(
+                "P1 profiling: LLM 输出**疑似被截断**导致 JSON 解析失败（D-06 同族）—— "
+                "响应长度=%d 字符, 截断信号=%s, 尾部=%r, model=%s, "
+                "本次预算 max_tokens=%s / timeout=%ss（可经 %s 调整）",
+                diagnosis["content_len"], diagnosis["truncation_signals"],
+                diagnosis["tail_snippet"], model_used, diagnosis["max_tokens"],
+                diagnosis["timeout_s"], diagnosis["env_knobs"])
+        else:
+            logger.warning(
+                "P1 profiling: LLM 输出**结构已收敛但非法 JSON**（非截断，需修 prompt 契约）—— "
+                "响应长度=%d 字符, 尾部=%r, model=%s",
+                diagnosis["content_len"], diagnosis["tail_snippet"], model_used)
+        return {"parse_error": True, "raw": text[:2000], "parse_diagnosis": diagnosis}
 
     def _trace(self, summary: str, project_id, run_id, stage) -> None:
         if self.tracer is None:

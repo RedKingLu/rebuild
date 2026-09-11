@@ -224,6 +224,18 @@ class ValidationAgent:
                         recs.append("依据独立验收语义结论修正/重做迁移产物后重跑"
                                     "（禁止照节点标题臆造通用样例）")
 
+        # ④'' D-05（V26.2 批次B）：P1 领域产物集完整性 + acceptance_criteria 第 4 条核验。
+        #     诚实降级本身不是惩罚对象——占位是「未伪造」的正面表现（D-097）；本检查只把「客观
+        #     事实」如实写进验收报告：哪些产物是占位、对应哪条验收标准未达成（缺陷分级思路，
+        #     借鉴 R 阶段验收标准 §0.1 的四档口径，不照搬用词）。判 passed=False（→ rework_
+        #     required，既有机制）仅限两种客观未达标情形，详见 _p1_domain_completeness_check。
+        p1_domain_gate_ok = True
+        if self.stage == "p1" and declared == "completed":
+            p1_checks, p1_issues, p1_hard_fail = self._p1_domain_completeness_check()
+            checks += p1_checks
+            issues += p1_issues
+            p1_domain_gate_ok = not p1_hard_fail
+
         # ④'（D-109）P2/P3 技术路线红线符合性【advisory】校验：项目已批准 project.tech_selection
         #    时，记录红线治理状态并对明显偏离发声（recommendation，不 flip passed——P0-P3 advisory；
         #    P4 由上面 _semantic_gate_p4 依红线作门禁拦截）。
@@ -236,7 +248,8 @@ class ValidationAgent:
 
         # ⑤ 综合裁决：pass = 域基线通过 且 无反伪造违规 且 独立结构核验门控通过
         #    且（P4）LLM 内容保真语义门控通过（P0-P3 语义/内联仍为 advisory）
-        passed = base_passed and antifake_ok and acc_gate_ok and sem_gate_ok
+        #    且（P1）领域产物集完整性门控通过（D-05）
+        passed = base_passed and antifake_ok and acc_gate_ok and sem_gate_ok and p1_domain_gate_ok
         if declared != "completed":
             passed = False
             # WP-6 (Q-R17.3-6-2): 未完成且系模型全失败强制中断 → 结构化 model_unavailable issue，
@@ -304,6 +317,12 @@ class ValidationAgent:
                               "_work_plan.json", "_gate_brief.json",
                               "_claim_evidence_map.json", "_validation.json")
 
+    # D-05（V26.2 批次B）：P1 领域产物集里，诚实占位数达到/超过此阈值（8 项里 4 项，即半数）
+    # 视为识别产出整体性缺失（非个别字段问题）——判定该阶段客观未达标。阈值取半数，与"逐条核对
+    # acceptance_criteria"的思路一致：不因单一次要字段占位就判失败（缺陷分级）。
+    _P1_MAJOR_GAP_THRESHOLD = 4
+    _P1_UNCERTAINTY_KEY = "uncertainty_manifest"
+
     def _disk_domain_artifacts(self) -> list:
         """从盘重读的【领域产物】refs（r3 约束 3）：排除 WorkAgent 编排报告；P4 追加
         AET 登记的 output_code/patch 真实产物 ref。供 handler.review 域校验使用。"""
@@ -360,6 +379,100 @@ class ValidationAgent:
             view["assessment_report"] = rep.get("report", rep.get("assessment_report", {}))
             view["analysis_only"] = rep.get("analysis_only", True)
         return view
+
+    # ── D-05（V26.2 批次B）：P1 领域产物集完整性 + acceptance_criteria 第 4 条核验 ──────
+    @staticmethod
+    def _is_p1_honest_placeholder(data) -> bool:
+        """识别 stage_handlers.RealP1Handler 写盘的诚实占位形态：
+        `{"identification_note": "LLM 未产出 {key}（诚实标注，未伪造）"}`（见 stage_handlers.py
+        执行路径，只读参照，不改动）。产物缺失/不可解析同样代表该产物未真实产出，一并计入占位。"""
+        if not isinstance(data, dict):
+            return True
+        if set(data.keys()) == {"identification_note"}:
+            return "LLM 未产出" in str(data.get("identification_note", ""))
+        return False
+
+    def _p1_domain_completeness_check(self) -> tuple[list, list, bool]:
+        """D-05 核心修复：P1 有一组固定领域产物 key（_LLM_ARTIFACT_KEYS，定义于
+        stage_handlers.RealP1Handler，只读引用不复制维护第二份清单——DRY），逐一从盘重读；
+        若干为「LLM 未产出（诚实标注）」占位时，如实记入 checks/issues，并逐条核对
+        work_plan.acceptance_criteria 第 4 条「盲区主动发声（uncertainty 非 0-gap）」是否达成。
+
+        边界（不惩罚诚实降级）：占位本身不是失败——它是「未伪造」的正面表现（D-097/公理3）。
+        本方法只把客观事实如实写进验收报告；返回的 hard_fail 只在两种情形为 True（均只触发
+        既有 rework_required 机制重跑 WorkAgent，非阶段 blocked/failed）：
+          ① uncertainty_manifest 是占位——它是 acceptance_criteria 里【明确点名】的第 4 条，
+             该条客观未达成（盲区清单本身缺失，不是"盲区数=0"）；
+          ② 占位数达到/超过 _P1_MAJOR_GAP_THRESHOLD（半数）——已非个别字段缺失，是识别产出的
+             整体性缺失。
+        单一次要字段占位（非 uncertainty_manifest、未达半数）→ 仅记入 issues 如实反映，不
+        flip passed（对应"诚实降级不代表阶段判定失败"）。
+        """
+        try:
+            from app.graph.stage_handlers import RealP1Handler
+            artifact_keys = list(RealP1Handler._LLM_ARTIFACT_KEYS)
+            static_criteria = list(RealP1Handler.acceptance_criteria)
+        except Exception:
+            logger.debug("validation_agent 读取 RealP1Handler 领域产物锚点失败（advisory）",
+                        exc_info=True)
+            artifact_keys = ["tech_stack", "dependency_draft", "entry_points", "config_inventory",
+                             "infra_clues", "test_inventory", "module_structure",
+                             self._P1_UNCERTAINTY_KEY]
+            static_criteria = []
+
+        work_plan = self._read_json("artifacts/p1/p1_work_plan.json") or {}
+        wp_criteria = work_plan.get("acceptance_criteria") or static_criteria
+
+        empty_keys = [key for key in artifact_keys
+                     if self._is_p1_honest_placeholder(self._read_json(f"artifacts/p1/{key}.json"))]
+
+        checks: list = []
+        issues: list = []
+        if not empty_keys:
+            checks.append({"item": f"P1 领域产物集完整性（{len(artifact_keys)} 项识别产物）",
+                           "passed": True,
+                           "reason": f"{len(artifact_keys)} 项识别产物均非诚实占位（LLM 已实质产出）",
+                           "evidence_ref": None})
+            return checks, issues, False
+
+        checks.append({"item": f"P1 领域产物集完整性（{len(artifact_keys)} 项识别产物）",
+                       "passed": False,
+                       "reason": f"{len(empty_keys)}/{len(artifact_keys)} 项为诚实占位（LLM 未产出）："
+                                f"{empty_keys}", "evidence_ref": None})
+        issues.append({
+            "type": "p1_domain_artifacts_incomplete",
+            "detail": (f"P1 领域产物集不完整：{empty_keys} 为「LLM 未产出（诚实标注，未伪造）」占位，"
+                      f"共 {len(empty_keys)}/{len(artifact_keys)} 项——占位本身未伪造（D-097 正面"
+                      "表现），但验收须如实记录，不得以 issues:[] 掩盖"),
+        })
+
+        hard_fail = False
+        uncertainty_missing = self._P1_UNCERTAINTY_KEY in empty_keys
+        if uncertainty_missing:
+            hard_fail = True
+            blind_spot_criterion = next(
+                (c for c in wp_criteria if "盲区主动发声" in c or "uncertainty" in c.lower()), None)
+            issues.append({
+                "type": "acceptance_criterion_unmet",
+                "detail": (
+                    (f"work_plan.acceptance_criteria「{blind_spot_criterion}」未达成：" if
+                     blind_spot_criterion else
+                     "acceptance_criteria 第 4 条「盲区主动发声（uncertainty 非 0-gap）」未达成："
+                     "（未在 work_plan 中定位到对应文案，按产物本身判定）：")
+                    + "uncertainty_manifest.json 是「LLM 未产出」诚实占位，无真实盲区清单内容"
+                    "（uncertainty 非 0-gap 要求未满足）"),
+            })
+
+        if len(empty_keys) >= self._P1_MAJOR_GAP_THRESHOLD:
+            hard_fail = True
+            issues.append({
+                "type": "p1_identification_major_gap",
+                "detail": (f"{len(empty_keys)}/{len(artifact_keys)} 项领域产物为诚实占位，已达/超过"
+                          f"半数阈值（{self._P1_MAJOR_GAP_THRESHOLD}）——识别产出整体性缺失（非个别"
+                          "字段问题），判定该阶段客观未达标"),
+            })
+
+        return checks, issues, hard_fail
 
     def _verify_generic_evidence_map(self, cem_ref, declared) -> tuple[bool, dict, list]:
         """通用 evidence map 磁盘可解析校验（claim/fact 通用）。declared!=completed 时不苛求。"""
@@ -520,6 +633,12 @@ class ValidationAgent:
             return {"status": "evidence_gap",
                     "detail": f"LLM 语义验收未完成（{cat}）：需有效模型 Key 端到端验证"}
         content = resp.get("content", "") or ""
+        if not content.strip():
+            # D-05 附带修复：模型响应 status=completed 但正文为空，此前直接报
+            # {"status":"completed","raw":""}——把"响应完成"误当成"验收内容已产出"。
+            # 空正文本身就是证据缺口（诚实降级，非伪造），不应冒充 completed（公理3/D-097）。
+            return {"status": "evidence_gap",
+                    "detail": "LLM 语义验收响应 completed 但正文为空（诚实降级为证据缺口，不冒充 completed）"}
         out = {"status": "completed", "raw": content[:200]}
         if parse_verdict:
             verdict, grounded, reason = self._parse_verdict(content)
