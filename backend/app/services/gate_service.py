@@ -32,6 +32,78 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── P5 返工信号（V26.2 返工修复第 8 项，Q-RW-4）───────────────────────────
+# 背景：P5 判定 rework_required 时，用户批准其 stage_promotion Gate 的真实语义是
+# "接受返工、退回 P4 重跑"，不是"晋级到 P6"。这个决策必须同时被两处独立消费：
+#   ① 图路由 make_router("p5")（app/graph/nodes.py）——决定图走到哪个节点；
+#   ② 本文件 _apply_promotion——图未在跑时（drive_promotion=True 的直连路径）
+#     独立推进 project.current_stage / run.stage_status。
+# 这两处是两套完全独立的代码路径（一个走 GraphState，一个只有 Gate 行 g 可用，
+# Gate 表没有自由格式的 metadata 列可持久化"这是一次返工批准"），若各自从
+# verdict/文案等模糊信号反推，分支逻辑一旦漂移（比如日后新增一种失败类型），两处
+# 就可能给出矛盾结论——图已经在跑 p4_work，但 DB 里 project.current_stage 却被
+# 写成了 p6，状态撕裂。
+#
+# 解法：显式落盘一份"这个 gate_id 一旦被批准 = 退回某阶段"的标记文件，由判定
+# rework 的一方（nodes.py 的 make_work_node，在 P5FailureRouter.route() 明确算出
+# p4_rework_required=True 时）写入；两个消费方都读同一份文件，且都用 gate_id
+# 精确匹配才采信——不匹配（比如文件是上一轮返工留下的旧标记，这一轮 P5 已经真正
+# 通过）就当没有信号，走原有的"正常晋级"逻辑。文件路径落在 P5 的产物目录下，是
+# 因为这个机制目前只服务 P5→P4 这一条路径（Q-RW-4 裁决的范围），不做成任意阶段
+# 通用的返工机制。
+_P5_REWORK_MARKER_REL = "artifacts/p5/p5_rework_decision.json"
+
+
+def write_p5_rework_marker(project_id: str, *, gate_id: str, run_id: str,
+                            target_stage: str, reason: str,
+                            plan_delta_id: Optional[str] = None) -> None:
+    """P5 判定需要返工时落盘"这个 gate_id 批准 = 退回 target_stage"的显式标记。
+
+    由 nodes.py 的 make_work_node 在创建该 Gate 之后调用（此时 gate_id 已知）。
+    失败只降级发声（不抛）：标记写入失败不该让 Gate 创建整体失败——退回路由会走不
+    动，但至少不会误判为"正常晋级"（read 侧找不到匹配文件时同样保守地判无信号）。
+    """
+    import json
+    from app.services import workspace_service
+    try:
+        p = workspace_service.workspace_path(project_id) / _P5_REWORK_MARKER_REL
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "gate_id": gate_id,
+            "run_id": run_id or "",
+            "rework_target_stage": target_stage,
+            "reason": reason,
+            "plan_delta_id": plan_delta_id,
+            "created_at": _now(),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        _logger.warning("写入 P5 返工标记失败 project=%s gate=%s target=%s",
+                        project_id, gate_id, target_stage, exc_info=True)
+
+
+def read_p5_rework_marker(project_id: str, gate_id: str) -> Optional[dict]:
+    """读取（若存在且 gate_id 精确匹配）本次批准是否携带"退回上一阶段"的标记。
+
+    gate_id 不匹配（标记来自另一个 Gate，通常是上一轮返工留下的旧文件）→ 视为无
+    信号，返回 None——这是防止旧标记误伤之后真正通过的同阶段 Gate 的唯一手段
+    （文件本身不会在消费后删除，见模块顶部说明；匹配失败即安全，无需再显式清理）。
+    """
+    import json
+    from app.services import workspace_service
+    try:
+        p = workspace_service.workspace_path(project_id) / _P5_REWORK_MARKER_REL
+        if not p.exists():
+            return None
+        marker = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        _logger.warning("读取 P5 返工标记失败 project=%s gate=%s", project_id, gate_id,
+                        exc_info=True)
+        return None
+    if not gate_id or marker.get("gate_id") != gate_id:
+        return None
+    return marker
+
+
 def _gate_to_response(g: Gate) -> GateResponse:
     # P2-C: graph capability must be a REAL probe, never the schema default
     # "not_connected" (state.py 红线：不得写死 not_connected). "live" when the
@@ -173,6 +245,17 @@ class GateService:
             db.commit()
             db.refresh(g)
 
+            # D-07 / B-R22-GATE-REDECIDE-REDRIVE 次级项：Gate 一旦被决策，
+            # project.active_gate 必须立刻不再指向它。该字段语义是「当前待决 Gate」，
+            # 客户端（前端 GatePanel、轮询脚本）据此判断"是否还需要提交决策"。
+            # 此前只有 stage_promotion 的 _apply_promotion 分支清理它，而：
+            #   ① plan_presentation / plan_review / action_approval 等 gate_type 从不清理；
+            #   ② 图驱动路径要等后台图整段跑完才由 routes_stages._run_graph_bg 更新，
+            #      阶段执行期内（真实规模项目可达数分钟）该字段仍指向已决 Gate。
+            # ⇒ 轮询客户端在这段窗口里会反复提交决策，正是 D-01 的诱因。故在决策落库后
+            # 立即同步清理（此处是所有决策路径的唯一必经点：REST 路由与图内部重放都经 decide）。
+            self._clear_active_gate_if_current(g)
+
             # Drive stage transition
             if g.gate_type == "stage_promotion" and drive_promotion:
                 self._apply_promotion(g, decision)
@@ -215,6 +298,37 @@ class GateService:
             return _gate_to_response(g), audit
         finally:
             db.close()
+
+    def _clear_active_gate_if_current(self, g: Gate) -> None:
+        """决策生效后把 project.active_gate 从本 Gate 上摘掉（D-07）。
+
+        只在它确实指向本 Gate 时清理 —— 否则会误清另一个真实待决 Gate（例如后台图已
+        创建下一阶段 Gate 并把 active_gate 指向了它）。
+        比较用的 project 走本服务自己的新 session 读取（`_db()`），不用
+        `svc.project_service` 那个长生命周期单例 session —— 后者的 identity map 可能持有
+        别的 session 早前写入前加载的旧 Project，据此比较会错判。写入仍复用
+        ProjectService.update（保持与 _apply_promotion 同一条写路径，不另开第二条）。
+        置空值用 `""` 而非 `None`：ProjectService.update 会过滤 None（那是"本次不更新该
+        字段"的通用语义，不得为了本需求放宽它，否则影响所有字段的更新行为），`""` 是本文件
+        _apply_promotion 既有的置空写法（同一约定，不另立第二种）。
+        失败只降级发声（不抛）：清理失败不该让一个已成功落库的决策变成 4xx/5xx；
+        客户端仍可用 gate_status 判断待决状态。
+        """
+        try:
+            from app.models.project import Project
+            _db = self._db()
+            try:
+                project = _db.get(Project, g.project_id)
+                points_at_this_gate = (project is not None
+                                       and (project.active_gate or "") == g.gate_id)
+            finally:
+                _db.close()
+            if points_at_this_gate:
+                self._svc.project_service.update(g.project_id, active_gate="")
+        except Exception:
+            _logger.warning("Gate %s 决策后清理 project.active_gate 失败（project=%s）——"
+                            "该字段可能仍指向已决 Gate，客户端须以 gate_status 判断待决状态",
+                            g.gate_id, g.project_id, exc_info=True)
 
     def _persist_tech_selection(self, g: Gate, override: dict | None) -> None:
         """D-109：把批准的技术路线选型落 project.tech_selection（项目红线）。
@@ -315,6 +429,26 @@ class GateService:
                         f"阶段 {cur} 晋级被拒绝：run {g.run_id} 在该阶段无真实产物"
                         f"（task_graph 未创建）。请先完成阶段执行再申请晋级。"
                     )
+            # V26.2 返工修复第 8 项（Q-RW-4）：这条是"直连"晋级路径（drive_promotion=
+            # True，图未在跑或图驱动检测失败时的兜底）。cur=="p5" 时必须检查这个 Gate
+            # 是否携带落盘的返工标记——检查方式、判据来源与图路由 make_router("p5")
+            # 完全相同（同一份文件、同一个 gate_id 精确匹配规则，见
+            # read_p5_rework_marker 顶部注释），这是保证两条独立代码路径不给出矛盾
+            # 结论的唯一手段。非 p5 阶段完全不做这个检查，不影响其它阶段既有行为。
+            rework_target: Optional[str] = None
+            if cur == "p5":
+                _marker = read_p5_rework_marker(g.project_id, g.gate_id)
+                rework_target = _marker.get("rework_target_stage") if _marker else None
+            if rework_target:
+                if g.run_id:
+                    self._svc.run_service.set_stage_status(g.run_id, cur, "rework_required")
+                    self._svc.run_service.set_stage_status(g.run_id, rework_target, "in_progress")
+                if project is not None:
+                    try:
+                        ps.update(g.project_id, current_stage=rework_target, active_gate="")
+                    except Exception:
+                        _logger.warning(f"_apply_promotion: rework update failed for project {g.project_id}", exc_info=True)
+                return
             try:
                 nxt = STAGE_ORDER[STAGE_ORDER.index(cur) + 1]
             except (ValueError, IndexError):

@@ -93,9 +93,14 @@ async def decide_gate(project_id: str, gate_id: str, req: GateDecisionRequest):
     """Resolve a Gate decision. WP-6: when a LangGraph checkpoint thread exists for
     gate.run_id, drives FlowRuntime.resume (graph advances stage); GateService records
     with drive_promotion=False to avoid double-advancement. Non-graph gates advance
-    directly (drive_promotion=True)."""
+    directly (drive_promotion=True).
+
+    幂等契约（D-01）：只有 gate_status == "waiting_decision" 的 Gate 可被本路由决策。
+    对已决策 Gate 重复提交同一决策 → 200 无操作（不驱动图、不写审计）；提交不同决策
+    → 409（不静默改判）。详见下方守卫处的完整说明。"""
     from app.graph.runtime import get_flow_runtime, graph_thread_active
     from app.api.routes_stages import _ensure_graph_task, _run_graph_bg
+    from app.services.gate_service import VALID_DECISIONS
 
     svc = _svc()
     # Look up gate first to get run_id (needed for graph thread check)
@@ -105,6 +110,58 @@ async def decide_gate(project_id: str, gate_id: str, req: GateDecisionRequest):
 
     run_id = gate.run_id or ""
     graph_driven = False
+
+    # D-01 / B-R22-GATE-REDECIDE-REDRIVE：已决策 Gate 再收到决策提交时的幂等拦截。
+    #
+    # 【为何拦】下面的图驱动分支（R17-6）只判「图线程是否仍暂停」，不判 Gate 是否已被决策。
+    #   一个已 approved 的 Gate 再收到一次 approve，就会再次 Command(resume=...) 恢复同一
+    #   checkpoint 线程 → 整个阶段被重新执行一遍。V26.2 总验收真实规模真跑实测：对同一个
+    #   已批准的 p1 plan_presentation Gate 重复提交 5 次 → 产生 5 个重复的 p1 晋级 Gate、
+    #   阶段产物分两批 mtime 互相覆写（同阶段两次执行结果还不一致）、真实 LLM 额度被重复消耗。
+    #   GateService.decide() 的幂等守卫（gate_service.py:166）位于图驱动【之后】，保护不到这里。
+    #
+    # 【拦哪一类】只拦「HTTP 客户端对已离开 waiting_decision 的 Gate 再次提交决策」——
+    #   即重试客户端、用户双击、轮询式驱动（真跑中的跟踪脚本正属此类）。
+    #   判据取 gate_status 而非"调用来源"或 decision 字段：waiting_decision 是本平台既有的
+    #   「可决策」定义（GateService.get_active 以它筛 active gate；StageService.promote 只挑
+    #   waiting_decision 的 Gate，否则报"无待决 Gate 可决策"），本守卫与之对齐即语义统一；
+    #   它还额外覆盖 mark_consumed 写入的 "consumed"（一次性高风险授权已被消费的 Gate，
+    #   不得靠再提交一次决策把 gate_status 改回 approved 而复活授权）。
+    #
+    # 【为何不拦另一类】图节点在 resume 时「重新应用同一决策」走的是
+    #   app/graph/nodes.py:502 → RealGateBackend.decide()（app/graph/gate_backend.py:124）
+    #   → GateService.decide()，**完全不经过本 HTTP 路由**，故本守卫对"图内部重放"没有任何
+    #   影响；那条既有幂等场景仍由 gate_service.py:166 的守卫处理（保持不变）。
+    #   正常【首次】批准（gate_status == "waiting_decision"）也不受影响，照旧走下面的图恢复路径。
+    #
+    # 【为何置于产物校验之前】本请求是对既有决策的重放，不改任何状态、不驱动图、不晋级，
+    #   因此无须（也不该）再跑一次晋级产物校验；R17-2 的空壳晋级校验只在真正会改状态的
+    #   路径上起作用，此处早返回不构成对它的绕过。
+    if gate.gate_status != "waiting_decision":
+        submitted = (req.decision or "").strip().lower()
+        if submitted not in VALID_DECISIONS:
+            raise HTTPException(
+                400, f"非法 Gate 决策：{req.decision!r}（允许 {sorted(VALID_DECISIONS)}）")
+        if submitted != (gate.decision or ""):
+            # 发声（公理 3）：不静默改写一个已生效的决策，也不假装新决策已被受理。
+            # 需要返工请对新开的 Gate 决策，而不是改判旧 Gate。
+            raise HTTPException(
+                409,
+                f"Gate {gate_id} 已被决策为 {gate.decision or '(空)'!r}"
+                f"（当前状态 {gate.gate_status}，决策时间 {gate.decided_at or '未记录'}），"
+                f"不接受改判为 {submitted!r}。如需返工请对新的 Gate 提交决策。",
+            )
+        logger.info("Gate %s 重复提交同一决策 %s（当前状态 %s）：幂等无操作，不驱动图",
+                    gate_id, submitted, gate.gate_status)
+        svc.trace_writer.write("gate_event", action="decide_gate_noop",
+                               summary=f"Gate {gate_id} already decided ({gate.decision}); "
+                                       f"repeat submit ignored (idempotent, graph not re-driven)",
+                               project_id=project_id, run_id=(run_id or None))
+        return SuccessEnvelope(
+            data={"gate": gate.model_dump(), "audit": None, "graph_driven": False,
+                  "transition_mode": "noop_already_decided"},
+            meta=Meta(source_status="real"),
+        )
 
     # R17-2 V-R17-1B-2/P1: gate 晋级强绑阶段产物。对 stage_promotion gate，晋级前校验
     # 该 run+stage 有真实产物（task_graph 存在 或 artifact_refs 非空），杜绝空壳晋级。

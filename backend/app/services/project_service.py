@@ -87,6 +87,10 @@ class ProjectService:
         if p is None:
             return None
         for k, v in fields.items():
+            # 约定（勿放宽）：v is None 表示「本次不更新该字段」，这是所有调用方共享的
+            # 通用语义。需要把某字段【置空】的调用方请传空值本身（如 active_gate=""，
+            # 见 GateService._clear_active_gate_if_current），不要改这里的过滤条件——
+            # 放宽它会让所有未显式传参/传 None 的字段被意外清空。
             if v is not None and hasattr(p, k):
                 setattr(p, k, v)
         p.updated_at = datetime.now(timezone.utc)
@@ -171,6 +175,10 @@ class ProjectService:
             "source_config": p.source_config,
             "current_stage": p.current_stage,
             "current_run_id": p.current_run_id,
+            # active_gate 语义（D-07）：**当前待决 Gate 的 id**。Gate 一经决策即由
+            # GateService._clear_active_gate_if_current 置为 ""；后台图产出下一个待决 Gate 时
+            # 由 routes_stages._run_graph_bg 指向新 Gate。空串/None = 当前无待决 Gate。
+            # 客户端仍应以 Gate 自身的 gate_status 为权威判据（该字段是便捷索引，非唯一真相）。
             "active_gate": p.active_gate,
             "evidence_gap_count": p.evidence_gap_count,
             "workspace_status": p.workspace_status or "ready",
