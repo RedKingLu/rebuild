@@ -86,17 +86,32 @@ def _promotion_gates(client, pid, stage):
 
 @pytest.fixture
 def fake_graph(monkeypatch):
-    """把「图线程活跃」+「后台驱动图」替换为可计数假实现（不跑真图、不调 LLM）。
+    """把「图暂停点」+「后台驱动图」替换为可计数假实现（不跑真图、不调 LLM）。
 
     假实现同时模拟真实图的可观测副作用：每被驱动一次，就为下一阶段建一个
     stage_promotion Gate（对应 nodes.make_work_node 的 promotion_gate_created）。
     返回 drives 列表，每次驱动追加一条 {run_id, decision, stage}。
+
+    B-ACC-DECISION-CROSSGATE-INJECTION 之后 routes_gates 改用
+    `graph_pending_gate_ids(run_id)` 判「被提交 Gate 是不是图暂停点」（原判据是
+    run 级的 graph_thread_active）。本文件锁定的是 D-01 幂等守卫，与同一性守卫
+    无关，因此这里让假暂停点覆盖【该 run 的全部 Gate】——等价于原来那个
+    "线程活跃即可驱动"的假实现（提交哪个 Gate 都算暂停点），本文件原有的判别力
+    因此逐条保持不变（重复提交仍必须由 D-01 守卫拦住，而不是被同一性守卫吸收）。
+    同一性守卫本身的锁定测试在 tests/test_acc_decision_crossgate_injection.py。
     """
     drives: list[dict] = []
     _next = {"p0": "p1", "p1": "p2", "p2": "p3", "p3": "p4", "p4": "p5", "p5": "p6"}
 
-    async def _fake_active(run_id):
-        return True
+    async def _fake_pending_gate_ids(run_id):
+        from app.core.database import get_session
+        from app.models.gate import Gate
+        db = get_session()
+        try:
+            return frozenset(
+                g.gate_id for g in db.query(Gate).filter(Gate.run_id == run_id).all())
+        finally:
+            db.close()
 
     def _fake_bg(run_id, decision, project_id, stage):
         drives.append({"run_id": run_id, "decision": decision, "stage": stage})
@@ -112,7 +127,7 @@ def fake_graph(monkeypatch):
     def _fake_ensure(coro):
         return None  # 不真的起后台线程
 
-    monkeypatch.setattr("app.graph.runtime.graph_thread_active", _fake_active)
+    monkeypatch.setattr("app.graph.runtime.graph_pending_gate_ids", _fake_pending_gate_ids)
     monkeypatch.setattr("app.api.routes_stages._run_graph_bg", _fake_bg)
     monkeypatch.setattr("app.api.routes_stages._ensure_graph_task", _fake_ensure)
     return drives
@@ -120,10 +135,10 @@ def fake_graph(monkeypatch):
 
 @pytest.fixture
 def no_graph(monkeypatch):
-    """无活跃图线程 → 走直连（direct）决策路径。"""
-    async def _fake_inactive(run_id):
-        return False
-    monkeypatch.setattr("app.graph.runtime.graph_thread_active", _fake_inactive)
+    """无图暂停点 → 走直连（direct）决策路径。"""
+    async def _fake_no_pending(run_id):
+        return frozenset()
+    monkeypatch.setattr("app.graph.runtime.graph_pending_gate_ids", _fake_no_pending)
 
 
 # ── D-01 核心：已决策 Gate 重复提交不得重复驱动阶段 ───────────────────────

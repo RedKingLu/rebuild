@@ -98,7 +98,7 @@ async def decide_gate(project_id: str, gate_id: str, req: GateDecisionRequest):
     幂等契约（D-01）：只有 gate_status == "waiting_decision" 的 Gate 可被本路由决策。
     对已决策 Gate 重复提交同一决策 → 200 无操作（不驱动图、不写审计）；提交不同决策
     → 409（不静默改判）。详见下方守卫处的完整说明。"""
-    from app.graph.runtime import get_flow_runtime, graph_thread_active
+    from app.graph.runtime import graph_pending_gate_ids
     from app.api.routes_stages import _ensure_graph_task, _run_graph_bg
     from app.services.gate_service import VALID_DECISIONS
 
@@ -174,20 +174,60 @@ async def decide_gate(project_id: str, gate_id: str, req: GateDecisionRequest):
                 f"（task_graph 未创建且 artifact_refs 为空）。请先完成阶段执行再申请晋级。"
             )
 
-    # R17-6: if gate has a checkpoint_ref (graph-created) and thread is still paused,
-    # fire-and-forget the graph resume; HTTP returns immediately. DB sync happens in
-    # _run_graph_bg once the graph actually completes.
-    if (gate.checkpoint_ref or run_id) and run_id:
+    # R17-6 + B-ACC-DECISION-CROSSGATE-INJECTION：只有「图当前正暂停在【本】Gate 上」时，
+    # 才可以把本次决策注入 graph resume。
+    #
+    # 【原缺陷】旧条件是 `if (gate.checkpoint_ref or run_id) and run_id: if await
+    #   graph_thread_active(run_id)`——两个判据都是 run 级的：checkpoint_ref 对同 run 的
+    #   每个图创建 Gate 恒等于 run_id（gate_backend.py: checkpoint_ref=run_id），
+    #   graph_thread_active 只答"该 run 的线程停着吗"。于是对同 run 里【任意】一个
+    #   waiting_decision 的 Gate 提交决策，都会把 req.decision 原样 Command(resume=) 进图，
+    #   而图恢复后按 state["pending_gate"] 把它写到【图自己暂停的那个】Gate 上。
+    #   真跑坐实：对 action_approval Gate gate-22343c 提交 reject，0.5 秒后同 run 的
+    #   stage_promotion Gate gate-9a4201 也变成 rejected（从未对它提交过任何决策）。
+    #   更严重的是本函数上方的 R17-2 空壳晋级校验按【被提交 Gate】的类型判断，提交
+    #   action_approval 时整道守卫被跳过 ⇒ 可经安全 Gate 驱动一次未校验的阶段晋级。
+    #
+    # 【新判据】graph_pending_gate_ids(run_id) 直接读 checkpoint 快照，解析出图暂停点的
+    #   gate_id（interrupt 载荷 ∩ state.pending_gate，两源一致才认，详见该函数 docstring）。
+    #   gate_id 在集合里 = 被提交 Gate 就是图恢复后会被写入的那个 Gate ⇒ 决策不可能落到
+    #   别的 Gate 上；同时"决策最终作用的 Gate == 被提交 Gate"，上方按被提交 Gate 做的
+    #   空壳晋级校验因此校的正是真正被晋级的那个 Gate（解除条件③）。
+    #
+    # 【非晋级类安全 Gate】action_approval / desensitization_override 这类 Gate 由
+    #   agent_loop / routes_registry / routes_toggle / opencode_acp_client 创建，**从不**是
+    #   图暂停点（全图唯一的 interrupt() 在 nodes.py 的 {stage}_gate 节点，其 pending_gate
+    #   只由 make_work_node 经 RealGateBackend.create 产生）⇒ 它们必然不在上述集合里，
+    #   决策只走直连路径（gate_service.decide 只对 gate_type=="stage_promotion" 调
+    #   _apply_promotion，故也不会晋级任何阶段）。这是解除条件②要求的效果，用同一性判据
+    #   自然达成，不额外维护类型黑/白名单（图暂停点类型是开放集：stage_promotion /
+    #   plan_presentation / plan_review / source_pending / model_unavailable …，名单必然漂移）。
+    #
+    # 【图暂停在别的 Gate 上时】不驱动图，但仍照常记录本 Gate 的决策（这是真实且合法的
+    #   场景：阶段执行途中 agent 停在 L3+ 工具审批 Gate 上等人批，而图停在别处），
+    #   并 warning 发声，便于事后核对状态。
+    if run_id:
         try:
-            if await graph_thread_active(run_id):
+            paused_gate_ids = await graph_pending_gate_ids(run_id)
+        except Exception as exc:
+            logging.getLogger("rebuild.routes_gates").warning(
+                "读取图暂停点失败 gate=%s run=%s：本次不驱动图（退回直连）: %s",
+                gate_id, run_id, exc, exc_info=True)
+            paused_gate_ids = frozenset()
+        if gate_id in paused_gate_ids:
+            try:
                 _ensure_graph_task(_run_graph_bg(run_id, req.decision, project_id, gate.stage or ""))
                 graph_driven = True
-        except Exception as exc:
-            import logging
-            logging.getLogger("rebuild.routes_gates").warning(
-                "graph task launch failed for gate %s run %s: %s", gate_id, run_id, exc, exc_info=True
-            )
-            graph_driven = False
+            except Exception as exc:
+                logging.getLogger("rebuild.routes_gates").warning(
+                    "graph task launch failed for gate %s run %s: %s", gate_id, run_id, exc,
+                    exc_info=True)
+                graph_driven = False
+        elif paused_gate_ids:
+            logger.warning(
+                "Gate %s（type=%s，run=%s）不是图暂停点（图停在 %s）：本次决策只作用于该 "
+                "Gate 自身，不驱动阶段图 resume（B-ACC-DECISION-CROSSGATE-INJECTION 守卫）",
+                gate_id, gate.gate_type, run_id, sorted(paused_gate_ids))
 
     try:
         gate_resp, audit = svc.gate_service.decide(gate_id, req, drive_promotion=not graph_driven)
