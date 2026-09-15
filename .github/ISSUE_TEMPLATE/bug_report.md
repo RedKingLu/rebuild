@@ -78,7 +78,8 @@ assignees: ''
 <!--
 可选，但很有帮助。例如：
 - 后端健康检查 `curl http://localhost:8000/api/health` 是否正常
-- 测试是否通过：`cd backend && R176_MOCK_LLM=1 uv run pytest -q`
+- 测试是否通过：`cd backend && uv run pytest -q`（不需要环境变量前缀；请连同输出结尾的
+  「LLM 模式」横幅一起贴，它说明这个数字是桩模式还是真实模型模式下取得的）
 - 是否在干净环境（重新 uv sync --dev / npm install）下也能复现
 -->
 
