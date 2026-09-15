@@ -10,15 +10,42 @@ providers:
     endpoint_openai: "https://api.deepseek.com"
     endpoint_anthropic: "https://api.deepseek.com/anthropic"
     env_key_var: "DEEPSEEK_API_KEY"
+    # ── 2026-09-13 主窗口实测 GET /models + 逐个真实 chat/completions 调用确认 ──
+    # 官方清单已从 3 个收敛为 **2 个**：`deepseek-flash` / `deepseek-v4-pro`。
+    # flash 系列改名：`deepseek-v4-flash` → **`deepseek-flash`**（规范名）。
+    # 实测证据（逐个真实调用，非采信清单）：
+    #   deepseek-flash                : OK 977ms，响应 model 字段 = deepseek-flash
+    #   deepseek-v4-flash             : OK 879ms，响应 model 字段 = **deepseek-flash** ⇒ 旧名是别名、已重定向
+    #   deepseek-v4-flash-vision-exp  : OK      ，响应 model 字段 = **deepseek-flash** ⇒ 同为别名，已非独立视觉模型
+    #   deepseek-v4-pro               : OK 936ms，响应 model 字段 = deepseek-v4-pro
     models:
+      - model_name: "deepseek-flash"
+        display_name: "DeepSeek Flash"
+        capability_tags: ["chat", "streaming", "coding", "review"]
+        cost_tier: "low"
+        supports_streaming: true
+        # 实测 2026-09-13：文本 1564ms（content 83 字符 + reasoning_content 319 字符）；
+        # 工具调用 933ms 成功发起（返回规范 tool_calls，参数 JSON 正确）。
+        supports_tool_calling: true
+        context_window_note: "1M tokens"
+        # ⚠ 该模型有 **reasoning 通道开销**：实测 completion_tokens=185 中 reasoning_tokens=146。
+        #   max_tokens 设过低（实测 16）会被 reasoning 吃光、content 返回空串 —— 调用方须留足预算，
+        #   这与 D-06（LLM JSON 输出截断）同一风险面：预算不足表现为"产物为空"而非报错。
+        recommended_use: "**默认主力**（用户 2026-09-13 明确指示优先用 flash）：日常编码、快速评审、高吞吐场景"
+      # ── 旧名保留为别名条目（实测仍可调用并重定向到 deepseek-flash）──────────────
+      # 不删除的理由：本仓多处测试把 `deepseek-official/deepseek-v4-flash` 钉成常量夹具
+      # （test_r175_p4_fix_batch5 / test_r1736_wp6 / test_r13_4_fusion 等），直接删会造成
+      # 一批假失败 —— 正是 test_model_gateway.py:173 注释记录过的"provider 清单变化导致测试
+      # 假失败"这一教训。保留别名可让既有引用继续工作，新代码应用规范名 deepseek-flash。
       - model_name: "deepseek-v4-flash"
-        display_name: "DeepSeek V4 Flash"
+        display_name: "DeepSeek V4 Flash（旧名，别名→deepseek-flash）"
         capability_tags: ["chat", "streaming", "coding", "review"]
         cost_tier: "low"
         supports_streaming: true
         supports_tool_calling: true
         context_window_note: "1M tokens"
-        recommended_use: "日常编码、快速评审、高吞吐场景"
+        deprecated_alias_of: "deepseek-flash"
+        recommended_use: "**已改名，勿用于新代码**：provider 侧重定向到 deepseek-flash（实测响应 model 字段即为新名）。保留仅为兼容既有测试夹具引用"
       - model_name: "deepseek-v4-pro"
         display_name: "DeepSeek V4 Pro"
         capability_tags: ["chat", "streaming", "coding", "review", "fusion"]
@@ -27,19 +54,10 @@ providers:
         supports_tool_calling: true
         is_fusion_capable: true
         context_window_note: "1M tokens"
-        recommended_use: "复杂分析、架构决策、Fusion 评审"
-      # ── 2026-09-06 用户提供的官方清单更新 + 主窗口实测 GET /models 确认（共 3 个）──
-      - model_name: "deepseek-v4-flash-vision-exp"
-        display_name: "DeepSeek V4 Flash Vision (实验)"
-        capability_tags: ["chat", "streaming", "coding", "vision"]
-        cost_tier: "low"
-        supports_streaming: true
-        # 实测 2026-09-06：工具调用 907ms 成功发起；文本 1130ms/81tok（**三者中最快**）
-        supports_tool_calling: true
-        context_window_note: "1M tokens（未经实测确认，沿用同系列声明）"
-        # ⚠ 名称含 -exp（experimental）：provider 可能随时变更或下线，不宜作为 P 阶段主力
-        #   依赖对象；vision（多模态）能力本轮**未实测**（本平台当前无图像输入场景）
-        recommended_use: "实验性：多模态场景探索；因 -exp 标记不建议作为生产主力"
+        # ⚠ 用户 2026-09-13 明确指示：**后续不使用 pro，优先用 flash**。
+        #   仍保留在目录中是因为 provider 侧确实存在该模型（实测可调用），删除会让
+        #   "平台声称的清单"与"provider 真实清单"不一致；但不得作为任何默认/主力选型。
+        recommended_use: "**不作为选型主力（用户 2026-09-13 指示）**。provider 侧存在且可调用，仅在用户显式指定时使用"
 
   - provider_id: "maas-icompify"
     provider_name: "MaaS (icompify)"
@@ -211,7 +229,9 @@ strategies:
     # 出厂 bootstrap 兜底默认（D-098）：这里【不】固化用户的真实选择。
     # 运行期生效的默认 = 用户在平台上配置的真实策略（动态：用户已配置的 Provider/Strategy/
     # Project 全局或自定义绑定），由 ProviderRegistry 动态解析；本 ref 仅在用户未配置任何策略时作 bootstrap。
-    default_profile_ref: "deepseek-official/deepseek-v4-flash"
+    # 2026-09-13：改指规范名 `deepseek-flash`（原 `deepseek-v4-flash` 已被 provider 改名为
+    # 此名，旧名仅作别名重定向）。用户 2026-09-13 明确指示：优先 flash，不用 pro。
+    default_profile_ref: "deepseek-official/deepseek-flash"
     fallback_profile_refs:
       - "maas-icompify/deepseek-v4-flash"
       - "agnes-ai/agnes-2.0-flash"
