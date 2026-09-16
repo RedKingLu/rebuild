@@ -22,8 +22,12 @@ BACKEND = Path(__file__).resolve().parents[1]
 
 # Reference revisions. _HEAD is ALSO asserted dynamically (test_head_is_read_dynamically)
 # so this file does not become a second source of truth for the head value.
-_HEAD = "a2b4c6d8e0f2"        # migration chain head (R20-2-01 D-117③: project.scenario)
-_PREV_HEAD = "b1c2d3e4f5a6"   # down_revision of head (R17.5-P4-FIX 批4 D-111) — used to manufacture drift
+# 批次一（B-ACC-GATE-APPROVAL-NOT-BOUND）新增迁移 b5d7f9a1c3e5（p_gate.action_fingerprint），
+# down_revision = 原 head a2b4c6d8e0f2 ⇒ 链头机械前移一步。本文件与本批次的两条 Gate
+# 安全守卫无关——它测的是"drift 检测读链头是否动态、不是硬编码"这一基础设施，任何新迁移
+# 都会让 _HEAD/_PREV_HEAD 需要同步前移一步，属正常维护，不是放宽任何安全判据。
+_HEAD = "b5d7f9a1c3e5"        # migration chain head (B-ACC-GATE-APPROVAL-NOT-BOUND：action_fingerprint)
+_PREV_HEAD = "a2b4c6d8e0f2"   # down_revision of head (R20-2-01 D-117③: project.scenario) — used to manufacture drift
 
 
 def _alembic_cfg() -> Config:

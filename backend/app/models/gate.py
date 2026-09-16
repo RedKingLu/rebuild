@@ -39,3 +39,10 @@ class Gate(Base):
     # WP-6: LangGraph checkpoint link — thread_id==run_id; non-null iff graph created this Gate
     checkpoint_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
     interrupt_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # B-ACC-GATE-APPROVAL-NOT-BOUND：action_approval Gate 被审阅的那一份入参的指纹
+    # （sha256 of "工具名\x00规范化入参 JSON"，见 tool_registry.action_args_fingerprint）。
+    # 【勿删】没有它，授权只能按 (run_id, 工具名) 匹配 = 一次性空白授权：用户看到入参 X
+    # 并批准，该 Gate 挂账到本 run 内下一次同名工具调用被消费，而那次的入参是 Y。
+    # 只对"工具/动作审批"类 Gate 有值；stage_promotion 等 Gate 恒为 NULL。
+    # 存的是 hex 摘要（不可逆），不是入参原文 —— 不引入新的凭据落盘面。
+    action_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)

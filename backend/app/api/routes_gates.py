@@ -63,31 +63,6 @@ async def create_gate(project_id: str, gate_data: dict):
     return SuccessEnvelope(data=gate, meta=Meta())
 
 
-def _stage_has_real_artifact(svc, run_id: str, stage: str, artifact_refs: list | None) -> bool:
-    """校验某 run 在某阶段是否有真实产物（task_graph 存在 OR artifact_refs 非空）。"""
-    # 1) artifact_refs 非空（gate 自身携带的产物引用）
-    if artifact_refs:
-        return True
-    # 2) task_graph 表存在该 run+stage
-    try:
-        db = svc.run_service._db()
-        try:
-            from app.models.task_graph import TaskGraph
-            return (
-                db.query(TaskGraph)
-                .filter(TaskGraph.run_id == run_id, TaskGraph.stage == stage)
-                .limit(1)
-                .count()
-                > 0
-            )
-        finally:
-            db.close()
-    except Exception as exc:
-        import logging
-        logging.getLogger("rebuild.routes_gates").warning("_stage_has_real_artifact 降级放行: %s", exc)
-        return True
-
-
 @router.post("/gates/{gate_id}/decision")
 async def decide_gate(project_id: str, gate_id: str, req: GateDecisionRequest):
     """Resolve a Gate decision. WP-6: when a LangGraph checkpoint thread exists for
@@ -100,7 +75,10 @@ async def decide_gate(project_id: str, gate_id: str, req: GateDecisionRequest):
     → 409（不静默改判）。详见下方守卫处的完整说明。"""
     from app.graph.runtime import graph_pending_gate_ids
     from app.api.routes_stages import _ensure_graph_task, _run_graph_bg
-    from app.services.gate_service import VALID_DECISIONS
+    # B-ACC-PROMOTION-DECISION-NOGUARD 解除条件③：`_stage_has_real_artifact` 已提取到
+    # gate_service（用户裁决 Q-B），本路由与 routes_stages.decide_promotion 共用同一份判据。
+    # 本处【只改 import】，下方调用点语义与文案未动。
+    from app.services.gate_service import VALID_DECISIONS, _stage_has_real_artifact
 
     svc = _svc()
     # Look up gate first to get run_id (needed for graph thread check)

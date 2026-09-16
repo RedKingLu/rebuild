@@ -104,6 +104,49 @@ def read_p5_rework_marker(project_id: str, gate_id: str) -> Optional[dict]:
     return marker
 
 
+# ── 共享守卫：晋级前的「阶段有无真实产物」判据（R17-2 V-R17-1B-2）────────────
+#
+# B-ACC-PROMOTION-DECISION-NOGUARD 解除条件③：该判据原本是 `app/api/routes_gates.py`
+# 的模块私有函数，只有 `/gates/{gate_id}/decision` 一条路由能用；`/stages/{stage}/
+# promotion-decision` 的图分支因此【完全没有】空壳晋级校验（该端点在图活跃时构造合成结果
+# 直接返回，根本不调 stage_service.promote()，promote() 内的 422 校验整条不执行）。
+#
+# 处置（用户 2026-09-15 裁决 Q-B：放本文件的模块级函数，不新增 _gate_guards.py）：
+# 提取到此处，`routes_gates` 与 `routes_stages` **import 同一份**。抄第二份等于制造
+# 第三处需要同步的判据 —— 本批次两条缺陷的共同教训正是"同一件事有两份判据必然漂移"。
+#
+# 【勿改函数体】提取时函数体逐字未变（含下面 `logging.getLogger("rebuild.routes_gates")`
+# 这个日志器名 —— 保留它是为了让"提取是纯移动、无行为变化"这一点可被 `git show` 逐行核对，
+# 也让既有日志过滤规则不因本次移动而失效）。422 语义与错误文案同样逐字保留在两个调用点。
+#
+# 注意与本文件内 `GateService._stage_has_real_artifact`（方法，2 参数）的区别：那是
+# `_apply_promotion` 内部用的既有判据（只看 task_graph，不看 artifact_refs，错误文案也不同）。
+# 两者的合并【不在本批次范围】—— 合并会改动 R17-2 的既有 422 文案与语义，属独立议题。
+def _stage_has_real_artifact(svc, run_id: str, stage: str, artifact_refs: list | None) -> bool:
+    """校验某 run 在某阶段是否有真实产物（task_graph 存在 OR artifact_refs 非空）。"""
+    # 1) artifact_refs 非空（gate 自身携带的产物引用）
+    if artifact_refs:
+        return True
+    # 2) task_graph 表存在该 run+stage
+    try:
+        db = svc.run_service._db()
+        try:
+            from app.models.task_graph import TaskGraph
+            return (
+                db.query(TaskGraph)
+                .filter(TaskGraph.run_id == run_id, TaskGraph.stage == stage)
+                .limit(1)
+                .count()
+                > 0
+            )
+        finally:
+            db.close()
+    except Exception as exc:
+        import logging
+        logging.getLogger("rebuild.routes_gates").warning("_stage_has_real_artifact 降级放行: %s", exc)
+        return True
+
+
 def _gate_to_response(g: Gate) -> GateResponse:
     # P2-C: graph capability must be a REAL probe, never the schema default
     # "not_connected" (state.py 红线：不得写死 not_connected). "live" when the
@@ -132,6 +175,7 @@ def _gate_to_response(g: Gate) -> GateResponse:
         evidence_refs=g.evidence_refs or [],
         trace_refs=g.trace_refs or [],
         audit_ref=g.audit_ref,
+        action_fingerprint=g.action_fingerprint,
         source_status="real",
         transition_mode=g.transition_mode or "real",
         graph_capability_status=graph_cap,
@@ -181,7 +225,15 @@ class GateService:
                artifact_refs: list[str] | None = None,
                evidence_refs: list[str] | None = None,
                checkpoint_ref: str | None = None,
-               interrupt_ref: str | None = None) -> GateResponse:
+               interrupt_ref: str | None = None,
+               action_fingerprint: str | None = None) -> GateResponse:
+        """创建 Gate。
+
+        action_fingerprint（B-ACC-GATE-APPROVAL-NOT-BOUND）：动作审批类 Gate 须传入
+        「被审阅的那一份入参」的指纹，使批准可绑定到具体内容而不是仅绑定工具名。
+        由调用方用 `tool_registry.action_args_fingerprint()` 计算（**只有一份实现**，
+        与 Gate 展示用的入参规范化同源）。非动作审批类 Gate 传 None。
+        """
         db = self._db()
         try:
             g = Gate(
@@ -198,6 +250,7 @@ class GateService:
                 evidence_refs=evidence_refs or [],
                 checkpoint_ref=checkpoint_ref,
                 interrupt_ref=interrupt_ref,
+                action_fingerprint=action_fingerprint,
             )
             db.add(g)
             db.commit()

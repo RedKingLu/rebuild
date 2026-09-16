@@ -130,8 +130,11 @@ class TestMigratedSchema:
             # R17.5-P4-FIX 批3 a1c2e3f40901 (project.tech_selection, D-109);
             # R17.5-P4-FIX 批4 b1c2d3e4f5a6 (call_log 内容/归因列, D-111);
             # R17.5-P4-FOLLOWUP c2d4f5a6b7c8 (task_plan/task_node output_target, D-114).
-            # R20-2-01 a2b4c6d8e0f2 (D-117③: project.scenario, new head).
-            assert ver == "a2b4c6d8e0f2", ver
+            # R20-2-01 a2b4c6d8e0f2 (D-117③: project.scenario);
+            # B-ACC-GATE-APPROVAL-NOT-BOUND b5d7f9a1c3e5 (p_gate.action_fingerprint, new head).
+            # 与本批次两条 Gate 安全守卫无关——这里断言的是"迁移链头"这一机械事实，
+            # 任何新迁移都会让它前移一步，属正常维护。
+            assert ver == "b5d7f9a1c3e5", ver
         finally:
             c.close()
 
@@ -204,8 +207,9 @@ class TestR15Migration:
             # R15-4 = 39528fb4d798; R16-B E3 = e4f5a6b7c8d9; R17.5 WP-6 = f8a1b2c3d4e5;
             # R17.5-P4-FIX 批3 = a1c2e3f40901 (D-109); 批4 = b1c2d3e4f5a6 (D-111);
             # R17.5-P4-FOLLOWUP = c2d4f5a6b7c8 (output_target, D-114);
-            # R20-2-01 = a2b4c6d8e0f2 (D-117③: project.scenario, new head).
-            assert ver == "a2b4c6d8e0f2", ver
+            # R20-2-01 = a2b4c6d8e0f2 (D-117③: project.scenario);
+            # B-ACC-GATE-APPROVAL-NOT-BOUND = b5d7f9a1c3e5 (p_gate.action_fingerprint, new head).
+            assert ver == "b5d7f9a1c3e5", ver
         finally:
             c.close()
 

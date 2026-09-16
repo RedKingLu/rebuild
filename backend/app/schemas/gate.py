@@ -24,6 +24,10 @@ class GateResponse(GraphPlaceholderFields):
     evidence_refs: list[str] = Field(default_factory=list)
     trace_refs: list[str] = Field(default_factory=list)
     audit_ref: Optional[str] = None
+    # B-ACC-GATE-APPROVAL-NOT-BOUND：被审阅入参的指纹（sha256 hex，不可逆摘要，非原文）。
+    # 【勿删】`tool_registry._resolve_action_gate` 用它比对"这次要执行的入参是否就是
+    # 用户批准过的那一份"；缺失即不授权（fail-closed）。非动作审批类 Gate 恒为 None。
+    action_fingerprint: Optional[str] = None
     source_status: str = "not_connected"
 
 
