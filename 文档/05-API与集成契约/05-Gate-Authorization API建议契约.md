@@ -4,8 +4,7 @@
 > 文档状态：**accepted**
 > 平台名称：rebuild
 > 当前版本：V26.2
-> 来源草稿：`产物/草稿/05-Gate-Authorization API建议契约.md`（v0.1）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程
+> 来源草稿：`产物/已完成/R1/05-Gate-Authorization%20API建议契约.md`（v0.1）
 > 最后更新时间：2026-06-24（R2 去重：§13 三模式定义收敛为引用详述源 D-025+02术语表）
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：定义 rebuild 当前版本中 Gate、Authorization、Policy Check、Interrupt/Resume、Risk Action 相关 API 的 R1 建议契约，包括对象边界、端点归口、字段建议、状态建议、授权模式、风险分级、Gate 决策、阶段晋级 Gate、执行期 Gate、Policy 阻断、Trace/Audit 关联、错误响应、事件建议、前端联调边界与 R2/R4/R9-R12 校准项。

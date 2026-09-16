@@ -4,8 +4,7 @@
 > 文档状态：**accepted**
 > 平台名称：rebuild
 > 当前版本：V26.2
-> 来源草稿：`产物/草稿/01-Policy-Hook-Authorization规范.md`
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程
+> 来源草稿：`产物/已完成/R1/01-Policy-Hook-Authorization规范.md`
 > 最后更新时间：2026-06-24
 > 修订说明：R2：新增引用 D-073 平台助手（§23A 代操作[规划/R-future]纳入 Policy/Hook/Authorization 与风险分级 L3+/强制 Gate、对话与代操作纳入 Audit、自测复用 ModelGateway 不泄露密钥）；R2 去重(Q5=B)：样板块补引用 AGENTS§18/01-决策记录，收敛通用复述，安全红线就地保留
 > 审核状态：经用户审核通过（2026-06-24）

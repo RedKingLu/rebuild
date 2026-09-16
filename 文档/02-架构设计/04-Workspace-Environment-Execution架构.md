@@ -4,8 +4,7 @@
 > 文档状态：**accepted**
 > 平台名称：rebuild
 > 当前版本：V26.2
-> 来源草稿：`产物/草稿/04-Workspace-Environment-Execution架构.md`（v0.1）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R2
+> 来源草稿：`产物/已完成/R1/04-Workspace-Environment-Execution架构.md`（v0.1）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：定义 rebuild 当前版本中 Project Workspace、Environment Profile、Execution Session 三对象的职责边界、内部结构、生命周期、安全约束、三状态分离（Coding/Execution/Runtime）、后台任务行为，以及与 LangGraph/API/前端的协作关系。本文聚焦于三对象的**架构机制**——状态域定义以 `03-Project-Run-TaskGraph状态架构.md` 为权威源，本文不重复。

@@ -4,8 +4,7 @@
 > 文档状态：**accepted**
 > 平台名称：rebuild
 > 当前版本：V26.2
-> 来源草稿：`产物/草稿/06-Model-Resource API建议契约.md`（v0.1）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程
+> 来源草稿：`产物/已完成/R1/06-Model-Resource%20API建议契约.md`（v0.1）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：定义 rebuild 当前版本中 ModelGateway、模型配置、模型策略、模型调用、Fusion 模型能力、Resource Registry、Skill/Tool/MCP/Expert Agent/Case/Knowledge/Template/Policy 等资源相关 API 的 R1 建议契约。

@@ -4,8 +4,7 @@
 > 文档状态：**accepted**
 > 平台名称：rebuild
 > 当前版本：V26.2
-> 来源草稿：`产物/草稿/07-SSE与事件契约.md`（v0.1）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程
+> 来源草稿：`产物/已完成/R1/07-SSE与事件契约.md`（v0.1）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：定义 rebuild 当前版本中 SSE 与事件流的 R1 建议契约——统一整合 Run/Stage/TaskGraph/Gate/AET/Model/Resource/Workspace/Execution 各域事件，定义 Event Envelope、订阅、断线重连、事件日志、安全脱敏与前端联调边界。

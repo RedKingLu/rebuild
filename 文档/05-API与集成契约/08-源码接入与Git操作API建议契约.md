@@ -4,8 +4,7 @@
 > 文档状态：**accepted**
 > 平台名称：rebuild
 > 当前版本：V26.2
-> 来源草稿：`产物/草稿/08-项目接入契约-本地-Git-ZIP-GitHub.md`（v0.1）+ `产物/草稿/源码接入与Git API契约.md`（v0.1）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程（补录）
+> 来源草稿：`产物/已完成/R1/08-项目接入契约-本地-Git-ZIP-GitHub.md`（v0.1）+ `产物/草稿/源码接入与Git API契约.md`（v0.1）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：定义 rebuild 当前版本中项目接入与 Git 操作的全链路 API 建议契约——前半部分覆盖本地目录、Git、ZIP、GitHub 四类接入的 Import Job 契约（原 08 内容 + D-058），后半部分覆盖接入完成后的 Git 工作流操作 API（status / diff / branch / commit / push / credential status）。本文是 02-Project-Run-阶段API 的接入层与操作层补充——02 覆盖 Project CRUD，本文覆盖源码进入 Workspace 的全流程及后续 Git 操作。

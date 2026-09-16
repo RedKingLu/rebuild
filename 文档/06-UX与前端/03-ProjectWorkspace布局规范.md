@@ -4,8 +4,7 @@
 > 文档状态：**accepted**
 > 平台名称：rebuild
 > 当前版本：V26.2
-> 来源草稿：`产物/草稿/03-ProjectWorkspace布局规范.md`（Copilot v0.1，2026-06-23）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程
+> 来源草稿：`产物/已完成/R1/03-ProjectWorkspace布局规范.md`（Copilot v0.1，2026-06-23）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：定义 rebuild 当前版本 Project Workspace 的前端布局规范——覆盖独立全屏 IDE 心智（D-046）、七区布局（活动图标条/左侧面板/顶部状态栏/Gate中央横幅/中央类型单例Tab/底部Dock/右侧检视）、VSCode式活动图标条、4种核心Tab类型（D-047）、代码与材料双视图（D-048）、Agent 对话常驻（D-047）、终端/输出/任务进度 Dock、Gate/Evidence/Trace/Audit 检视、SSE 实时刷新、断线恢复、退出≠停止任务（D-052）、响应式策略、安全脱敏、mock 边界，以及 R2/R3/R4/R8/R9-R12 校准项。
