@@ -91,6 +91,25 @@ def _strip_url_credentials(value: str) -> str:
     return _URL_CREDENTIAL_RE.sub(r"\1", value, count=1)
 
 
+def bash_whitelist_violation(code: str) -> str | None:
+    """bash 命令首词是否被 ALLOWED_COMMANDS 挡下：违规返回该首词，合规返回 None。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件④：`tool_registry` 需要在**创建
+    action_approval Gate 之前**知道"这条命令即便批准了也会被白名单挡回"，以免请用户为
+    一条注定无法执行的命令签核（真跑坐实：`gate-22343c` 请签核 `find source -name …`，
+    而 `find` 不在白名单 ⇒ 批准后仍返回 `命令不在允许列表中: find`）。
+
+    判据只写这一份：`_run_subprocess` 的 bash 分支与上述预检**调用同一个函数**，
+    避免"预检用一套首词解析、真执行用另一套"造成漂移（多一处判据就多一处会漂的地方）。
+    本函数只做判定，不改变 ALLOWED_COMMANDS 的内容（加 `find` 属
+    `B-ACC-NO-READONLY-FILEGLOB`，归批次三，本批次明确不做）。
+    """
+    first_word = (code.strip().split() or [""])[0].split("/")[-1]
+    if first_word and first_word not in ALLOWED_COMMANDS:
+        return first_word
+    return None
+
+
 def _match_deny_regex(code: str) -> str | None:
     """R18-1 P1-06：编译正则 DENY 检查（覆盖子串匹配漏报的变体）。命中返回模式串。"""
     for pat in DENY_REGEXES:
@@ -246,8 +265,9 @@ async def _run_subprocess(code: str, language: str, timeout: int,
         cmd = ["python3", "-c", code]
     elif language in ("bash", "sh", "shell"):
         if enforce_whitelist:
-            first_word = (code.strip().split() or [""])[0].split("/")[-1]
-            if first_word and first_word not in ALLOWED_COMMANDS:
+            # 判据与 tool_registry 建 Gate 前的预检共用同一个函数（不写第二份首词解析）
+            first_word = bash_whitelist_violation(code)
+            if first_word:
                 return {
                     "exit_code": 1, "stdout": "",
                     "stderr": f"命令不在允许列表中: {first_word}",

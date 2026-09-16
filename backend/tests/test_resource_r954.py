@@ -339,7 +339,16 @@ def _make_l3_tool(db, tool_slug="danger_exec_tool"):
 def test_tool_registry_l3_creates_action_approval_gate():
     """OD-06: an L3+ tool must NOT execute silently — execute_tool creates a REAL
     action_approval Gate (via GateService) and returns awaiting_approval. No fabrication:
-    the gate is verifiable through GateService."""
+    the gate is verifiable through GateService.
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件④（如实说明测试改动）：命令原为 `"rm -rf /"`。
+    本批次新增"建 Gate 前先过白名单"预检（`tool_registry._precheck_command_allowed`），
+    `write_scope="execute"` 的工具会走该预检；`rm` 不在 `ALLOWED_COMMANDS`，即便获批也会被
+    执行层挡回——这正是预检要拦的"注定无法执行、不该请用户签核"的场景，属"测试依赖了
+    该预检要消灭的行为"（用不会被批准后执行的命令去验证"能建 Gate"）。本用例的验证意图是
+    "L3 工具会被真实 Gate 挡住"，与命令内容是否在白名单无关，故改用白名单内的 `echo`
+    （与下方 `test_tool_registry_action_approval_gate_does_not_advance_stage` 的 `"ls"`
+    同类），不改变本用例验证的能力，也不放宽任何守卫。"""
     import asyncio
     from app.core.database import get_session
     from app.services.tool_registry import execute_tool
@@ -350,7 +359,7 @@ def test_tool_registry_l3_creates_action_approval_gate():
         _make_l3_tool(db, "danger_exec_tool")
         project_id = "proj-l3-test"
         result = asyncio.run(
-            execute_tool("danger_exec_tool", {"command": "rm -rf /"}, project_id,
+            execute_tool("danger_exec_tool", {"command": "echo danger-simulated"}, project_id,
                          stage="p1", db=db, run_id="run-l3-test", tracer=None)
         )
         # execution must be parked behind a real approval gate, not run

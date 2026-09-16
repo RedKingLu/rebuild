@@ -299,10 +299,16 @@ class AgentLoop:
         `args`（B-R20-GATE-NO-PAYLOAD，用户 2026-09-06 批准）：工具入参经
         `tool_registry._redacted_action_payload` **脱敏后**写入 summary，使审批者可知情决策。
         与 `tool_registry._create_risk_gate` 共用同一个脱敏渲染器（单一事实源，避免两处措辞漂移）。
+
+        B-ACC-GATE-APPROVAL-NOT-BOUND：同时持久化**被审阅入参的指纹**。本方法创建的 Gate
+        正是 `tool_registry._resolve_action_gate` 会拿去授权 re-dispatch 的那一类，若这里不写
+        指纹，比对必然不通过（fail-closed）⇒ 用户批准后工具仍会再弹一次 Gate。指纹用与
+        tool_registry 完全相同的那一个函数计算（`action_args_fingerprint`），不另算一份。
         """
         try:
             from app.dependencies import get_services
-            from app.services.tool_registry import _redacted_action_payload
+            from app.services.tool_registry import (
+                _redacted_action_payload, action_args_fingerprint)
             payload = _redacted_action_payload(fn_name, args)
             gate = get_services().gate_service.create(
                 project_id=project_id, run_id=run_id or "", stage=stage,
@@ -312,6 +318,7 @@ class AgentLoop:
                 summary=(f"Agent 拟执行受控动作 {fn_name}（{risk}）。"
                          f"\n待执行入参（已脱敏）：{payload}"),
                 options=["approve", "reject"],
+                action_fingerprint=action_args_fingerprint(fn_name, args),
             )
             return gate.gate_id
         except Exception as e:

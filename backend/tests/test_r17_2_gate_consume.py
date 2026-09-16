@@ -54,15 +54,26 @@ async def _make_full_content_draft(target_rel="output_code/consume_target.txt"):
     return drafted["patch_ref"], target_rel
 
 
-def _create_approved_gate() -> str:
-    """Create a real action_approval gate matching the tool, then approve it."""
+def _create_approved_gate(args: dict | None = None) -> str:
+    """Create a real action_approval gate matching the tool, then approve it.
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND（如实说明测试改动）：本 helper 原先建 Gate 时不绑定任何
+    入参指纹——这正是该缺陷的形态本身（"批准"只按工具名生效，与被执行的具体入参无关）。
+    `_resolve_action_gate` 现在要求 `action_fingerprint` 与本次调用入参的指纹一致才授权
+    （指纹缺失 fail-closed，不匹配）；下面两个用到本 helper 的测试原本依赖"无指纹也能
+    授权"这一不安全行为，现改为传入**将被执行的那一份 `args`** 并据此计算指纹，使"批准"
+    真正绑定到被审阅的入参——这正是本批次要验证的目标，不是放宽守卫掩盖失败。
+    """
     gs = get_services().gate_service
+    fingerprint = (tool_registry.action_args_fingerprint(_TOOL, args)
+                  if args is not None else None)
     gate = gs.create(
         project_id=_PID, run_id=_RUN, stage="p4",
         gate_type="action_approval", risk_level="L4",
         reason=f"高风险工具 {_TOOL} 执行前需人工审批",
         summary=f"Agent 拟执行高风险工具 {_TOOL}，请审批",
         options=["approve", "reject"],
+        action_fingerprint=fingerprint,
     )
     gid = gate.gate_id
     # Approve it directly in the DB (deterministic, no promotion side-effects).
@@ -80,7 +91,7 @@ async def test_gate_consumed_after_successful_highrisk_write():
     init_workspace(_PID)
     _seed_high_risk_tool()
     patch_ref, target_rel = await _make_full_content_draft()
-    gid = _create_approved_gate()
+    gid = _create_approved_gate({"patch_ref": patch_ref, "target_path": target_rel})
 
     gs = get_services().gate_service
     assert gs.get(gid).gate_status == "approved"
@@ -118,7 +129,7 @@ async def test_consumption_writes_audit():
     init_workspace(_PID)
     _seed_high_risk_tool()
     patch_ref, target_rel = await _make_full_content_draft()
-    gid = _create_approved_gate()
+    gid = _create_approved_gate({"patch_ref": patch_ref, "target_path": target_rel})
 
     db = get_session()
     try:
@@ -140,7 +151,7 @@ async def test_confirmed_true_does_not_consume_gate():
     init_workspace(_PID)
     _seed_high_risk_tool()
     patch_ref, target_rel = await _make_full_content_draft()
-    gid = _create_approved_gate()
+    gid = _create_approved_gate({"patch_ref": patch_ref, "target_path": target_rel})
 
     gs = get_services().gate_service
     db = get_session()

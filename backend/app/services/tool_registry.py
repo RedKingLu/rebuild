@@ -588,7 +588,13 @@ async def execute_tool(
     approved_gate_id = ""  # set below iff a re-dispatched (gate-approved) call executes
 
     if _rank(risk) >= _rank(_GATE_RISK_THRESHOLD):
-        gate_state, gate_id = _resolve_action_gate(project_id, run_id, tool_name)
+        # B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件④：建 Gate【之前】先过白名单。
+        # 注定被挡的命令直接诚实 blocked，【不建 Gate】、不请用户签核。
+        blocked_precheck = _precheck_command_allowed(tool_name, args, write_scope, risk)
+        if blocked_precheck is not None:
+            _write_trace(tracer, project_id, tool_name, args, blocked_precheck)
+            return blocked_precheck
+        gate_state, gate_id = _resolve_action_gate(project_id, run_id, tool_name, args)
         approved = confirmed or gate_state == "approved"
         if not approved:
             if gate_state == "pending" and gate_id:
@@ -1335,8 +1341,42 @@ async def _execute_via_provider(tool_name: str, args: dict, project_id: str, ent
         return {"error": f"ExecutionProvider failed: {e}"}
 
 
-def _resolve_action_gate(project_id: str, run_id: str, tool_name: str) -> tuple[str, str]:
-    """Resolve the single action_approval Gate for (project_id, run_id, tool_name).
+def _canonical_action_args_json(args: dict | None) -> str:
+    """入参的**唯一**规范化实现：键排序 + 紧凑分隔符。指纹与 Gate 展示都调用它。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件②点名的坑：指纹若用与展示【不同源】的
+    规范化结果（典型是"展示脱敏后、比对未脱敏"），会造成永不匹配、反复弹 Gate。
+    故规范化只写这一份：`_redacted_action_payload`（展示）在此结果上再做脱敏，
+    `action_args_fingerprint`（比对）在此结果上做 sha256。
+
+    【只做两件事】键排序 + 紧凑分隔符。**不做**大小写折叠、空白折叠、路径规范化、
+    值裁剪 —— 刻意偏"规范化不足"一侧：宁可多弹一次 Gate（入参只差一个空格也重新审批），
+    不可少拦一次（把两条语义不同的命令认成同一条）。
+    """
+    import json as _json
+    return _json.dumps(args or {}, sort_keys=True, ensure_ascii=False,
+                       separators=(",", ":"))
+
+
+def action_args_fingerprint(tool_name: str, args: dict | None) -> str:
+    """「这次要执行的动作」的指纹 = sha256(工具名 \\x00 规范化入参 JSON) 的 hex。
+
+    建 Gate 时持久化到 `Gate.action_fingerprint`，取授权时（`_resolve_action_gate`）
+    比对。工具名与入参之间用 `\\x00` 分隔：它不可能出现在 JSON 文本里，因此
+    ("ab", {"c":1}) 与 ("a", {"b":1}) 之类的拼接歧义不可能发生。
+
+    args 无法 JSON 序列化时**抛异常**（不返回退化指纹）：调用方在建 Gate 前就会失败，
+    绝不能出现"指纹算不出来就当作匹配"的 fail-open（安全检查不给旁路，见 §2.2）。
+    """
+    import hashlib as _hashlib
+    canonical = _canonical_action_args_json(args)
+    return _hashlib.sha256(
+        f"{tool_name}\x00{canonical}".encode("utf-8")).hexdigest()
+
+
+def _resolve_action_gate(project_id: str, run_id: str, tool_name: str,
+                         args: dict | None) -> tuple[str, str]:
+    """Resolve the single action_approval Gate for (project_id, run_id, tool_name, args).
 
     WP-C3 / B-R17.2-TOOL-DOUBLEGATE: returns ("approved", gate_id) when an approved gate
     for this action exists (either one execute_tool created, or one the agent_loop
@@ -1344,6 +1384,21 @@ def _resolve_action_gate(project_id: str, run_id: str, tool_name: str) -> tuple[
     re-dispatched call executes instead of opening a SECOND gate. Returns ("pending",
     gate_id) when a waiting gate exists (reuse it, no duplicate). Returns ("none", "")
     otherwise. Never fabricates a gate.
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND（P1）：`_matches` 原先是 `return tool_name in blob`
+    —— **只比工具名，内容盲**。后果是机制层的、不是偶发：用户看到入参 X 并批准，该 Gate
+    转 approved 后一直挂账，直到本 run 内**下一次**同名工具调用把它消费掉，而那次调用的
+    入参是当时新传入的 Y ⇒ **人工签核的是 X，实际授权的是 Y**。现增加入参指纹比对：
+    指纹不一致 ⇒ 不认这个 Gate ⇒ 上层照常新建 Gate 重新请人审批。
+
+    指纹缺失（NULL）的 Gate **一律不匹配**（fail-closed）。它包括：本改动前建的历史
+    Gate、以及 routes_registry / routes_toggle / ACP HITL 等**不是工具调用**的
+    action_approval Gate（那些 Gate 从不代表"批准了某工具的某份入参"，被 tool_name 子串
+    偶然命中过就是误授权）。代价是升级后已批准但未消费的旧 Gate 需重新审批一次 —— 取
+    "宁可多弹一次 Gate，不可少拦一次"（吸收②§5.3）。
+
+    比对**不可关闭**：无 enabled 开关、无环境变量旁路、无 try/except 静默跳过
+    （沿用 `detect_protocol_leak` 确立的"安全检查不给开关 + fail-closed"模式）。
     """
     try:
         from app.dependencies import get_services
@@ -1353,13 +1408,20 @@ def _resolve_action_gate(project_id: str, run_id: str, tool_name: str) -> tuple[
         logger.warning("_resolve_action_gate: gate lookup failed for %s: %s", tool_name, e)
         return ("none", "")
 
+    # 指纹在【比对前】算出：算不出来（入参不可序列化）就让异常向上抛，
+    # 绝不退化为"不比对"。
+    expected_fingerprint = action_args_fingerprint(tool_name, args)
+
     def _matches(g) -> bool:
         if g.gate_type != "action_approval":
             return False
         if run_id and (g.run_id or "") != run_id:
             return False
         blob = f"{g.reason or ''} {g.summary or ''}"
-        return tool_name in blob
+        if tool_name not in blob:
+            return False
+        # 授权必须绑定到被审阅的那一份入参（本条是 B-ACC-GATE-APPROVAL-NOT-BOUND 的修复本体）
+        return (g.action_fingerprint or "") == expected_fingerprint
 
     approved = [g for g in gates if _matches(g) and g.gate_status == "approved"]
     if approved:
@@ -1385,12 +1447,16 @@ def _redacted_action_payload(tool_name: str, args: dict | None, max_chars: int =
          Gate 与其审计记录都会持久化，原样落盘等于把凭据写进审计（违 AGENTS §8 / D-032）。
 
     复用既有 `security_authorization.redact_secrets()`，**不另造脱敏实现**（单一事实源）。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件②：入参的**规范化**同样只有一份实现
+    （`_canonical_action_args_json`）—— 本函数展示的、`action_args_fingerprint` 比对的，
+    是同一个规范化结果，只是本函数在其上再做一次脱敏。这样不会出现"展示脱敏后、比对未
+    脱敏"导致永不匹配、反复弹 Gate 的情形。
     """
     if not args:
         return "（无入参）"
     try:
-        import json as _json
-        raw = _json.dumps(args, ensure_ascii=False, sort_keys=True)
+        raw = _canonical_action_args_json(args)
     except Exception:
         raw = str(args)
     try:
@@ -1406,6 +1472,69 @@ def _redacted_action_payload(tool_name: str, args: dict | None, max_chars: int =
     return raw
 
 
+def _precheck_command_allowed(tool_name: str, args: dict | None,
+                              write_scope: str, risk: str) -> dict | None:
+    """建 action_approval Gate【之前】的白名单预检：注定被挡回 → 返回 blocked 结果；否则 None。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件④。真跑坐实的问题：`gate-22343c` 请用户签核
+    `find source -name "*.dll" … | head -50`，而 `find` 不在 `ALLOWED_COMMANDS` ⇒ 即便
+    批准也会被挡回 `{"blocked": true, "stderr": "命令不在允许列表中: find"}`。
+    **平台在请用户为一条注定无法执行的命令签核** —— 既浪费人工裁决成本，也会训练用户
+    "反正批了也没事"的习惯，与 Gate 的设计目的相反。
+
+    三条边界（都刻意收窄，避免把预检做成第二道安全策略）：
+      ① 只对"会走 ExecutionProvider 执行命令"的工具生效，判据与下方真实分发条件同构；
+      ② 只在**真正会执行白名单检查的 provider** 下生效：container / remote /
+         workspace_local 档不走 `ALLOWED_COMMANDS`（后者显式 `enforce_whitelist=False`），
+         对它们预检会变成凭空拦截合法命令；
+      ③ 判定复用 `execution_provider.bash_whitelist_violation`（同一份首词解析与同一份
+         名单），**不在本文件复制白名单**。本批次不改名单内容（加 `find` 属
+         `B-ACC-NO-READONLY-FILEGLOB`，归批次三）。
+
+    预检自身故障时 fail-open（返回 None，照旧建 Gate）：这不是安全检查 —— 白名单的
+    **权威执行点仍在 provider 内**，预检只是"别拿注定失败的命令去打扰用户"的前置优化。
+    与之相对，入参指纹比对是安全检查，因此**没有**任何 except 旁路（见
+    `_resolve_action_gate`）。两者性质不同，处置也不同，勿混。
+    """
+    if not (tool_name == "run_safe_command" or write_scope in ("execute", "system")):
+        return None
+    code = (args or {}).get("code") or (args or {}).get("command") or ""
+    if not code:
+        return None
+    try:
+        from app.services.execution_provider import (
+            LocalSubprocessExecutionProvider,
+            bash_whitelist_violation,
+            get_execution_provider,
+        )
+        provider = get_execution_provider()
+        if not isinstance(provider, LocalSubprocessExecutionProvider):
+            return None
+        first_word = bash_whitelist_violation(code)
+    except Exception:
+        logger.warning("tool_registry: 建 Gate 前白名单预检失败 tool=%s（照旧建 Gate，"
+                       "白名单仍由 ExecutionProvider 权威执行）", tool_name, exc_info=True)
+        return None
+    if not first_word:
+        return None
+    return {
+        # 与 provider 的 blocked 结果同形（调用方已在按这些字段判断），另加 status/tool_name
+        "status": "blocked_not_allowed",
+        "tool_name": tool_name,
+        "risk_level": risk,
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": f"命令不在允许列表中: {first_word}",
+        "blocked": True,
+        "provider": "local_subprocess",
+        "fallback": False,
+        "timed_out": False,
+        "signal": None,
+        "message": (f"命令首词 {first_word!r} 不在允许列表中，即便人工批准也会被执行层挡回，"
+                    f"因此**未创建** action_approval Gate（不请用户为注定无法执行的命令签核）。"),
+    }
+
+
 def _create_risk_gate(project_id: str, run_id: str, stage: str,
                       tool_name: str, risk: str, args: dict | None = None) -> dict:
     """OD-06: an L3+ tool requires human approval before it runs. Create a real
@@ -1419,8 +1548,13 @@ def _create_risk_gate(project_id: str, run_id: str, stage: str,
 
     `args`（B-R20-GATE-NO-PAYLOAD，用户 2026-09-06 批准）：工具入参经 `_redacted_action_payload`
     脱敏后写入 Gate 的 summary，使审批者能在知情前提下决策。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND：同时把**被审阅的这一份入参的指纹**持久化到 Gate
+    （`action_fingerprint`），使 `_resolve_action_gate` 取授权时能比对"要执行的入参是不是
+    用户批准过的那一份"。指纹与上面展示用的入参同源（同一个规范化函数）。
     """
     payload = _redacted_action_payload(tool_name, args)
+    fingerprint = action_args_fingerprint(tool_name, args)
     try:
         from app.dependencies import get_services
         gs = get_services().gate_service
@@ -1441,6 +1575,7 @@ def _create_risk_gate(project_id: str, run_id: str, stage: str,
             summary=(f"Agent 拟执行高风险工具 {tool_name}（{risk}），请审批。"
                      f"\n待执行入参（已脱敏）：{payload}"),
             options=["approve", "reject"],
+            action_fingerprint=fingerprint,
         )
     except Exception as e:
         logger.warning("action_approval gate create failed for tool %s: %s", tool_name, e)
