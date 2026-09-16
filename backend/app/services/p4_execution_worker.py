@@ -27,7 +27,6 @@ import difflib
 import hashlib
 import json
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -36,6 +35,8 @@ from app.services.workspace_service import workspace_path
 from app.services.workspace_mediator import WorkspaceMediator
 from app.services.heartbeat_service import write_heartbeat
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+# V26.2 返工批次二（Q-B2-5）："不设即无上限"的 env 旋钮解析（共享实现）。
+from app.services.stage_agent_loop import optional_int_env
 # B-RW-P4WORKER-WRITE-UNGUARDED（D-P0-01 第三入口）：`_write()` 是工具循环结束后模型最终轮次
 # 原始文本直写落盘的路径，此前零校验内容合法性。复用同一 content_validity 模块（不抄第二份
 # 判据，B-R20-REDACT-THREE-IMPLS 的教训），与 tool_registry.py 已接的三处工具调用入口共享
@@ -82,7 +83,13 @@ _MAX_SOURCE_BYTES = 200_000  # read cap for a single source reference (advisory)
 # reasoning chain consumes budget before the migrated code / multi-file JSON is emitted,
 # so a too-small cap truncates the real product mid-output (same failure class as P3's
 # empty task_plans). Env-tunable; the model's large context window accommodates it.
-_GEN_MAX_TOKENS = int(os.environ.get("P4_GEN_MAX_TOKENS", "32768"))
+#
+# ⚠ V26.2 返工批次二（用户裁决 Q-B2-1 / Q-B2-5，2026-09-16）：现口径 **默认不设平台侧上限**
+# （`P4_GEN_MAX_TOKENS` 不设 ⇒ None ⇒ 请求体无 max_tokens 键），旋钮保留作逃生阀。P4 是本平台
+# 单次输出体量最大的阶段（多文件迁移代码），也是最需要"没有平台天花板"的阶段。原文保留作留痕。
+# 台账补正：本处**属于批次 F 已建旋钮范式的第 5 处**，`B-V262-TOKENBUDGET-UNFIXED-4` 登记的
+# "已修 4 处"漏登了它。
+_GEN_MAX_TOKENS = optional_int_env("P4_GEN_MAX_TOKENS")
 
 
 def _get_services():
@@ -951,6 +958,11 @@ class P4ExecutionWorker:
 
         Grounded when source_content was pre-read; honest blocked when there is no real
         source bound — the former title-only臆造 else-branch is REMOVED (不照标题臆造).
+
+        V26.2 返工批次二（甲 ⑤ 的逐处评估结论）：本调用原为硬编码 `max_tokens=4096`，评估结论是
+        **纳入取消范围** —— 它产出的是**一整个迁移后代码文件的正文**，4096 对代码文件明显偏小，
+        与 P4 主路径同属"结构化/大体量产物被平台天花板砍断"这一缺陷类；且截断后果是写盘一个
+        半截的代码文件（比解析失败更难发现）。故与 P4 主调用共用同一旋钮（默认不设上限）。
         """
         title = node.get("title") or node.get("node_id") or "execution"
         if source_content is None:
@@ -966,7 +978,7 @@ class P4ExecutionWorker:
             {"role": "user", "content": user},
         ]
         try:
-            result = await self.gateway.call(messages=messages, max_tokens=4096,
+            result = await self.gateway.call(messages=messages, max_tokens=_GEN_MAX_TOKENS,
                                              temperature=0.2, source="api",
                                              project_id=self.project_id, stage="p4")
         except Exception as e:

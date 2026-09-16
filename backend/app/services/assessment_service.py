@@ -35,6 +35,20 @@ logger = logging.getLogger(__name__)
 
 # WP-6 (Q-R17.3-6-2): 模型全失败中断时前端可采取操作（复用 gateway 单一事实源）。
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+# V26.2 返工批次二（Q-B2-1 / Q-B2-2）：共享截断诊断 + "不设即无上限"的 env 旋钮解析。
+from app.services.stage_agent_loop import (
+    DEFAULT_STAGE_TIMEOUT_SECONDS as _STAGE_TIMEOUT,
+    diagnose_parse_failure as _diagnose_parse_failure_shared,
+    log_parse_failure as _log_parse_failure,
+    optional_int_env,
+)
+
+# `B-V262-TOKENBUDGET-UNFIXED-4`（P0）：真实规模真跑实测本调用的 completion **两次触顶原硬编码
+# max_tokens=16384**（call_log `scall_2028cf9b15fc`=16384 / `scall_1067d990b613`=16387）→ P2 评估
+# 报告 JSON 中途截断 → 阶段判 `unparseable_output`，6 类评估产出全空。
+# 用户 2026-09-16 裁决 Q-B2-1：取消平台侧硬预算（不再抬高天花板）。默认 None ⇒ 请求体无
+# max_tokens 键；旋钮 `P2_ASSESSMENT_MAX_TOKENS` 保留作逃生阀。实测触顶值 16384/16387 仅作留痕。
+_ASSESSMENT_MAX_TOKENS = optional_int_env("P2_ASSESSMENT_MAX_TOKENS")
 
 # §4.5 six core assessment outputs
 ASSESSMENT_OUTPUTS = [
@@ -174,7 +188,8 @@ class AssessmentService:
         loop = await run_stage_tool_loop(
             gw, system_content=system_content, user_content=self._build_user_prompt(inputs),
             project_id=project_id, run_id=run_id or "", stage=stage,
-            strategy_id=strategy_id, max_tokens=16384, temperature=0.3, tracer=self.tracer)
+            strategy_id=strategy_id, max_tokens=_ASSESSMENT_MAX_TOKENS, temperature=0.3,
+            tracer=self.tracer)
         if loop["status"] != "completed":
             reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P2 assessment model call not completed: {reason}", project_id, run_id, stage)
@@ -294,15 +309,25 @@ class AssessmentService:
         """Parse the LLM JSON output defensively into the 6 outputs.
 
         批2: robust extractor handles prose-wrapped / fenced JSON from the tool loop.
+
+        V26.2 返工批次二（甲 ②）：本处此前无截断诊断 —— 真实规模真跑撞顶 16384/16387 时，现场
+        只看得到"输出非合法 JSON"，看不出"被砍断"。现接入共享诊断（`suspected_truncation` /
+        `truncation_signals`），诊断随 `assessment_report.parse_diagnosis` 落进产物。
         """
         from app.services.stage_agent_loop import extract_json_object
         data = extract_json_object(content)
         if data is not None:
             out: dict[str, Any] = data
         else:
-            # unparseable → keep raw text in the report; lists stay empty (honest,
-            # the NodeLoop ReviewPass retries structured output — T2)
-            out = {"assessment_report": {"raw": (content or "").strip()[:2000], "parse_error": True}}
+            # unparseable → keep raw text + 可诊断信息 in the report; lists stay empty
+            # (honest, the NodeLoop ReviewPass retries structured output — T2)
+            text = (content or "").strip()
+            diagnosis = _diagnose_parse_failure_shared(
+                text, max_tokens=_ASSESSMENT_MAX_TOKENS, timeout_s=_STAGE_TIMEOUT,
+                env_knobs="P2_ASSESSMENT_MAX_TOKENS")
+            _log_parse_failure(logger, "P2 assessment", diagnosis)
+            out = {"assessment_report": {"raw": text[:2000], "parse_error": True,
+                                         "parse_diagnosis": diagnosis}}
         # assessment_report must be an OBJECT; a non-dict value (model returned a bare
         # string / prose while the JSON itself parsed) is unstructured output — normalize
         # to a parse_error report so downstream never receives a bare str (single source

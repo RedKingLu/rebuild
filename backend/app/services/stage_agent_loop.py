@@ -32,12 +32,151 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from typing import Any, Optional
 
 logger = logging.getLogger("rebuild.stage_agent_loop")
 
+# ── V26.2 返工批次二（Q-B2-1 / Q-B2-5）：P 环节的输出预算旋钮与截断诊断，单一实现 ──────
+# 用户 2026-09-16 裁决：**所有 P 环节暂时不设硬 token 预算**。前史（不要删——它解释了
+# 为什么"把数字调高"这条路已被否决）：
+#   · 批次 B/F 把 P1 profiling=32768 / P1 baseline=16384 / P3 planning=32768 /
+#     P4 gen=32768 / P5 verification=16384 改成 env 可调并抬高默认值；
+#   · 但 P0 intake / P1 tech_selection / P2 assessment（均 16384 硬编码）与 P6 delivery
+#     （8192 硬编码）未改，真实规模（MicroOA 1018 文件）真跑时 P0 撞 16383、
+#     P2 撞 16384 / 16387 —— 即"抬高天花板"只是把天花板挪一格，样本再大一点就再撞一次。
+# ⇒ 本批次取消平台侧硬编码天花板本身，把输出上限交还给「模型自身最大输出长度」+
+#    「adapter 的三层时间护栏」（_STREAM_TOTAL_TIMEOUT / _REQUEST_TIMEOUT / 首字节超时，
+#    本批次**不得**放宽）。**注意：这不等于"截断风险已消除"** —— 平台侧天花板移除后，
+#    模型自身上限与时间护栏仍可能造成输出不完整，故截断诊断比以前更重要（见下）。
+# 旋钮保留、默认"不设"：成本失控时运维仍可设一个上限救急（逃生阀），且不设时请求体里
+# 根本不出现 max_tokens 键（见 litellm_adapter 的条件写入）。
+
+
+def optional_int_env(name: str) -> Optional[int]:
+    """读一个"不设即无上限"的整数型 env 旋钮：未设置 / 空串 → None（不设预算）。
+
+    取值非法（非整数）时**不静默吞掉**（公理3/AGENTS §10-21）：告警并按"不设"处理 ——
+    宁可无平台天花板（有时间护栏兜底），也不要因一个配置笔误把预算悄悄设成 0 / 崩在
+    模块导入期。返回 <=0 同样视为"不设"（0 或负数作为上限无意义）。
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        val = int(raw)
+    except ValueError:
+        logger.warning("env 旋钮 %s 取值 %r 不是整数，已按「不设上限」处理", name, raw)
+        return None
+    if val <= 0:
+        logger.warning("env 旋钮 %s 取值 %d <= 0，已按「不设上限」处理", name, val)
+        return None
+    return val
+
+
+# 诊断里 max_tokens 字段在"不设预算"时的显示口径：**不写 null**，写清"平台没设、
+# 由谁决定"，使读产物/日志的人一眼看得出"这次截断不是平台砍的"（U8）。
+MAX_TOKENS_UNSET_DISPLAY = "未设置（无平台侧上限，由模型自身最大输出长度与超时护栏决定）"
+
+
+def scan_json_shape(text: str) -> tuple[int, bool]:
+    """扫描 JSON 文本的结构收敛状态：返回 (未闭合的括号深度, 是否停在字符串内部)。
+
+    纯诊断用，**不做任何 JSON 修补、不放宽解析严格性** —— 只用来区分「输出被截断（结构
+    未闭合）」与「输出完整但非法（键名/引号写错）」这两种处置完全不同的失败。
+
+    Q-B2-2（用户 2026-09-16 裁决）：本函数与 diagnose_parse_failure 是全平台**唯一**实现，
+    原先散在 profiling_service / acceptance_baseline_service / p5_verification_agent 的三份
+    逐字副本已改为调用本函数（防三份副本各自漂移）。
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+    return depth, in_string
+
+
+def diagnose_parse_failure(text: str, *, max_tokens: Optional[int] = None,
+                           timeout_s: Optional[float] = None, env_knobs: str = "",
+                           decode_error: Optional[Exception] = None) -> dict:
+    """构造 JSON 解析失败的可诊断信息（D-06 同族，共享实现）。
+
+    让"解析失败"不再只是一句 parse_error —— 读产物/日志的人能分辨到底是「被截断」还是
+    「输出了非法 JSON」，两者的可操作结论完全不同（前者查上限/护栏，后者改 prompt 契约）。
+
+    `max_tokens=None` 表示本次调用**未设平台侧上限**，此时 `max_tokens` 字段填
+    MAX_TOKENS_UNSET_DISPLAY 而非 null —— 取消硬预算后这一区分是现场归因的关键：
+    截断信号 + "未设置" ⇒ 原因在模型自身上限 / provider 侧 / 时间护栏，不在平台预算。
+
+    `decode_error` 仅在调用方确有异常对象时写入（保持 acceptance_baseline_service 既有
+    诊断体形状不变）。
+    """
+    depth, in_string = scan_json_shape(text)
+    signals: list[str] = []
+    if not text:
+        # 空响应也是预算/护栏问题的已知形态（R17.5-P4-FIX 批2.8 实测：推理链耗尽输出预算后
+        # 最终文本为空）；归入"疑似截断"以给出同一个可操作结论，措辞保留不确定性。
+        signals.append("empty_content: 响应为空（可能推理链耗尽输出预算后无最终文本）")
+    if in_string:
+        signals.append("unclosed_string: 文本末尾停在未闭合的字符串内")
+    if depth > 0:
+        signals.append(f"unbalanced_depth={depth}: 有 {depth} 层 {{/[ 未闭合")
+    if text and not text.rstrip().endswith(("}", "]")):
+        signals.append("tail_not_closed: 末尾字符不是 } 或 ]")
+    diagnosis: dict = {
+        "content_len": len(text),
+        "suspected_truncation": bool(signals),
+        "truncation_signals": signals,
+    }
+    if decode_error is not None:
+        diagnosis["decode_error"] = f"{type(decode_error).__name__}: {decode_error}"
+    diagnosis["tail_snippet"] = text[-80:] if text else ""
+    diagnosis["max_tokens"] = max_tokens if max_tokens is not None else MAX_TOKENS_UNSET_DISPLAY
+    diagnosis["timeout_s"] = timeout_s
+    diagnosis["env_knobs"] = env_knobs
+    return diagnosis
+
+
+def log_parse_failure(log, label: str, diagnosis: dict, *,
+                      model_used: Optional[str] = None) -> None:
+    """按失败模式分级发声（公理3，共享实现）：疑似截断 → error 级并给出旋钮与上限口径；
+    结构已收敛但非法 JSON → warning 级并指向 prompt 契约。`label` 为阶段标识（如
+    "P0 intake"），`log` 为调用方自己的 logger（保持日志归属不变）。"""
+    if diagnosis.get("suspected_truncation"):
+        log.error(
+            "%s: LLM 输出**疑似被截断**导致 JSON 解析失败（D-06 同族）—— 响应长度=%d 字符, "
+            "截断信号=%s, 尾部=%r, model=%s, 本次上限 max_tokens=%s / timeout=%ss"
+            "（可经 %s 设置一个显式上限）",
+            label, diagnosis.get("content_len", 0), diagnosis.get("truncation_signals"),
+            diagnosis.get("tail_snippet"), model_used, diagnosis.get("max_tokens"),
+            diagnosis.get("timeout_s"), diagnosis.get("env_knobs") or "（本调用无 env 旋钮）")
+    else:
+        log.warning(
+            "%s: LLM 输出**结构已收敛但非法 JSON**（非截断，需修 prompt 契约）—— "
+            "响应长度=%d 字符, 尾部=%r, model=%s",
+            label, diagnosis.get("content_len", 0), diagnosis.get("tail_snippet"), model_used)
+
 _MAX_TOOL_ROUNDS = 6  # bounded tool-calling rounds (mirror p4 worker / agent_loop)
+
+# 本循环单次模型调用的默认请求超时（秒）。原为 `run_stage_tool_loop` 签名里的字面量 180.0；
+# V26.2 返工批次二把它提成命名常量，唯一目的是让**未显式传 timeout 的调用点**能在截断诊断里
+# 如实写出"本次真实生效的超时是多少"，而不是写 null 或另抄一个 180（取值不变，非行为变更）。
+DEFAULT_STAGE_TIMEOUT_SECONDS = 180.0
 
 # R21 dsh 范式吸收「循环卫生」①：同一 (工具名+参数) 组合连续调用达到此轮数时，
 # 提醒模型换方法或收尾 —— 只提醒，不拦截（本次调用仍照常执行）。阈值与文案均为
@@ -139,13 +278,18 @@ async def run_stage_tool_loop(
     run_id: str = "",
     stage: str = "p0",
     strategy_id: str = "system-default",
-    max_tokens: int = 32768,
+    max_tokens: Optional[int] = None,
     temperature: float = 0.3,
-    timeout: Optional[float] = 180.0,
+    timeout: Optional[float] = DEFAULT_STAGE_TIMEOUT_SECONDS,
     tracer=None,
     max_rounds: int = _MAX_TOOL_ROUNDS,
 ) -> dict:
     """Run a bounded multi-round tool-calling loop for a P-stage agent.
+
+    `max_tokens` 默认 **None = 不设平台侧输出上限**（V26.2 返工批次二，用户裁决 Q-B2-1）：
+    None 会一路透传到 adapter，请求体里根本不出现该键（不是传 `max_tokens: None`）。调用方
+    仍**可以**显式传一个上限作为逃生阀 —— 只是默认不传。上限交还给模型自身最大输出长度与
+    adapter 的三层时间护栏（本批次不得放宽那三层）。
 
     `max_rounds` defaults to `_MAX_TOOL_ROUNDS` (6) but MAY be overridden per call/run
     by the caller — an explicit optional parameter, not a global config knob (R21).

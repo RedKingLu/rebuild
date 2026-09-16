@@ -181,11 +181,15 @@ def test_shape_scanner_separates_truncation_from_malformed():
 # ── ④ env 可调（复用 R11-7 范式）→ 取值生效且真正透传 ──────────────────────
 
 def test_budget_defaults_and_env_override(monkeypatch):
-    """默认 16384 / 240s；env 覆盖后重载模块，取值生效（不必真调模型）。"""
+    """默认**不设上限**（V26.2 返工批次二裁决 Q-B2-1）/ 240s；env 覆盖后重载模块，取值生效。"""
     import app.services.acceptance_baseline_service as mod
 
     reloaded = importlib.reload(mod)
-    assert reloaded._BASELINE_MAX_TOKENS == 16384, "默认输出预算须显著高于触顶值 6144"
+    # V26.2 返工批次二（用户裁决 Q-B2-1，2026-09-16）：原断言为 `== 16384`（"默认输出预算须显著
+    # 高于触顶值 6144"）。该口径已被裁决取代 —— 不再设平台侧硬预算（抬高天花板只是把撞顶推迟到
+    # 更大的样本，本缺陷第二次出现即因此）。旋钮仍生效（见下），故这是**机械事实随实现前移**，
+    # 不是放宽守卫：不设上限比设 16384 更不容易被截断。
+    assert reloaded._BASELINE_MAX_TOKENS is None, "默认不设平台侧输出上限（Q-B2-1）"
     assert reloaded._BASELINE_TIMEOUT == 240.0, "默认超时须高于 adapter fail-fast 的 60s"
 
     monkeypatch.setenv("P1_BASELINE_MAX_TOKENS", "20480")

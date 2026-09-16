@@ -37,6 +37,58 @@ _STREAM_TOTAL_TIMEOUT = float(os.environ.get("LLM_STREAM_TOTAL_TIMEOUT", "240"))
 # 必然立刻超时的调用）。非策略参数，不做可配置（Skill §3.3 不必要的可配置性）。
 _MIN_RETRY_BUDGET_SECONDS = 1.0
 
+# ── V26.2 返工批次二（§2.2 anthropic 协议防御）───────────────────────────────
+# 本批次起 `max_tokens=None` 表示"不设平台侧上限"，请求体里**不写该键**（见
+# `_apply_max_tokens`）。但 **Anthropic Messages API 的 `max_tokens` 是必填字段**，省略会直接
+# 400 —— 所以只要 api_format=="anthropic"，就不能省略，必须回落到一个显式上限。
+# 现状（2026-09-16 实测 model_profiles.yaml）：三个 provider 的 api_format 全为 "openai"，
+# 无一走 anthropic 分支 ⇒ 本护栏当前不改变任何真实调用行为。但 `endpoint_anthropic` 已配置、
+# `_select_api_base()` 支持该分支且其注释明写"非封闭枚举、预期会扩展" ⇒ 一旦有人把某
+# provider 切成 anthropic，缺这个护栏就是该 provider 全部调用直接失败。
+# 回落值的依据（不是拍脑袋的新数字）：取平台自己曾用过的**最高一档**预算 32768（批次 B/F 为
+# P1 profiling / P3 planning / P4 生成设定的默认值，其推导见各处注释），而不是另立一个数。
+# 可经 env 覆盖：某模型上限更高/更低时不必改代码。
+_ANTHROPIC_FALLBACK_MAX_TOKENS = int(
+    os.environ.get("LLM_ANTHROPIC_FALLBACK_MAX_TOKENS", "32768"))
+_ANTHROPIC_FALLBACK_REASON = (
+    "anthropic 协议要求 max_tokens 必填，本次调用未设平台侧上限，"
+    f"已回落到显式上限 {_ANTHROPIC_FALLBACK_MAX_TOKENS}"
+    "（可经 LLM_ANTHROPIC_FALLBACK_MAX_TOKENS 调整）"
+)
+
+
+def _resolve_max_tokens(api_format: str, max_tokens: Optional[int]) -> tuple[Optional[int], dict]:
+    """决定本次请求实际使用的 max_tokens，并返回回落说明（空 dict = 未发生回落）。
+
+    - 非 anthropic 协议：原样返回（None 表示后续不写该键）。
+    - anthropic 协议且未设上限：回落到 `_ANTHROPIC_FALLBACK_MAX_TOKENS`，并给出结构化
+      回落说明供调用方记录（**不静默省略导致 400，也不静默用一个无依据的数字**）。
+    """
+    if max_tokens is not None or api_format != "anthropic":
+        return max_tokens, {}
+    logger.warning("max_tokens 回落：%s", _ANTHROPIC_FALLBACK_REASON)
+    return _ANTHROPIC_FALLBACK_MAX_TOKENS, {
+        "max_tokens_fallback": {
+            "applied": True,
+            "api_format": api_format,
+            "value": _ANTHROPIC_FALLBACK_MAX_TOKENS,
+            "reason": _ANTHROPIC_FALLBACK_REASON,
+            "env_knob": "LLM_ANTHROPIC_FALLBACK_MAX_TOKENS",
+        }
+    }
+
+
+def _apply_max_tokens(kwargs: dict, key: str, max_tokens: Optional[int]) -> None:
+    """**条件写入**输出上限键：仅在非 None 时写。
+
+    为什么不能"传 None 就完事"（V26.2 返工批次二实测前提②）：旧实现无条件写
+    `{"max_tokens": max_tokens}`，传 None 会把 `max_tokens: None` 真的发给 litellm，行为
+    依赖库版本 / provider 实现（可能报 400、可能当 0、可能忽略），不可靠。取消预算的正确
+    物理形态是**请求体里根本没有这个键**，不是这个键的值是 null。
+    """
+    if max_tokens is not None:
+        kwargs[key] = max_tokens
+
 
 class StreamStallTimeout(TimeoutError):
     """流式调用挂起保护触发（B-R18-1-STREAM-HANG）。
@@ -202,7 +254,7 @@ class LiteLLMAdapter:
         api_base: str,
         api_key: str,
         api_format: str = "openai",
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         stream: bool = False,
         timeout: Optional[float] = None,
@@ -211,6 +263,10 @@ class LiteLLMAdapter:
         """Execute a completion call via litellm.
 
         IMPORTANT: api_key is used in-memory only for this call; never persisted.
+
+        V26.2 返工批次二（Q-B2-1）：`max_tokens=None`（默认）表示**不设平台侧输出上限** ——
+        请求体里不写该键（`_apply_max_tokens`），上限交还给模型自身能力与本方法的时间护栏；
+        anthropic 协议例外，见 `_resolve_max_tokens`。显式传值仍然生效（逃生阀）。
 
         R11-7: `timeout` overrides the module default per call — slow domains (e.g. P3
         planning, single call 60-120s) need a longer request timeout than the fail-fast
@@ -236,6 +292,10 @@ class LiteLLMAdapter:
         call_id = f"call_{uuid.uuid4().hex[:12]}"
         t0 = time.monotonic()
         result = ModelCallResult(call_id=call_id, model_name=model)
+        # anthropic 协议必填 max_tokens → 未设上限时回落并把原因带进 trace_data（不静默）。
+        effective_max_tokens, fallback_trace = _resolve_max_tokens(api_format, max_tokens)
+        if fallback_trace:
+            result.trace_data.update(fallback_trace)
 
         # 单次请求超时：与下面交给 litellm 的值同源（双保险 —— litellm 那条链失效时本层兜住）。
         per_attempt_timeout = float(timeout) if timeout is not None else _REQUEST_TIMEOUT
@@ -247,7 +307,6 @@ class LiteLLMAdapter:
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
             "temperature": temperature,
             "api_key": api_key,
             "api_base": api_base,
@@ -255,6 +314,7 @@ class LiteLLMAdapter:
             # R9-5-1: never hang on a dead provider; R11-7: per-call override for slow domains
             "timeout": per_attempt_timeout,
         }
+        _apply_max_tokens(kwargs, "max_tokens", effective_max_tokens)
         if extra_params:
             kwargs.update(extra_params)
 
@@ -329,7 +389,7 @@ class LiteLLMAdapter:
         messages: list[dict],
         api_base: str,
         api_key: str,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         timeout: Optional[float] = None,
     ) -> ModelCallResult:
@@ -363,10 +423,11 @@ class LiteLLMAdapter:
             "input": messages,
             "api_key": api_key,
             "api_base": api_base,
-            "max_output_tokens": max_tokens,
             "temperature": temperature,
             "timeout": per_attempt_timeout,
         }
+        # V26.2 返工批次二：未设上限 ⇒ 请求体不含 max_output_tokens 键（Responses 通道口径）。
+        _apply_max_tokens(kwargs, "max_output_tokens", max_tokens)
 
         for attempt in range(_MAX_RETRIES + 1):
             try:
@@ -422,7 +483,7 @@ class LiteLLMAdapter:
         messages: list[dict],
         api_base: str,
         api_key: str,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         timeout: Optional[float] = None,
     ):
@@ -458,11 +519,12 @@ class LiteLLMAdapter:
             "input": messages,
             "api_key": api_key,
             "api_base": api_base,
-            "max_output_tokens": max_tokens,
             "temperature": temperature,
             "timeout": per_attempt_timeout,
             "stream": True,
         }
+        # V26.2 返工批次二：未设上限 ⇒ 请求体不含 max_output_tokens 键。
+        _apply_max_tokens(kwargs, "max_output_tokens", max_tokens)
         try:
             stream = await asyncio.wait_for(
                 litellm.aresponses(**kwargs), timeout=per_attempt_timeout)
@@ -501,7 +563,7 @@ class LiteLLMAdapter:
         api_base: str,
         api_key: str,
         api_format: str = "openai",
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         tools: Optional[list[dict]] = None,
         extra_params: Optional[dict] = None,
@@ -540,11 +602,17 @@ class LiteLLMAdapter:
            attempt 各拿一份完整上限，最坏耗时 = 上限 ×(_MAX_RETRIES+1) 再乘 gateway 的
            fallback 链长度（240s → 单 profile 约 974s，多 profile 达数十分钟），正是「≥10
            分钟无进展」的放大机制。预算不足时不再空转重试。
+
+        V26.2 返工批次二（Q-B2-1）：`max_tokens=None`（默认）= 不设平台侧输出上限，请求体里
+        **不含** `max_tokens` 键。此时上述三层时间护栏 + 模型自身最大输出长度是**唯一**的输出
+        边界 —— 故本批次明确禁止放宽这三层（取消 token 预算已经放宽了一个维度，两者同时放宽
+        会让失控风险叠加）。anthropic 协议因该字段必填而回落，见 `_resolve_max_tokens`；回落
+        原因随最终 `done` / `error` 帧的 `max_tokens_fallback` 键上报（不静默）。
         """
+        effective_max_tokens, fallback_trace = _resolve_max_tokens(api_format, max_tokens)
         base_kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
             "temperature": temperature,
             "api_key": api_key,
             "api_base": api_base,
@@ -552,6 +620,7 @@ class LiteLLMAdapter:
             "stream_options": {"include_usage": True},
             "timeout": timeout if timeout is not None else _REQUEST_TIMEOUT,
         }
+        _apply_max_tokens(base_kwargs, "max_tokens", effective_max_tokens)
         if tools:
             base_kwargs["tools"] = tools
             base_kwargs["tool_choice"] = "auto"
@@ -656,7 +725,7 @@ class LiteLLMAdapter:
                 if not content_emitted and not tool_emitted and reasoning_buf.strip():
                     committed = True
                     yield {"type": "token", "content": reasoning_buf, "call_id": call_id}
-                yield {"type": "done", "usage": usage, "call_id": call_id}
+                yield {"type": "done", "usage": usage, "call_id": call_id, **fallback_trace}
                 return
             except Exception as e:
                 error_cat, error_msg = _classify_litellm_error(e)
@@ -678,7 +747,7 @@ class LiteLLMAdapter:
                     committed, attempt, budget_left, error_cat, error_msg)
                 await _aclose_stream(response)
                 yield {"type": "error", "error_category": error_cat,
-                       "error_message": error_msg, "call_id": call_id}
+                       "error_message": error_msg, "call_id": call_id, **fallback_trace}
                 return
 
     # ── Self-test / connectivity check ────────────────────────────────

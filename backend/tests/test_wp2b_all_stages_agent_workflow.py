@@ -629,21 +629,32 @@ async def test_c4_validation_reads_domain_from_disk_not_process(isolated_data):
 
 async def test_c4_acceptance_service_participates_in_gating(isolated_data, monkeypatch):
     """C4 门控：AcceptanceService 独立结构核验参与 pass/fail（不再仅异常记 issue）。
-    令独立核验异常 → ValidationAgent 独立验收不通过（acceptance_check_error 门控）。"""
+    令独立核验异常 → ValidationAgent 独立验收不通过（acceptance_check_error 门控）。
+
+    V26.2 返工批次二（`B-ACC-P0-PARSEERROR-STILL-ACCEPTED`）：本用例原来用 `RealP0Handler()`
+    默认服务跑，识别调用落到 conftest 的 LLM 桩上，桩返回的是 `"mocked llm response"`（不是
+    JSON）—— 也就是说**它此前是靠"P0 识别不可解析仍被判 completed"这一缺陷行为**满足下面那句
+    `assert result["status"] == "completed"` 前置的。该行为已按台账修掉（解析失败 ⇒ 非完成态）。
+    本用例真正要验的是"独立结构核验异常 ⇒ 门控不通过"，与 P0 解析无关，故改为注入本文件既有的
+    `_IntakeGateway(_P0_IDENT)`（返回**可解析**的识别 JSON）来正当地得到一个 completed 前置。
+    这是"测试依赖了不安全行为"的修正，不是为了让测试变绿而放宽守卫。
+    """
     from app.graph.stage_handlers import RealP0Handler
+    from app.services.intake_service import IntakeService
     pid = "wp2b-c4-gate"
     _seed(pid)
-    handler = RealP0Handler()
+    gw = _IntakeGateway(_P0_IDENT)
+    handler = RealP0Handler(intake_service=IntakeService(gateway=gw))
     wa = WorkAgent("p0", pid, run_id="r1", handler=handler)
     result = await wa.execute({"source_type": "manual", "project_id": pid})
     assert result["status"] == "completed"
 
-    va = ValidationAgent("p0", pid, run_id="r1", handler=handler)
+    va = ValidationAgent("p0", pid, run_id="r1", handler=handler, gateway=gw)
     # 未打桩时应通过（基线）
     assert va.validate(result).passed
 
     # 令 AcceptanceService 独立核验抛错 → 门控判不通过（非静默 accepted，REC-1）
-    va2 = ValidationAgent("p0", pid, run_id="r1", handler=handler)
+    va2 = ValidationAgent("p0", pid, run_id="r1", handler=handler, gateway=gw)
     monkeypatch.setattr(va2, "_acceptance_check",
                         lambda *a, **k: {"result": "error", "agent_id": None,
                                          "error": "InjectedError", "recommendations": []})

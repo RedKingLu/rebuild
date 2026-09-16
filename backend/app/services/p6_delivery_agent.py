@@ -32,6 +32,23 @@ from typing import Any, Optional
 
 logger = logging.getLogger("rebuild.p6_delivery_agent")
 
+# V26.2 返工批次二（Q-B2-1 / Q-B2-2）：共享截断诊断 + "不设即无上限"的 env 旋钮解析。
+from app.services.stage_agent_loop import (
+    DEFAULT_STAGE_TIMEOUT_SECONDS as _STAGE_TIMEOUT,
+    diagnose_parse_failure as _diagnose_parse_failure_shared,
+    log_parse_failure as _log_parse_failure,
+    optional_int_env,
+)
+
+# `B-V262-TOKENBUDGET-UNFIXED-4`（P0）：本调用原为硬编码 **max_tokens=8192** —— 比同族另外三处
+# （均 16384）低一半，比真实规模真跑已实测撞顶的 16384 还低 ⇒ 截断风险实际更高而非更低。
+# （台账 `02-阻塞项.md` 对本处的登记是准确的：路径 `app/services/`、值 8192，且已注明"预算是四者
+#   最低"。**是 V26.2 返工批次二施工计划 §1.2 转述台账时把它写成了 `app/agents/…=16384`**，本批次
+#   已在修复报告中更正该转述，不需要改台账本身。）
+# 用户 2026-09-16 裁决 Q-B2-1：取消平台侧硬预算。默认 None ⇒ 请求体无 max_tokens 键；
+# 旋钮 `P6_DELIVERY_MAX_TOKENS` 保留作逃生阀。
+_DELIVERY_MAX_TOKENS = optional_int_env("P6_DELIVERY_MAX_TOKENS")
+
 # 编排 + 锚点字段（skill-first，D-108）：交付方法论/环节/许可纪律/反伪造红线随 P6 stage skill
 # (P-migration-delivery) 正文走，此处只保留"怎么编排 + 输出什么锚点键 + 不可越权红线"。
 _SYSTEM_PROMPT = (
@@ -148,7 +165,8 @@ class P6DeliveryAgent:
             loop = await run_stage_tool_loop(
                 gw, system_content=system_content, user_content=user_content,
                 project_id=project_id, run_id=run_id or "", stage=stage,
-                strategy_id=strategy_id, max_tokens=8192, temperature=0.3, tracer=self.tracer)
+                strategy_id=strategy_id, max_tokens=_DELIVERY_MAX_TOKENS, temperature=0.3,
+                tracer=self.tracer)
             if loop["status"] != "completed":
                 reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
                 return P6AdvisoryResult(
@@ -195,11 +213,18 @@ class P6DeliveryAgent:
         )
 
     def _parse(self, content: str) -> dict:
+        """V26.2 返工批次二（甲 ②）：接入共享截断诊断（本处此前完全没有诊断）。"""
         from app.services.stage_agent_loop import extract_json_object
         data = extract_json_object(content)
         if not isinstance(data, dict):
-            return {"delivery_narrative": {"raw": (content or "").strip()[:1500],
-                                           "parse_error": True},
+            text = (content or "").strip()
+            diagnosis = _diagnose_parse_failure_shared(
+                text, max_tokens=_DELIVERY_MAX_TOKENS, timeout_s=_STAGE_TIMEOUT,
+                env_knobs="P6_DELIVERY_MAX_TOKENS")
+            _log_parse_failure(logger, "P6 advisory", diagnosis)
+            return {"delivery_narrative": {"raw": text[:1500],
+                                           "parse_error": True,
+                                           "parse_diagnosis": diagnosis},
                     "operation_rollback_notes": {}, "acceptance_advice": {},
                     "experience_notes": []}
         return data

@@ -370,6 +370,11 @@ class ValidationAgent:
             intake = self._read_json("artifacts/p0/intake_report.json") or {}
             view["source_type"] = intake.get("source_type")
             view["file_count"] = intake.get("file_count", 0)
+            # `B-ACC-P0-PARSEERROR-STILL-ACCEPTED` 解除条件 ②：P0 域校验新增"识别键大面积为空"
+            # 的确定性检查，其输入同样**从盘重读**（与 read_from_disk_only 一致），不取
+            # WorkAgent 进程内推理 dict。缺该键时 review 侧不判（不误伤），故只在存在时传。
+            if isinstance(intake.get("identification"), dict):
+                view["identification"] = intake["identification"]
         elif self.stage == "p1":
             # P1 域校验（RealP1Handler.review）判定建档识别产物 + 原始验收基准存在性；
             # 从盘重读 artifacts 已在 view["artifacts"]。status 反映是否 completed。
@@ -624,6 +629,11 @@ class ValidationAgent:
         parse_verdict=True 时解析结构化 verdict/grounded/reason（P4 门禁用）。"""
         try:
             from app.services.work_agent import _run_coro
+            # V26.2 返工批次二（甲 ⑤ 的逐处评估结论）：本处 512 **保留现值**，不纳入"取消 P 环节硬
+            # 预算"的范围。依据：产出是**定长小裁决**（`{"verdict","grounded","reason"}`），体量不随
+            # 项目规模增长；且一旦因任何原因拿不到结论，下方一律走**诚实 evidence_gap**，而 P4 的语义
+            # 门禁对 evidence_gap 是 **fail-closed**（诚实不通过，见 `_semantic_gate_p4`）——
+            # 即截断的方向是"更严"而不是"放行"，与本次缺陷（把不可用谎报为可用）方向相反。
             resp = _run_coro(gw.call(messages=[{"role": "user", "content": prompt}],
                                      source="api", max_tokens=512))
         except Exception:

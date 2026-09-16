@@ -70,10 +70,17 @@ def _skill_files(include_scenarios: bool) -> list[Path]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 已登记 allowlist（每项须附理由）：
-#   assessment_service.py:54 —— P2 assessment_report 的 JSON 输出子字段键（与
+#   assessment_service.py:68 —— P2 assessment_report 的 JSON 输出子字段键（与
 #   compatibility_hosting / database_migration / deployment_hosting 并列），不是场景 id，
 #   早于场景机制存在。⚠️ 日后不得为"清理 J-1 命中"而改动该行 —— 会破坏 P2 报告 schema 键约定。
-_J1_ALLOWLIST = {"backend/app/services/assessment_service.py:54"}
+#   ⚠️ 本 allowlist 以 **file:line** 为键，因此**任何在该行之上插入/删除行的改动都会让它失配**，
+#   表现为一次与真实缺陷无关的红。V26.2 返工批次二（取消 P 环节硬 token 预算）在
+#   assessment_service.py 顶部加了旋钮定义与背景注释，该行由 **:54 → :68**，据此更新键值；
+#   被 allowlist 的**内容逐字未变**（同一句 P2 报告子字段键说明），守卫强度不变。
+#   建议（未在本批次实施，避免顺手重构守卫测试）：把键从行号改为**内容指纹**（例如
+#   allowlist 存 `(相对路径, 该行 strip 后的文本)`），这样它对无关的行号漂移免疫，
+#   同时仍然精确 —— 否则每次改动该文件上游都会误报一次。
+_J1_ALLOWLIST = {"backend/app/services/assessment_service.py:68"}
 
 
 def test_j1_no_scenario_id_literals_in_logic_code():

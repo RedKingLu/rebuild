@@ -1119,16 +1119,22 @@ class TestStreamReasoningFallback:
         assert captured["max_tokens"] == 32768
 
     def test_stage_and_planning_max_tokens_raised(self):
-        """(c) The stage loop default + P3 planning cap are raised so reasoning + large JSON
-        产物 fit (was 8192 → truncated at the cap producing empty_content)."""
+        """(c) 原口径：把 stage loop 默认值与 P3 planning 上限**抬高**到 32768（8192 会截断）。
+
+        V26.2 返工批次二（用户裁决 Q-B2-1，2026-09-16）改为**取消平台侧硬预算**：抬高天花板只是
+        把撞顶推迟到更大的样本（本缺陷第二次出现正因如此 —— 抬到 32768 后，未抬的四处又在 16384
+        撞顶）。故断言口径随实现前移为"默认不设上限"（None）。这是**更强**的保证而非放宽：
+        None 的含义是请求体里根本没有 max_tokens 键，不存在平台侧天花板可撞。
+        逃生阀仍可用，见 `test_max_tokens_forwarded_to_litellm`（显式传值照旧生效）。
+        """
         import inspect
         from app.services import stage_agent_loop, planning_service
         sig = inspect.signature(stage_agent_loop.run_stage_tool_loop)
-        assert sig.parameters["max_tokens"].default == 32768
-        assert planning_service._PLANNING_MAX_TOKENS >= 32768
+        assert sig.parameters["max_tokens"].default is None
+        assert planning_service._PLANNING_MAX_TOKENS is None
 
     def test_p4_gen_max_tokens_raised(self):
-        """(c) P4 generation cap raised above the former hardcoded 16384 so reasoning models
-        don't truncate the migrated code / multi-file product mid-output."""
+        """(c) 原口径：P4 生成上限抬高到 32768。同上，V26.2 返工批次二改为默认不设上限
+        （`P4_GEN_MAX_TOKENS` 不设 ⇒ None）。P4 是单次输出体量最大的阶段，最不该有平台天花板。"""
         from app.services import p4_execution_worker
-        assert p4_execution_worker._GEN_MAX_TOKENS >= 32768
+        assert p4_execution_worker._GEN_MAX_TOKENS is None

@@ -372,6 +372,14 @@ class RealP0Handler:
             intake["identification"] = {
                 "status": intake_result.status, "reason": intake_result.reason,
                 "note": "P0 识别需有效模型 Key，未降级为规则识别（D-097/公理3）"}
+            # `B-ACC-P0-PARSEERROR-STILL-ACCEPTED` + 甲②：失败原因是"输出不可解析"时，把可诊断
+            # 证据一并落进产物（parse_error / raw / parse_diagnosis）——只有日志会随进程滚走，
+            # 读产物的人同样需要能分辨"被截断"还是"输出非法 JSON"（标注须有消费方，D-06）。
+            _ident = intake_result.identification or {}
+            if _ident.get("parse_error"):
+                for _k in ("parse_error", "raw", "parse_diagnosis"):
+                    if _k in _ident:
+                        intake["identification"][_k] = _ident[_k]
             _mediated_write(project_id, stage_artifact_ref("p0", "intake_report.json"),
                             json.dumps(intake, ensure_ascii=False, indent=2),
                             auditor=self.auditor, stage="p0", action="write_intake_report")
@@ -454,17 +462,93 @@ class RealP0Handler:
         except Exception:
             logger.warning("P0 stage package 写入失败（advisory）", exc_info=True)
 
+    # `B-ACC-P0-PARSEERROR-STILL-ACCEPTED` 解除条件 ②：识别键大面积为空的**确定性**门控。
+    # 阈值口径**取同源，不另定数字**：P1 侧 `validation_agent._P1_MAJOR_GAP_THRESHOLD` 取"领域产物
+    # 半数"（8 项里 4 项）；本处同样取半数 —— 由字段清单 //2 派生（12 个识别键 → 6），使清单增减
+    # 时阈值自动跟随，不留第二处需要人工同步的数字。
+    @staticmethod
+    def _identification_fields() -> list:
+        """识别键锚点清单的单一事实源是 `intake_service.INTAKE_IDENTIFICATION_FIELDS`
+        （只读引用，不在本文件复制第二份清单 —— DRY；同 validation_agent 只读引用
+        `RealP1Handler._LLM_ARTIFACT_KEYS` 的既有范式）。延迟 import 与本文件既有
+        intake_service 引用方式一致（`:122` / `:272`）。"""
+        from app.services.intake_service import INTAKE_IDENTIFICATION_FIELDS
+        return list(INTAKE_IDENTIFICATION_FIELDS)
+
+    @classmethod
+    def _empty_identification_keys(cls, identification: dict) -> tuple[list, list]:
+        """返回 (实质为空的识别键, 全部识别键)。**确定性事实判断**，不是质量判定。
+
+        空的定义严格且客观：键缺失，或值为 None / "" / [] / {}。有内容即算产出 —— 内容好不好
+        **不在本方法的判断范围内**（见 review() 的边界说明）。
+        """
+        fields = cls._identification_fields()
+        empty = []
+        for key in fields:
+            if key not in identification:
+                empty.append(key)
+                continue
+            val = identification[key]
+            if val is None or (isinstance(val, (str, list, dict, tuple)) and len(val) == 0):
+                empty.append(key)
+        return empty, fields
+
     def review(self, result: dict) -> ReviewResult:
+        """P0 确定性域规则。
+
+        ⚠ 边界（`B-ACC-P0-PARSEERROR-STILL-ACCEPTED` 解除条件 ② 的实现边界，**勿删勿扩**）：
+          · 本方法只做**确定性事实判断**：源码是否为空、阶段是否声明完成、识别键是否**大面积
+            为空**。"大面积为空"是可数的客观事实（键缺失/值为 null/空串/空数组/空对象），
+            **不是**对识别内容好不好的质量判定。
+          · 识别**质量**的语义判定仍由独立 LLM Acceptance Agent 承担（WP-4，validation_agent
+            p0=llm）。**不得**把"判断识别得准不准/合不合理"搬进本方法（那是越权，会把 LLM 判断
+            规则化，违反 AGENTS §2.3 / §10-25）。
+          · 反过来也**不得**因"这看起来像质量判定"而删掉下面这条空键检查：它拦的是"识别产物
+            整体立不住却报 issues:[]"这一**谎报**形态（与 D-05 同族；P2 侧同类失败早有
+            `unparseable_output` 守卫，P0 侧此前是纯缺口）。
+        """
         issues = []
         # 域规则（确定性）：非手动项目源码为空 → 应阻断引导补凭据。
         if result.get("source_type") not in ("manual",) and result.get("file_count", 0) == 0:
             issues.append({"type": "empty_source",
                            "detail": "非手动项目但源码目录为空（应阻断并引导补凭据）"})
-        # 识别质量语义判定由独立 LLM Acceptance Agent 承担（WP-4，validation_agent p0=llm）；
-        # 此处仅保留确定性域规则（存在性/空源），不做规则化识别质量判定。
+        # 域规则（确定性）：阶段未声明完成 → 域基线不得通过（与 P1/P2 review 同范式）。
+        # 此前本方法**完全不看 status**：识别失败/blocked 时域校验照样 passed=True，只靠
+        # ValidationAgent 的 declared!=completed 兜住 —— 少一层，且直接用 handler.review 作
+        # review_fn 的路径（nodes.py 非 Agent 工作流分支）会静默通过。
+        status = result.get("status")
+        if status not in ("completed", None):
+            reason = result.get("reason") or f"P0 未完成（status={status}）"
+            return ReviewResult(
+                passed=False,
+                issues=issues + [{"type": "p0_not_completed", "detail": reason}],
+                recommendations=["按 reason 修正后重跑 P0 接入识别"],
+                reviewer="p0_review_skill")
+        # 域规则（确定性）：识别键大面积为空 → 产出 issue 并影响 verdict，不得以 issues:[] 掩盖。
+        # 只在"声明完成 + 确实带了 identification"时才判（缺该键的调用方不误伤；产物缺失由
+        # artifacts / 独立结构核验负责）。
+        identification = result.get("identification")
+        if isinstance(identification, dict):
+            empty_keys, fields = self._empty_identification_keys(identification)
+            threshold = len(fields) // 2
+            if len(empty_keys) >= threshold:
+                detail = (
+                    f"P0 识别键大面积为空：{len(empty_keys)}/{len(fields)} 项（{empty_keys}）"
+                    f"—— 已达/超过半数阈值（{threshold}，与 P1 领域产物集完整性门控同源口径）。"
+                    "识别产物整体立不住，不得判阶段无问题")
+                if identification.get("parse_error"):
+                    diagnosis = identification.get("parse_diagnosis") or {}
+                    detail += (f"；根因线索：模型输出无法解析为 JSON（疑似截断="
+                               f"{bool(diagnosis.get('suspected_truncation'))}，"
+                               f"信号={diagnosis.get('truncation_signals')}）")
+                issues.append({"type": "p0_identification_major_gap", "detail": detail})
+        recommendations: list = []
+        if issues:
+            recommendations = (["补充源码凭据后重新导入"]
+                               if any(i.get("type") == "empty_source" for i in issues)
+                               else ["重跑 P0 识别并确认模型按契约输出完整 JSON"])
         return ReviewResult(passed=not issues, issues=issues,
-                            recommendations=["补充源码凭据后重新导入"] if issues else [],
-                            reviewer="p0_review_skill")
+                            recommendations=recommendations, reviewer="p0_review_skill")
 
 
 class RealP1Handler:

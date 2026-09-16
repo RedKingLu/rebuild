@@ -449,7 +449,7 @@ class ModelGateway:
         messages: list[dict],
         user_override: Optional[str] = None,
         strategy_id: str = "system-default",
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         stream: bool = False,
         timeout: Optional[float] = None,
@@ -459,6 +459,12 @@ class ModelGateway:
         stage: Optional[str] = None,
     ) -> dict:
         """Execute a model call through the gateway.
+
+        V26.2 返工批次二（Q-B2-1）：`max_tokens` 默认 **None = 不设平台侧输出上限**（原默认
+        4096）。改默认值的理由：本网关是 P 阶段唯一的模型出口，留一个 4096 的隐式默认等于
+        留一个比本次缺陷里撞顶的 16384 更低的暗坑 —— 任何忘记传该参数的 P 阶段调用点都会被
+        悄悄砍在 4096。改为 None 后"没传"即"不设上限"，与调用方显式传 None 语义一致。
+        当前所有调用点均显式传值，故该默认值变更不改变任何既有调用的行为。
 
         R13-6: when user_override starts with "fusion/", the caller has selected a Fusion
         virtual model — dispatch directly to the aggregation engine, bypassing the
@@ -637,7 +643,7 @@ class ModelGateway:
         messages: list[dict],
         user_override: Optional[str] = None,
         strategy_id: str = "system-default",
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         tools: Optional[list[dict]] = None,
         source: str = "api",
@@ -648,6 +654,9 @@ class ModelGateway:
         timeout: Optional[float] = None,
     ):
         """Stream a model call through the gateway as an async generator.
+
+        V26.2 返工批次二（Q-B2-1）：`max_tokens` 默认 **None = 不设平台侧输出上限**（原默认
+        4096，理由同 `call()`）。None 透传到 adapter 后请求体里不含该键。
 
         Yields {"type": "token"/"tool_calls"/"done"/"error"} frames.
         Fallback policy (T3): if an error frame arrives BEFORE any token is yielded to the

@@ -60,8 +60,10 @@ def test_profiling_max_tokens_and_timeout_env_tunable():
         assert ps._PROFILING_TIMEOUT == 99.0
     finally:
         _restore_env(ps, old)
-        # 还原后应回到任务书给出的默认值（32768 / 300），供下一条测试及全量回归复核。
-        assert ps._PROFILING_MAX_TOKENS == 32768
+        # V26.2 返工批次二（用户裁决 Q-B2-1 / Q-B2-5，2026-09-16）：默认值口径由"32768"改为
+        # **不设**（None = 无平台侧上限）。旋钮仍然生效（上面的断言即证），只是不设时不再有
+        # 平台天花板。此处是**机械事实随实现前移**，不是放宽守卫。
+        assert ps._PROFILING_MAX_TOKENS is None
         assert ps._PROFILING_TIMEOUT == 300.0
 
 
@@ -75,7 +77,8 @@ def test_p5_verification_max_tokens_and_timeout_env_tunable():
         assert p5va._P5_VERIFICATION_TIMEOUT == 77.0
     finally:
         _restore_env(p5va, old)
-        assert p5va._P5_VERIFICATION_MAX_TOKENS == 16384
+        # V26.2 返工批次二：默认口径改为**不设上限**（同上，机械事实随实现前移）。
+        assert p5va._P5_VERIFICATION_MAX_TOKENS is None
         assert p5va._P5_VERIFICATION_TIMEOUT == 240.0
 
 

@@ -32,6 +32,14 @@ from typing import Optional
 logger = logging.getLogger("rebuild.profiling_service")
 
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+# V26.2 返工批次二（Q-B2-2）：截断诊断与"不设即无上限"的 env 旋钮解析改用共享实现，
+# 本文件不再保留本地副本（防三份逐字副本各自漂移）。
+from app.services.stage_agent_loop import (
+    diagnose_parse_failure as _diagnose_parse_failure_shared,
+    log_parse_failure as _log_parse_failure,
+    optional_int_env,
+    scan_json_shape,
+)
 
 # D-06（V26.2 总验收真实规模真跑，2026-09-11，批次B）：真实项目（1018 文件 / 197,447 行）上
 # 本调用的 completion **恰好 4 次触顶原硬编码 max_tokens=16384**（存档响应头部为
@@ -53,7 +61,14 @@ from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_
 #     acceptance_baseline_service 对 16384 预算、单次调用取 240s（依据实测 60-120s 延迟 ×2
 #     余量）；profiling 预算是其 2 倍且为多轮工具循环，300s 留出更合理的余量。
 # 二者只调请求超时与输出预算，不涉及模型/endpoint 选择（策略仍由 ModelGateway 解析，D-098）。
-_PROFILING_MAX_TOKENS = int(os.environ.get("P1_PROFILING_MAX_TOKENS", "32768"))
+#
+# ⚠ V26.2 返工批次二（用户裁决 Q-B2-1 / Q-B2-5，2026-09-16）：**上面这段默认值推导已不再作为
+# 默认值使用**（保留原文，因为它记录了"抬高天花板"这条路线的实测依据与其失败方式：批次 F 把
+# 四处抬到 32768/16384 后，未抬的四处又在真实规模撞顶 16383/16384/16387 —— 抬高只是把天花板
+# 挪一格）。现口径：**默认不设平台侧上限**（`P1_PROFILING_MAX_TOKENS` 不设 ⇒ None ⇒ 请求体里
+# 无 max_tokens 键），旋钮保留作成本失控时的逃生阀（设了就仍然生效）。TIMEOUT 旋钮不变 ——
+# 三层时间护栏是取消预算后仅剩的护栏，本批次不得放宽。
+_PROFILING_MAX_TOKENS = optional_int_env("P1_PROFILING_MAX_TOKENS")
 _PROFILING_TIMEOUT = float(os.environ.get("P1_PROFILING_TIMEOUT", "300"))
 
 # LLM-produced 建档 identification fields (通用锚点，样本值由 LLM 生成)。file_index /
@@ -235,51 +250,22 @@ class ProfilingService:
     def _scan_json_shape(text: str) -> tuple[int, bool]:
         """扫描 JSON 文本的结构收敛状态：返回 (未闭合的括号深度, 是否停在字符串内部)。
 
-        纯诊断用，不做任何修补（同 acceptance_baseline_service 范式，D-06 同族）——只用来区分
-        「输出被截断（结构未闭合）」与「输出完整但非法」这两种处置完全不同的失败。
+        V26.2 返工批次二（Q-B2-2）：实现已提取到 `stage_agent_loop.scan_json_shape`（全平台
+        唯一一份），此处仅为薄转发，保留方法名以不破坏既有调用/测试。
         """
-        depth = 0
-        in_string = False
-        escaped = False
-        for ch in text:
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-                continue
-            if ch == '"':
-                in_string = True
-            elif ch in "{[":
-                depth += 1
-            elif ch in "}]":
-                depth -= 1
-        return depth, in_string
+        return scan_json_shape(text)
 
     def _diagnose_parse_failure(self, text: str) -> dict:
-        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 本次预算取值。让"解析失败"
-        不再只是一句 parse_error——读产物/日志的人能分辨是「被截断」还是「输出非法 JSON」。"""
-        depth, in_string = self._scan_json_shape(text)
-        signals: list[str] = []
-        if not text:
-            signals.append("empty_content: 响应为空（可能推理链耗尽输出预算后无最终文本）")
-        if in_string:
-            signals.append("unclosed_string: 文本末尾停在未闭合的字符串内")
-        if depth > 0:
-            signals.append(f"unbalanced_depth={depth}: 有 {depth} 层 {{/[ 未闭合")
-        if text and not text.rstrip().endswith(("}", "]")):
-            signals.append("tail_not_closed: 末尾字符不是 } 或 ]")
-        return {
-            "content_len": len(text),
-            "suspected_truncation": bool(signals),
-            "truncation_signals": signals,
-            "tail_snippet": text[-80:] if text else "",
-            "max_tokens": _PROFILING_MAX_TOKENS,
-            "timeout_s": _PROFILING_TIMEOUT,
-            "env_knobs": "P1_PROFILING_MAX_TOKENS / P1_PROFILING_TIMEOUT",
-        }
+        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 本次上限取值。让"解析失败"
+        不再只是一句 parse_error——读产物/日志的人能分辨是「被截断」还是「输出非法 JSON」。
+
+        V26.2 返工批次二（Q-B2-2）：算法已共享化，本方法只负责把**本服务的**上限/超时/旋钮名
+        喂给共享实现。未设上限时诊断里的 max_tokens 显示"未设置（…）"而非 null，使现场看得出
+        "这不是平台砍的"。
+        """
+        return _diagnose_parse_failure_shared(
+            text, max_tokens=_PROFILING_MAX_TOKENS, timeout_s=_PROFILING_TIMEOUT,
+            env_knobs="P1_PROFILING_MAX_TOKENS / P1_PROFILING_TIMEOUT")
 
     def _parse(self, content: str, *, model_used: Optional[str] = None) -> dict:
         from app.services.stage_agent_loop import extract_json_object
@@ -288,20 +274,7 @@ class ProfilingService:
             return data
         text = (content or "").strip()
         diagnosis = self._diagnose_parse_failure(text)
-        if diagnosis["suspected_truncation"]:
-            # 截断：可操作结论是「提高输出预算」，用 error 级并直接给出旋钮（D-06）。
-            logger.error(
-                "P1 profiling: LLM 输出**疑似被截断**导致 JSON 解析失败（D-06 同族）—— "
-                "响应长度=%d 字符, 截断信号=%s, 尾部=%r, model=%s, "
-                "本次预算 max_tokens=%s / timeout=%ss（可经 %s 调整）",
-                diagnosis["content_len"], diagnosis["truncation_signals"],
-                diagnosis["tail_snippet"], model_used, diagnosis["max_tokens"],
-                diagnosis["timeout_s"], diagnosis["env_knobs"])
-        else:
-            logger.warning(
-                "P1 profiling: LLM 输出**结构已收敛但非法 JSON**（非截断，需修 prompt 契约）—— "
-                "响应长度=%d 字符, 尾部=%r, model=%s",
-                diagnosis["content_len"], diagnosis["tail_snippet"], model_used)
+        _log_parse_failure(logger, "P1 profiling", diagnosis, model_used=model_used)
         return {"parse_error": True, "raw": text[:2000], "parse_diagnosis": diagnosis}
 
     def _trace(self, summary: str, project_id, run_id, stage) -> None:

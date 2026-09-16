@@ -29,6 +29,14 @@ from typing import Any, Optional
 
 logger = logging.getLogger("rebuild.p5_verification_agent")
 
+# V26.2 返工批次二（Q-B2-2）：截断诊断与"不设即无上限"的 env 旋钮解析改用共享实现。
+from app.services.stage_agent_loop import (
+    diagnose_parse_failure as _diagnose_parse_failure_shared,
+    log_parse_failure as _log_parse_failure,
+    optional_int_env,
+    scan_json_shape,
+)
+
 # D-06（V26.2 总验收真实规模真跑，2026-09-11，批次B）：真实规模下本调用的 completion
 # **1 次触顶原硬编码 max_tokens=8192**（存档响应头部为 `{"validation_strategy":
 # {"applicable_dimensions"…` 即被砍断）→ advisory（维度适用性/失败解读/修复建议）解析失败。
@@ -44,7 +52,11 @@ logger = logging.getLogger("rebuild.p5_verification_agent")
 #     单次调用延迟 ×2 余量）；本调用同为单轮 run_stage_tool_loop（advisory 层按已有确定性
 #     事实解读，无需像 profiling 那样多轮读源），故沿用该量级，不再另加时长。
 # 二者只调请求超时与输出预算，不涉及模型/endpoint 选择（策略仍由 ModelGateway 解析，D-098）。
-_P5_VERIFICATION_MAX_TOKENS = int(os.environ.get("P5_VERIFICATION_MAX_TOKENS", "16384"))
+#
+# ⚠ V26.2 返工批次二（用户裁决 Q-B2-1 / Q-B2-5，2026-09-16）：**上面 16384 的推导已不再作为默认值
+# 使用**（原文保留：它记录了触顶实测与"×2 抬高"路线的依据）。现口径：**默认不设平台侧上限**
+# （`P5_VERIFICATION_MAX_TOKENS` 不设 ⇒ None ⇒ 请求体无 max_tokens 键），旋钮保留作逃生阀。
+_P5_VERIFICATION_MAX_TOKENS = optional_int_env("P5_VERIFICATION_MAX_TOKENS")
 _P5_VERIFICATION_TIMEOUT = float(os.environ.get("P5_VERIFICATION_TIMEOUT", "240"))
 
 # 编排 + 锚点字段（skill-first，D-108）：验证方法论/维度/反伪造红线随 P5 stage skill
@@ -205,48 +217,20 @@ class P5VerificationAgent:
     @staticmethod
     def _scan_json_shape(text: str) -> tuple[int, bool]:
         """扫描 JSON 文本的结构收敛状态：返回 (未闭合的括号深度, 是否停在字符串内部)。
-        纯诊断，不做修补（同 acceptance_baseline_service / profiling_service 范式，D-06 同族）。"""
-        depth = 0
-        in_string = False
-        escaped = False
-        for ch in text:
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-                continue
-            if ch == '"':
-                in_string = True
-            elif ch in "{[":
-                depth += 1
-            elif ch in "}]":
-                depth -= 1
-        return depth, in_string
+
+        V26.2 返工批次二（Q-B2-2）：实现已提取到 `stage_agent_loop.scan_json_shape`（全平台
+        唯一一份），此处仅为薄转发，保留方法名以不破坏既有调用/测试。
+        """
+        return scan_json_shape(text)
 
     def _diagnose_parse_failure(self, text: str) -> dict:
-        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 本次预算取值。"""
-        depth, in_string = self._scan_json_shape(text)
-        signals: list[str] = []
-        if not text:
-            signals.append("empty_content: 响应为空（可能推理链耗尽输出预算后无最终文本）")
-        if in_string:
-            signals.append("unclosed_string: 文本末尾停在未闭合的字符串内")
-        if depth > 0:
-            signals.append(f"unbalanced_depth={depth}: 有 {depth} 层 {{/[ 未闭合")
-        if text and not text.rstrip().endswith(("}", "]")):
-            signals.append("tail_not_closed: 末尾字符不是 } 或 ]")
-        return {
-            "content_len": len(text),
-            "suspected_truncation": bool(signals),
-            "truncation_signals": signals,
-            "tail_snippet": text[-80:] if text else "",
-            "max_tokens": _P5_VERIFICATION_MAX_TOKENS,
-            "timeout_s": _P5_VERIFICATION_TIMEOUT,
-            "env_knobs": "P5_VERIFICATION_MAX_TOKENS / P5_VERIFICATION_TIMEOUT",
-        }
+        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 本次上限取值。
+
+        V26.2 返工批次二（Q-B2-2）：算法共享化，本方法只喂本服务的上限/超时/旋钮名。
+        """
+        return _diagnose_parse_failure_shared(
+            text, max_tokens=_P5_VERIFICATION_MAX_TOKENS, timeout_s=_P5_VERIFICATION_TIMEOUT,
+            env_knobs="P5_VERIFICATION_MAX_TOKENS / P5_VERIFICATION_TIMEOUT")
 
     def _parse(self, content: str) -> dict:
         from app.services.stage_agent_loop import extract_json_object
@@ -255,18 +239,7 @@ class P5VerificationAgent:
             return data
         text = (content or "").strip()
         diagnosis = self._diagnose_parse_failure(text)
-        if diagnosis["suspected_truncation"]:
-            logger.error(
-                "P5 advisory: LLM 输出**疑似被截断**导致 JSON 解析失败（D-06 同族）—— "
-                "响应长度=%d 字符, 截断信号=%s, 尾部=%r, "
-                "本次预算 max_tokens=%s / timeout=%ss（可经 %s 调整）",
-                diagnosis["content_len"], diagnosis["truncation_signals"],
-                diagnosis["tail_snippet"], diagnosis["max_tokens"],
-                diagnosis["timeout_s"], diagnosis["env_knobs"])
-        else:
-            logger.warning(
-                "P5 advisory: LLM 输出**结构已收敛但非法 JSON**（非截断，需修 prompt 契约）—— "
-                "响应长度=%d 字符, 尾部=%r", diagnosis["content_len"], diagnosis["tail_snippet"])
+        _log_parse_failure(logger, "P5 advisory", diagnosis)
         return {"validation_strategy": {"raw": text[:1500], "parse_error": True,
                                         "parse_diagnosis": diagnosis},
                 "failure_interpretation": [], "repair_suggestions": []}

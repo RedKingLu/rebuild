@@ -24,6 +24,14 @@ from typing import Optional
 
 logger = logging.getLogger("rebuild.acceptance_baseline_service")
 
+# V26.2 返工批次二（Q-B2-2）：截断诊断与"不设即无上限"的 env 旋钮解析改用共享实现。
+from app.services.stage_agent_loop import (
+    MAX_TOKENS_UNSET_DISPLAY,
+    diagnose_parse_failure as _diagnose_parse_failure_shared,
+    optional_int_env,
+    scan_json_shape,
+)
+
 # D-06（V26.2 总验收真实规模真跑，2026-09-10）：真实项目（1018 文件 / 197,447 行）上本调用的
 # completion **触顶原硬编码 max_tokens=6144**（call_log `call_5aa2351f4c19` completion_tokens=6144
 # = 上限），静态基线 JSON 中途截断 → `_parse` 的 json.loads 报
@@ -41,7 +49,13 @@ logger = logging.getLogger("rebuild.acceptance_baseline_service")
 #   · 240s 与 planning 同值。原路径无 timeout 形参 → 落到 adapter 的 fail-fast 默认 60s，而
 #     真实规模下本调用为单次非流式大 JSON 生成（实测同项目 P3 单次调用 60-120s），60s 明显偏紧。
 # 二者**只调请求超时与输出预算，不涉及模型/endpoint 选择**（策略仍由 ModelGateway 解析，D-098）。
-_BASELINE_MAX_TOKENS = int(os.environ.get("P1_BASELINE_MAX_TOKENS", "16384"))
+#
+# ⚠ V26.2 返工批次二（用户裁决 Q-B2-1 / Q-B2-5，2026-09-16）：**上面 16384 的推导已不再作为默认值
+# 使用**（原文保留：它记录了"按触顶值 ×N 抬高天花板"这条路线的实测依据，也记录了它为何不够 ——
+# 批次 F 抬高后未抬的四处又在真实规模撞顶）。现口径：**默认不设平台侧上限**
+# （`P1_BASELINE_MAX_TOKENS` 不设 ⇒ None ⇒ 请求体无 max_tokens 键），旋钮保留作逃生阀。
+# 上一版注释里"**不设无上限**"那句已被本次用户裁决推翻，按裁决执行。
+_BASELINE_MAX_TOKENS = optional_int_env("P1_BASELINE_MAX_TOKENS")
 _BASELINE_TIMEOUT = float(os.environ.get("P1_BASELINE_TIMEOUT", "240"))
 
 _STATIC_SYSTEM_PROMPT = (
@@ -236,52 +250,21 @@ class AcceptanceBaselineService:
 
         纯诊断用：**不做任何 JSON 修补，也不放宽解析严格性**——只用来区分
         「输出被截断（结构未闭合）」与「输出完整但非法（如键名/引号写错）」这两种
-        处置完全不同的失败（前者要加输出预算，后者要改 prompt 契约）。
+        处置完全不同的失败。
+
+        V26.2 返工批次二（Q-B2-2）：实现已提取到 `stage_agent_loop.scan_json_shape`（全平台
+        唯一一份），此处仅为薄转发，保留方法名以不破坏既有调用/测试。
         """
-        depth = 0
-        in_string = False
-        escaped = False
-        for ch in text:
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-                continue
-            if ch == '"':
-                in_string = True
-            elif ch in "{[":
-                depth += 1
-            elif ch in "}]":
-                depth -= 1
-        return depth, in_string
+        return scan_json_shape(text)
 
     def _diagnose_parse_failure(self, text: str, err: Exception) -> dict:
-        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 预算取值。"""
-        depth, in_string = self._scan_json_shape(text)
-        signals: list[str] = []
-        if not text:
-            # 空响应也是预算问题的已知形态（R17.5-P4-FIX 批2.8 实测：推理链耗尽 max_tokens 后
-            # 最终文本为空）；归入"疑似截断"以给出同一个可操作结论=加预算，措辞保留不确定性。
-            signals.append("empty_content: 响应为空（可能推理链耗尽输出预算后无最终文本）")
-        if in_string:
-            signals.append("unclosed_string: 文本末尾停在未闭合的字符串内")
-        if depth > 0:
-            signals.append(f"unbalanced_depth={depth}: 有 {depth} 层 {{/[ 未闭合")
-        if text and not text.rstrip().endswith(("}", "]")):
-            signals.append("tail_not_closed: 末尾字符不是 } 或 ]")
-        return {
-            "content_len": len(text),
-            "suspected_truncation": bool(signals),
-            "truncation_signals": signals,
-            "decode_error": f"{type(err).__name__}: {err}",
-            "tail_snippet": text[-80:] if text else "",
-            "max_tokens": _BASELINE_MAX_TOKENS,
-            "timeout_s": _BASELINE_TIMEOUT,
-            "env_knobs": "P1_BASELINE_MAX_TOKENS / P1_BASELINE_TIMEOUT",
-        }
+        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 上限取值。
+
+        V26.2 返工批次二（Q-B2-2）：算法共享化，本方法只喂本服务的上限/超时/旋钮名。
+        """
+        return _diagnose_parse_failure_shared(
+            text, max_tokens=_BASELINE_MAX_TOKENS, timeout_s=_BASELINE_TIMEOUT,
+            env_knobs="P1_BASELINE_MAX_TOKENS / P1_BASELINE_TIMEOUT", decode_error=err)
 
     def _parse(self, content: str, *, model_used: Optional[str] = None) -> dict:
         text = (content or "").strip()
@@ -295,7 +278,10 @@ class AcceptanceBaselineService:
                 return data
             diagnosis = {"content_len": len(text), "suspected_truncation": False,
                          "truncation_signals": [], "decode_error": f"not_a_json_object: {type(data).__name__}",
-                         "tail_snippet": text[-80:], "max_tokens": _BASELINE_MAX_TOKENS,
+                         "tail_snippet": text[-80:],
+                         # 与共享诊断同口径：未设平台侧上限时显示"未设置（…）"而非 null。
+                         "max_tokens": (_BASELINE_MAX_TOKENS if _BASELINE_MAX_TOKENS is not None
+                                        else MAX_TOKENS_UNSET_DISPLAY),
                          "timeout_s": _BASELINE_TIMEOUT,
                          "env_knobs": "P1_BASELINE_MAX_TOKENS / P1_BASELINE_TIMEOUT"}
             logger.warning(
