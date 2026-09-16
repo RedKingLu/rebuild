@@ -25,6 +25,37 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# B-ACC-HELD-ACTION-INVISIBLE：挂起动作采集**只有一份实现**（services/held_actions），
+# 本模块与 validation_agent 都 import 它。此处做成模块级薄封装是为了让采集失败不至于
+# 让整份 Gate Brief 写不出来（该报告是用户 Gate 决策的主材料，不可因附加段落而丢失）。
+def _collect_held(project_id: str, run_id: str, stage: str) -> List[dict]:
+    try:
+        from app.services.held_actions import collect_held_actions
+        return collect_held_actions(project_id, run_id, stage)
+    except Exception:
+        import logging
+        logging.getLogger("rebuild.stage_reports").warning(
+            "held_actions 采集不可用 project=%s stage=%s —— held_actions 段为空"
+            "【不代表无挂起动作】", project_id, stage, exc_info=True)
+        return []
+
+
+def _merge_held_note(honest_notes: Optional[str], held: List[dict]) -> str:
+    try:
+        from app.services.held_actions import merge_held_actions_note
+        return merge_held_actions_note(honest_notes, held)
+    except Exception:
+        # 发声（公理 3）：走到这里意味着已采集到的挂起动作**没能并入 honest_notes**，
+        # 即产物在这一处又变回"看不出有动作被挂起"——正是本条台账要治的形态，不可静默。
+        # 上面 `_collect_held` 的失败已单独发声，两处失败原因不同故不合并。
+        import logging
+        logging.getLogger("rebuild.stage_reports").warning(
+            "挂起动作说明并入 honest_notes 失败（已采集到 %d 条挂起动作，"
+            "本份产物的 honest_notes 不含它们；held_actions 段仍有原始数据）",
+            len(held or []), exc_info=True)
+        return (honest_notes or "").strip()
+
+
 class StageReports:
     """Produce/locate the three review reports for a stage in a project workspace.
 
@@ -101,8 +132,17 @@ class StageReports:
     def gate_brief(self, *, stage: str, what_happened: str, key_artifacts: List[dict],
                    risks: List[dict], honest_notes: str = "",
                    validation_verdict: Optional[dict] = None,
-                   claim_evidence_summary: Optional[dict] = None) -> str:
-        """用户可读阶段审核摘要（内容真实，D-101）。WorkAgent 侧 + ValidationAgent 侧合成。"""
+                   claim_evidence_summary: Optional[dict] = None,
+                   run_id: str = "") -> str:
+        """用户可读阶段审核摘要（内容真实，D-101）。WorkAgent 侧 + ValidationAgent 侧合成。
+
+        B-ACC-HELD-ACTION-INVISIBLE 解除条件 ①②：本报告须反映"本阶段有 N 个动作因待审批
+        未执行"并列出 gate_id，且该信息须并入 `honest_notes` —— 否则用户在 Gate 上读到的
+        是一份"什么都完成了"的摘要，而实际有 L4 动作被 fail-closed 拦下从未执行。
+        采集实现只有一份（`services/held_actions`），与 validation 报告共用。
+        `run_id` 可选：缺省（空串）时按 project+stage 采集，不因调用方没传 run_id 就跳过采集。
+        """
+        held = _collect_held(self.project_id, run_id, stage)
         return self._write_json("gate_brief", {
             "what_happened": what_happened,
             "key_artifacts": key_artifacts,
@@ -110,7 +150,9 @@ class StageReports:
             "validation_verdict": validation_verdict,
             "claim_evidence_summary": claim_evidence_summary or {},
             "decision_options": ["approve", "reject", "request_changes"],
-            "honest_notes": honest_notes,
+            "held_actions": held,
+            "held_action_count": len(held),
+            "honest_notes": _merge_held_note(honest_notes, held),
         })
 
     # ── ⑤b fact/claim-evidence map 报告（R17.3-6 WP-2，AGT-05/EVI-01） ───

@@ -584,8 +584,15 @@ class TestGateBackendReworkText:
         assert "返工" not in gate.reason
 
     def test_normal_stage_promotion_without_brief_falls_back_to_canned_text(self, isolated_data):
-        """防回归：没有 rework metadata、也没有真实 brief 时，仍落入既有兜底文案
-        （该文案本身留存，只是新增了一个更早判断的返工分支，不改变它的存在）。"""
+        """没有 rework metadata、也没有真实 brief 时的兜底文案。
+
+        **V26.3 R24（B-V262-GATEREASON-HARDCODED 解除条件 ④）改写本例的断言**：原断言为
+        `assert "小循环通过，请求阶段晋级" in gate.reason`，即锁定了旧兜底文案。而"小循环通过"
+        是在**断言一个本函数并未读到任何证据的结论**——走到这一支恰恰意味着 gate_brief 读不
+        到、验收结论不可知。该断言锁定的是不安全行为（平台替验收结论下断言），按本轮口径
+        属"测试依赖了不安全行为"⇒ 改测试而非改守卫。
+        新契约：兜底文案必须诚实说明"未能读取独立验收报告"，且不得出现"通过"字样。
+        """
         from app.graph.gate_backend import RealGateBackend
         pid = "gbtext-3"
         workspace_service.init_workspace(pid)
@@ -596,7 +603,12 @@ class TestGateBackendReworkText:
         )
         from app.dependencies import get_services
         gate = get_services().gate_service.get(gate_id)
-        assert "小循环通过，请求阶段晋级" in gate.reason
+        assert "未能读取独立验收报告" in gate.reason
+        assert "请求阶段晋级" in gate.reason
+        # "未通过"本身含"通过"两字，故逐项排除肯定式通过断言，而不是简单查子串。
+        for forbidden in ("小循环通过", "已完成并通过独立验收", "已通过验收"):
+            assert forbidden not in gate.reason, gate.reason
+        assert "已完成并产出三类审核报告" not in gate.summary
 
     def test_replay_of_real_gate_401a97_scenario_no_longer_misleading(self, isolated_data):
         """A 部分：重放 gate-401a97 的真实场景——P5 判定 rework_required，Gate 创建时

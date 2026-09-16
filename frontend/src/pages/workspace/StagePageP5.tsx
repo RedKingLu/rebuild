@@ -195,29 +195,55 @@ function StagesBlock({ stages }: { stages: any[] }) {
   );
 }
 
-export function StagePageP5({ projectId, runId = '', stageStatus: _stageStatus, onReExecute: _onReExecute }: Props) {
+export function StagePageP5({ projectId, runId = '', stageStatus, onReExecute: _onReExecute }: Props) {
   const [p5Input, setP5Input] = useState<any>(null);
   const [gate, setGate] = useState<GateInfo>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // B-ACC-FE-423-CONSOLE：P5 输入被后端加锁（423）时的诚实原因，用于渲染空态说明。
+  const [lockedReason, setLockedReason] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);
     setError(null);
+    setLockedReason(null);
     try {
       const rid = runId || '';
-      const idxRes = rid
+      // ── B-ACC-FE-423-CONSOLE（P2）─────────────────────────────────────────
+      // 旧代码无条件 fetch `/p5/input`。P4 未完成时后端**正确**返 423 Locked
+      // （D-023/D-092 诚实加锁），但浏览器会为每个 4xx 响应在 console 落一条
+      // `Failed to load resource: … 423 (Locked)` —— 这是浏览器网络层自己打的，
+      // **JS 侧无法抑制**，唯一的消除办法就是不发这个请求。
+      // 本轮真跑中它是全流程唯一的 console error 来源（其余 5 页 / 3 面板均为 0），
+      // 留着它就无法建立"console 零错误"这条可观测性基线，未来真错误会被噪声掩盖。
+      //
+      // 判据用**已有的**阶段状态（父组件 WorkspacePage 传入 `run.stage_status.p5`），
+      // 不新增任何探测请求：`not_enabled` 恒等于"P4 未完成、P4→P5 Gate 未通过"
+      // （gate_service._apply_promotion 只在上一阶段批准后才把下一阶段置 in_progress）。
+      // `stageStatus` 为 undefined 时**照旧发请求**（保持既有行为，不因判据缺失而误伤）。
+      const p5NotEnabled = stageStatus === 'not_enabled';
+      const idxRes = (rid && !p5NotEnabled)
         ? fetch(`/api/projects/${projectId}/runs/${rid}/p5/input`)
         : Promise.resolve(null);
       const gateRes = fetch(`/api/projects/${projectId}/gates/active`);
 
       const [idx, g] = await Promise.all([idxRes, gateRes]);
+      if (p5NotEnabled) {
+        setLockedReason('P4 尚未完成（P5 阶段未启用），P5 输入尚未就绪。');
+      }
       // R19-3-03：Response.json() 只能读一次。旧版写成 `(await r.json()).data || (await r.json())`,
       // 当后端返回无 data 字段的裸对象时，第二次 json() 因 body 已消费而抛
       // "body stream already read"，整页被 catch 吞成加载失败。改为读一次再取字段。
       if (idx && idx.ok) {
         const pd = await idx.json();
         setP5Input(pd?.data ?? pd);
+      } else if (idx && idx.status === 423) {
+        // 加锁是**预期且正确**的语义（不得靠让后端不返 423 来解除，见台账解除条件 ③）。
+        // 旧代码把所有非 2xx 一律静默丢弃 ⇒ 423（预期加锁）与 500（真故障）不可区分。
+        // 此处只对 423 走诚实空态，其余非 2xx 走 error 分支照常发声。
+        setLockedReason('P5 输入未就绪：P4→P5 Gate 未通过或 P4 未完成（后端 423 Locked）。');
+      } else if (idx && !idx.ok) {
+        setError(`P5 输入读取失败（HTTP ${idx.status}）`);
       }
       if (g.ok) {
         const gj = await g.json();
@@ -231,7 +257,7 @@ export function StagePageP5({ projectId, runId = '', stageStatus: _stageStatus, 
     }
   };
 
-  useEffect(() => { load(); }, [projectId, runId]);
+  useEffect(() => { load(); }, [projectId, runId, stageStatus]);
 
   const isGateOpen = gate && gate.gate_status === 'waiting_decision';
   // R12-18 修复 R12-4-04：优先使用 p5_validation_report（handler 执行后持久化的真实结果）
@@ -287,6 +313,8 @@ export function StagePageP5({ projectId, runId = '', stageStatus: _stageStatus, 
 
       {!loading && !p5Input && !error && (
         <div style={{ ...card, color: 'var(--color-text-muted)' }}>
+          {/* B-ACC-FE-423-CONSOLE：加锁时给出诚实原因，而不是只留一句通用引导语 */}
+          {lockedReason && <div style={{ marginBottom: 6 }}>{lockedReason}</div>}
           P4 完成后，P5 将在此展示全量验证结果（构建 / 运行 / 测试 / 静态检查）。
         </div>
       )}

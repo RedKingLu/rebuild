@@ -1601,11 +1601,21 @@ class RealP4Handler:
         dep_check_ref, dep_check_doc, dep_evidence_id = await self._run_dependency_check(
             project_id, run_id)
 
+        # B-V262-DUP-SYMBOL-CROSSNODE + B-V262-UNDECLARED-DEP：P4 尾部再做一次**产出物整体
+        # 一致性**静态核查（跨文件重复符号 + 用了但未声明的依赖）。定位与依赖校验逐条同构：
+        # 只读、不改任何产出文件、**不参与门禁**（不读不改 status/graph_status/criteria_met）、
+        # 结论一律 needs_human_review（暴露≠拦截，R19-2-03）。
+        # 归口 P4 而非 P5 的理由见 services/output_code_consistency 模块 docstring
+        # （真跑实测 NU1605 依赖还原失败会物理遮蔽后续编译错误 ⇒ 绑在构建成功上等于让缺陷继续隐身）。
+        consistency_ref, consistency_doc, consistency_evidence_id = \
+            await self._run_output_consistency_check(project_id, run_id)
+
         # C7: write a structured P4 execution-summary report (change manifest + patch index +
         # per-node results) — the primary readable review material attached to the P4→P5 Gate.
         summary_ref = self._write_execution_summary(
             project_id, tg, exec_nodes, eng, p4_ev, patch_refs,
-            node_type_dist, acceptance_results, dep_check_doc=dep_check_doc)
+            node_type_dist, acceptance_results, dep_check_doc=dep_check_doc,
+            consistency_doc=consistency_doc)
 
         # graph_status → handler status：completed→completed；其余（failed/waiting_gate/blocked/
         # rework_required）→ blocked（诚实非 completed，交 StageLoop 升级 Gate / 准备 P4→P5 Gate）。
@@ -1784,9 +1794,93 @@ class RealP4Handler:
                     ref, counts.get("coordinates", 0), counts.get("unresolvable", 0))
         return ref, doc, evidence_id
 
+    async def _run_output_consistency_check(
+            self, project_id: str, run_id: str) -> tuple[str | None, dict | None, str | None]:
+        """B-V262-DUP-SYMBOL-CROSSNODE + B-V262-UNDECLARED-DEP：产出物整体一致性静态核查。
+
+        产出独立主产物 `artifacts/p4/p4_output_consistency.json` + AET Evidence。
+        两条缺陷合在一个产物里，是因为它们**同属一个此前无守卫的维度**（产出物整体一致性），
+        且都只需要对 `output_code/` 做一次静态索引 —— 拆成两个产物会让读者以为它们是两件
+        不相关的事，也会把同一次全树遍历做两遍。
+
+        定位纪律（与 `_run_dependency_check` 逐条同构，不另立规矩）：
+        本方法【不产 pass/通过 结论】、【不参与门禁】——不读也不改 criteria_met/graph_status/
+        status，失败即诚实降级为 (None, None, None)，绝不让本核查的异常影响 P4 完成判定。
+
+        独立取证红线：不 import 任何 p5_* 模块、不读 `artifacts/p5_validation_report.json`。
+        """
+        try:
+            from app.services import manifest_parsers, output_code_consistency
+            from app.services.workspace_service import workspace_path
+            output_code_dir = workspace_path(project_id) / "output_code"
+            # 清单解析走与依赖校验**同一个纯函数层**（manifest_parsers），不写第二份解析。
+            # 这里会对清单**再解析一遍**（`_run_dependency_check` 内部也解析过一次）——
+            # 如实说明而不假装复用：要真正复用就得改 `run_dependency_check` 的公开签名把
+            # manifests 传进去/带出来，为一次纯本地文件读的微优化改公开接口不值得（KISS）。
+            # 成本可控：`discover_manifests` 只按 5 个文件名模式 glob，不读源码文件。
+            manifests = manifest_parsers.parse_all_manifests(output_code_dir)
+            doc = output_code_consistency.run_consistency_check(
+                output_code_dir, manifests, run_id)
+        except Exception:
+            logger.warning("P4 产出物一致性核查执行失败（advisory，不影响 P4 完成判定）",
+                           exc_info=True)
+            return None, None, None
+        if doc is None:
+            # output_code/ 下无任何可索引的 C#/Java 源文件 —— 没有可判的对象，不产噪音产物。
+            return None, None, None
+
+        ref = stage_artifact_ref("p4", "p4_output_consistency.json")
+        try:
+            _mediated_write(project_id, ref, json.dumps(doc, ensure_ascii=False, indent=2),
+                            auditor=self.auditor, stage="p4",
+                            action="write_output_consistency")
+        except Exception:
+            logger.warning("P4 产出物一致性核查产物写入失败（advisory）", exc_info=True)
+            return None, None, None
+
+        counts = doc.get("counts", {})
+        artifact_sha256 = hashlib.sha256(
+            json.dumps(doc, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        findings_brief = (
+            [f"重复符号：{c['symbol']}（{c['file_count']} 个文件）"
+             for c in doc.get("duplicate_symbols", [])]
+            + [f"用了但未声明：{f['namespace']}（{f['reference_count']} 处引用）"
+               for f in doc.get("undeclared_dependencies", [])]
+        )
+        evidence_id = f"ev-p4-consistency-{(run_id or 'norun')[:8]}"
+        try:
+            aet = self._aet if self._aet is not None else self._services().aet_service
+            aet.write_evidence(
+                project_id,
+                evidence_id=evidence_id,
+                evidence_type="output_consistency",
+                status="candidate", source="p4", stage="p4",
+                claim=(f"P4 产出物一致性核查：索引 {counts.get('files_scanned', 0)} 个源文件 / "
+                      f"{counts.get('symbols_indexed', 0)} 个顶层类型，检出 "
+                      f"{counts.get('duplicate_symbol_conflicts', 0)} 处跨文件重复符号、"
+                      f"{counts.get('undeclared_dependencies', 0)} 处用了但未声明的依赖"),
+                extra={
+                    # 陷阱：D-111 幽灵过滤要求 run_id 匹配，否则 Evidence 被静默剔除
+                    "run_id": run_id,
+                    "artifact_ref": ref,
+                    "artifact_sha256": artifact_sha256,
+                    "counts": counts,
+                    "findings_brief": findings_brief,
+                    "evidence_basis": "static_index_of_output_code",
+                    "boundary": doc.get("boundary", {}),
+                })
+        except Exception:
+            logger.warning("P4 产出物一致性核查 Evidence 写入失败（advisory）", exc_info=True)
+            return ref, doc, None
+        logger.info("R24: wrote P4 output consistency %s (%d dup-symbol, %d undeclared-dep)",
+                    ref, counts.get("duplicate_symbol_conflicts", 0),
+                    counts.get("undeclared_dependencies", 0))
+        return ref, doc, evidence_id
+
     def _write_execution_summary(self, project_id, tg, exec_nodes, eng, p4_evidence,
                                  patch_refs, node_type_dist,
-                                 acceptance_results, dep_check_doc: dict | None = None) -> str | None:
+                                 acceptance_results, dep_check_doc: dict | None = None,
+                                 consistency_doc: dict | None = None) -> str | None:
         """C7: persist a structured P4 execution summary to artifacts/p4/p4_execution_summary.json.
 
         Contains a change manifest (output_code files with real sha256/bytes), a patch index,
@@ -1915,6 +2009,31 @@ class RealP4Handler:
                 unresolved_scope.append(
                     f"依赖不可解析：{brief} → 待用户修复；平台只暴露不代改（R19-2-03）")
 
+        # B-V262-DUP-SYMBOL-CROSSNODE + B-V262-UNDECLARED-DEP：把产出物一致性核查的检出项
+        # 写进 unresolved_scope，使"这些发现"出现在 P4 执行摘要这一**用户 Gate 主审核材料**里
+        # —— 光有独立产物不够：两条缺陷的共同教训正是"信号建好了但阶段产物看不见"
+        # （同 B-ACC-HELD-ACTION-INVISIBLE 的模式）。
+        output_consistency_ptr = None
+        if consistency_doc:
+            oc_counts = consistency_doc.get("counts", {})
+            output_consistency_ptr = {
+                "ref": stage_artifact_ref("p4", "p4_output_consistency.json"),
+                "status": consistency_doc.get("status"),
+                "files_scanned": oc_counts.get("files_scanned", 0),
+                "symbols_indexed": oc_counts.get("symbols_indexed", 0),
+                "duplicate_symbol_conflicts": oc_counts.get("duplicate_symbol_conflicts", 0),
+                "undeclared_dependencies": oc_counts.get("undeclared_dependencies", 0),
+                "boundary": consistency_doc.get("boundary", {}),
+            }
+            for c in consistency_doc.get("duplicate_symbols", []):
+                unresolved_scope.append(
+                    f"跨文件重复符号：{c['symbol']} 在 {c['file_count']} 个文件中各声明一次"
+                    f"（C# CS0101/CS0111，工程将无法编译）→ 需人工复核；平台只暴露不代改")
+            for f in consistency_doc.get("undeclared_dependencies", []):
+                unresolved_scope.append(
+                    f"用了但未声明的依赖：{f['namespace']}（{f['reference_count']} 处引用）"
+                    f"→ 需人工复核；平台只暴露不代改")
+
         _sec_hints = ("auth", "登录", "login", "密码", "password", "ldap", "权限",
                       "permission", "token", "会话", "session", "认证")
         security_notes = [
@@ -1948,6 +2067,12 @@ class RealP4Handler:
         }
         if dependency_check_ptr:
             summary["dependency_check"] = dependency_check_ptr
+        # B-V262-DUP-SYMBOL-CROSSNODE / B-V262-UNDECLARED-DEP：产出物一致性核查指针 +
+        # unresolved_scope 只读追加。与 dependency_check 同款处理：**只放指针+摘要**，
+        # 全量在独立产物 artifacts/p4/p4_output_consistency.json 里；不改本函数早退语义、
+        # 不改 P4 status/graph_status/criteria_met。
+        if output_consistency_ptr:
+            summary["output_consistency"] = output_consistency_ptr
         out = out_dir / "p4_execution_summary.json"
         ref = _mediated_write(project_id, stage_artifact_ref("p4", out.name),
                               json.dumps(summary, ensure_ascii=False, indent=2),

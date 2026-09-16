@@ -1,7 +1,7 @@
 """P5 输入事实源服务（R12-3-C1）。
 
 权威路径：**DB artifact refs + 项目工作区文件路径**（D-105②）。
-不新增顶层 ``/home/king/rebuild/output_code/`` 或 ``patches/`` 第二事实源。
+不新增顶层 ``<repo>/output_code/`` 或 ``patches/`` 第二事实源。
 
 职责：
   给定 project_id / run_id，为 RealP5Handler（C3 起）提供对 P4 产物的稳定读取：

@@ -782,8 +782,11 @@ class WorkAgent:
         from app.graph.stage_reports import StageReports
         reports = StageReports(self.project_id, self.stage)
         # D-10：validation_verdict 从真实落盘的独立验收结论取值（不再硬传 None）。
+        # B-ACC-HELD-ACTION-INVISIBLE：传 run_id，使 held_actions 采集能按 (run, stage) 过滤
+        # （不传则退化为 project+stage 采集，仍会采集，但可能带上别的 run 的挂起动作）。
         ref = reports.gate_brief(**partial, validation_verdict=self._validation_verdict(),
-                                 claim_evidence_summary={"total": len(entries)})
+                                 claim_evidence_summary={"total": len(entries)},
+                                 run_id=self.run_id or "")
         return partial, ref
 
     # ── 通用 evidence map（fact/claim）+ LLM 内联引用合成 ──────────────────

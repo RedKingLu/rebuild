@@ -161,6 +161,10 @@ def _finalize_agent_gate_material(stage: str, project_id: str, run_id: str,
             honest_notes=partial.get("honest_notes", ""),
             validation_verdict=verdict,
             claim_evidence_summary=cem_summary,
+            # B-ACC-HELD-ACTION-INVISIBLE：这一份是**覆写**到同一路径的最终 Gate Brief
+            # （见本函数 docstring）。run_id 必须传下去，否则 held_actions 段会按 project
+            # 级采集，可能带上别的 run 的挂起动作。
+            run_id=run_id or "",
         )
     except Exception:
         gb_ref = wa.gate_brief_ref

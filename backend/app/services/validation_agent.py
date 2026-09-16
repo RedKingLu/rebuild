@@ -50,6 +50,10 @@ class ValidationResult:
     recommendations: list = field(default_factory=list)
     claim_evidence_verification: dict = field(default_factory=dict)
     read_from_disk_only: bool = True
+    # B-ACC-HELD-ACTION-INVISIBLE 解除条件 ①：本阶段因待审批而未执行的动作。
+    # 【勿删】没有它，`{stage}_validation.json` 会在有 L4 动作被 fail-closed 拦下的情况下
+    # 仍然只写 `issues: []`，读报告的人必须去翻 Trace 才能知道"有动作没跑"。
+    held_actions: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -63,6 +67,8 @@ class ValidationResult:
             "recommendations": self.recommendations,
             "claim_evidence_verification": self.claim_evidence_verification,
             "read_from_disk_only": self.read_from_disk_only,
+            "held_actions": self.held_actions,
+            "held_action_count": len(self.held_actions),
             "validated_at": _now(),
         }
 
@@ -268,11 +274,33 @@ class ValidationAgent:
                     }})
         verdict = self._verdict_for(passed, acc, declared)
 
+        # ⑥ B-ACC-HELD-ACTION-INVISIBLE 解除条件 ①②：把"本阶段有 N 个动作因待审批未执行"
+        #    写进验收报告。采集实现与 stage_reports.gate_brief 共用同一份
+        #    （services/held_actions），不抄第二份判据。
+        #    **刻意不 flip passed、也不塞进 issues**（理由见 held_actions 模块 docstring：
+        #    动作被挂起是设计如此，公理 6；而 review_pass 会拿 issues 驱动整阶段返工重跑）。
+        #    走 `held_actions` 独立段 + 一条 checks 记录两条可见通道。
+        held: list = []
+        try:
+            from app.services.held_actions import collect_held_actions
+            held = collect_held_actions(self.project_id, self.run_id or "", self.stage)
+        except Exception:
+            logger.warning("独立验收：挂起动作采集不可用 stage=%s —— held_actions 段为空"
+                           "【不代表无挂起动作】", self.stage, exc_info=True)
+        checks.append({
+            "item": "挂起动作可见性（因待审批未执行的动作）",
+            # passed 语义 = "本项检查本身完成了"，不是"没有挂起动作"——有挂起动作是合法状态。
+            "passed": True,
+            "reason": (f"{len(held)} 个动作因待审批未执行："
+                       f"{[h['gate_id'] for h in held]}" if held else "无挂起动作"),
+            "evidence_ref": None,
+        })
+
         result = ValidationResult(
             stage=self.stage, passed=passed, verdict=verdict,
             agent_id=acc.get("agent_id"), checks=checks, issues=issues,
             recommendations=recs, claim_evidence_verification=cev_verification,
-            read_from_disk_only=True,
+            read_from_disk_only=True, held_actions=held,
         )
         self.last_result = result
         self._persist(result)
@@ -390,11 +418,32 @@ class ValidationAgent:
     def _is_p1_honest_placeholder(data) -> bool:
         """识别 stage_handlers.RealP1Handler 写盘的诚实占位形态：
         `{"identification_note": "LLM 未产出 {key}（诚实标注，未伪造）"}`（见 stage_handlers.py
-        执行路径，只读参照，不改动）。产物缺失/不可解析同样代表该产物未真实产出，一并计入占位。"""
-        if not isinstance(data, dict):
+        执行路径，只读参照，不改动）。产物缺失/不可解析同样代表该产物未真实产出，一并计入占位。
+
+        ── B-ACC-ONBOARD 系列之外的一条：B-ACC-P1-LIST-FALSE-PLACEHOLDER（P2）────────
+        原实现首句是 `if not isinstance(data, dict): return True` —— **任何非 dict 产物
+        （含内容充实的合法 JSON 数组）一律判为"未产出"**。真跑实测 `p1_validation.json`
+        因此写下事实错误的断言「1/8 项为诚实占位（LLM 未产出）：['entry_points']」，
+        而 `artifacts/p1/entry_points.json` 是 4878 字节、15 条、每条带 path/kind/why 的
+        充实数组。方向是"过度报告"（把真实产物报成未产出），触及"声称与产出不符"。
+
+        修法（解除条件 ①）：非 dict 时只有**真正缺失/为空**才算占位：
+          · None（`_read_json` 读不到或不可解析）→ 占位；
+          · 空 list / 空 tuple / 空 set / 空 str → 占位（无实质内容）；
+          · **非空** list / str / 标量 → 不是占位（有实质内容）。
+        **dict 分支逐字不变**（含"空 dict 不算占位"这一既有行为）—— 台账登记的缺陷只在
+        非 dict 这一支；顺手改 dict 分支会让 `_P1_MAJOR_GAP_THRESHOLD` 的触发面发生
+        未登记的变化（空 dict 会新增计入占位 ⇒ 更容易 hard_fail），属本轮明令禁止的
+        "顺手重构"，不做。
+        """
+        if isinstance(data, dict):
+            if set(data.keys()) == {"identification_note"}:
+                return "LLM 未产出" in str(data.get("identification_note", ""))
+            return False
+        if data is None:
             return True
-        if set(data.keys()) == {"identification_note"}:
-            return "LLM 未产出" in str(data.get("identification_note", ""))
+        if isinstance(data, (list, tuple, set, str, bytes)):
+            return len(data) == 0
         return False
 
     def _p1_domain_completeness_check(self) -> tuple[list, list, bool]:

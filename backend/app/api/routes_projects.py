@@ -512,6 +512,21 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
         raise HTTPException(404, f"Project {project_id} not found")
 
     # 1. Update Environment Profile
+    # ── B-ACC-ONBOARD-SWALLOW（P2）────────────────────────────────────────────
+    # 原代码：`try: update_environment(...) except Exception: logger.warning(...)`
+    # —— 裸 except 把**输入校验失败**也吞了。实测传 `env_kind: "container"` 时
+    # `workspace_service.update_environment` 正确 `raise ValueError("无效 env_kind：…")`，
+    # 但接口仍返 **200 且 warnings: []**，而 `.rebuild/environment.json` 完全未更新。
+    # 连带损失比单字段更重：`env_kind` / `language_hint` / `framework_hint` / `status`
+    # **同在一个 dict 中被原子拒绝**，调用方声明的 language_hint / framework_hint 一并丢失，
+    # 且调用方无从得知。违 AGENTS §10-21（静默 except，异常必须发声）之精神。
+    #
+    # 修法（解除条件 ①②）：按异常性质分治，**不再用一个 except 覆盖两类**——
+    #   · ValueError = 输入校验失败 ⇒ **422**（与 schema 层一致，边界失败要快）。
+    #     置于 svc.update() 之前，故 422 时项目尚未被改动，不留半截状态。
+    #   · 其余异常 = 落盘 IO 类 ⇒ 可降级，但**必须经响应 warnings 字段回传**给调用方，
+    #     不再只写服务端日志（"记了日志"不等于"告知了调用方"）。
+    warnings: list[str] = []
     try:
         from app.services.workspace_service import update_environment
         env_updates = {"status": "declared"}
@@ -522,8 +537,14 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
         if req.framework_hint:
             env_updates["framework_hint"] = req.framework_hint
         update_environment(project_id, env_updates)
-    except Exception:
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except Exception as exc:
         logger.warning("Environment update failed", exc_info=True)
+        warnings.append(
+            f"环境档案写入失败（{type(exc).__name__}）：本次声明的 env_kind / language_hint / "
+            f"framework_hint 均未落盘（同一 dict 原子写入），请重试或改用 "
+            f"PATCH /projects/{project_id}/environment 单独设置。")
 
     # 2. Update Project
     updates = {"onboarding_done": True}
@@ -697,7 +718,8 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
         "graph_driven": False,
         "next": "点击『开始』(POST /onboarding/execute) 启动 P0 图执行",
     }
-    return SuccessEnvelope(data=_resp_data, meta=Meta())
+    # B-ACC-ONBOARD-SWALLOW：可降级的落盘失败经 warnings 回传（空列表 = 无降级，语义不变）。
+    return SuccessEnvelope(data=_resp_data, meta=Meta(), warnings=warnings)
 
 
 # ── P1 Full-Stack Profiling (R9-3C) ─────────────────────────────────────

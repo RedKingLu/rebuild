@@ -42,7 +42,18 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_DB = "/home/king/rebuild/backend/.data/rebuild.db"
+# Q-R22-9 同族（第 5 处，台账只记了 config.py 的 4 处）：这里原本也是
+# `"/home/king/rebuild/backend/.data/rebuild.db"` 字面量 —— 同样把开发者主目录带进
+# 将要公开的代码，且任何其他克隆者拿到的都是失效路径。
+# 修法与 config.py 同源：复用 `core.config.BACKEND_DIR`（**同一个单一事实源**，不在本文件
+# 复制第二份 parents[N] 推导）。
+#
+# 刻意**不**改成读 `settings.database_url`：那会让本常量随测试夹具的隔离库/环境变量变化，
+# 即在"去掉硬编码"之外附带一个未登记的行为变更（本轮例外授权第 ② 条：行为不变）。
+# 需要指向别的库时，三个公开函数都已支持显式传 `db_path=`，那才是正确用法。
+from app.core.config import BACKEND_DIR as _BACKEND_DIR
+
+DEFAULT_DB = str(_BACKEND_DIR / ".data" / "rebuild.db")
 
 # ── (code, message) 二元组的 code 常量（模块级字符串，刻意不用 Enum：
 #    沿用 R20-3 ③§5.5 的论证——封闭 code 清单会撞 AGENTS §10-27）──

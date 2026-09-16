@@ -31,6 +31,81 @@ def _read_gate_brief(project_id: str, artifact_refs: List[str]) -> Optional[dict
     return None
 
 
+# ── B-V262-GATEREASON-HARDCODED：晋级 Gate 文案按独立验收 verdict 的真实取值分派 ──────
+#
+# 原缺陷（本文件旧 :105 行）：
+#     reason = f"{stage} 阶段已完成并通过独立验收，请求阶段晋级{verdict_txt}"
+# "已完成并通过独立验收"是**无条件断言**，真实 verdict 只被拼进后面括号里的 verdict_txt。
+# 于是 verdict == "rework_required" 时产出：
+#     「p2 阶段已完成并通过独立验收，请求阶段晋级（独立验收：rework_required，2 项问题）」
+# —— 前半句断言通过、后半句写着需返工，**字面语义自相矛盾**。用户若照前半句批准，平台上
+# 就留下一次伪造的"通过"记录（gate-401a97 的形态）。
+#
+# 为什么旧的返工分支没兜住：那一支（下方 `_rework_target`）的触发条件是
+# metadata["rework_target_stage"] 非空，而该字段只由 nodes.py 的 make_work_node 在
+# P5FailureRouter 判 p4_rework_required 时写入 ⇒ **只覆盖 P5**。P0~P4 任一阶段判
+# rework_required 时全部落进上面那句硬编码文案（台账解除条件 ③ 要求覆盖 P0~P4）。
+#
+# 修法（解除条件 ①③，单一数据源）：**直接读已经拿在手里的 brief["validation_verdict"]
+# ["verdict"]** 分派文案，不再靠 metadata 反推。verdict 的取值来源是
+# validation_agent._verdict_for()（accepted / accepted_with_warning / rework_required）
+# 与 acceptance_service 的 result（conditional_pass / blocked 等），此处按"是否代表通过"
+# 二分，未登记取值一律走"结论无法识别"的诚实分支——**绝不默认成通过**。
+_VERDICT_PHRASE: dict[str, tuple[str, bool]] = {
+    # verdict → (阶段状态陈述, 是否代表"未通过")
+    "accepted": ("已完成并通过独立验收", False),
+    "accepted_with_warning": ("已完成，独立验收通过但带告警", False),
+    "conditional_pass": ("已完成，独立验收有条件通过", False),
+    "rework_required": ("未通过独立验收，判定需要返工", True),
+    "rework": ("未通过独立验收，判定需要返工", True),
+    "blocked": ("未通过独立验收，判定阻塞", True),
+    "failed": ("未通过独立验收，判定失败", True),
+    "gate_required": ("未取得独立验收通过结论，判定需人工裁决", True),
+}
+# 三种"没有可信通过结论"的兜底，全部按未通过处理（fail-closed 的文案版本：宁可让用户多看
+# 一眼产物，不可让平台替验收结论下断言）。
+_VERDICT_UNKNOWN = ("执行结束，但独立验收结论无法识别", True)
+_VERDICT_ABSENT = ("执行结束，未取得独立验收结论", True)
+# 解除条件 ④：无 brief 时的旧兜底文案是 `{stage} 小循环通过，请求阶段晋级` +
+# `{stage} 阶段已完成并产出三类审核报告，请审阅后决策。`——"小循环通过"同样是在**断言一个
+# 本函数并未读到任何证据的结论**（brief 读不到就意味着验收结论不可知）。同批改为诚实表述。
+_VERDICT_NO_BRIEF = ("执行结束，但未能读取独立验收报告，验收结论未知", True)
+_NOT_PASSED_WARNING = "批准即在验收未通过/未知的情况下晋级，请先查阅本阶段验收报告再决策。"
+
+
+def _promotion_gate_texts(stage: str, brief: Optional[dict]) -> tuple[str, str]:
+    """合成 stage_promotion Gate 的 (reason, summary)，文案由真实 verdict 决定。
+
+    brief is None → 连验收报告都没读到（_VERDICT_NO_BRIEF）。
+    brief 有但无 validation_verdict → _VERDICT_ABSENT。
+    verdict 不在 _VERDICT_PHRASE → _VERDICT_UNKNOWN（**不当成通过**）。
+    """
+    if brief is None:
+        phrase, not_passed = _VERDICT_NO_BRIEF
+        reason = f"{stage} 阶段{phrase}，请求阶段晋级"
+        return reason + f"。{_NOT_PASSED_WARNING}", (
+            f"{stage} 阶段执行结束，但未能读取独立验收报告 —— {_NOT_PASSED_WARNING}")
+
+    what = brief.get("what_happened") or f"{stage} 阶段已完成"
+    vv = brief.get("validation_verdict") or {}
+    verdict = str(vv.get("verdict") or "").strip().lower()
+    if not vv or not verdict:
+        phrase, not_passed = _VERDICT_ABSENT
+        verdict_txt = ""
+    else:
+        phrase, not_passed = _VERDICT_PHRASE.get(verdict, _VERDICT_UNKNOWN)
+        verdict_txt = f"（独立验收：{vv.get('verdict', '')}，{vv.get('issues_count', 0)} 项问题）"
+
+    reason = f"{stage} 阶段{phrase}，请求阶段晋级{verdict_txt}"
+    if not_passed:
+        reason += f"。{_NOT_PASSED_WARNING}"
+    notes = brief.get("honest_notes") or ""
+    summary = what + (f" {notes}" if notes else "")
+    if not_passed:
+        summary = f"{summary} {_NOT_PASSED_WARNING}".strip()
+    return reason, summary
+
+
 def _project_name(project_id: str) -> str:
     """取项目名（欢迎语用）。失败返 None。"""
     try:
@@ -94,19 +169,9 @@ class RealGateBackend:
             else:
                 # R17.3-6 WP-2 (AGT-02/D-101): 若 artifact_refs 含真实 Gate Brief 落盘报告，
                 # 读其 what_happened / validation_verdict 合成真实 summary/reason（替换硬编码模板）。
-                brief = _read_gate_brief(project_id, artifact_refs)
-                if brief:
-                    what = brief.get("what_happened") or f"{stage} 阶段已完成"
-                    vv = brief.get("validation_verdict") or {}
-                    verdict_txt = ""
-                    if vv:
-                        verdict_txt = f"（独立验收：{vv.get('verdict','')}，{vv.get('issues_count',0)} 项问题）"
-                    notes = brief.get("honest_notes") or ""
-                    reason = f"{stage} 阶段已完成并通过独立验收，请求阶段晋级{verdict_txt}"
-                    summary = what + (f" {notes}" if notes else "")
-                else:
-                    reason = f"{stage} 小循环通过，请求阶段晋级"
-                    summary = f"{stage} 阶段已完成并产出三类审核报告，请审阅后决策。"
+                # B-V262-GATEREASON-HARDCODED：文案分派整体移到模块级 _promotion_gate_texts()，
+                # 由真实 verdict 决定"通过/未通过/未知"，见该函数上方的根因说明。
+                reason, summary = _promotion_gate_texts(stage, _read_gate_brief(project_id, artifact_refs))
                 retry_action = None
         gate = gs.create(
             project_id=project_id, run_id=run_id or "", stage=stage,

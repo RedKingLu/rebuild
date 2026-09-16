@@ -147,6 +147,55 @@ def _stage_has_real_artifact(svc, run_id: str, stage: str, artifact_refs: list |
         return True
 
 
+# ── B-V262-ACTIVEGATE-NOORDER：`get_active()` 的语义定义（本注释即该语义的详述源）──────
+#
+# 【语义】`get_active(project_id)` 返回「本项目当前**阻塞流程推进**的那一个待决 Gate」。
+#   不是"最新的待决 Gate"，也不是"任意一个待决 Gate"。要列举全部待决 Gate 用
+#   `list_by_project()` / `GET /api/projects/{id}/gates`——本方法是单槽位，天然只能返一个。
+#
+# 【为什么按"阻塞性"而不是按时间】待决 Gate 分两类，**性质不同**：
+#   ① 流程阻塞类：图在它上面 interrupt 了，不决策则阶段无法推进
+#      （stage_promotion / plan_review / plan_presentation / source_pending / model_unavailable）；
+#   ② 动作审批类：只挂住**一次工具调用**，阶段本身继续跑，且**按设计可能长期挂着不批**
+#      （action_approval / l5_high_risk_command / high_risk_action /
+#        community_resource_introduction / desensitization_release）。
+#   两类混在一个槽位里抢占，无论按"最早"还是"最新"排序都会互相遮蔽（台账 ⚠ 修法警示）。
+#   ⇒ 唯一正确的修法是按类分流：①  永远优先于 ②。
+#
+# 【判据为何取 checkpoint_ref 而不是 gate_type 名单】`checkpoint_ref` 只由
+#   `gate_backend.RealGateBackend.create()`（本仓唯一的图侧建 Gate 入口，:120
+#   `checkpoint_ref=run_id or None`）写入 ⇒ **"有 checkpoint_ref" 等价于"这是图的一个暂停点"**，
+#   这是结构事实，不随 gate_type 名单漂移；日后新增任何图暂停类型自动落进 ① 类，无名单可维护
+#   （与 routes_stages._promotion_gate_candidates 用"图暂停点"做判据的既有取向一致）。
+#   `_FLOW_BLOCKING_GATE_TYPES` 只作**补充**，覆盖 run_id 为空（checkpoint_ref 因此为 NULL）
+#   或经 `POST /gates` / 测试夹具直建的流程类 Gate ——两个条件取并集，只做"提升"不做"降级"，
+#   故不会把任何现有流程类 Gate 误判成动作类。
+#
+# 【同类内的取序】保持既有 `ORDER BY gate_id` 升序，**刻意不改**。理由：`Gate.gate_id` 是
+#   `gate-{uuid4().hex[:6]}`（models/gate.py:12），与创建时间**无关**，且 Gate 表**没有
+#   created_at 列** ⇒ "最新优先"在当前 schema 下根本无法表达。硬加 DESC 只是换一个同样与
+#   时间无关的任意序，却会改变所有既有单 Gate 之外场景的返回值。同类内出现多个待决 Gate
+#   本身是异常（B-R22-GATE-REDECIDE-REDRIVE 曾实测产生 5 个重复 p1 晋级 Gate），已由
+#   routes_stages 的 409「有 N 个待决 Gate，请传 gate_id」正面处理，不靠本方法猜。
+#   ⇒ 「按创建时间取最新」须先加 created_at 列（Alembic 迁移），已作为待确认项上报，不在本次范围。
+_FLOW_BLOCKING_GATE_TYPES = frozenset({
+    "stage_promotion", "plan_review", "plan_presentation",
+    "source_pending", "model_unavailable",
+})
+
+
+def _is_flow_blocking(g) -> bool:
+    """该 Gate 是否属于「不决策则流程无法推进」的一类（语义详述见上方注释块）。
+
+    入参刻意不标注具体类型：本函数同时被喂 ORM `Gate`（本文件 `get_active` 内）与
+    `GateResponse`（`services/held_actions` 走 `list_by_project()` 的返回值）。两者都有
+    `checkpoint_ref` / `gate_type` 两个字段，判据只用这两个 ⇒ 一份实现服务两种载体，
+    不为了类型标注而复制第二份判据（那正是本仓反复登记的"同一件事两份判据必然漂移"）。
+    """
+    return bool(getattr(g, "checkpoint_ref", None)) or \
+        (getattr(g, "gate_type", "") or "") in _FLOW_BLOCKING_GATE_TYPES
+
+
 def _gate_to_response(g: Gate) -> GateResponse:
     # P2-C: graph capability must be a REAL probe, never the schema default
     # "not_connected" (state.py 红线：不得写死 not_connected). "live" when the
@@ -209,13 +258,36 @@ class GateService:
             db.close()
 
     def get_active(self, project_id: str) -> Optional[GateResponse]:
+        """返回本项目**当前最该由用户处理的那一个**待决 Gate。见 _is_flow_blocking 的语义定义。
+
+        B-V262-ACTIVEGATE-NOORDER：旧实现是无 `ORDER BY` 的 `.first()`，SQLite 下实际返回
+        **最早**那条 `waiting_decision` Gate。而 `action_approval` 类 Gate **按设计会长期挂着
+        不批**（没人会为一条只读的 `find` 命令签核），它建得早就**永久占据**本方法这个槽位 ⇒
+        之后所有阶段晋级 Gate 在本端点上永不可见，而前端 StagePageP4/P5/P6 消费的正是本端点。
+
+        **不能**只加 `ORDER BY ... DESC` 收口（台账 ⚠ 修法警示）：那只是把遮蔽方向从"旧遮蔽新"
+        翻成"新遮蔽旧"，新建的 action_approval 反过来遮蔽晋级 Gate，问题类型不变。故按
+        **阻塞性语义分流**（解除条件 ②），两类不再互相抢占同一槽位。
+        """
         db = self._db()
         try:
-            g = db.query(Gate).filter(
-                Gate.project_id == project_id,
-                Gate.gate_status == "waiting_decision",
-            ).first()
-            return _gate_to_response(g) if g else None
+            pending = (
+                db.query(Gate)
+                .filter(Gate.project_id == project_id,
+                        Gate.gate_status == "waiting_decision")
+                .order_by(Gate.gate_id)   # 同类内取序确定化，见 _is_flow_blocking 注释末段
+                .all()
+            )
+            if not pending:
+                return None
+            blocking = [g for g in pending if _is_flow_blocking(g)]
+            chosen = blocking[0] if blocking else pending[0]
+            if len(pending) > 1:
+                _logger.info(
+                    "get_active(project=%s)：%d 个待决 Gate，按阻塞性语义选中 %s"
+                    "（type=%s，阻塞类 %d 个）；其余待决 Gate 仍可经 GET /gates 列举",
+                    project_id, len(pending), chosen.gate_id, chosen.gate_type, len(blocking))
+            return _gate_to_response(chosen)
         finally:
             db.close()
 

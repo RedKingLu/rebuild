@@ -5,8 +5,23 @@
 //  2. l5_high_risk_command 渲染为「高风险命令审批 Gate（L5）」且展示被拦命令原文
 //  3. 决策请求打到通用 Gate 端点 /gates/{id}/decision，
 //     **不是**阶段晋级端点 promotion-decision（否则用户"批准"会误推进阶段）
-import { chromium } from 'playwright-core';
-const EXEC = '/home/king/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome';
+import { chromium } from 'playwright';
+
+// ── B-V262-E2E-SCRIPT-HYGIENE（P2）────────────────────────────────────────────
+// 本脚本此前偏离 e2e/ 下 24 个主流脚本的写法，同时踩中两个已登记缺陷模式：
+//   缺陷 1 · 未声明依赖：`import { chromium } from 'playwright-core'`，而 package.json
+//     声明的是 `playwright`（playwright-core 只是它的传递依赖）⇒ 这正是
+//     B-V262-UNDECLARED-DEP 点名的"用了却未在清单声明"，只不过那条记在平台**替用户**做的
+//     依赖校验上，本条是平台自己犯同一个错。改用已声明的 `playwright`（解除条件 ①③）。
+//   缺陷 2 · 硬编码开发者主目录：`executablePath` 写死
+//     `<开发者主目录>/.cache/ms-playwright/chromium-XXXX/chrome-linux64/chrome`，
+//     与 Q-R22-9 同族，且本文件会随转公开一起公开。
+// 改法（解除条件 ①）：默认**不指定** executablePath，交给 playwright 自己解析它安装的
+// 浏览器（主流 24 个脚本的写法）；确需指定时读环境变量 `PLAYWRIGHT_CHROMIUM_EXEC`，
+// **不设任何缺省值** —— 缺失就用 playwright 自带的，绝不静默回落到别人机器上的路径。
+// 环境变量显式设成空串视为"没设"，同样不静默用旧路径。
+const CHROMIUM_EXEC = (process.env.PLAYWRIGHT_CHROMIUM_EXEC || '').trim();
+const LAUNCH_OPTS = { headless: true, ...(CHROMIUM_EXEC ? { executablePath: CHROMIUM_EXEC } : {}) };
 
 const BASE = 'http://localhost:5173';
 const PID = process.argv[2];
@@ -16,7 +31,7 @@ const apiCalls = [];
 const decisionCalls = [];
 
 const run = async () => {
-  const browser = await chromium.launch({ headless: true, executablePath: EXEC });
+  const browser = await chromium.launch(LAUNCH_OPTS);
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   page.on('console', m => { if (m.type() === 'error') errs.push(m.text()); });
   page.on('requestfinished', async r => {

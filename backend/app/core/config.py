@@ -7,6 +7,33 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# ── Q-R22-9：路径类默认值从仓库位置推导，不写死开发者主目录 ─────────────────────
+#
+# 缺陷原文（本文件旧 :21/:31/:34/:68 四处）：
+#     database_url        = "sqlite:////home/king/rebuild/backend/.data/rebuild.db"
+#     source_dir          = "/home/king/rebuild/source"
+#     workspace_dir       = "/home/king/rebuild/工作区"
+#     toolchain_cache_dir = "/home/king/rebuild/backend/.data/toolchain-cache"
+# 四者都可由 `REBUILD_*` 环境变量覆盖（`env_prefix="REBUILD_"`），故对本机运行无影响，
+# 但有两个真实问题：① 把开发者用户名与本机目录结构带进将要公开的代码（AGENTS §10-28
+# 转公开前置）；② 任何其他克隆者拿到的默认值都是**失效路径** —— 与 README 的开箱预期不符
+# （需先设 4 个环境变量才能跑，而文档并未这样要求）。
+#
+# 修法 = Q-R22-9 选项 A：从本文件位置推导仓库根，保留 `REBUILD_*` 覆盖能力。
+# 本文件位于 `<repo>/backend/app/core/config.py`，故 parents[2]=backend、parents[3]=repo 根。
+# **本机实测四个推导值与原字面量逐字相同**（见 R24 报告的对照命令输出）⇒ 行为不变。
+#
+# 为什么用 parents[N] 而不是向上搜 `.git` / 标记文件：搜索会在"仓库被重命名/被嵌套进另一个
+# 仓库/以 zip 形式解包（无 .git）"时给出不同答案，即引入一个随环境变化的行为；
+# 而 `parents[N]` 只依赖**本文件在包内的固定位置**，这个位置由 Python 包结构本身保证。
+# 相对路径（如 "../../工作区"）同样被排除：它随进程 cwd 变化，而 `.gitignore` 里专门有
+# 「防误 cwd 运行把 .data 落到非后端目录产生游离物」的条目，说明此类问题历史上真出过。
+_CONFIG_FILE = Path(__file__).resolve()
+BACKEND_DIR = _CONFIG_FILE.parents[2]     # <repo>/backend
+REPO_ROOT = _CONFIG_FILE.parents[3]       # <repo>
+_DEFAULT_DB_FILE = BACKEND_DIR / ".data" / "rebuild.db"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -18,7 +45,8 @@ class Settings(BaseSettings):
 
     # Data
     data_dir: str = "./.data"
-    database_url: str = "sqlite:////home/king/rebuild/backend/.data/rebuild.db"
+    # 注意 sqlite 的四斜杠形式：`sqlite:///` + 绝对路径（绝对路径本身以 / 开头）。
+    database_url: str = f"sqlite:///{_DEFAULT_DB_FILE}"
 
     # CORS — allow BOTH dev (Vite 5173) and container (nginx 8080) frontends.
     # 端口标准单一事实源：文档/02-架构设计/06-容器化部署与执行隔离规范.md §1.1
@@ -28,10 +56,10 @@ class Settings(BaseSettings):
     debug: bool = True
 
     # Source resources base directory (skills, agents, mcp, resources, cases, knowledge)
-    source_dir: str = "/home/king/rebuild/source"
+    source_dir: str = str(REPO_ROOT / "source")
 
     # Workspace root — per-project isolated directories (D-050)
-    workspace_dir: str = "/home/king/rebuild/工作区"
+    workspace_dir: str = str(REPO_ROOT / "工作区")
 
     # R19-3-05 硬编码收敛：对外声明的平台版本号单一来源（MCP clientInfo 等协议握手复用）。
     #
@@ -65,7 +93,7 @@ class Settings(BaseSettings):
     # toolchain_cache_dir：包缓存目录（跨轮复用）。**不复用宿主 ~/.nuget**（可能带私有源凭据）。
     # toolchain_build_timeout_s：单个构建阶段（restore / build）的超时上限。
     toolchain_container_enabled: bool = True
-    toolchain_cache_dir: str = "/home/king/rebuild/backend/.data/toolchain-cache"
+    toolchain_cache_dir: str = str(BACKEND_DIR / ".data" / "toolchain-cache")
     toolchain_build_timeout_s: int = 900
 
     # R19-2 G2 依赖真实性校验（dependency_registry_service.py）。只读查询公共 registry

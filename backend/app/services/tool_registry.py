@@ -12,8 +12,9 @@ Execution routing by write_scope / binds_via (type_metadata):
   risk_level≥L3    → OD-06: create a real action_approval Gate (GateService) and
                      return awaiting_approval; honest risk_flagged if no Gate backend.
 
-Built-in 3 tools (get_project_info/read_artifact/run_profiling) remain available
-as seed-driven tools so capability is not lost when Registry is empty.
+Built-in tools (see module-level `_BUILTIN_SCHEMAS`) remain available even when the
+Registry table is empty or was seeded before a tool was added — `seed_all()` only inserts
+when the table is empty, so a newly added tool row never reaches an already-seeded DB.
 """
 
 from __future__ import annotations
@@ -224,6 +225,15 @@ def _source_equivalent(out_rel: str) -> str:
 # ── Built-in tool fallback (seed-equivalent schemas) ────────────────────────
 # These match the hard-coded AGENT_TOOLS in agent_loop.py so the agent always
 # has at minimum these three regardless of whether DB seed is populated.
+# find_files（B-ACC-NO-READONLY-FILEGLOB）的双上限。取名常量而非字面量：这两个数字是
+# "别把一次只读检索变成拖垮阶段的全树遍历"这一取舍的表达，须可被单点调整并被测试引用。
+# 300 条足以覆盖真实项目按名检索的用途（真跑中模型要的是 *.csproj/*.sln 这类少量清单）；
+# 扫描上限 20000 与 code_grep 的 5000 同族但更宽 —— 本工具只 stat 文件名、不读内容，单条成本
+# 远低于 code_grep 的逐行正则。
+_FIND_FILES_MAX_RESULTS = 300
+_FIND_FILES_MAX_SCAN = 20000
+
+
 _BUILTIN_SCHEMAS = [
     {
         "type": "function",
@@ -378,11 +388,78 @@ _BUILTIN_SCHEMAS = [
         "_risk_level": "L0",
         "_write_scope": "none",
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": (
+                "在 workspace 内按【文件名】glob 模式递归检索（只读，L1）。"
+                "用于「在整棵源码树里找出所有 *.csproj / *.sln / *.master」这类纯只读检索 —— "
+                "list_files 不递归、code_grep 只搜文件内容，此前只能去调 L4 命令执行器跑 find。"
+                "只返回路径与字节数，不读文件内容；结果条数与扫描条数有上限并如实回报 truncated。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "文件名 glob，如 *.csproj；多个模式用逗号分隔，如 *.sln,*.csproj",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "检索起点目录，相对 workspace 根，默认 source/",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": f"最多返回条数（上限 {_FIND_FILES_MAX_RESULTS}）",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+        "_source": "builtin",
+        "_tool_id": "builtin:find_files",
+        "_risk_level": "L1",
+        "_write_scope": "none",
+    },
 ]
 
 # Risk levels that require gate review (T2.3 / S3 note: full HITL接线→R9-5-7)
 _GATE_RISK_THRESHOLD = "L3"
 _RISK_ORDER = ["L0", "L1", "L2", "L3", "L4", "L5"]
+
+
+# ── B-ACC-NO-READONLY-FILEGLOB 解除条件 ②：run_safe_command 的 write_scope ─────────
+#
+# 缺陷原文（本文件旧 :689 与 :1499 两处）：`if tool_name == "run_safe_command" or
+# write_scope in ("execute", "system")` —— 即靠**工具名特判**绕过"该工具没声明
+# write_scope"这一事实。而它偏偏是 7 个工具里唯一能执行任意命令（因而能任意写）的那个，
+# 其余写类工具都老实声明了 write_scope。属**声明缺失被特判绕过**，不是有意设计
+# （原注释自陈 "run_safe_command carries no write_scope (defaults to 'none')"）。
+#
+# 处置：① `seed.py` 里为它显式声明 `write_scope: "execute"`（真实能力）；
+#       ② 两处散落的 `tool_name == ...` 特判**收敛为下面这一个归一化函数**，判定点只剩
+#          `write_scope in ("execute","system")`，不再有第二处需要同步的工具名。
+#
+# 为什么保留 `_LEGACY_EXEC_SCOPE_FALLBACK` 而不是"彻底删除特判"：
+#   `seed_all()` 只在 ResourceEntry 表**为空**时插入（seed.py:317 `if existing == 0`），
+#   刻意不覆盖运营者的既有编辑。⇒ 任何**已经 seed 过**的库（含本机 24MB 的 rebuild.db）里
+#   run_safe_command 那行的 type_metadata 仍然没有 write_scope。若此时彻底删除兜底，
+#   `meta.get("write_scope","none")` 会让它落进 `_execute_read` 分支 —— **一个 L4 通用命令
+#   执行器被当成只读工具分派**，这是货真价实的安全边界变更（AGENTS §10 与本轮例外授权第 ④ 条
+#   都禁止）。故兜底必须留，但从"两处 if 特判"降级为"一处声明缺失时的补默认值"：
+#   语义从"这个工具名特殊"变成"这个工具名的历史行数据缺声明，按其真实能力补上"。
+#   ⇒ 台账解除条件 ② 的"移除特判绕过"**部分达成**（判定点已单一化、声明已补齐），
+#     "零特判"须待 seed 具备安全的行级 upsert 能力后才能做，已作为待确认项上报。
+_LEGACY_EXEC_SCOPE_FALLBACK = {"run_safe_command": "execute"}
+
+
+def _effective_write_scope(tool_name: str, meta: dict) -> str:
+    """工具的实际 write_scope：优先取声明值；声明缺失时按上表补真实能力，否则 "none"。"""
+    declared = (meta or {}).get("write_scope")
+    if declared:
+        return declared
+    return _LEGACY_EXEC_SCOPE_FALLBACK.get(tool_name, "none")
 
 
 def _rank(risk: str) -> int:
@@ -584,7 +661,9 @@ async def execute_tool(
     # no Gate backend (see _create_risk_gate).
     risk = tool_entry.risk_level.value if hasattr(tool_entry.risk_level, "value") else "L0"
     meta = tool_entry.type_metadata or {}
-    write_scope = meta.get("write_scope", "none")
+    # B-ACC-NO-READONLY-FILEGLOB ②：经归一化函数取实际 write_scope（见其定义处说明），
+    # 下游所有分派判定只看 write_scope，不再有第二处 `tool_name == "run_safe_command"` 特判。
+    write_scope = _effective_write_scope(tool_name, meta)
     approved_gate_id = ""  # set below iff a re-dispatched (gate-approved) call executes
 
     if _rank(risk) >= _rank(_GATE_RISK_THRESHOLD):
@@ -691,9 +770,10 @@ async def execute_tool(
         # 发声：Hook 引擎异常必须可见，但不因引擎故障阻断已授权的合法工具（fail-open 仅限引擎自身故障）。
         logger.warning("tool_registry: PreToolUse hook 引擎异常 tool=%s", tool_name, exc_info=True)
 
-    # Execute by scope. run_safe_command / execute-scope tools are checked first because
-    # run_safe_command carries no write_scope (defaults to "none") yet must run via provider.
-    if tool_name == "run_safe_command" or write_scope in ("execute", "system"):
+    # Execute by scope. execute/system-scope tools are checked first.
+    # （B-ACC-NO-READONLY-FILEGLOB ②：原先此处还有 `tool_name == "run_safe_command" or`
+    #  的工具名特判，已收敛进 _effective_write_scope() —— 判定点只剩 write_scope 一个。）
+    if write_scope in ("execute", "system"):
         result = await _execute_via_provider(tool_name, args, project_id, tool_entry)
     elif write_scope in ("none",):
         result = await _execute_read(tool_name, args, project_id)
@@ -745,7 +825,21 @@ async def execute_tool(
     return result
 
 async def _execute_builtin(tool_name: str, args: dict, project_id: str, stage: str) -> dict:
-    """Handle the three built-in tool implementations."""
+    """Handle the built-in tool implementations（_BUILTIN_SCHEMAS 里那一组）。
+
+    注：原 docstring 写的是 "the three built-in tools"，而本函数早已分派 8 个；
+    R24 再加 find_files 后为 9 个。此处只把数量措辞改为不写死数字（写死数字必然过期），
+    不动任何分派逻辑。权威清单 = 模块级 `_BUILTIN_SCHEMAS`。
+    """
+    # B-ACC-NO-READONLY-FILEGLOB：find_files 的实现**只有一份**（在 _execute_read 里，
+    # 与 fs_read/list_files/code_grep 同处），此处只做转发。
+    # 为什么它同时出现在 _BUILTIN_SCHEMAS 与 seed.py：`seed_all()` 只在 ResourceEntry 表为空
+    # 时插入（seed.py:317），已 seed 过的库拿不到新增工具行 ⇒ `execute_tool` 查不到
+    # tool_entry 会落到本函数。列进 _BUILTIN_SCHEMAS 才能让**既有库**里的 agent 也看得见、
+    # 用得上这个只读工具；seed.py 那份则服务全新库（届时走 registry 分派，风险位/参数
+    # schema 由 Registry 权威提供）。两条路径共用同一实现，不存在第二份逻辑。
+    if tool_name == "find_files":
+        return await _execute_read(tool_name, args, project_id)
     if tool_name == "get_project_info":
         from app.services import workspace_service
         ws = workspace_service.workspace_path(project_id)
@@ -935,6 +1029,78 @@ async def _execute_read(tool_name: str, args: dict, project_id: str) -> dict:
         for p in sorted(full.iterdir())[:500]:
             entries.append({"name": p.name, "type": "dir" if p.is_dir() else "file"})
         return {"path": rel, "count": len(entries), "entries": entries}
+
+    # ── find_files: 递归按【文件名】模式检索（B-ACC-NO-READONLY-FILEGLOB 解除条件 ①）──
+    #
+    # 为什么必须有这个工具：本仓 L1 只读工具此前存在一个能力洞 ——
+    #   · list_files 用 `full.iterdir()`，**不递归**（且上限 500 条）；
+    #   · code_grep 搜的是**文件内容**，不搜文件名；
+    #   · fs_read 需要已知确切路径。
+    # ⇒ "在整棵源码树里按多个文件名模式递归检索"这个**纯只读**操作在 L1 里没有对应能力，
+    # 模型要找 `*.csproj` / `*.sln` / `*.master` 只能去调 **L4** 的 run_safe_command 跑
+    # `find`（真跑中的 gate-22343c 即由此产生：平台请用户为一条只读命令签核，还因 find 不在
+    # 白名单而注定失败）。本工具把该能力补在 L1，使按名检索不必再碰 L4。
+    #
+    # 【绝不降 run_safe_command 的风险位】它是通用命令执行器（白名单含 python3 ⇒ 可任意代码
+    # 执行），L4 由能力本身决定，与某次调用的内容无关（Q-ACC-2 复核已推翻降级方向）。
+    # 本工具是"补只读能力"，**不触碰任何安全边界**。
+    #
+    # 安全约束（与既有只读工具同源，不另造）：
+    #   · 路径经同一个 `_confine()` 约束在 workspace 内（越界即拒）；
+    #   · 只返回**路径名**，不读任何文件内容 ⇒ 天然无内容泄漏面；
+    #   · 结果条数与扫描条数双上限，truncated 如实回报（与 code_grep 同款诚实截断）；
+    #   · 用 `fnmatch` 做 glob 匹配而不是 `re`：模型写的是 `*.csproj` 这类 glob，
+    #     交给 re.compile 会得到意外语义；且 glob 不存在灾难性回溯。
+    if tool_name == "find_files":
+        import fnmatch
+        raw_patterns = args.get("pattern") or args.get("patterns") or args.get("name") or ""
+        if isinstance(raw_patterns, str):
+            patterns = [s.strip() for s in raw_patterns.split(",") if s.strip()]
+        elif isinstance(raw_patterns, (list, tuple)):
+            patterns = [str(s).strip() for s in raw_patterns if str(s).strip()]
+        else:
+            patterns = []
+        if not patterns:
+            return {"error": "需要 pattern 参数（文件名 glob，如 *.csproj；多个用逗号分隔）"}
+        rel = args.get("path") or "source"
+        base = _confine(rel)
+        if base is None:
+            return {"error": "路径越界: 仅允许检索 workspace 内目录"}
+        if not base.exists() or not base.is_dir():
+            return {"error": f"目录不存在: {rel}"}
+        skip = {".git", "node_modules", "__pycache__", ".venv", "bin", "obj"}
+        try:
+            max_results = int(args.get("max_results", _FIND_FILES_MAX_RESULTS)
+                              or _FIND_FILES_MAX_RESULTS)
+        except (TypeError, ValueError):
+            max_results = _FIND_FILES_MAX_RESULTS
+        max_results = max(1, min(max_results, _FIND_FILES_MAX_RESULTS))
+        hits: list[dict] = []
+        scanned = 0
+        scan_capped = False
+        for p in base.rglob("*"):
+            if any(s in p.parts for s in skip):
+                continue
+            if not p.is_file():
+                continue
+            scanned += 1
+            if scanned > _FIND_FILES_MAX_SCAN:
+                scan_capped = True
+                break
+            if any(fnmatch.fnmatch(p.name, pat) for pat in patterns):
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    size = None
+                hits.append({"path": str(p.relative_to(ws_root)), "bytes": size})
+                if len(hits) >= max_results:
+                    break
+        return {"patterns": patterns, "path": rel, "match_count": len(hits),
+                "files": hits, "files_scanned": scanned,
+                "truncated": len(hits) >= max_results or scan_capped,
+                # 诚实标注截断原因，避免读者把"命中 300 条"误读为"总共就 300 条"
+                "truncation_reason": ("result_cap" if len(hits) >= max_results
+                                      else ("scan_cap" if scan_capped else None))}
 
     # ── code_grep: search a pattern under a directory ──
     if tool_name == "code_grep":
@@ -1496,7 +1662,7 @@ def _precheck_command_allowed(tool_name: str, args: dict | None,
     与之相对，入参指纹比对是安全检查，因此**没有**任何 except 旁路（见
     `_resolve_action_gate`）。两者性质不同，处置也不同，勿混。
     """
-    if not (tool_name == "run_safe_command" or write_scope in ("execute", "system")):
+    if write_scope not in ("execute", "system"):
         return None
     code = (args or {}).get("code") or (args or {}).get("command") or ""
     if not code:

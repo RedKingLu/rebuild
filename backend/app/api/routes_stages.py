@@ -250,9 +250,14 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
         # the graph resume launch failed → fall back to the direct single-decision path.
         # There are no graph side-effects to reconcile, so promote() decides the gate and
         # advances state.
+        # B-ACC-PROMOTE-DIRECT-RUNBLIND：**把上面已解析好的 target_gate_id 传下去**。
+        # 旧代码只把 `req` 原样传下、`target_gate_id` 未传下，而 promote() 又不读 req.gate_id
+        # ⇒ 它自己按 stage 全局重查（无 run_id 过滤）⇒ R17-2 校验的是 Gate A、决策却可能落到
+        # 另一个 run 的 Gate B。传下解析结果后，"校验对象 == 执行对象"在本分支上结构性成立。
         try:
             result = svc.stage_service.promote(
-                project_id, run_id, stage, req, drive_promotion=True)
+                project_id, run_id, stage, req, drive_promotion=True,
+                target_gate_id=target_gate_id)
         except ValueError as e:
             # R17-2 V-R17-1B-2: 无产物晋级拒绝统一 422（非法值仍 400）
             code = 422 if "无真实产物" in str(e) else 400

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useSettingsStore } from '../../stores';
 import { Icon } from '../../components/ui/Icon';
+import { MockBadge } from '../../components/ui/StatusBadge';
 import {
   listCredentials, createCredential, deleteCredential, rotateCredential,
   type CredentialInfo,
@@ -181,6 +182,30 @@ export function SettingsPage() {
         <div className="card"><div className="spread"><b>记忆策略</b><span className="tag grey">默认关</span></div></div>
         <div className="card"><div className="spread"><b>安全扫描策略</b><span className="tag amber">占位</span></div></div>
         <div className="card"><div className="spread"><b>外部 Agent 自我批准</b><span className="tag red">禁止</span></div></div>
+      </div>
+
+      {/* ── V26.2 返工批次二（用户裁决 Q-B2-1 后半句："可以在前端界面增加一个待开发的按钮显示"）──
+          用户裁决已取消 P 环节的硬 token 预算：平台不再设输出上限，上限交还给模型自身最大输出
+          长度与后端三层时间护栏。运维仍可经 env 旋钮临时压一个上限（逃生阀），但**尚无前端配置
+          入口** —— 这里显式把该入口标为「规划中」，而不是让它在界面上不存在（避免"平台到底能不能
+          配"无处可查）。
+          实现约束（D-097 / AGENTS §10-20 不得以 placeholder 冒充 implemented）：
+            · 状态标记复用既有 MockBadge 的 future 档（灰色「规划中」），不新增状态枚举、不新造组件；
+            · 按钮 disabled 不可点击、不发起任何请求（避免制造 B-ACC-FE-423-CONSOLE 那类
+              "明知会失败仍发请求"的 console error）。 */}
+      <div className="card" style={{ marginTop: 14 }}>
+        <div className="spread">
+          <b>模型输出上限（Token 预算）配置</b>
+          <MockBadge level="future" />
+        </div>
+        <div className="hash" style={{ marginTop: 6 }}>
+          当前 P0-P6 各阶段不设平台侧输出上限：上限由所选模型自身的最大输出长度与后端超时护栏
+          决定。如需临时压低上限（例如成本失控时），暂由后端环境变量旋钮设置（见 backend/.env.example
+          的「P 阶段输出上限」一节）。本页的可视化配置入口尚未开发。
+        </div>
+        <button className="btn" disabled title="尚未开发（规划中）" style={{ marginTop: 8 }}>
+          配置输出上限
+        </button>
       </div>
 
       <div className="card" style={{ marginTop: 14 }}>

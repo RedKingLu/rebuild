@@ -100,6 +100,51 @@ _PATH_HEALED = _selfheal_path()
 _MOCK_LLM, _MOCK_LLM_SOURCE = _resolve_mock_llm_mode()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# B-ACC-BACKEND-PREREQ-SILENT-SKIP：C 类前提 · 后端可达性（探测，不自愈）
+# ══════════════════════════════════════════════════════════════════════════════
+# 批次零把 PATH（A 类）与 R176_MOCK_LLM（B 类）机器化了，但**这一条它治不了**——
+# 测试进程起不了一个服务器。台账现象：全套件里唯一要求"后端在运行 + ≥2 provider 可达"的
+# 真跑用例（`tests/test_r13_5_live_e2e.py`）在前提缺失时**诚实跳过**（行为正确、不是伪造），
+# 但在 `-q` 下只表现为 **skip 计数 +1** ⇒ 读输出的人看不出少验了什么。与
+# B-ACC-G1-MOCKFLAG-FLAKY 同族：**验证强度被静默削弱，且削弱不可见**。
+#
+# 本节按解除条件 ①②③ 落地，分两块：
+#   ① 会话级**探测**（本节）：起始探一次后端可达性，写进两处横幅。
+#      **探测而非自愈**（解除条件 ② 原话）：探到不可达就明确发声，**不试图去启动它**——
+#      测试套件擅自拉起一个真实服务器会污染宿主端口与数据库，是比静默 skip 更坏的行为。
+#   ② 结尾**逐条列举本次全部 skip 及其原因**（见 pytest_terminal_summary）：复用批次零
+#      已建立的 `terminal_summary` 通道，**不另造机制**（解除条件 ① 明写）。
+#      做成"列举全部 skip"而不是"只报后端那一条"，是因为家族教训已经很清楚：针对单个
+#      变量/单条用例打补丁，换一个前提就再犯一次（该家族已出现 4 次）。
+#
+# 解除条件 ③（不得引入网络等待拖慢全量）：只做一次 TCP connect，超时
+# `_BACKEND_PROBE_TIMEOUT_S` 秒；最坏代价即该常量本身，相对 40+ 分钟的全量可忽略。
+# 刻意用 socket 而非 HTTP 请求：不需要知道后端答什么，只需要知道**有没有人在那个端口上**；
+# TCP 层探测更快，且不会因某个路由 500 而误判为"后端没起"。
+_BACKEND_PROBE_TIMEOUT_S = 0.3
+# 端口标准单一事实源 = 后端统一 8000（AGENTS §10-19）。此处与
+# `tests/test_r13_5_live_e2e.py` 的 `LIVE_BASE` 读**同一个环境变量**，不另立第二个开关。
+_LIVE_BASE = os.environ.get("LIVE_BASE", "http://localhost:8000")
+
+
+def _probe_backend_reachable(base: str) -> tuple[bool, str]:
+    """TCP 层探测后端是否在监听。返回 (是否可达, 说明)。不抛异常、不启动任何进程。"""
+    import socket
+    from urllib.parse import urlsplit
+    parts = urlsplit(base)
+    host = parts.hostname or "localhost"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=_BACKEND_PROBE_TIMEOUT_S):
+            return True, f"{host}:{port} 有进程在监听"
+    except OSError as exc:
+        return False, f"{host}:{port} 连接失败（{type(exc).__name__}）"
+
+
+_BACKEND_REACHABLE, _BACKEND_PROBE_DETAIL = _probe_backend_reachable(_LIVE_BASE)
+
+
 def _run_precondition_banner() -> list[str]:
     """本次运行的前提横幅。**任何人看一眼就知道自己跑的是桩还是真实模型。**"""
     if _MOCK_LLM:
@@ -121,7 +166,43 @@ def _run_precondition_banner() -> list[str]:
     ]
     if _PATH_HEALED:
         lines.append(f"  PATH 自愈：已前置解释器 bin 目录 {_PATH_HEALED}（子进程工具链可见性）")
+    # B-ACC-BACKEND-PREREQ-SILENT-SKIP：后端可达性是**探测**结果，不自愈。
+    if _BACKEND_REACHABLE:
+        lines.append(f"  后端可达性：可达（{_BACKEND_PROBE_DETAIL}）—— 依赖真实后端的用例可真跑")
+    else:
+        lines.append(f"  后端可达性：【不可达】（{_BACKEND_PROBE_DETAIL}）—— 依赖真实后端的用例会"
+                     f"诚实 skip，本次验证强度因此下降；套件不会替你启动后端（探测而非自愈）")
     lines.append("═" * 78)
+    return lines
+
+
+def _skip_reason(report) -> str:
+    """从一份 skipped 报告里取出人类可读的跳过原因。取不到就如实说取不到。"""
+    lr = getattr(report, "longrepr", None)
+    if isinstance(lr, (tuple, list)) and len(lr) >= 3:
+        return str(lr[2]).replace("Skipped: ", "", 1)
+    return str(lr) if lr else "（未提供原因）"
+
+
+def _skip_inventory_lines(terminalreporter) -> list[str]:
+    """本次运行**每一条** skip 的逐条清单（B-ACC-BACKEND-PREREQ-SILENT-SKIP 解除条件 ①）。
+
+    为什么必须逐条列出而不是只报后端那一条：本家族（"运行前提未设导致假失败/静默降级"）
+    已出现 4 次，每次换一个变量或换一条用例就再犯一次。只治后端这一条，下一次换成
+    "缺 docker" / "缺 dotnet SDK" 又会静默削弱一次。故把口径升级为
+    **任何 skip 都必须在结尾可见**，`-q` 下也不例外（无需 `-rs`）。
+    """
+    reports = terminalreporter.stats.get("skipped", []) or []
+    if not reports:
+        return []
+    lines = ["", f"本次跳过的用例（{len(reports)} 条，逐条列出原因 —— 跳过=少验了东西，不是通过）："]
+    for r in reports:
+        loc = getattr(r, "nodeid", None) or "（未知用例）"
+        lines.append(f"  · {loc}")
+        lines.append(f"      原因：{_skip_reason(r)}")
+    if not _BACKEND_REACHABLE:
+        lines.append("  提示：本次后端不可达，上列中依赖真实后端的用例属【前提缺失】而非代码问题；"
+                     "补齐后端后重跑即可恢复该部分验证强度。")
     return lines
 
 
@@ -137,8 +218,13 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     **末尾**。全量套件耗时 40-80 分钟、输出上千行，开头的横幅早已滚出屏幕；实际读日志的人
     读的是 `tail`。`pytest_terminal_summary` 的输出紧贴通过/失败计数上方，正好把"在测什么"
     与"测出了什么"钉在同一屏，任何 `tail -n 20` 都带得到。
+
+    B-ACC-BACKEND-PREREQ-SILENT-SKIP 解除条件 ①：在同一处**追加本次全部 skip 的逐条清单**
+    （复用本通道，不另造机制）——使 `-q` 下也能看出"少验了什么"，不必额外加 `-rs`。
     """
     for line in _run_precondition_banner():
+        terminalreporter.write_line(line)
+    for line in _skip_inventory_lines(terminalreporter):
         terminalreporter.write_line(line)
 
 
