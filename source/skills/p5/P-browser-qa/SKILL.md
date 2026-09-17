@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/browser-qa (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-browser-qa（浏览器级 QA 验证）
 
@@ -46,7 +47,7 @@ P5 验证阶段，当迁移对象为 Web 应用（如 ASP.NET WebForms/MVC、JSP
 - 关键交互断言通过；登录、提交、查询等核心路径必须 SHIP 级通过
 - DO-NOT-SHIP 阻塞项清零后方可判 completed
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 目标环境可能要求国产浏览器（奇安信、红莲花、统信浏览器）兼容，须在目标内核回放，不能只验 Chrome。
 - WebForms 的 ViewState/回发模型迁移到现代前端后交互模型变化大，断言应聚焦业务结果而非 DOM 细节等价。
 - on-prem 内网部署，自动化脚本须能在隔离网络运行，依赖（浏览器二进制、字体）需预置离线。

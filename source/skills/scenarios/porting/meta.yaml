@@ -1,0 +1,16 @@
+tier: typical
+display_name: 软件移植
+summary: 跨操作系统 / 跨 CPU 架构 / 跨移动平台移植，判据为目标平台上行为等价
+selection_candidates:
+  - name: Linux (当前 LTS 发行版)
+    note: Windows → Linux 的主流目标；须处理大小写敏感文件系统与路径分隔符
+  - name: ARM64 (aarch64)
+    note: x86_64 → ARM64；原生依赖须在目标架构重新编译，注意对齐与字节序
+  - name: 跨平台框架 (Qt / .NET MAUI / Flutter)
+    note: 桌面原生 → 跨平台；平台相关调用须收敛到适配层
+related_skills:
+  - P-docker-patterns
+  - P-benchmark
+  - P-browser-qa
+  - P-deployment-patterns
+related_resources: []

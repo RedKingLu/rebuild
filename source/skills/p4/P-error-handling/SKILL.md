@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/error-handling (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-error-handling（迁移运行期错误处理模式）
 
@@ -42,7 +43,7 @@ metadata:
 - 对外响应不含栈/SQL/连接串/Key 等内部信息。
 - 无空 catch、无吞异常后伪成功。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 国产 DB 驱动异常类型与原生不同（SQLState/错误码差异），须建映射，避免把可重试的连接抖动误判为永久失败。
 - 方言不匹配（语法/分页/NULL 语义）多在运行期暴露，应归类为 `DialectError` 并指向具体 SQL，便于回到 P-database-migrations 修正。
 - 东方通/宝兰德等中间件连接池耗尽、超时配置不当易引发级联失败，熔断 + 连接池配额是关键防线。

@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/agentic-engineering (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-agentic-engineering（评估优先的迁移工程规划）
 
@@ -43,7 +44,7 @@ metadata:
 - 高风险节点均有 Gate 点与回滚预案。
 - 确定性转换优先原则已落实（机械转换未滥用高档位模型）。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - Oracle/MSSQL → 达梦/openGauss/GaussDB 的类型映射、方言差异属机械转换，应规划为确定性 codemod 单元，仅边界 case 升档模型。
 - .NET Framework/Java legacy 的架构识别（WCF/WebForms/EJB）需语义理解，单独成高档位单元。
 - 验收判据须含"在麒麟/统信 OS 上启动并通过冒烟"，不能只验本地开发机。

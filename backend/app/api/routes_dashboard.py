@@ -7,7 +7,7 @@ from app.core.database import get_db
 from app.schemas.common import SuccessEnvelope, Meta
 from app.services.project_service import ProjectService
 from app.services.integration_service import IntegrationSummaryService
-from app.models.project import Project, ProjectStatus
+from app.models.project import ProjectStatus
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 

@@ -9,6 +9,7 @@ metadata:
   source: rebuild R17.5（吸收 ECC blueprint / architecture-decision-records 语境 + 参考轨 P2-1~P2-8）
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-migration-assessment（迁移评估工作流）
 
@@ -56,7 +57,7 @@ metadata:
 - 每条 risk/blocker/gap 的 evidence_refs 指向真实存在的上游产物 ref。
 - 无有效模型 Key 时诚实 blocked，不降级为规则评估。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 
 - 目标环境（麒麟/统信 + 达梦/人大金仓/openGauss/GaussDB + TongWeb/宝兰德）差异大，训练数据稀缺——不确定一律进 uncertainty/evidence_gap，勿臆测国产组件行为。
 - 兼容承载与目标库 DDL/DML 的实测往往需真实信创环境，本阶段标 evidence_gap，留 P3/PoC 实测，**不把"不可实测"写成"不可行"终局裁决**。

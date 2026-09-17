@@ -6,7 +6,6 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from app.dependencies import get_services
-from app.graph.runtime import graph_thread_active
 from app.schemas.stage import StagePlanRequest, PromotionRequest, PromotionDecision
 from app.schemas.common import SuccessEnvelope, Meta
 
@@ -61,16 +60,119 @@ async def create_promotion_gate(project_id: str, run_id: str, stage: str, req: P
     return SuccessEnvelope(data=gate, meta=Meta())
 
 
+def _promotion_gate_candidates(svc, project_id: str, run_id: str, stage: str,
+                               paused_gate_ids: frozenset) -> list:
+    """本端点在 (run_id, stage) 上【可决策】的待决 Gate 候选集。
+
+    候选判据两条（取并集），都不是 gate_type 名单：
+      ① `gate_type == "stage_promotion"` —— 本端点的本职对象（阶段晋级）；
+      ② `gate_id ∈ paused_gate_ids` —— 图此刻正暂停在它上面。**无论其 gate_type**。
+         这一条是必需的：图的暂停点类型是开放集（plan_presentation / plan_review /
+         source_pending / model_unavailable …，见 app/graph/nodes.py），前端 GatePanel
+         对所有非安全类 Gate 都打本端点。若只认 stage_promotion，用户批准 p1 计划
+         Gate 会被 409 挡死，项目卡在计划页。而"图暂停点"本身就是同一性判据的来源，
+         用它做候选判据不会随新增 gate_type 漂移（新类型自动被覆盖，无名单可维护）。
+
+    三个过滤条件（run_id / stage / waiting_decision）缺一不可：
+      · run_id：跨 run 的 Gate 绝不能被本 run 的决策命中；
+      · stage：URL 里的 {stage} 必须与 Gate 自己的 stage 一致 —— 这正是
+        B-ACC-PROMOTION-DECISION-NOGUARD 的核心形态（图停在 p2，对 /stages/p0/
+        提交 approve，旧代码照样注入图并把决策写到 p2 那个 Gate 上）；
+      · waiting_decision：已决策 / 已消费的 Gate 不是可决策对象（与 GateService.get_active、
+        StageService.promote 的既有"可决策"定义对齐）。
+    """
+    candidates = []
+    for g in svc.gate_service.list_by_project(project_id):
+        if g.gate_status != "waiting_decision":
+            continue
+        if (g.run_id or "") != run_id:
+            continue
+        if (g.stage or "").lower() != (stage or "").lower():
+            continue
+        if g.gate_type == "stage_promotion" or g.gate_id in paused_gate_ids:
+            candidates.append(g)
+    return candidates
+
+
+def _resolve_promotion_target(svc, project_id: str, run_id: str, stage: str,
+                              requested_gate_id: str | None, paused_gate_ids: frozenset):
+    """求本次决策【指名】作用的那个 Gate，返回 (gate_id, gate)。判不出来就 409，绝不猜。
+
+    B-ACC-PROMOTION-DECISION-NOGUARD 解除条件①②：本端点原先连 gate_id 字段都没有，
+    结构上不可能做同一性判定；决策被原样注入图后由图写到【它自己暂停的那个】Gate 上。
+
+    传了 gate_id → 用它，但必须通过三道对齐校验（存在 / 同 run / 同 stage / 待决），
+    否则 409。**不允许**"传了一个别的 Gate 的 id 也照样执行"——那是换个入口重现同一缺陷。
+
+    没传 gate_id → 按 (run_id, stage) 推断唯一待决对象（既有 11 个调用方走这条）：
+      恰好 1 个 → 用它（行为与修复前的意图等价，向后兼容）
+      0 个 / ≥2 个 → 409 且【不驱动图】。用户 2026-09-15 裁决 Q-A：「失效吧」——
+        "未建 Gate 就直接驱动图"这一用法**应当失效**。0 个正是缺陷甲的形态：没有可判定
+        的对象却把决策注入图，图会把它应用到自己暂停的那个 Gate 上。≥2 个真实存在过
+        （B-R22-GATE-REDECIDE-REDRIVE 实测产生 5 个重复 p1 晋级 Gate），历史数据仍有
+        这类记录，故必须处理而不是假设"不会发生"。
+    """
+    requested = (requested_gate_id or "").strip()
+    if requested:
+        gate = svc.gate_service.get(requested)
+        if gate is None:
+            raise HTTPException(404, f"Gate {requested} 不存在，无法对其提交晋级决策。")
+        if (gate.run_id or "") != run_id or (gate.stage or "").lower() != (stage or "").lower():
+            raise HTTPException(
+                409,
+                f"gate_id {requested} 与 URL 指定的对象不一致（Gate 属于 "
+                f"run={gate.run_id or '(空)'} / stage={gate.stage or '(空)'}，URL 为 "
+                f"run={run_id} / stage={stage}）：拒绝跨对象决策。请对该 Gate 自己的 "
+                f"run/stage 路径提交，或改用 /gates/{requested}/decision。")
+        if gate.gate_status != "waiting_decision":
+            raise HTTPException(
+                409,
+                f"Gate {requested} 当前状态为 {gate.gate_status}（决策 "
+                f"{gate.decision or '(空)'!r}），不是待决对象，不接受再次决策。"
+                f"如需返工请对新的 Gate 提交决策。")
+        return requested, gate
+
+    candidates = _promotion_gate_candidates(svc, project_id, run_id, stage, paused_gate_ids)
+    if len(candidates) == 1:
+        return candidates[0].gate_id, candidates[0]
+    if not candidates:
+        raise HTTPException(
+            409,
+            f"该 run+stage 无待决晋级 Gate（run={run_id}, stage={stage}），"
+            f"无法判定要决策哪个对象；请传 gate_id。"
+            + (f"（图当前暂停在 {sorted(paused_gate_ids)}，"
+               f"若要决策它请用它自己的 stage 路径或 /gates/{{gate_id}}/decision）"
+               if paused_gate_ids else ""))
+    raise HTTPException(
+        409,
+        f"该 run+stage 有 {len(candidates)} 个待决 Gate："
+        f"{sorted(g.gate_id for g in candidates)}，无法判定要决策哪一个；请传 gate_id 指名。")
+
+
 @router.post("/{stage}/promotion-decision")
 async def decide_promotion(project_id: str, run_id: str, stage: str, req: PromotionDecision):
     """Resolve a stage-promotion Gate. W9: unified single decision kernel
-    (GateService.decide). When a paused LangGraph checkpoint thread exists for this
-    run, the decision drives FlowRuntime.resume (thread_id=run_id) — the graph node
-    calls _gate_backend.decide() internally, so stage_service.promote() is SKIPPED
-    (no double-advancement, no stale-gate fallback). Non-graph runs fall back to
-    stage_service.promote(drive_promotion=True) for direct advancement."""
+    (GateService.decide). When the LangGraph checkpoint thread for this run is paused
+    ON THE TARGET GATE, the decision drives FlowRuntime.resume (thread_id=run_id) — the
+    graph node calls _gate_backend.decide() internally, so stage_service.promote() is
+    SKIPPED (no double-advancement, no stale-gate fallback). Non-graph runs, and runs
+    whose graph is paused somewhere else, fall back to stage_service.promote(
+    drive_promotion=True) for direct advancement.
+
+    B-ACC-PROMOTION-DECISION-NOGUARD（P0/CRITICAL）：本端点此前的图驱动判据只有 run 级的
+    `graph_thread_active(run_id)`，且请求体没有 gate_id ⇒ 结构上不可能判定"决策的是哪个
+    Gate"；加之图分支构造合成结果直接返回、不走 promote()，R17-2 空壳晋级校验在该分支
+    **整条缺席**。现改为：先指名对象（req.gate_id 或按 run+stage 唯一推断，判不出即 409）
+    → 跑 R17-2 空壳晋级校验（与 routes_gates 共用同一份判据与文案）→ 只有"图确实暂停在
+    这个对象上"才注入图 resume。"""
     import uuid as _uuid
-    from app.services.gate_service import VALID_DECISIONS
+    # 【复用，不另造】同一性判据与空壳晋级判据都 import 既有实现：
+    #   · graph_pending_gate_ids —— routes_gates 已在用的同一份（解除条件②明写"不另造第二份"）
+    #   · _stage_has_real_artifact —— 已提取到 gate_service 的共享守卫（解除条件③，用户裁决 Q-B）
+    # 在函数内 import（而非模块顶层）与 routes_gates.decide_gate 保持一致，也让测试可以
+    # monkeypatch `app.graph.runtime.graph_pending_gate_ids` 同时覆盖两条路由。
+    from app.graph.runtime import graph_pending_gate_ids
+    from app.services.gate_service import VALID_DECISIONS, _stage_has_real_artifact
 
     svc = _svc()
 
@@ -82,9 +184,36 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
         raise HTTPException(
             400, f"非法晋级决策：{req.decision!r}（允许 {sorted(VALID_DECISIONS)}）")
 
+    # ── 图暂停点：同一性判定的唯一权威来源（读 checkpoint 快照，见该函数 docstring）──
+    # 读失败 → 空集（fail-closed：宁可退回直连路径，也不在不知道图停在哪的情况下注入决策），
+    # 与 routes_gates.decide_gate 的处理完全一致。
+    try:
+        paused_gate_ids = await graph_pending_gate_ids(run_id)
+    except Exception as exc:
+        logger.warning("读取图暂停点失败 run=%s：本次不驱动图（退回直连）: %s",
+                       run_id, exc, exc_info=True)
+        paused_gate_ids = frozenset()
 
+    # ── 指名被决策的对象（判不出即 409，且不驱动图）──
+    target_gate_id, target_gate = _resolve_promotion_target(
+        svc, project_id, run_id, stage, req.gate_id, paused_gate_ids)
+
+    # ── R17-2 V-R17-1B-2：空壳晋级校验，覆盖【图分支与直连分支】（解除条件③）──
+    # 置于图分支【之前】，与 routes_gates.decide_gate 同构；判据函数与 422 文案逐字同源。
+    # 原缺陷：图分支合成结果直接返回、不调 promote()，promote() 内的该校验整条不执行 ⇒
+    # 图活跃（正常情况）时可驱动一次空壳晋级。
+    if target_gate.gate_type == "stage_promotion" and run_id:
+        if not _stage_has_real_artifact(svc, run_id, target_gate.stage or "",
+                                        target_gate.artifact_refs):
+            raise HTTPException(
+                422,
+                f"阶段 {target_gate.stage} 晋级被拒绝：run {run_id} 在该阶段无真实产物"
+                f"（task_graph 未创建且 artifact_refs 为空）。请先完成阶段执行再申请晋级。"
+            )
+
+    # ── 同一性判定：只有"图正暂停在这个 Gate 上"才可以把决策注入 graph resume ──
     graph_driven = False
-    if await graph_thread_active(run_id):
+    if target_gate_id in paused_gate_ids:
         try:
             # R17-6: fire-and-forget graph resume; HTTP returns immediately.
             _ensure_graph_task(_run_graph_bg(run_id, req.decision, project_id, stage))
@@ -92,6 +221,13 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
         except Exception as e:
             logger.warning("graph task launch failed for run=%s: %s", run_id, e)
             graph_driven = False
+    elif paused_gate_ids:
+        # 真实且合法的场景：阶段执行途中图停在别处（或停在另一个 Gate 上）。照常记录本
+        # Gate 的决策，但不注入图 —— 否则决策会被应用到图自己暂停的那个 Gate 上。
+        logger.warning(
+            "Gate %s（type=%s，run=%s，stage=%s）不是图暂停点（图停在 %s）：本次决策只作用于"
+            "该 Gate 自身，不驱动阶段图 resume（B-ACC-PROMOTION-DECISION-NOGUARD 守卫）",
+            target_gate_id, target_gate.gate_type, run_id, stage, sorted(paused_gate_ids))
 
     if graph_driven:
         # R17-6: graph resumed in the background; DB sync happens there on completion.
@@ -99,7 +235,8 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
         # for the next gate / stage change rather than polling this response.
         result = {
             "promotion_id": f"promo-{_uuid.uuid4().hex[:8]}",
-            "gate_id": "",
+            # 诚实回填被决策对象（旧代码在此硬编码 ""，调用方无从知道决策落到了哪个 Gate）
+            "gate_id": target_gate_id,
             "from_stage": stage,
             "decision": req.decision,
             "gate_status": {
@@ -109,13 +246,18 @@ async def decide_promotion(project_id: str, run_id: str, stage: str, req: Promot
             "transition_mode": "real_background",
         }
     else:
-        # Non-graph run (no active graph thread), OR the graph resume launch failed
-        # (graph_thread_active False, or _ensure_graph_task raised before the graph
-        # ran) → fall back to the direct single-decision path. There are no graph
-        # side-effects to reconcile, so promote() decides the gate and advances state.
+        # Non-graph run (no active graph thread), the graph is paused on ANOTHER gate, OR
+        # the graph resume launch failed → fall back to the direct single-decision path.
+        # There are no graph side-effects to reconcile, so promote() decides the gate and
+        # advances state.
+        # B-ACC-PROMOTE-DIRECT-RUNBLIND：**把上面已解析好的 target_gate_id 传下去**。
+        # 旧代码只把 `req` 原样传下、`target_gate_id` 未传下，而 promote() 又不读 req.gate_id
+        # ⇒ 它自己按 stage 全局重查（无 run_id 过滤）⇒ R17-2 校验的是 Gate A、决策却可能落到
+        # 另一个 run 的 Gate B。传下解析结果后，"校验对象 == 执行对象"在本分支上结构性成立。
         try:
             result = svc.stage_service.promote(
-                project_id, run_id, stage, req, drive_promotion=True)
+                project_id, run_id, stage, req, drive_promotion=True,
+                target_gate_id=target_gate_id)
         except ValueError as e:
             # R17-2 V-R17-1B-2: 无产物晋级拒绝统一 422（非法值仍 400）
             code = 422 if "无真实产物" in str(e) else 400

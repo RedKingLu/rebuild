@@ -57,6 +57,24 @@ def _attempt_entry(profile, provider, model: str, outcome: str, *,
     }
 
 
+def _effective_api_format(profile, provider) -> str:
+    """B-R20-NO-RESPONSES-CHANNEL: profile 级 api_format_override（若设置）优先于
+    provider 的默认 api_format。使同一 provider 能对不同 model profile 混用不同调用通道
+    （如 maas-icompify 大多数 profile 走 openai chat completions，新增一个 profile 走
+    Responses），不需要整 provider 切换、不影响既有 fallback 链行为。"""
+    return getattr(profile, "api_format_override", "") or provider.api_format
+
+
+def _select_api_base(provider, api_format: str) -> str:
+    """按 api_format 选 endpoint（openai / anthropic / responses 三态）。非封闭枚举——
+    新增一种 api_format 取值时只需再加一个 elif 分支，无需改动调用方或 schema。"""
+    if api_format == "responses" and provider.endpoint_responses:
+        return provider.endpoint_responses
+    if api_format == "anthropic" and provider.endpoint_anthropic:
+        return provider.endpoint_anthropic
+    return provider.endpoint_openai or provider.endpoint_anthropic
+
+
 @dataclass
 class ModelGatewayStatus:
     """Aggregate status for GET /api/model/status."""
@@ -357,7 +375,7 @@ class ModelGateway:
                     chain.append((p, prov, f"candidate:{ref}", ref != (strategy.default_profile_ref if strategy else None)))
 
         for cand_profile, cand_provider, cand_reason, is_fb in chain:
-            model_name = resolve_api_model_name(cand_profile, cand_provider.api_format)
+            model_name = resolve_api_model_name(cand_profile, _effective_api_format(cand_profile, cand_provider))
             if cand_profile.status != "configured":
                 candidates.append(_attempt_entry(cand_profile, cand_provider, model_name,
                                                   "not_configured", error_category="not_configured",
@@ -431,7 +449,7 @@ class ModelGateway:
         messages: list[dict],
         user_override: Optional[str] = None,
         strategy_id: str = "system-default",
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         stream: bool = False,
         timeout: Optional[float] = None,
@@ -441,6 +459,12 @@ class ModelGateway:
         stage: Optional[str] = None,
     ) -> dict:
         """Execute a model call through the gateway.
+
+        V26.2 返工批次二（Q-B2-1）：`max_tokens` 默认 **None = 不设平台侧输出上限**（原默认
+        4096）。改默认值的理由：本网关是 P 阶段唯一的模型出口，留一个 4096 的隐式默认等于
+        留一个比本次缺陷里撞顶的 16384 更低的暗坑 —— 任何忘记传该参数的 P 阶段调用点都会被
+        悄悄砍在 4096。改为 None 后"没传"即"不设上限"，与调用方显式传 None 语义一致。
+        当前所有调用点均显式传值，故该默认值变更不改变任何既有调用的行为。
 
         R13-6: when user_override starts with "fusion/", the caller has selected a Fusion
         virtual model — dispatch directly to the aggregation engine, bypassing the
@@ -508,17 +532,20 @@ class ModelGateway:
                     is_fallback=is_fb))
                 continue
 
-            api_format = try_provider.api_format
-            if api_format == "anthropic" and try_provider.endpoint_anthropic:
-                api_base = try_provider.endpoint_anthropic
-            else:
-                api_base = try_provider.endpoint_openai or try_provider.endpoint_anthropic
+            api_format = _effective_api_format(try_profile, try_provider)
+            api_base = _select_api_base(try_provider, api_format)
 
-            r = await self._adapter.complete(
-                model=model_name, messages=messages, api_base=api_base, api_key=key_val,
-                api_format=api_format, max_tokens=max_tokens, temperature=temperature,
-                stream=stream, timeout=timeout,
-            )
+            if api_format == "responses":
+                r = await self._adapter.complete_via_responses(
+                    model=model_name, messages=messages, api_base=api_base, api_key=key_val,
+                    max_tokens=max_tokens, temperature=temperature, timeout=timeout,
+                )
+            else:
+                r = await self._adapter.complete(
+                    model=model_name, messages=messages, api_base=api_base, api_key=key_val,
+                    api_format=api_format, max_tokens=max_tokens, temperature=temperature,
+                    stream=stream, timeout=timeout,
+                )
             if r.status == "completed":
                 attempted_chain.append(_attempt_entry(
                     try_profile, try_provider, model_name, "completed", is_fallback=is_fb))
@@ -592,6 +619,9 @@ class ModelGateway:
             "call_id": result.call_id,
             "status": result.status,
             "content": result.content if result.status == "completed" else "",
+            # B-R20-NO-RESPONSES-CHANNEL: Responses 通道结构化 reasoning/thinking 文本，
+            # 单独暴露（不混入 content）。非 Responses 通道恒为 ""，现有调用方无需处理。
+            "reasoning_content": getattr(result, "reasoning_content", "") or "",
             "model": litellm_model,
             "profile_id": profile.profile_id,
             "provider_id": provider.provider_id,
@@ -613,7 +643,7 @@ class ModelGateway:
         messages: list[dict],
         user_override: Optional[str] = None,
         strategy_id: str = "system-default",
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         tools: Optional[list[dict]] = None,
         source: str = "api",
@@ -624,6 +654,9 @@ class ModelGateway:
         timeout: Optional[float] = None,
     ):
         """Stream a model call through the gateway as an async generator.
+
+        V26.2 返工批次二（Q-B2-1）：`max_tokens` 默认 **None = 不设平台侧输出上限**（原默认
+        4096，理由同 `call()`）。None 透传到 adapter 后请求体里不含该键。
 
         Yields {"type": "token"/"tool_calls"/"done"/"error"} frames.
         Fallback policy (T3): if an error frame arrives BEFORE any token is yielded to the
@@ -721,19 +754,26 @@ class ModelGateway:
                         is_fallback=is_fb))
                     continue
 
-                api_format = try_provider.api_format
-                api_base = (try_provider.endpoint_anthropic
-                            if api_format == "anthropic" and try_provider.endpoint_anthropic
-                            else try_provider.endpoint_openai or try_provider.endpoint_anthropic)
+                api_format = _effective_api_format(try_profile, try_provider)
+                api_base = _select_api_base(try_provider, api_format)
                 litellm_model = _model_name
 
                 profile_failed_pre_token = False
 
-                async for frame in self._adapter.stream_complete(
-                    model=litellm_model, messages=messages, api_base=api_base, api_key=key_val,
-                    max_tokens=max_tokens, temperature=temperature, tools=tools,
-                    timeout=timeout,
-                ):
+                stream_source = (
+                    self._adapter.stream_via_responses(
+                        model=litellm_model, messages=messages, api_base=api_base,
+                        api_key=key_val, max_tokens=max_tokens, temperature=temperature,
+                        timeout=timeout,
+                    ) if api_format == "responses" else
+                    self._adapter.stream_complete(
+                        model=litellm_model, messages=messages, api_base=api_base, api_key=key_val,
+                        max_tokens=max_tokens, temperature=temperature, tools=tools,
+                        timeout=timeout,
+                    )
+                )
+
+                async for frame in stream_source:
                     ftype = frame.get("type")
 
                     if ftype == "error":
@@ -886,11 +926,8 @@ class ModelGateway:
         key_val, key_source = self._resolve_key(provider, user_override is not None)
         if not key_val:
             return None
-        api_format = provider.api_format
-        if api_format == "anthropic" and provider.endpoint_anthropic:
-            api_base = provider.endpoint_anthropic
-        else:
-            api_base = provider.endpoint_openai or provider.endpoint_anthropic
+        api_format = _effective_api_format(profile, provider)
+        api_base = _select_api_base(provider, api_format)
         return {
             "model": resolve_api_model_name(profile, api_format),
             "api_base": api_base,
@@ -955,11 +992,8 @@ class ModelGateway:
             }
 
         # Determine endpoint
-        api_format = provider.api_format
-        if api_format == "anthropic" and provider.endpoint_anthropic:
-            api_base = provider.endpoint_anthropic
-        else:
-            api_base = provider.endpoint_openai or provider.endpoint_anthropic
+        api_format = _effective_api_format(profile, provider)
+        api_base = _select_api_base(provider, api_format)
 
         litellm_model = resolve_api_model_name(profile, api_format)
 
@@ -1238,6 +1272,7 @@ def _provider_to_dict(p: ProviderInfo) -> dict:
         "api_format": p.api_format,
         "endpoint_openai": p.endpoint_openai,
         "endpoint_anthropic": p.endpoint_anthropic,
+        "endpoint_responses": p.endpoint_responses,
         "credential_status": p.credential_status,
         "key_source": p.key_source,
         "status": p.status,
@@ -1264,6 +1299,7 @@ def _profile_to_dict(p: ModelProfileInfo) -> dict:
         "context_window_note": p.context_window_note,
         "recommended_use": p.recommended_use,
         "not_recommended_use": p.not_recommended_use,
+        "api_format_override": p.api_format_override,
         "status": p.status,
     }
 

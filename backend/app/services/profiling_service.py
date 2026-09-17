@@ -25,12 +25,51 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger("rebuild.profiling_service")
 
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+# V26.2 返工批次二（Q-B2-2）：截断诊断与"不设即无上限"的 env 旋钮解析改用共享实现，
+# 本文件不再保留本地副本（防三份逐字副本各自漂移）。
+from app.services.stage_agent_loop import (
+    diagnose_parse_failure as _diagnose_parse_failure_shared,
+    log_parse_failure as _log_parse_failure,
+    optional_int_env,
+    scan_json_shape,
+)
+
+# D-06（V26.2 总验收真实规模真跑，2026-09-11，批次B）：真实项目（1018 文件 / 197,447 行）上
+# 本调用的 completion **恰好 4 次触顶原硬编码 max_tokens=16384**（存档响应头部为
+# `{"tech_stack": {"primary_language": "C#"…` 即被砍断）→ 建档识别 JSON 中途截断解析失败 →
+# 8 个识别键全部落为 None → stage_handlers 写成"LLM 未产出 xxx（诚实标注）"占位——这正是
+# D-05（P1 8/23 域产物为空、独立验收仍判 accepted/0 问题）的真正根因。
+# 复用 acceptance_baseline_service 刚建立的 env 可调范式（不新造机制）。
+#
+# 默认值依据（实测，非拍脑袋）：
+#   · 32768 = 触顶值 16384 的 2 倍。acceptance_baseline_service 同批已把静态基线（3 个数组
+#     字段）的预算提到 16384（触顶值 6144 的 2.67 倍）；profiling 一次要产出 8 个键
+#     （tech_stack/dependency_draft/entry_points/config_inventory/infra_clues/test_inventory/
+#     module_structure/uncertainty_manifest），其中 dependency_draft 真实规模下要覆盖 49 个
+#     依赖包（D-13 实测计数），内容体量与 R11-7 为 P3 task_plans 设的预算同级，而非
+#     acceptance_baseline 的小体量清单，故直接复用平台已有的更高一档（32768），不再另立一个
+#     居中的新数字。
+#   · 300s：本调用走 run_stage_tool_loop（多轮工具循环，可按需 list_files/fs_read/code_grep
+#     探读真实源，不是单次 non-stream 调用），且预算翻倍后单轮生成耗时也会拉长；
+#     acceptance_baseline_service 对 16384 预算、单次调用取 240s（依据实测 60-120s 延迟 ×2
+#     余量）；profiling 预算是其 2 倍且为多轮工具循环，300s 留出更合理的余量。
+# 二者只调请求超时与输出预算，不涉及模型/endpoint 选择（策略仍由 ModelGateway 解析，D-098）。
+#
+# ⚠ V26.2 返工批次二（用户裁决 Q-B2-1 / Q-B2-5，2026-09-16）：**上面这段默认值推导已不再作为
+# 默认值使用**（保留原文，因为它记录了"抬高天花板"这条路线的实测依据与其失败方式：批次 F 把
+# 四处抬到 32768/16384 后，未抬的四处又在真实规模撞顶 16383/16384/16387 —— 抬高只是把天花板
+# 挪一格）。现口径：**默认不设平台侧上限**（`P1_PROFILING_MAX_TOKENS` 不设 ⇒ None ⇒ 请求体里
+# 无 max_tokens 键），旋钮保留作成本失控时的逃生阀（设了就仍然生效）。TIMEOUT 旋钮不变 ——
+# 三层时间护栏是取消预算后仅剩的护栏，本批次不得放宽。
+_PROFILING_MAX_TOKENS = optional_int_env("P1_PROFILING_MAX_TOKENS")
+_PROFILING_TIMEOUT = float(os.environ.get("P1_PROFILING_TIMEOUT", "300"))
 
 # LLM-produced 建档 identification fields (通用锚点，样本值由 LLM 生成)。file_index /
 # source_structure / cicd / doc 等由采集提供，不在此列。
@@ -160,7 +199,8 @@ class ProfilingService:
             gw, system_content=system_content,
             user_content=self._build_user_prompt(facts, upstream or {}),
             project_id=project_id, run_id=run_id or "", stage=stage,
-            strategy_id=strategy_id, max_tokens=16384, temperature=0.3, tracer=self.tracer)
+            strategy_id=strategy_id, max_tokens=_PROFILING_MAX_TOKENS, temperature=0.3,
+            timeout=_PROFILING_TIMEOUT, tracer=self.tracer)
         if loop["status"] != "completed":
             reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P1 profiling model call not completed: {reason}", project_id, run_id, stage)
@@ -170,7 +210,7 @@ class ProfilingService:
                                    model_error_category=loop.get("error_category", "model_unavailable"),
                                    model_user_actions=_MODEL_USER_ACTIONS)
 
-        parsed = self._parse(loop.get("content", ""))
+        parsed = self._parse(loop.get("content", ""), model_used=loop.get("model_used"))
         self._trace("P1 profiling completed (LLM identification)", project_id, run_id, stage)
         return ProfilingResult(
             status="completed", identification=parsed, model_used=loop.get("model_used"),
@@ -206,13 +246,36 @@ class ProfilingService:
             "uncertainty_manifest 中发声识别盲区与任何与 P0 的冲突。严格输出上述 JSON。"
         )
 
-    def _parse(self, content: str) -> dict:
+    @staticmethod
+    def _scan_json_shape(text: str) -> tuple[int, bool]:
+        """扫描 JSON 文本的结构收敛状态：返回 (未闭合的括号深度, 是否停在字符串内部)。
+
+        V26.2 返工批次二（Q-B2-2）：实现已提取到 `stage_agent_loop.scan_json_shape`（全平台
+        唯一一份），此处仅为薄转发，保留方法名以不破坏既有调用/测试。
+        """
+        return scan_json_shape(text)
+
+    def _diagnose_parse_failure(self, text: str) -> dict:
+        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 本次上限取值。让"解析失败"
+        不再只是一句 parse_error——读产物/日志的人能分辨是「被截断」还是「输出非法 JSON」。
+
+        V26.2 返工批次二（Q-B2-2）：算法已共享化，本方法只负责把**本服务的**上限/超时/旋钮名
+        喂给共享实现。未设上限时诊断里的 max_tokens 显示"未设置（…）"而非 null，使现场看得出
+        "这不是平台砍的"。
+        """
+        return _diagnose_parse_failure_shared(
+            text, max_tokens=_PROFILING_MAX_TOKENS, timeout_s=_PROFILING_TIMEOUT,
+            env_knobs="P1_PROFILING_MAX_TOKENS / P1_PROFILING_TIMEOUT")
+
+    def _parse(self, content: str, *, model_used: Optional[str] = None) -> dict:
         from app.services.stage_agent_loop import extract_json_object
         data = extract_json_object(content)
         if data is not None:
             return data
-        logger.warning("P1 profiling: LLM 输出无法解析为 JSON（返工重试结构化输出）")
-        return {"parse_error": True, "raw": (content or "").strip()[:2000]}
+        text = (content or "").strip()
+        diagnosis = self._diagnose_parse_failure(text)
+        _log_parse_failure(logger, "P1 profiling", diagnosis, model_used=model_used)
+        return {"parse_error": True, "raw": text[:2000], "parse_diagnosis": diagnosis}
 
     def _trace(self, summary: str, project_id, run_id, stage) -> None:
         if self.tracer is None:

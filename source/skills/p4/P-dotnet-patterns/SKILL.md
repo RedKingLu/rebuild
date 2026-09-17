@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/dotnet-patterns (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-dotnet-patterns（.NET 现代化与信创兼容模式）
 
@@ -42,7 +43,7 @@ metadata:
 - 在麒麟/统信 OS 上成功启动并通过冒烟。
 - DI/async/配置三项现代化模式落地，无 `.Result`/`.Wait()` 同步阻塞。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 高频映射：`HttpContext.Current`→`IHttpContextAccessor`；`ConfigurationManager.AppSettings`→`IConfiguration`；`[WebMethod]`/`.asmx`→Controller；WCF→gRPC/Web API；`System.Web`→`Microsoft.AspNetCore`。
 - Windows 不可移植项：GDI+ 绘图、注册表、`EventLog`、Windows 服务、IIS `web.config` 处理管线——迁移时替换为跨平台等价（SkiaSharp、配置文件、systemd、Kestrel 中间件）。
 - 数据库访问层连接到信创 DB（达梦/openGauss）须换驱动与连接串，与 P-database-migrations 协同。

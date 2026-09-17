@@ -128,6 +128,13 @@ class AutoReviewAgent:
         )
         try:
             from app.services.work_agent import _run_coro
+            # V26.2 返工批次二（甲 ⑤ 的逐处评估结论）：本处 512 **保留现值**，不纳入"取消 P 环节硬
+            # 预算"的范围。依据：产出是**定长小裁决**（`{"verdict":"proceed|escalate","reason":"…"}`，
+            # 正文约数十 token，512 已有约 10 倍余量），体量**不随项目规模增长** —— 与本次缺陷
+            # （结构化大产物被砍断）不同类；取消上限反而可能让本该一句话的裁决失控生成（成本）。
+            # 残余风险已知并如实登记：推理模型仍可能把 512 全耗在推理链上导致最终文本为空；但该失败
+            # 走的是下方**诚实 evidence_gap** 分支（不伪造结论），且 Auto 模式还有 Policy 底线兜底，
+            # 方向安全（不会把"没审到"变成"审过了"）。
             resp = _run_coro(gw.call(messages=[{"role": "user", "content": prompt}],
                                      source="api", max_tokens=512, temperature=0.0))
         except Exception:

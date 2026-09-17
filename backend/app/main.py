@@ -122,14 +122,18 @@ async def lifespan(app: FastAPI):
         logging.getLogger("uvicorn").debug("close_checkpointer failed (non-fatal, may be uninitialized)", exc_info=True)
 
 
+_settings = Settings()
+
+# R22 批次六（R22-07）：version 由字面量改为读 settings.app_version，推翻 R19-3-05
+# 「FastAPI 版本声明按验收口径不动」的取舍——理由详见 core/config.py 的 app_version 注释。
+# 为此把 _settings 的实例化上移到 app 构造之前（复用同一实例，不新增实例/import）。
 app = FastAPI(
     title="rebuild 平台后端",
-    version="V26.1.1",
+    version=_settings.app_version,
     lifespan=lifespan,
 )
 
 # CORS — allow frontend dev server
-_settings = Settings()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_settings.cors_origin_list,
@@ -257,3 +261,7 @@ app.include_router(eval_router, prefix="/api")
 # R15-4-C11: OfficialSource empty seam (returns not_connected; no real API)
 from app.api.routes_official_sources import official_router
 app.include_router(official_router, prefix="/api")
+
+# R20-3: 场景包只读 API（场景包发现来自文件系统，无 DB 注册；写操作走文件系统）
+from app.api.routes_scenarios import router as scenarios_router
+app.include_router(scenarios_router, prefix="/api")

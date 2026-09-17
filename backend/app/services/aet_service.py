@@ -126,6 +126,14 @@ class AETService:
                        extra: dict | None = None) -> dict:
         """Write a real Evidence object to workspace/evidence/{evidence_id}.json.
 
+        R21 / B-R20-EVIDENCE-SHA-STALE: P4 execution is multi-node and the same
+        output file path can legitimately be overwritten by a later node/run.
+        When the new Evidence references the same file (output_code_ref) as an
+        older, not-yet-superseded Evidence record, mark that older record with
+        superseded_by=<this evidence_id> so P5's sha256 basis check (see
+        p5_verification_service._verify_p4_evidence_real) can skip stale history
+        instead of misreading a legitimate overwrite as basis tampering.
+
         Returns the evidence dict (can be serialized as API response).
         """
         from datetime import datetime, timezone
@@ -142,9 +150,46 @@ class AETService:
         if extra:
             ev.update(extra)
         ev_dir = self._evidence_dir(project_id)
+
+        out_ref = ev.get("output_code_ref")
+        if out_ref:
+            self._mark_superseded_by_file_ref(ev_dir, out_ref, evidence_id)
+
         ev_file = ev_dir / f"{evidence_id}.json"
         ev_file.write_text(json.dumps(ev, ensure_ascii=False, indent=2), encoding="utf-8")
         return ev
+
+    def _mark_superseded_by_file_ref(self, ev_dir: Path, output_code_ref: str,
+                                     new_evidence_id: str) -> None:
+        """Mark older Evidence records that reference the same file as superseded.
+
+        Scans existing Evidence JSON files in ev_dir; any record (other than the
+        one about to be written) whose output_code_ref matches and that is not
+        already superseded gets superseded_by=new_evidence_id persisted back to
+        disk. This is what lets P5 verification skip stale sha256 basis from an
+        earlier write of the same file without ever skipping the CURRENT
+        (non-superseded) record's sha256 check — tampering of the latest write
+        still fails verification.
+        """
+        for f in sorted(ev_dir.glob("*.json")):
+            if f.stem == new_evidence_id:
+                continue
+            try:
+                old = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                # 发声：历史 Evidence 文件损坏时跳过标记，不阻塞新 Evidence 写入。
+                logger.warning("write_evidence: 读取历史 Evidence 失败 file=%s", f, exc_info=True)
+                continue
+            if old.get("output_code_ref") != output_code_ref:
+                continue
+            if old.get("superseded_by"):
+                continue  # already marked stale by an even newer write
+            old["superseded_by"] = new_evidence_id
+            try:
+                f.write_text(json.dumps(old, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                # 发声：标记失败不应阻塞新 Evidence 写入，但需要留痕以便排查。
+                logger.warning("write_evidence: 标记 superseded_by 失败 file=%s", f, exc_info=True)
 
     def list_evidence(self, project_id: Optional[str] = None, stage: Optional[str] = None) -> list:
         """Read real Evidence objects from workspace/{project_id}/evidence/.

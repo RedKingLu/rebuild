@@ -219,6 +219,32 @@ async def archive_project(
     )
 
 
+# ── R21 长时任务心跳（B-R20-NO-LONGTASK-MONITOR）: 只读发现挂起，不做自动接管 ──
+
+@router.get("/{project_id}/heartbeat")
+async def get_project_heartbeat(
+    project_id: str,
+    run_id: str | None = Query(None, description="若指定，仅认可该 run 的心跳；不匹配→unknown"),
+    db: Session = Depends(get_db),
+):
+    """Read the current long-running-task heartbeat status for a project.
+
+    Read-only discovery endpoint (D-037: no retry/resume triggered here). Status is
+    always one of alive / stalled / unknown — "unknown" (never a default "alive")
+    when no heartbeat has ever been recorded, or when `run_id` does not match the
+    heartbeat currently on record.
+    """
+    svc = ProjectService(db)
+    if svc.get(project_id) is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+    from app.services.heartbeat_service import read_heartbeat_status
+    status = read_heartbeat_status(project_id, run_id=run_id)
+    return SuccessEnvelope(
+        data={"project_id": project_id, "run_id": run_id, **status},
+        meta=Meta(),
+    )
+
+
 # ── ZIP upload: create project + upload source ──────────────────────
 
 @router.post("/upload")
@@ -226,6 +252,7 @@ async def create_project_with_zip(
     name: str = Form(..., min_length=1, max_length=200),
     description: str = Form(""),
     file: UploadFile = File(...),
+    scenario: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
     """Create a project with a ZIP file upload as source.
@@ -240,7 +267,9 @@ async def create_project_with_zip(
     svc = ProjectService(db)
     from app.schemas.project import ProjectCreate
     req = ProjectCreate(name=name, description=description, source_type="zip",
-                        source_config={"original_filename": file.filename})
+                        source_config={"original_filename": file.filename},
+                        # R20-2-03: ZIP 上传路径与 JSON 创建路径对齐，同样可选择场景。
+                        scenario=(scenario.strip() or None) if scenario else None)
     project = svc.create(req)
 
     # Extract ZIP to managed directory
@@ -468,6 +497,9 @@ class OnboardingCompleteRequest(_BaseModel):
     target_os: str | None = None
     target_os_label: str | None = None
     target_env_note: str | None = None
+    # R20-2-01 (D-117③/D-118②)：项目重构场景 id（自由文本，开放可扩展，非封闭枚举）。
+    # 与 target_cpu_arch 等同组：用户输入采集（非识别逻辑），落库成为项目级目标态约束之一。
+    scenario: str | None = None
 
 
 @router.post("/{project_id}/onboarding/complete")
@@ -480,6 +512,21 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
         raise HTTPException(404, f"Project {project_id} not found")
 
     # 1. Update Environment Profile
+    # ── B-ACC-ONBOARD-SWALLOW（P2）────────────────────────────────────────────
+    # 原代码：`try: update_environment(...) except Exception: logger.warning(...)`
+    # —— 裸 except 把**输入校验失败**也吞了。实测传 `env_kind: "container"` 时
+    # `workspace_service.update_environment` 正确 `raise ValueError("无效 env_kind：…")`，
+    # 但接口仍返 **200 且 warnings: []**，而 `.rebuild/environment.json` 完全未更新。
+    # 连带损失比单字段更重：`env_kind` / `language_hint` / `framework_hint` / `status`
+    # **同在一个 dict 中被原子拒绝**，调用方声明的 language_hint / framework_hint 一并丢失，
+    # 且调用方无从得知。违 AGENTS §10-21（静默 except，异常必须发声）之精神。
+    #
+    # 修法（解除条件 ①②）：按异常性质分治，**不再用一个 except 覆盖两类**——
+    #   · ValueError = 输入校验失败 ⇒ **422**（与 schema 层一致，边界失败要快）。
+    #     置于 svc.update() 之前，故 422 时项目尚未被改动，不留半截状态。
+    #   · 其余异常 = 落盘 IO 类 ⇒ 可降级，但**必须经响应 warnings 字段回传**给调用方，
+    #     不再只写服务端日志（"记了日志"不等于"告知了调用方"）。
+    warnings: list[str] = []
     try:
         from app.services.workspace_service import update_environment
         env_updates = {"status": "declared"}
@@ -490,8 +537,14 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
         if req.framework_hint:
             env_updates["framework_hint"] = req.framework_hint
         update_environment(project_id, env_updates)
-    except Exception:
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except Exception as exc:
         logger.warning("Environment update failed", exc_info=True)
+        warnings.append(
+            f"环境档案写入失败（{type(exc).__name__}）：本次声明的 env_kind / language_hint / "
+            f"framework_hint 均未落盘（同一 dict 原子写入），请重试或改用 "
+            f"PATCH /projects/{project_id}/environment 单独设置。")
 
     # 2. Update Project
     updates = {"onboarding_done": True}
@@ -517,6 +570,10 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
             "source": "user_onboarding",
             "note": (req.target_env_note or ""),
         }
+    # R20-2-01/06 (D-117③)：引导向导可补选/改选场景（"后填覆盖先填"——若创建时已选，此处
+    # 再填会覆盖）。只在用户真填了才写；空串归一为 None，不写入空场景（诚实，不编造 R20-2-06）。
+    if req.scenario is not None:
+        updates["scenario"] = req.scenario.strip() or None
     # R9-5-7 T1/T2: persist remote-Git submission choice into source_config so the
     # materializer (step 5b) clones the chosen repo. Honest deferred if no creds.
     if req.submission_kind == "remote_git" and req.git_remote_url:
@@ -661,7 +718,8 @@ async def complete_onboarding(project_id: str, req: OnboardingCompleteRequest, d
         "graph_driven": False,
         "next": "点击『开始』(POST /onboarding/execute) 启动 P0 图执行",
     }
-    return SuccessEnvelope(data=_resp_data, meta=Meta())
+    # B-ACC-ONBOARD-SWALLOW：可降级的落盘失败经 warnings 回传（空列表 = 无降级，语义不变）。
+    return SuccessEnvelope(data=_resp_data, meta=Meta(), warnings=warnings)
 
 
 # ── P1 Full-Stack Profiling (R9-3C) ─────────────────────────────────────
@@ -772,14 +830,23 @@ async def execute_onboarding(project_id: str, db: Session = Depends(get_db)):
         try:
             from app.services.workspace_service import get_execution_mode as _get_mode
             _exec_mode = _get_mode(project_id)
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-14）：控制流不变（None → 下面走 Run 快照兜底）。发声的理由就写在
+            # 上方注释里：**这条链路上一次静默降级就是"auto/manual 被悄悄当 plan 跑"的原 bug**。
+            # 若权威控制源（workspace.json）读不出来而无人知晓，等于让那个 bug 原地复活。
+            logger.warning("graph_stream: 读 workspace 执行模式失败（%s: %s）—— 转用 Run 快照兜底 project=%s",
+                           type(e).__name__, e, project_id)
             _exec_mode = None
         if not _exec_mode:
             try:
                 from app.services.run_service import RunService as _RS
                 _run_now = _RS(svc_deps).get(run_id)
                 _exec_mode = getattr(_run_now, "execution_mode", None) or "plan"
-            except Exception:
+            except Exception as e:
+                # R24 第二遍（Q2-15）：控制流不变（最终兜底 "plan"）。但落到这里意味着**两级
+                # 控制源都没读到**，本次图执行用的是平台默认值而非用户选择 —— 必须留痕。
+                logger.warning("graph_stream: 读 Run 执行模式快照亦失败（%s: %s）—— 本次按默认 plan "
+                               "执行（非用户选择）project=%s run=%s", type(e).__name__, e, project_id, run_id)
                 _exec_mode = "plan"
         init_state = {
             "run_id": run_id,

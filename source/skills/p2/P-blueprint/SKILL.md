@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/blueprint (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-blueprint（迁移蓝图）
 
@@ -49,7 +50,7 @@ metadata:
 - 每个高风险项都有回滚预案。
 - 蓝图与 P2 评估 / ADR 双向可追溯。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 
 - schema 迁移必须前置于数据迁移，且类型映射（Oracle/MSSQL → 达梦 DM/openGauss/GaussDB）须在独立步骤先确认并立 brief，否则数据步骤大概率返工。
 - 服务改造与数据库迁移的依赖方向要明确：ORM / SQL 方言改写依赖目标库已就绪。

@@ -389,6 +389,7 @@ export function WorkspacePage() {
               sourceType={project.source_type}
               initialMode={ws.execMode}
               codingAgentRef={project.coding_agent_ref}
+              initialScenario={project.scenario}
               onDone={() => { setOnbDismissed(true); }}
             />
           )}

@@ -181,6 +181,17 @@ def _build_p0_migration_target(project_id: str) -> dict | None:
         return None
 
 
+def _build_project_context(project_id: str) -> dict | None:
+    """R20-2-04：Project → context_assembler 的 project= dict（B-R20-SCENARIO-NOT-WIRED）。
+
+    实现放在 project_service（services 层）而非本文件，供 work_agent.py / node_loop.py 等
+    services 层的断链调用点也能直接复用而不产生 services→graph 反向依赖（DRY，见
+    project_service.build_project_context_dict 的注释）。此处只是薄封装，供本文件既有
+    "_build_p0_migration_target 范式"风格的调用点统一调用。"""
+    from app.services.project_service import ProjectService
+    return ProjectService.build_project_context_dict(project_id)
+
+
 def _build_project_tech_selection(project_id: str) -> dict | None:
     """D-109：读取 Project 级技术路线选型红线（P1→P2 gate 用户批准后落库）。
     项目红线（非识别）；缺失（未到 P1 或未批准）则 None（诚实，不编造）。供 P2/P4 上下文注入。"""
@@ -323,13 +334,14 @@ class RealP0Handler:
             node_state["upstream_output"] = {"migration_target": migration_target}
         try:
             from app.services.context_assembler import assemble_context, build_system_prompt
+            _proj = _build_project_context(project_id)
             context_package = assemble_context(
-                project_id, "p0", node_state=node_state,
+                project_id, "p0", project=_proj, node_state=node_state,
                 task_type="onboarding", include_body=True, skill_disclosure="full")
             bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
             skill_body = "\n\n".join(bodies)[:12000]
             system_prompt = build_system_prompt(
-                project_id, "p0", node_state=node_state,
+                project_id, "p0", project=_proj, node_state=node_state,
                 task_type="onboarding", skill_disclosure="metadata")
         except Exception:
             logger.warning("P0 上下文装配失败（advisory，识别照常以事实包推理）", exc_info=True)
@@ -360,6 +372,14 @@ class RealP0Handler:
             intake["identification"] = {
                 "status": intake_result.status, "reason": intake_result.reason,
                 "note": "P0 识别需有效模型 Key，未降级为规则识别（D-097/公理3）"}
+            # `B-ACC-P0-PARSEERROR-STILL-ACCEPTED` + 甲②：失败原因是"输出不可解析"时，把可诊断
+            # 证据一并落进产物（parse_error / raw / parse_diagnosis）——只有日志会随进程滚走，
+            # 读产物的人同样需要能分辨"被截断"还是"输出非法 JSON"（标注须有消费方，D-06）。
+            _ident = intake_result.identification or {}
+            if _ident.get("parse_error"):
+                for _k in ("parse_error", "raw", "parse_diagnosis"):
+                    if _k in _ident:
+                        intake["identification"][_k] = _ident[_k]
             _mediated_write(project_id, stage_artifact_ref("p0", "intake_report.json"),
                             json.dumps(intake, ensure_ascii=False, indent=2),
                             auditor=self.auditor, stage="p0", action="write_intake_report")
@@ -442,17 +462,93 @@ class RealP0Handler:
         except Exception:
             logger.warning("P0 stage package 写入失败（advisory）", exc_info=True)
 
+    # `B-ACC-P0-PARSEERROR-STILL-ACCEPTED` 解除条件 ②：识别键大面积为空的**确定性**门控。
+    # 阈值口径**取同源，不另定数字**：P1 侧 `validation_agent._P1_MAJOR_GAP_THRESHOLD` 取"领域产物
+    # 半数"（8 项里 4 项）；本处同样取半数 —— 由字段清单 //2 派生（12 个识别键 → 6），使清单增减
+    # 时阈值自动跟随，不留第二处需要人工同步的数字。
+    @staticmethod
+    def _identification_fields() -> list:
+        """识别键锚点清单的单一事实源是 `intake_service.INTAKE_IDENTIFICATION_FIELDS`
+        （只读引用，不在本文件复制第二份清单 —— DRY；同 validation_agent 只读引用
+        `RealP1Handler._LLM_ARTIFACT_KEYS` 的既有范式）。延迟 import 与本文件既有
+        intake_service 引用方式一致（`:122` / `:272`）。"""
+        from app.services.intake_service import INTAKE_IDENTIFICATION_FIELDS
+        return list(INTAKE_IDENTIFICATION_FIELDS)
+
+    @classmethod
+    def _empty_identification_keys(cls, identification: dict) -> tuple[list, list]:
+        """返回 (实质为空的识别键, 全部识别键)。**确定性事实判断**，不是质量判定。
+
+        空的定义严格且客观：键缺失，或值为 None / "" / [] / {}。有内容即算产出 —— 内容好不好
+        **不在本方法的判断范围内**（见 review() 的边界说明）。
+        """
+        fields = cls._identification_fields()
+        empty = []
+        for key in fields:
+            if key not in identification:
+                empty.append(key)
+                continue
+            val = identification[key]
+            if val is None or (isinstance(val, (str, list, dict, tuple)) and len(val) == 0):
+                empty.append(key)
+        return empty, fields
+
     def review(self, result: dict) -> ReviewResult:
+        """P0 确定性域规则。
+
+        ⚠ 边界（`B-ACC-P0-PARSEERROR-STILL-ACCEPTED` 解除条件 ② 的实现边界，**勿删勿扩**）：
+          · 本方法只做**确定性事实判断**：源码是否为空、阶段是否声明完成、识别键是否**大面积
+            为空**。"大面积为空"是可数的客观事实（键缺失/值为 null/空串/空数组/空对象），
+            **不是**对识别内容好不好的质量判定。
+          · 识别**质量**的语义判定仍由独立 LLM Acceptance Agent 承担（WP-4，validation_agent
+            p0=llm）。**不得**把"判断识别得准不准/合不合理"搬进本方法（那是越权，会把 LLM 判断
+            规则化，违反 AGENTS §2.3 / §10-25）。
+          · 反过来也**不得**因"这看起来像质量判定"而删掉下面这条空键检查：它拦的是"识别产物
+            整体立不住却报 issues:[]"这一**谎报**形态（与 D-05 同族；P2 侧同类失败早有
+            `unparseable_output` 守卫，P0 侧此前是纯缺口）。
+        """
         issues = []
         # 域规则（确定性）：非手动项目源码为空 → 应阻断引导补凭据。
         if result.get("source_type") not in ("manual",) and result.get("file_count", 0) == 0:
             issues.append({"type": "empty_source",
                            "detail": "非手动项目但源码目录为空（应阻断并引导补凭据）"})
-        # 识别质量语义判定由独立 LLM Acceptance Agent 承担（WP-4，validation_agent p0=llm）；
-        # 此处仅保留确定性域规则（存在性/空源），不做规则化识别质量判定。
+        # 域规则（确定性）：阶段未声明完成 → 域基线不得通过（与 P1/P2 review 同范式）。
+        # 此前本方法**完全不看 status**：识别失败/blocked 时域校验照样 passed=True，只靠
+        # ValidationAgent 的 declared!=completed 兜住 —— 少一层，且直接用 handler.review 作
+        # review_fn 的路径（nodes.py 非 Agent 工作流分支）会静默通过。
+        status = result.get("status")
+        if status not in ("completed", None):
+            reason = result.get("reason") or f"P0 未完成（status={status}）"
+            return ReviewResult(
+                passed=False,
+                issues=issues + [{"type": "p0_not_completed", "detail": reason}],
+                recommendations=["按 reason 修正后重跑 P0 接入识别"],
+                reviewer="p0_review_skill")
+        # 域规则（确定性）：识别键大面积为空 → 产出 issue 并影响 verdict，不得以 issues:[] 掩盖。
+        # 只在"声明完成 + 确实带了 identification"时才判（缺该键的调用方不误伤；产物缺失由
+        # artifacts / 独立结构核验负责）。
+        identification = result.get("identification")
+        if isinstance(identification, dict):
+            empty_keys, fields = self._empty_identification_keys(identification)
+            threshold = len(fields) // 2
+            if len(empty_keys) >= threshold:
+                detail = (
+                    f"P0 识别键大面积为空：{len(empty_keys)}/{len(fields)} 项（{empty_keys}）"
+                    f"—— 已达/超过半数阈值（{threshold}，与 P1 领域产物集完整性门控同源口径）。"
+                    "识别产物整体立不住，不得判阶段无问题")
+                if identification.get("parse_error"):
+                    diagnosis = identification.get("parse_diagnosis") or {}
+                    detail += (f"；根因线索：模型输出无法解析为 JSON（疑似截断="
+                               f"{bool(diagnosis.get('suspected_truncation'))}，"
+                               f"信号={diagnosis.get('truncation_signals')}）")
+                issues.append({"type": "p0_identification_major_gap", "detail": detail})
+        recommendations: list = []
+        if issues:
+            recommendations = (["补充源码凭据后重新导入"]
+                               if any(i.get("type") == "empty_source" for i in issues)
+                               else ["重跑 P0 识别并确认模型按契约输出完整 JSON"])
         return ReviewResult(passed=not issues, issues=issues,
-                            recommendations=["补充源码凭据后重新导入"] if issues else [],
-                            reviewer="p0_review_skill")
+                            recommendations=recommendations, reviewer="p0_review_skill")
 
 
 class RealP1Handler:
@@ -565,13 +661,14 @@ class RealP1Handler:
             node_state["upstream_output"] = {"migration_target": upstream["migration_target"]}
         try:
             from app.services.context_assembler import assemble_context, build_system_prompt
+            _proj = _build_project_context(project_id)
             context_package = assemble_context(
-                project_id, "p1", node_state=node_state, task_type="profiling",
+                project_id, "p1", project=_proj, node_state=node_state, task_type="profiling",
                 include_body=True, skill_disclosure="full")
             bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
             skill_body = "\n\n".join(bodies)[:12000]
             system_prompt = build_system_prompt(
-                project_id, "p1", node_state=node_state, task_type="profiling",
+                project_id, "p1", project=_proj, node_state=node_state, task_type="profiling",
                 skill_disclosure="metadata")
         except Exception:
             logger.warning("P1 上下文装配失败（advisory，识别照常以事实包推理）", exc_info=True)
@@ -675,9 +772,11 @@ class RealP1Handler:
         migration_target = upstream.get("migration_target") or _build_p0_migration_target(project_id)
         try:
             svc = self._tech_selection_svc()
+            _proj = _build_project_context(project_id)
             result = await svc.select(
                 project_id, identification=identification, upstream=upstream,
-                migration_target=migration_target, run_id=run_id, stage="p1")
+                migration_target=migration_target, run_id=run_id, stage="p1",
+                scenario=(_proj or {}).get("scenario"))
         except Exception as e:  # honest: surface, never fake a selection (公理3)
             logger.warning("P1 tech_selection 生成异常（advisory，写诚实 failed 产物）", exc_info=True)
             self._write_json(project_id, "tech_selection.json", {
@@ -887,13 +986,14 @@ class RealP2Handler:
                 node_state["upstream_output"] = _redlines
             # D-108: 加载 P2 评估 stage skill 正文（P-migration-assessment），评估需求随 skill 走，
             # 提示词瘦身、给 Agent 灵活度（skill-first，仿 P0/P1 include_body + skill_disclosure=full）。
+            _proj = _build_project_context(project_id)
             context_package = assemble_context(
-                project_id, "p2", node_state=node_state,
+                project_id, "p2", project=_proj, node_state=node_state,
                 task_type="assessment", include_body=True, skill_disclosure="full")
             bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
             skill_body = "\n\n".join(bodies)[:12000]
             system_prompt = build_system_prompt(
-                project_id, "p2", node_state=node_state,
+                project_id, "p2", project=_proj, node_state=node_state,
                 task_type="assessment", skill_disclosure="metadata")
         except Exception:
             logger.warning("P2 context assembly failed (advisory, domain work proceeds)",
@@ -1069,11 +1169,12 @@ class RealP3Handler:
             from app.services.context_assembler import assemble_context, build_system_prompt
             node_state = {"node_task": "P3 规划：生成 Stage Plan / Task Plan / TaskGraph（必生）",
                           "task": "迁移方案与任务图规划"}
+            _proj = _build_project_context(project_id)
             context_package = assemble_context(
-                project_id, "p3", node_state=node_state,
+                project_id, "p3", project=_proj, node_state=node_state,
                 task_type="planning", skill_disclosure="metadata")
             system_prompt = build_system_prompt(
-                project_id, "p3", node_state=node_state,
+                project_id, "p3", project=_proj, node_state=node_state,
                 task_type="planning", skill_disclosure="metadata")
         except Exception:
             logger.warning("P3 context assembly failed (advisory, domain work proceeds)",
@@ -1374,7 +1475,7 @@ class RealP4Handler:
         try:
             from app.services.context_assembler import assemble_context
             context_package = assemble_context(
-                project_id, "p4",
+                project_id, "p4", project=_build_project_context(project_id),
                 node_state={"node_task": "P4 执行：按 P3 TaskGraph 执行 execution 节点"},
                 task_type="execution", include_body=True, skill_disclosure="full")
             bodies = [s.get("body") for s in (context_package.get("skills") or []) if s.get("body")]
@@ -1500,11 +1601,21 @@ class RealP4Handler:
         dep_check_ref, dep_check_doc, dep_evidence_id = await self._run_dependency_check(
             project_id, run_id)
 
+        # B-V262-DUP-SYMBOL-CROSSNODE + B-V262-UNDECLARED-DEP：P4 尾部再做一次**产出物整体
+        # 一致性**静态核查（跨文件重复符号 + 用了但未声明的依赖）。定位与依赖校验逐条同构：
+        # 只读、不改任何产出文件、**不参与门禁**（不读不改 status/graph_status/criteria_met）、
+        # 结论一律 needs_human_review（暴露≠拦截，R19-2-03）。
+        # 归口 P4 而非 P5 的理由见 services/output_code_consistency 模块 docstring
+        # （真跑实测 NU1605 依赖还原失败会物理遮蔽后续编译错误 ⇒ 绑在构建成功上等于让缺陷继续隐身）。
+        consistency_ref, consistency_doc, consistency_evidence_id = \
+            await self._run_output_consistency_check(project_id, run_id)
+
         # C7: write a structured P4 execution-summary report (change manifest + patch index +
         # per-node results) — the primary readable review material attached to the P4→P5 Gate.
         summary_ref = self._write_execution_summary(
             project_id, tg, exec_nodes, eng, p4_ev, patch_refs,
-            node_type_dist, acceptance_results, dep_check_doc=dep_check_doc)
+            node_type_dist, acceptance_results, dep_check_doc=dep_check_doc,
+            consistency_doc=consistency_doc)
 
         # graph_status → handler status：completed→completed；其余（failed/waiting_gate/blocked/
         # rework_required）→ blocked（诚实非 completed，交 StageLoop 升级 Gate / 准备 P4→P5 Gate）。
@@ -1571,7 +1682,13 @@ class RealP4Handler:
             return {"path": rel_path,
                     "sha256": hashlib.sha256(raw).hexdigest(),
                     "bytes": len(raw)}
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-16）：控制流与返回形状完全不变（sha256="" / bytes=0，调用方据此
+            # 判"证据基础不可用"）。但 sha256 为空是**证据链上的空洞**，静默会让"文件本来就没有"
+            # 与"文件在却读不动/被 mediator 挡回"长得一模一样 —— 必须发声（AGENTS §10-21）。
+            # 不改 mediator 的 guard_read 越界判定，不改任何返回字段。
+            logger.warning("stage_handlers._file_facts 读文件失败：%s（%s: %s）—— "
+                           "本条证据以空 sha256/0 字节记入（诚实标记不可校验）", rel_path, type(e).__name__, e)
             return {"path": rel_path, "sha256": "", "bytes": 0}
 
     def _write_pending_review(self, project_id, review_nodes, node_type_dist,
@@ -1683,9 +1800,93 @@ class RealP4Handler:
                     ref, counts.get("coordinates", 0), counts.get("unresolvable", 0))
         return ref, doc, evidence_id
 
+    async def _run_output_consistency_check(
+            self, project_id: str, run_id: str) -> tuple[str | None, dict | None, str | None]:
+        """B-V262-DUP-SYMBOL-CROSSNODE + B-V262-UNDECLARED-DEP：产出物整体一致性静态核查。
+
+        产出独立主产物 `artifacts/p4/p4_output_consistency.json` + AET Evidence。
+        两条缺陷合在一个产物里，是因为它们**同属一个此前无守卫的维度**（产出物整体一致性），
+        且都只需要对 `output_code/` 做一次静态索引 —— 拆成两个产物会让读者以为它们是两件
+        不相关的事，也会把同一次全树遍历做两遍。
+
+        定位纪律（与 `_run_dependency_check` 逐条同构，不另立规矩）：
+        本方法【不产 pass/通过 结论】、【不参与门禁】——不读也不改 criteria_met/graph_status/
+        status，失败即诚实降级为 (None, None, None)，绝不让本核查的异常影响 P4 完成判定。
+
+        独立取证红线：不 import 任何 p5_* 模块、不读 `artifacts/p5_validation_report.json`。
+        """
+        try:
+            from app.services import manifest_parsers, output_code_consistency
+            from app.services.workspace_service import workspace_path
+            output_code_dir = workspace_path(project_id) / "output_code"
+            # 清单解析走与依赖校验**同一个纯函数层**（manifest_parsers），不写第二份解析。
+            # 这里会对清单**再解析一遍**（`_run_dependency_check` 内部也解析过一次）——
+            # 如实说明而不假装复用：要真正复用就得改 `run_dependency_check` 的公开签名把
+            # manifests 传进去/带出来，为一次纯本地文件读的微优化改公开接口不值得（KISS）。
+            # 成本可控：`discover_manifests` 只按 5 个文件名模式 glob，不读源码文件。
+            manifests = manifest_parsers.parse_all_manifests(output_code_dir)
+            doc = output_code_consistency.run_consistency_check(
+                output_code_dir, manifests, run_id)
+        except Exception:
+            logger.warning("P4 产出物一致性核查执行失败（advisory，不影响 P4 完成判定）",
+                           exc_info=True)
+            return None, None, None
+        if doc is None:
+            # output_code/ 下无任何可索引的 C#/Java 源文件 —— 没有可判的对象，不产噪音产物。
+            return None, None, None
+
+        ref = stage_artifact_ref("p4", "p4_output_consistency.json")
+        try:
+            _mediated_write(project_id, ref, json.dumps(doc, ensure_ascii=False, indent=2),
+                            auditor=self.auditor, stage="p4",
+                            action="write_output_consistency")
+        except Exception:
+            logger.warning("P4 产出物一致性核查产物写入失败（advisory）", exc_info=True)
+            return None, None, None
+
+        counts = doc.get("counts", {})
+        artifact_sha256 = hashlib.sha256(
+            json.dumps(doc, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        findings_brief = (
+            [f"重复符号：{c['symbol']}（{c['file_count']} 个文件）"
+             for c in doc.get("duplicate_symbols", [])]
+            + [f"用了但未声明：{f['namespace']}（{f['reference_count']} 处引用）"
+               for f in doc.get("undeclared_dependencies", [])]
+        )
+        evidence_id = f"ev-p4-consistency-{(run_id or 'norun')[:8]}"
+        try:
+            aet = self._aet if self._aet is not None else self._services().aet_service
+            aet.write_evidence(
+                project_id,
+                evidence_id=evidence_id,
+                evidence_type="output_consistency",
+                status="candidate", source="p4", stage="p4",
+                claim=(f"P4 产出物一致性核查：索引 {counts.get('files_scanned', 0)} 个源文件 / "
+                      f"{counts.get('symbols_indexed', 0)} 个顶层类型，检出 "
+                      f"{counts.get('duplicate_symbol_conflicts', 0)} 处跨文件重复符号、"
+                      f"{counts.get('undeclared_dependencies', 0)} 处用了但未声明的依赖"),
+                extra={
+                    # 陷阱：D-111 幽灵过滤要求 run_id 匹配，否则 Evidence 被静默剔除
+                    "run_id": run_id,
+                    "artifact_ref": ref,
+                    "artifact_sha256": artifact_sha256,
+                    "counts": counts,
+                    "findings_brief": findings_brief,
+                    "evidence_basis": "static_index_of_output_code",
+                    "boundary": doc.get("boundary", {}),
+                })
+        except Exception:
+            logger.warning("P4 产出物一致性核查 Evidence 写入失败（advisory）", exc_info=True)
+            return ref, doc, None
+        logger.info("R24: wrote P4 output consistency %s (%d dup-symbol, %d undeclared-dep)",
+                    ref, counts.get("duplicate_symbol_conflicts", 0),
+                    counts.get("undeclared_dependencies", 0))
+        return ref, doc, evidence_id
+
     def _write_execution_summary(self, project_id, tg, exec_nodes, eng, p4_evidence,
                                  patch_refs, node_type_dist,
-                                 acceptance_results, dep_check_doc: dict | None = None) -> str | None:
+                                 acceptance_results, dep_check_doc: dict | None = None,
+                                 consistency_doc: dict | None = None) -> str | None:
         """C7: persist a structured P4 execution summary to artifacts/p4/p4_execution_summary.json.
 
         Contains a change manifest (output_code files with real sha256/bytes), a patch index,
@@ -1814,6 +2015,31 @@ class RealP4Handler:
                 unresolved_scope.append(
                     f"依赖不可解析：{brief} → 待用户修复；平台只暴露不代改（R19-2-03）")
 
+        # B-V262-DUP-SYMBOL-CROSSNODE + B-V262-UNDECLARED-DEP：把产出物一致性核查的检出项
+        # 写进 unresolved_scope，使"这些发现"出现在 P4 执行摘要这一**用户 Gate 主审核材料**里
+        # —— 光有独立产物不够：两条缺陷的共同教训正是"信号建好了但阶段产物看不见"
+        # （同 B-ACC-HELD-ACTION-INVISIBLE 的模式）。
+        output_consistency_ptr = None
+        if consistency_doc:
+            oc_counts = consistency_doc.get("counts", {})
+            output_consistency_ptr = {
+                "ref": stage_artifact_ref("p4", "p4_output_consistency.json"),
+                "status": consistency_doc.get("status"),
+                "files_scanned": oc_counts.get("files_scanned", 0),
+                "symbols_indexed": oc_counts.get("symbols_indexed", 0),
+                "duplicate_symbol_conflicts": oc_counts.get("duplicate_symbol_conflicts", 0),
+                "undeclared_dependencies": oc_counts.get("undeclared_dependencies", 0),
+                "boundary": consistency_doc.get("boundary", {}),
+            }
+            for c in consistency_doc.get("duplicate_symbols", []):
+                unresolved_scope.append(
+                    f"跨文件重复符号：{c['symbol']} 在 {c['file_count']} 个文件中各声明一次"
+                    f"（C# CS0101/CS0111，工程将无法编译）→ 需人工复核；平台只暴露不代改")
+            for f in consistency_doc.get("undeclared_dependencies", []):
+                unresolved_scope.append(
+                    f"用了但未声明的依赖：{f['namespace']}（{f['reference_count']} 处引用）"
+                    f"→ 需人工复核；平台只暴露不代改")
+
         _sec_hints = ("auth", "登录", "login", "密码", "password", "ldap", "权限",
                       "permission", "token", "会话", "session", "认证")
         security_notes = [
@@ -1847,6 +2073,12 @@ class RealP4Handler:
         }
         if dependency_check_ptr:
             summary["dependency_check"] = dependency_check_ptr
+        # B-V262-DUP-SYMBOL-CROSSNODE / B-V262-UNDECLARED-DEP：产出物一致性核查指针 +
+        # unresolved_scope 只读追加。与 dependency_check 同款处理：**只放指针+摘要**，
+        # 全量在独立产物 artifacts/p4/p4_output_consistency.json 里；不改本函数早退语义、
+        # 不改 P4 status/graph_status/criteria_met。
+        if output_consistency_ptr:
+            summary["output_consistency"] = output_consistency_ptr
         out = out_dir / "p4_execution_summary.json"
         ref = _mediated_write(project_id, stage_artifact_ref("p4", out.name),
                               json.dumps(summary, ensure_ascii=False, indent=2),
@@ -2308,7 +2540,21 @@ class RealP5Handler:
             result["plan_delta_reason"] = route.plan_delta_reason
 
         # 构建 review issues（含返工建议）
-        issues = [{"type": f"p5_{failure_type}", "detail": route.action}]
+        # V26.2 返工修复第 8 项：P5FailureRouter 已判定 p4_rework_required/plan_delta_type/
+        # plan_delta_reason（见上方③④两段），但这几个字段只写进本方法局部变量 result——
+        # ValidationAgent.validate() 调用本方法时喂入的是磁盘重读的 disk_view（r3 约束 3），
+        # 不是这份 result，所以写进 result 的字段实际到不了任何消费方（这正是本轮要修的
+        # "算了却没人消费"）。issues 列表里的 dict 是唯一一条能原样穿过 ValidationAgent
+        # 聚合、活到 StageLoopResult.rounds 的通道（validation_agent.py 逐项 append 原
+        # dict，不重新构造）。因此把这几个显式字段直接放进这条 issue dict——nodes.py 的
+        # make_work_node 据此（且仅据此显式字段，不从 verdict/failure_type 文本反推）
+        # 判断是否要落"P5 返工"标记、创建 PlanDelta、路由回 P4（Q-RW-4）。
+        issue_entry = {"type": f"p5_{failure_type}", "detail": route.action}
+        if route.p4_rework_required:
+            issue_entry["p4_rework_required"] = True
+            issue_entry["plan_delta_type"] = route.plan_delta_type
+            issue_entry["plan_delta_reason"] = route.plan_delta_reason
+        issues = [issue_entry]
         recommendations = []
         if route.retry_allowed:
             recommendations.append(f"P5 有界重试（第 {route.retry_count} 次）")
@@ -2368,14 +2614,24 @@ class RealP5Handler:
             # 消费者，不自碰 assemble_context —— 满足 X-4-5 单一事实源）。装配失败=advisory 降级，非阻断。
             skill_body, system_prompt = "", ""
             try:
-                from app.services.context_assembler import assemble_context
+                from app.services.context_assembler import assemble_context, build_system_prompt
+                _proj = _build_project_context(project_id)
+                _p5_node_state = {"node_task": "P5 验证：规划验证策略、解读失败、提修复建议（不替代真实测试）"}
                 pkg = assemble_context(
-                    project_id, "p5",
-                    node_state={"node_task": "P5 验证：规划验证策略、解读失败、提修复建议（不替代真实测试）"},
+                    project_id, "p5", project=_proj,
+                    node_state=_p5_node_state,
                     task_type="verification", include_body=True, skill_disclosure="full")
                 bodies = [s.get("body") for s in (pkg.get("skills") or []) if s.get("body")]
                 skill_body = "\n\n".join(bodies)[:12000]
-                system_prompt = pkg.get("system_prompt", "") or ""
+                # R20-2-04 §7.6 方案 A：assemble_context 从不返回 "system_prompt" 键（§5.7/§16 J-6
+                # 已实证 has system_prompt key? False）——此前的旧写法恒读到空串（pkg 字典里根本
+                # 没有这个键），P5 advisory agent 从未真收到过 system_prompt/scenario_line
+                # （AGENTS §10-17 反模式）。改为再调一次公开 API build_system_prompt（仍走
+                # X-4-5 单一装配入口，不绕过）。
+                system_prompt = build_system_prompt(
+                    project_id, "p5", project=_proj,
+                    node_state=_p5_node_state,
+                    task_type="verification", skill_disclosure="metadata")
             except Exception:
                 logger.warning("P5 advisory context assembly failed (advisory)", exc_info=True)  # 公理3
             facts = {
@@ -2574,6 +2830,28 @@ class RealP6Handler:
             logger.warning("P6: P5 report load failed: %s", e, exc_info=True)
             return {}
 
+    def _scan_stage_artifact_paths(self, ws, stage: str) -> list[str]:
+        """列举 `artifacts/{stage}/` 下最多 30 个真实文件的**相对路径**（只读、只记路径）。
+
+        R24 第二遍（Q2-25）：从 `_gather_upstream_facts` 原地抽出，使那个函数从嵌套 d6 降到 d3。
+        搬入的代码**逐字未变**（含 30 个上限、`p.is_file()` 过滤、以及扫描失败时的 warning 文案）；
+        「扫描中途异常 → 返回已收集到的部分结果」这一语义也逐字保留（原实现同样是把异常吞在
+        内层、`found` 保持已填内容继续往下走）。只读、非门禁，与 Gate / 风险分级无关。
+        """
+        d = ws / "artifacts" / stage
+        if not (d.exists() and d.is_dir()):
+            return []
+        found: list[str] = []
+        try:
+            for p in sorted(d.rglob("*")):
+                if len(found) >= 30:
+                    break
+                if p.is_file():
+                    found.append(str(p.relative_to(ws)))
+        except Exception:
+            logger.warning("P6: upstream scan failed for %s", stage, exc_info=True)
+        return found
+
     def _gather_upstream_facts(self, project_id: str) -> dict:
         """GAP-P6-5：确定性列举 P2/P3/P4 上游产物可用性（只读、非门禁）。
 
@@ -2585,17 +2863,7 @@ class RealP6Handler:
             from app.services.workspace_service import workspace_path
             ws = workspace_path(project_id)
             for stage in ("p2", "p3", "p4"):
-                d = ws / "artifacts" / stage
-                found: list[str] = []
-                if d.exists() and d.is_dir():
-                    try:
-                        for p in sorted(d.rglob("*")):
-                            if len(found) >= 30:
-                                break
-                            if p.is_file():
-                                found.append(str(p.relative_to(ws)))
-                    except Exception:
-                        logger.warning("P6: upstream scan failed for %s", stage, exc_info=True)
+                found = self._scan_stage_artifact_paths(ws, stage)
                 facts[stage] = {"available": bool(found), "artifacts": found}
         except Exception as e:
             logger.warning("P6: gather upstream facts failed (non-blocking): %s", e, exc_info=True)
@@ -2611,6 +2879,11 @@ class RealP6Handler:
         try:
             p4_input = input_svc.read_p4_input(project_id, run_id)
         except Exception as e:
+            # R24 第二遍（Q2-17）：返回值一字不改（blocked = fail-closed，P6 不执行，方向更严）。
+            # 但 reason 里只有 `type(e).__name__`，**异常消息与堆栈全部丢失** —— 运维看到
+            # "P5 输入读取异常：KeyError" 无从定位是哪个 key。发声补齐，不改判定。
+            logger.warning("P6: 读 P5 输入异常（%s: %s）—— P6 诚实 blocked（fail-closed）"
+                           "project=%s run=%s", type(e).__name__, e, project_id, run_id, exc_info=True)
             return {"status": "blocked",
                     "reason": f"P5 输入读取异常：{type(e).__name__}",
                     "artifacts": [], "evidence_refs": []}
@@ -2747,14 +3020,21 @@ class RealP6Handler:
             # 消费者，不自碰 assemble_context —— 满足 X-4-5 单一事实源）。装配失败=advisory 降级，非阻断。
             skill_body, system_prompt = "", ""
             try:
-                from app.services.context_assembler import assemble_context
+                from app.services.context_assembler import assemble_context, build_system_prompt
+                _proj = _build_project_context(project_id)
+                _p6_node_state = {"node_task": "P6 交付：组织交付叙述、部署/运维/回退提示、验收结论建议（不替代确定性门禁）"}
                 pkg_ctx = assemble_context(
-                    project_id, "p6",
-                    node_state={"node_task": "P6 交付：组织交付叙述、部署/运维/回退提示、验收结论建议（不替代确定性门禁）"},
+                    project_id, "p6", project=_proj,
+                    node_state=_p6_node_state,
                     task_type="delivery", include_body=True, skill_disclosure="full")
                 bodies = [s.get("body") for s in (pkg_ctx.get("skills") or []) if s.get("body")]
                 skill_body = "\n\n".join(bodies)[:12000]
-                system_prompt = pkg_ctx.get("system_prompt", "") or ""
+                # R20-2-04 §7.6 方案 A（同 P5 :2395-2402 的修法）：assemble_context 从不返回
+                # "system_prompt" 键，此前恒空，P6 advisory agent 从未真收到过 scenario_line。
+                system_prompt = build_system_prompt(
+                    project_id, "p6", project=_proj,
+                    node_state=_p6_node_state,
+                    task_type="delivery", skill_disclosure="metadata")
             except Exception:
                 logger.warning("P6 advisory context assembly failed (advisory)", exc_info=True)  # 公理3
             indexes = pkg.indexes or {}

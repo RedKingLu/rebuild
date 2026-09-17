@@ -10,15 +10,42 @@ providers:
     endpoint_openai: "https://api.deepseek.com"
     endpoint_anthropic: "https://api.deepseek.com/anthropic"
     env_key_var: "DEEPSEEK_API_KEY"
+    # ── 2026-09-13 主窗口实测 GET /models + 逐个真实 chat/completions 调用确认 ──
+    # 官方清单已从 3 个收敛为 **2 个**：`deepseek-flash` / `deepseek-v4-pro`。
+    # flash 系列改名：`deepseek-v4-flash` → **`deepseek-flash`**（规范名）。
+    # 实测证据（逐个真实调用，非采信清单）：
+    #   deepseek-flash                : OK 977ms，响应 model 字段 = deepseek-flash
+    #   deepseek-v4-flash             : OK 879ms，响应 model 字段 = **deepseek-flash** ⇒ 旧名是别名、已重定向
+    #   deepseek-v4-flash-vision-exp  : OK      ，响应 model 字段 = **deepseek-flash** ⇒ 同为别名，已非独立视觉模型
+    #   deepseek-v4-pro               : OK 936ms，响应 model 字段 = deepseek-v4-pro
     models:
+      - model_name: "deepseek-flash"
+        display_name: "DeepSeek Flash"
+        capability_tags: ["chat", "streaming", "coding", "review"]
+        cost_tier: "low"
+        supports_streaming: true
+        # 实测 2026-09-13：文本 1564ms（content 83 字符 + reasoning_content 319 字符）；
+        # 工具调用 933ms 成功发起（返回规范 tool_calls，参数 JSON 正确）。
+        supports_tool_calling: true
+        context_window_note: "1M tokens"
+        # ⚠ 该模型有 **reasoning 通道开销**：实测 completion_tokens=185 中 reasoning_tokens=146。
+        #   max_tokens 设过低（实测 16）会被 reasoning 吃光、content 返回空串 —— 调用方须留足预算，
+        #   这与 D-06（LLM JSON 输出截断）同一风险面：预算不足表现为"产物为空"而非报错。
+        recommended_use: "**默认主力**（用户 2026-09-13 明确指示优先用 flash）：日常编码、快速评审、高吞吐场景"
+      # ── 旧名保留为别名条目（实测仍可调用并重定向到 deepseek-flash）──────────────
+      # 不删除的理由：本仓多处测试把 `deepseek-official/deepseek-v4-flash` 钉成常量夹具
+      # （test_r175_p4_fix_batch5 / test_r1736_wp6 / test_r13_4_fusion 等），直接删会造成
+      # 一批假失败 —— 正是 test_model_gateway.py:173 注释记录过的"provider 清单变化导致测试
+      # 假失败"这一教训。保留别名可让既有引用继续工作，新代码应用规范名 deepseek-flash。
       - model_name: "deepseek-v4-flash"
-        display_name: "DeepSeek V4 Flash"
+        display_name: "DeepSeek V4 Flash（旧名，别名→deepseek-flash）"
         capability_tags: ["chat", "streaming", "coding", "review"]
         cost_tier: "low"
         supports_streaming: true
         supports_tool_calling: true
         context_window_note: "1M tokens"
-        recommended_use: "日常编码、快速评审、高吞吐场景"
+        deprecated_alias_of: "deepseek-flash"
+        recommended_use: "**已改名，勿用于新代码**：provider 侧重定向到 deepseek-flash（实测响应 model 字段即为新名）。保留仅为兼容既有测试夹具引用"
       - model_name: "deepseek-v4-pro"
         display_name: "DeepSeek V4 Pro"
         capability_tags: ["chat", "streaming", "coding", "review", "fusion"]
@@ -27,7 +54,10 @@ providers:
         supports_tool_calling: true
         is_fusion_capable: true
         context_window_note: "1M tokens"
-        recommended_use: "复杂分析、架构决策、Fusion 评审"
+        # ⚠ 用户 2026-09-13 明确指示：**后续不使用 pro，优先用 flash**。
+        #   仍保留在目录中是因为 provider 侧确实存在该模型（实测可调用），删除会让
+        #   "平台声称的清单"与"provider 真实清单"不一致；但不得作为任何默认/主力选型。
+        recommended_use: "**不作为选型主力（用户 2026-09-13 指示）**。provider 侧存在且可调用，仅在用户显式指定时使用"
 
   - provider_id: "maas-icompify"
     provider_name: "MaaS (icompify)"
@@ -35,8 +65,37 @@ providers:
     api_format: "openai"
     endpoint_openai: "https://api.icompify.com/v1"
     endpoint_anthropic: "https://api.icompify.com/anthropic"
+    # Codex Responses 通道（2026-09-06 用户提供的更新接口规范；2026-09-08 接线并真实调用
+    # 验证，见 B-R20-NO-RESPONSES-CHANNEL 交付报告）。
+    # 注意：这里存的是"base URL"（与 endpoint_openai 同一约定），不带 "/responses" 路径
+    # 后缀 —— litellm.aresponses() 会自动拼接该后缀发往「实际路径 /v1/responses」；若这里
+    # 存带后缀的完整路径会变成 ".../responses/responses" 触发 404（真实调用实测确认，此前
+    # 版本误存了带后缀的完整路径，已修正）。
+    endpoint_responses: "https://api.icompify.com/v1"
     env_key_var: "LLM_API_KEY"
+    # ── 模型清单同步自 provider 实测（2026-09-06，GET /v1/models 返 11 个）──
+    # 实测方法与全量数据见 证据/进度追踪/05-验收与证据索引.md「icompify 模型实测」。
+    # 移除：qwen3.5（provider 侧已下线，实测 /v1/models 无此 id）。
     models:
+      # ── 推荐主力（实测最快且输出干净）──
+      - model_name: "qwen3.8-27b"
+        display_name: "Qwen 3.8 27B (MaaS)"
+        capability_tags: ["chat", "streaming", "coding", "review"]
+        cost_tier: "low"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "128K tokens"
+        # 实测 2026-09-06：文本 955ms/123tok 直出正文；工具调用 406ms（**全场最快**）
+        recommended_use: "推荐默认：日常编码、快速评审、工具调用密集场景"
+      - model_name: "deepseek-v4-flash"
+        display_name: "DeepSeek V4 Flash (MaaS)"
+        capability_tags: ["chat", "streaming", "coding", "review"]
+        cost_tier: "low"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "1M tokens"
+        # 实测 2026-09-06：文本 468ms/111tok 直出；工具 816ms。R20-4 真跑中稳定
+        recommended_use: "推荐默认：日常编码、快速评审（大上下文场景优先）"
       - model_name: "deepseek-v4-pro"
         display_name: "DeepSeek V4 Pro (MaaS)"
         capability_tags: ["chat", "streaming", "coding", "review", "fusion"]
@@ -45,15 +104,47 @@ providers:
         supports_tool_calling: true
         is_fusion_capable: true
         context_window_note: "1M tokens"
+        # 实测 2026-09-06：文本 3165ms/180tok；工具 1468ms。R20-4 真跑主力（276 次调用全程稳定）
         recommended_use: "复杂分析、架构决策、Fusion 评审"
-      - model_name: "deepseek-v4-flash"
-        display_name: "DeepSeek V4 Flash (MaaS)"
-        capability_tags: ["chat", "streaming", "coding", "review"]
+      - model_name: "minimax-m3"
+        display_name: "MiniMax M3 (MaaS)"
+        capability_tags: ["chat", "streaming", "coding"]
+        cost_tier: "low"
+        supports_streaming: true
+        # 实测 2026-09-06 更正：**支持工具调用**（原配置记 false，实测 475ms 成功发起 get_stack）
+        supports_tool_calling: true
+        context_window_note: "32K tokens"
+        recommended_use: "轻量对话、快速问答"
+      # ── 推理型（thinking 固定开销约 400-500 tok，max_tokens 须留足余量）──
+      - model_name: "glm-5.3-flash"
+        display_name: "GLM 5.3 Flash (MaaS)"
+        capability_tags: ["chat", "streaming", "long_context", "reasoning"]
         cost_tier: "low"
         supports_streaming: true
         supports_tool_calling: true
-        context_window_note: "1M tokens"
-        recommended_use: "日常编码、快速评审"
+        context_window_note: "128K tokens"
+        # ⚠ 实测 2026-09-06：max_tokens=400 时 400tok 全被 thinking 吃掉、content 为空；
+        #   max_tokens=1500 时 535tok 正常出 142 字正文。**调用方须给 ≥1500**
+        recommended_use: "长文本理解；调用时 max_tokens 须 ≥1500（thinking 开销）"
+      - model_name: "glm-5.2"
+        display_name: "GLM 5.2 (MaaS)"
+        capability_tags: ["chat", "streaming", "long_context", "reasoning"]
+        cost_tier: "medium"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "128K tokens"
+        # ⚠ 同 glm-5.3-flash：400→content 空；1500→582tok 出 80 字正文
+        recommended_use: "长文本理解、知识密集型；max_tokens 须 ≥1500"
+      - model_name: "glm-5.1"
+        display_name: "GLM 5.1 (MaaS)"
+        capability_tags: ["chat", "streaming", "long_context", "reasoning"]
+        cost_tier: "medium"
+        supports_streaming: true
+        supports_tool_calling: true
+        context_window_note: "128K tokens"
+        # ⚠ 实测 2026-09-06：文本 23.9-32.5s（**慢**）+ 同样的 thinking 吃配额行为
+        recommended_use: "不建议用于长链路（实测 24-33s）；仅在需要 5.1 特定行为时选用"
+      # ── 长上下文型（实测偏慢，长链路慎用）──
       - model_name: "kimi-k2.6"
         display_name: "Kimi K2.6 (MaaS)"
         capability_tags: ["chat", "streaming", "coding", "long_context"]
@@ -61,31 +152,60 @@ providers:
         supports_streaming: true
         supports_tool_calling: true
         context_window_note: "128K+ tokens"
-        recommended_use: "长上下文分析、代码审查"
-      - model_name: "minimax-m3"
-        display_name: "MiniMax M3 (MaaS)"
-        capability_tags: ["chat", "streaming"]
-        cost_tier: "low"
+        # ⚠ 实测 2026-09-06：文本 20.1s、工具 4.9s
+        recommended_use: "长上下文分析；不建议用于多轮工具循环（实测 20s+）"
+      - model_name: "kimi-k3"
+        display_name: "Kimi K3 (MaaS)"
+        capability_tags: ["chat", "streaming", "coding", "long_context"]
+        cost_tier: "medium"
         supports_streaming: true
-        supports_tool_calling: false
-        context_window_note: "32K tokens"
-        recommended_use: "轻量对话、快速问答"
-      - model_name: "qwen3.5"
-        display_name: "Qwen 3.5 (MaaS)"
+        supports_tool_calling: true
+        context_window_note: "256K+ tokens"
+        # ❌ 实测 2026-09-06：文本 38.9s、**工具调用 44.2s** —— 逼近/超过 R19 的
+        #    LLM_REQUEST_TIMEOUT=60s chunk 间读超时，多轮工具循环极易触发 StreamStallTimeout。
+        #    **不得用于 P 阶段工具循环**（run_stage_tool_loop 最多 6 轮、P4 worker 14 轮）
+        recommended_use: "仅超长上下文单次分析；禁用于 P 阶段工具循环（实测 44s）"
+      - model_name: "qwen3.8"
+        display_name: "Qwen 3.8 (MaaS)"
         capability_tags: ["chat", "streaming", "coding"]
         cost_tier: "low"
         supports_streaming: true
         supports_tool_calling: true
         context_window_note: "128K tokens"
+        # 实测 2026-09-06：文本 3006ms/125tok 直出；工具 1404ms
         recommended_use: "通用编码、文档生成"
-      - model_name: "glm-5.2"
-        display_name: "GLM 5.2 (MaaS)"
-        capability_tags: ["chat", "streaming", "long_context"]
+      # ── provider 侧聚合模型（与本平台 rebuild-fusion 虚拟服务商是两回事）──
+      - model_name: "fusion"
+        display_name: "Fusion 聚合 (MaaS 侧)"
+        capability_tags: ["chat", "streaming", "review"]
         cost_tier: "medium"
         supports_streaming: true
         supports_tool_calling: true
-        context_window_note: "128K tokens"
-        recommended_use: "长文本理解、知识密集型任务"
+        context_window_note: "未知（provider 未声明）"
+        # 实测 2026-09-06：文本 1662ms/460tok（prompt 开销 690tok，明显高于其他模型
+        #   → 推断 provider 侧自带聚合前置 prompt）；工具 2872ms
+        # ⚠ 命名易与本平台 provider_id=rebuild-fusion 混淆，二者无关
+        recommended_use: "provider 侧聚合评审；注意与平台 rebuild-fusion 区分"
+      # ── Responses 通道验证 profile（B-R20-NO-RESPONSES-CHANNEL，2026-09-08 接线）──
+      # 与上面 qwen3.8-27b（openai chat completions 通道）是【同一个底层模型】，只是换一条
+      # 调用通道 —— 用不同 model_name 只是为了让 profile_id（= provider_id/model_name）
+      # 不与上面那条撞键；真实发往 provider 的模型名由 api_model_name 指定为原始 id。
+      # api_format_override="responses" 只影响这一个 profile，不影响本 provider 其余
+      # profile（仍走 openai chat completions，包括 system-default 策略的 fallback 链）。
+      # 实测 2026-09-08：真实调用成功，见交付报告；获得结构化 reasoning（thinking）字段。
+      - model_name: "qwen3.8-27b-responses"
+        api_model_name: "openai/qwen3.8-27b"
+        api_format_override: "responses"
+        display_name: "Qwen 3.8 27B (MaaS, Codex Responses 通道)"
+        capability_tags: ["chat", "responses", "reasoning"]
+        cost_tier: "low"
+        supports_streaming: true
+        # 工具调用未验证：Responses API 的 tool 参数形状与 chat completions 不同，adapter
+        # 当前未实现转换（stream_via_responses/complete_via_responses 均不透传 tools），
+        # 如实标 false，避免平台把需要工具调用的阶段路由到这里却静默拿不到工具。
+        supports_tool_calling: false
+        context_window_note: "128K tokens（沿用 qwen3.8-27b 声明，Responses 通道下未单独实测）"
+        recommended_use: "验证/使用 Responses 通道以获取结构化 reasoning（thinking）字段"
 
   - provider_id: "agnes-ai"
     provider_name: "AgnesAI"
@@ -109,7 +229,9 @@ strategies:
     # 出厂 bootstrap 兜底默认（D-098）：这里【不】固化用户的真实选择。
     # 运行期生效的默认 = 用户在平台上配置的真实策略（动态：用户已配置的 Provider/Strategy/
     # Project 全局或自定义绑定），由 ProviderRegistry 动态解析；本 ref 仅在用户未配置任何策略时作 bootstrap。
-    default_profile_ref: "deepseek-official/deepseek-v4-flash"
+    # 2026-09-13：改指规范名 `deepseek-flash`（原 `deepseek-v4-flash` 已被 provider 改名为
+    # 此名，旧名仅作别名重定向）。用户 2026-09-13 明确指示：优先 flash，不用 pro。
+    default_profile_ref: "deepseek-official/deepseek-flash"
     fallback_profile_refs:
       - "maas-icompify/deepseek-v4-flash"
       - "agnes-ai/agnes-2.0-flash"

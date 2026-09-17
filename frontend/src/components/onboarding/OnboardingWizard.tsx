@@ -9,6 +9,7 @@ import { fetchEnvironment, updateEnvironment, updateMode, type EnvironmentProfil
 import { fetchModelGatewayStatus, type ModelGatewayStatus, listProfiles, type ModelProfileInfo } from '../../services/modelService';
 import { listGitAccounts, listAccountRepos, listCodingAgents,
   type GitAccountInfo, type GitRepoInfo, type CodingAgentInfo } from '../../services/integrationService';
+import { listScenarios, type ScenarioOption } from '../../services/scenarioService';
 
 interface Props {
   projectId: string;
@@ -19,6 +20,8 @@ interface Props {
   initialMode?: string;
   /** Current coding agent ref, if any */
   codingAgentRef?: string | null;
+  /** R20-2-01: 项目已有的场景值（若创建页已填），引导向导控件初值须回显它（"后填覆盖先填"）。 */
+  initialScenario?: string | null;
 }
 
 const STEPS = [
@@ -29,7 +32,7 @@ const STEPS = [
   { id: 'confirm', label: '摘要确认' },
 ];
 
-export function OnboardingWizard({ projectId, projectName, sourceType, onDone, initialMode, codingAgentRef }: Props) {
+export function OnboardingWizard({ projectId, projectName, sourceType, onDone, initialMode, codingAgentRef, initialScenario }: Props) {
   const [stepIdx, setStepIdx] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -43,6 +46,14 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
   // 开放可扩展 / 允许自由输入（datalist 仅为常见建议，非封闭枚举）；平台可基于源环境推荐，用户点选为准。
   const [targetCpuArch, setTargetCpuArch] = useState('');
   const [targetOs, setTargetOs] = useState('');
+  // R20-2-01/03 (D-117③): 重构场景（可选）。回显已有 scenario（创建页可能已填），引导向导
+  // 可改选/补选；"后填覆盖先填" —— 本处提交值会覆盖创建页已落库的值（onboarding/complete）。
+  const [scenario, setScenario] = useState(initialScenario || '');
+  const [scenarioOptions, setScenarioOptions] = useState<ScenarioOption[]>([]);
+  const [scenarioLoadError, setScenarioLoadError] = useState(false);
+  const [scenarioDiscoveryStatus, setScenarioDiscoveryStatus] = useState('');
+  const [scenarioInvalidCount, setScenarioInvalidCount] = useState(0);
+
 
   // Step 2 state — Submission method (R9-5-7 T1/T2: 本轮只接远端 Git)
   const [submissionKind, setSubmissionKind] = useState<'remote_git' | 'local_git'>('remote_git');
@@ -102,6 +113,17 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
     listGitAccounts().then(setGitAccounts).catch(() => {});
     // R9-5-7 T8: load coding agents for the external-platform delegation picker
     listCodingAgents().then(setCodingAgents).catch(() => {});
+
+    // R20-2-03: 场景建议列表来自运行期 GET /api/scenarios（前端零场景常量）。
+    // 失败须显式提示（不静默 catch(() => {})——新增代码不沿用本文件既有的静默反模式，
+    // 仅有的既存 5 处 .catch(() => {}) 不动，§10-23 精准修改）。
+    listScenarios()
+      .then(r => {
+        setScenarioOptions(r.scenarios);
+        setScenarioDiscoveryStatus(r.discovery_status);
+        setScenarioInvalidCount(r.invalid.length);
+      })
+      .catch(() => setScenarioLoadError(true));
   }, [projectId, sourceType]);
 
   // R9-5-7 T1/T2: when a Git account is chosen, load its repos
@@ -178,6 +200,9 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
           target_cpu_arch_label: targetCpuArch.trim() || null,
           target_os: targetOs.trim() || null,
           target_os_label: targetOs.trim() || null,
+          // R20-2-01/03 (D-117③)：引导向导可补选/改选场景，"后填覆盖先填"——会覆盖创建页
+          // 已落库的值。留空则不传具体新值（后端诚实保持原值不变，不猜场景 R20-2-06）。
+          scenario: scenario.trim() || null,
         }),
       });
       if (!resp.ok) {
@@ -295,6 +320,41 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
                   </datalist>
                 </div>
               </div>
+            </div>
+            {/* R20-2-01/03 (D-117③)：重构场景（可选）。与目标运行环境同组、同一开放输入
+                范式——共用 <input list>+<datalist>，允许自由填写不在建议列表里的场景 id。
+                回显已有 scenario（若创建页已填）；此处提交会"后填覆盖先填"。 */}
+            <div style={{ marginTop: 8, paddingTop: 12, borderTop: '1px dashed var(--color-border)' }}>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>重构场景（可选）</div>
+              <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 10 }}>
+                可从建议中选择，也可自由填写（不限于列出选项）。留空则后续阶段再确认。
+              </div>
+              <input list="onboarding-scenario-options" value={scenario}
+                onChange={e => setScenario(e.target.value)}
+                placeholder="可选，如自定义场景标识"
+                style={{ width: '100%', padding: '8px', border: '1px solid var(--color-border)', borderRadius: 4, fontSize: 13 }} />
+              <datalist id="onboarding-scenario-options">
+                {scenarioOptions.map(s => (
+                  <option key={s.scenario_id} value={s.scenario_id} label={
+                    `${s.display_name}${s.tier === 'typical' ? '（典型场景 · 配套资源更丰富）' : '（自定义场景）'}`
+                  } />
+                ))}
+              </datalist>
+              {scenarioLoadError && (
+                <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+                  场景列表加载失败，可手动填写场景标识。
+                </div>
+              )}
+              {!scenarioLoadError && scenarioDiscoveryStatus === 'root_missing' && (
+                <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+                  未发现场景包目录，可留空或手动填写场景标识。
+                </div>
+              )}
+              {!scenarioLoadError && scenarioInvalidCount > 0 && (
+                <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+                  {scenarioInvalidCount} 个场景包目录不完整，已跳过。
+                </div>
+              )}
             </div>
             {envProfile && (
               <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
@@ -517,6 +577,11 @@ export function OnboardingWizard({ projectId, projectName, sourceType, onDone, i
               {(targetCpuArch.trim() || targetOs.trim()) && (
                 <div>✓ 目标环境：<b>{[targetCpuArch.trim(), targetOs.trim()].filter(Boolean).join(' · ')}</b></div>
               )}
+              <div>✓ 重构场景：<b>{
+                scenario.trim()
+                  ? (scenarioOptions.find(s => s.scenario_id === scenario.trim())?.display_name || scenario.trim())
+                  : '未选择（后续阶段再确认）'
+              }</b></div>
               <div>✓ 模型：<b>{gwStatus?.global_status === 'healthy' ? '全局默认' : '待配置'}</b></div>
               <div>✓ 模式：<b>{execMode === 'manual' ? '手动' : execMode === 'plan' ? '计划确认' : '自动'}</b></div>
             </div>

@@ -25,20 +25,22 @@ live here, keyed by `hook_impl`.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.services.security_authorization import contains_secret
+
 logger = logging.getLogger("rebuild.hook_engine")
 
-# Secret patterns for the pre-write policy hook (mirror P6 desensitization / D-032).
-_SECRET_PATTERNS = [
-    re.compile(r"sk-[a-z0-9]{20,}", re.IGNORECASE),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
-    re.compile(r"(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*[\"']?([^\s\"']{8,})"),
-]
+# Secret detection for the pre-write policy hook (D-032) is NOT maintained here as a
+# second, independently-drifting pattern list. It used to be (a 3-pattern private copy
+# that predated the URL-embedded-credential pattern `security_authorization` picked up
+# on 2026-09-06/07 — `postgresql://user:pass@host` / `redis://:pass@host` sailed straight
+# through this hook's old copy while `security_authorization.redact_secrets()` already
+# caught it, B-R20-REDACT-THREE-IMPLS). `_impl_pre_write_policy` below calls
+# `security_authorization.contains_secret()` — the single shared implementation — instead.
 
 
 @dataclass
@@ -90,12 +92,27 @@ def _impl_pre_write_policy(ctx: dict) -> tuple[str, str]:
         return "block", f"pre-write 策略拦截：禁止写入 source/（只读，D-099①）: {target}"
 
     content = args.get("content")
-    if isinstance(content, str) and content:
-        for pat in _SECRET_PATTERNS:
-            if pat.search(content):
-                return "block", ("pre-write 策略拦截：拟写入内容包含疑似密钥/凭据"
-                                 "（sk-/AKIA/api_key 等），禁止将明文密钥写入工作区产物（D-032）")
+    if isinstance(content, str) and content and contains_secret(content):
+        return "block", ("pre-write 策略拦截：拟写入内容包含疑似密钥/凭据"
+                         "（sk-/AKIA/api_key/URL 内嵌凭据等），禁止将明文密钥写入工作区产物（D-032）")
     return "allow", "pre-write 策略校验通过"
+
+
+def enforce_pre_write_policy(ctx: dict) -> tuple[str, str]:
+    """Code-layer, Registry-independent entry point for the D-032/D-099① pre-write check.
+
+    `run_hooks()` below only dispatches hook resources whose `ResourceEntry.enabled` is
+    True — i.e. the check is only as strong as the DB row backing it. This function calls
+    the exact same check body (`_impl_pre_write_policy`) but bypasses the Registry lookup
+    entirely: it is meant to be called unconditionally by `tool_registry.execute_tool`
+    (B-R21-HOOK-DISABLE-BYPASS) so that even if the `"pre-write Policy check"`
+    `ResourceEntry` row is disabled — via `PATCH /resources/{id}/disable`, which today
+    carries no risk-gating of its own for most resources — the underlying secret/
+    source-readonly check still runs and still fails closed. Delegating to
+    `_impl_pre_write_policy` (rather than re-implementing the check) guarantees the two
+    call sites can never behaviorally drift apart.
+    """
+    return _impl_pre_write_policy(ctx)
 
 
 _BUILTIN_HOOKS = {

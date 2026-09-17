@@ -12,8 +12,9 @@ Execution routing by write_scope / binds_via (type_metadata):
   risk_level≥L3    → OD-06: create a real action_approval Gate (GateService) and
                      return awaiting_approval; honest risk_flagged if no Gate backend.
 
-Built-in 3 tools (get_project_info/read_artifact/run_profiling) remain available
-as seed-driven tools so capability is not lost when Registry is empty.
+Built-in tools (see module-level `_BUILTIN_SCHEMAS`) remain available even when the
+Registry table is empty or was seeded before a tool was added — `seed_all()` only inserts
+when the table is empty, so a newly added tool row never reaches an already-seeded DB.
 """
 
 from __future__ import annotations
@@ -35,9 +36,32 @@ _WRITE_TOP_DIRS = ("output_code", "artifacts", "patches", "source")
 _EXT_THEN_JUNK_RE = re.compile(r"^(.*?\.[A-Za-z0-9]{1,10})\s*[（(、，。：:].*$")
 # 保留的合法路径段字符（ASCII 标识符 + . - _ 空格→_）。
 _ILLEGAL_SEG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# D-02：两端的非法字符整段丢弃（不留 `_` 残渣），只有**中间**的非法串才压成 `_`。
+_ILLEGAL_LEAD_RE = re.compile(r"^[^A-Za-z0-9._-]+")
+_ILLEGAL_TAIL_RE = re.compile(r"[^A-Za-z0-9._-]+$")
 # R19-3-01：阶段产物目录前缀（p0…p6）。模型常写 `p1/tech_stack.json` 而漏掉 `artifacts/`
 # 顶层；旧版一律前缀成 output_code/，导致真跑 output_code 里混入 p0/p1 的 json（非代码产物）。
 _STAGE_DIR_RE = re.compile(r"^p[0-6]$")
+
+
+def _clean_seg_chars(text: str) -> str:
+    """清洗一段文本里的非法字符：两端非法串**整段丢弃**，中间非法串压成单个 `_`。
+
+    D-02：旧版做 `sub("_", …).strip("._-")`，尾部 strip 连**原名自带**的前导/尾部下划线一并
+    剥掉，把多语言强约定文件名改废：`_ViewStart.cshtml` / `_ViewImports.cshtml` /
+    `_Layout.cshtml`（ASP.NET Core Razor 强制约定名，改名即失效）、`__init__.py`（改名即静默
+    失去 Python 包结构）、`_partial.html`、`_variables.scss`。
+    改为"只丢弃清洗过程中**本就非法**的两端字符"后：原名自带的 `_` / `.` 原样保留，而
+    D-114 要治的"中文描述污染"仍被剔净（尾部 `_` 残渣不会留下），两者互不牺牲。
+    """
+    text = _ILLEGAL_LEAD_RE.sub("", text)
+    text = _ILLEGAL_TAIL_RE.sub("", text)
+    text = _ILLEGAL_SEG_RE.sub("_", text)
+    # 退化段（清洗后不含任何字母数字，如 `_` / `...`）按旧行为丢弃：调用方据此走兜底
+    # 文件名或丢段，避免产出 `...` 这类纯标点路径段。
+    if not any(ch.isalnum() and ord(ch) < 128 for ch in text):
+        return ""
+    return text
 
 
 def _sanitize_segment(seg: str) -> str:
@@ -53,11 +77,11 @@ def _sanitize_segment(seg: str) -> str:
     # 中文名文件互相静默覆盖。
     stem, dot, ext = seg.rpartition(".")
     if dot and stem and re.fullmatch(r"[A-Za-z0-9]{1,10}", ext):
-        cleaned_stem = _ILLEGAL_SEG_RE.sub("_", stem).strip("._-")
+        cleaned_stem = _clean_seg_chars(stem)
         if not cleaned_stem:
             cleaned_stem = "file_" + hashlib.md5(stem.encode("utf-8")).hexdigest()[:8]
         return f"{cleaned_stem}.{ext}"
-    seg = _ILLEGAL_SEG_RE.sub("_", seg).strip("._-")   # 剔除 CJK/空格/标点
+    seg = _clean_seg_chars(seg)               # 剔除 CJK/空格/标点
     return seg
 
 
@@ -201,6 +225,15 @@ def _source_equivalent(out_rel: str) -> str:
 # ── Built-in tool fallback (seed-equivalent schemas) ────────────────────────
 # These match the hard-coded AGENT_TOOLS in agent_loop.py so the agent always
 # has at minimum these three regardless of whether DB seed is populated.
+# find_files（B-ACC-NO-READONLY-FILEGLOB）的双上限。取名常量而非字面量：这两个数字是
+# "别把一次只读检索变成拖垮阶段的全树遍历"这一取舍的表达，须可被单点调整并被测试引用。
+# 300 条足以覆盖真实项目按名检索的用途（真跑中模型要的是 *.csproj/*.sln 这类少量清单）；
+# 扫描上限 20000 与 code_grep 的 5000 同族但更宽 —— 本工具只 stat 文件名、不读内容，单条成本
+# 远低于 code_grep 的逐行正则。
+_FIND_FILES_MAX_RESULTS = 300
+_FIND_FILES_MAX_SCAN = 20000
+
+
 _BUILTIN_SCHEMAS = [
     {
         "type": "function",
@@ -355,11 +388,78 @@ _BUILTIN_SCHEMAS = [
         "_risk_level": "L0",
         "_write_scope": "none",
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": (
+                "在 workspace 内按【文件名】glob 模式递归检索（只读，L1）。"
+                "用于「在整棵源码树里找出所有 *.csproj / *.sln / *.master」这类纯只读检索 —— "
+                "list_files 不递归、code_grep 只搜文件内容，此前只能去调 L4 命令执行器跑 find。"
+                "只返回路径与字节数，不读文件内容；结果条数与扫描条数有上限并如实回报 truncated。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "文件名 glob，如 *.csproj；多个模式用逗号分隔，如 *.sln,*.csproj",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "检索起点目录，相对 workspace 根，默认 source/",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": f"最多返回条数（上限 {_FIND_FILES_MAX_RESULTS}）",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+        "_source": "builtin",
+        "_tool_id": "builtin:find_files",
+        "_risk_level": "L1",
+        "_write_scope": "none",
+    },
 ]
 
 # Risk levels that require gate review (T2.3 / S3 note: full HITL接线→R9-5-7)
 _GATE_RISK_THRESHOLD = "L3"
 _RISK_ORDER = ["L0", "L1", "L2", "L3", "L4", "L5"]
+
+
+# ── B-ACC-NO-READONLY-FILEGLOB 解除条件 ②：run_safe_command 的 write_scope ─────────
+#
+# 缺陷原文（本文件旧 :689 与 :1499 两处）：`if tool_name == "run_safe_command" or
+# write_scope in ("execute", "system")` —— 即靠**工具名特判**绕过"该工具没声明
+# write_scope"这一事实。而它偏偏是 7 个工具里唯一能执行任意命令（因而能任意写）的那个，
+# 其余写类工具都老实声明了 write_scope。属**声明缺失被特判绕过**，不是有意设计
+# （原注释自陈 "run_safe_command carries no write_scope (defaults to 'none')"）。
+#
+# 处置：① `seed.py` 里为它显式声明 `write_scope: "execute"`（真实能力）；
+#       ② 两处散落的 `tool_name == ...` 特判**收敛为下面这一个归一化函数**，判定点只剩
+#          `write_scope in ("execute","system")`，不再有第二处需要同步的工具名。
+#
+# 为什么保留 `_LEGACY_EXEC_SCOPE_FALLBACK` 而不是"彻底删除特判"：
+#   `seed_all()` 只在 ResourceEntry 表**为空**时插入（seed.py:317 `if existing == 0`），
+#   刻意不覆盖运营者的既有编辑。⇒ 任何**已经 seed 过**的库（含本机 24MB 的 rebuild.db）里
+#   run_safe_command 那行的 type_metadata 仍然没有 write_scope。若此时彻底删除兜底，
+#   `meta.get("write_scope","none")` 会让它落进 `_execute_read` 分支 —— **一个 L4 通用命令
+#   执行器被当成只读工具分派**，这是货真价实的安全边界变更（AGENTS §10 与本轮例外授权第 ④ 条
+#   都禁止）。故兜底必须留，但从"两处 if 特判"降级为"一处声明缺失时的补默认值"：
+#   语义从"这个工具名特殊"变成"这个工具名的历史行数据缺声明，按其真实能力补上"。
+#   ⇒ 台账解除条件 ② 的"移除特判绕过"**部分达成**（判定点已单一化、声明已补齐），
+#     "零特判"须待 seed 具备安全的行级 upsert 能力后才能做，已作为待确认项上报。
+_LEGACY_EXEC_SCOPE_FALLBACK = {"run_safe_command": "execute"}
+
+
+def _effective_write_scope(tool_name: str, meta: dict) -> str:
+    """工具的实际 write_scope：优先取声明值；声明缺失时按上表补真实能力，否则 "none"。"""
+    declared = (meta or {}).get("write_scope")
+    if declared:
+        return declared
+    return _LEGACY_EXEC_SCOPE_FALLBACK.get(tool_name, "none")
 
 
 def _rank(risk: str) -> int:
@@ -435,7 +535,14 @@ def _build_schema(entry) -> Optional[dict]:
         try:
             import json
             params = json.loads(input_contract)
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-08）：控制流不变（params=None → 下方退化为空 schema
+            # `{"type":"object","properties":{},"required":[]}`）。但那意味着**该工具的入参约束
+            # 整段丢失**，模型会拿到一个没有参数的 schema —— 静默是不可接受的。
+            # 不触碰任何风险分级/write_scope 判定，只发声。
+            logger.warning("tool_registry 工具 %r 的 input_contract 不是合法 JSON（%s: %s）—— "
+                           "schema 退化为空参数对象，该工具的入参约束本次未生效",
+                           entry.name, type(e).__name__, e)
             params = None
     if not params:
         params = {"type": "object", "properties": {}, "required": []}
@@ -561,11 +668,19 @@ async def execute_tool(
     # no Gate backend (see _create_risk_gate).
     risk = tool_entry.risk_level.value if hasattr(tool_entry.risk_level, "value") else "L0"
     meta = tool_entry.type_metadata or {}
-    write_scope = meta.get("write_scope", "none")
+    # B-ACC-NO-READONLY-FILEGLOB ②：经归一化函数取实际 write_scope（见其定义处说明），
+    # 下游所有分派判定只看 write_scope，不再有第二处 `tool_name == "run_safe_command"` 特判。
+    write_scope = _effective_write_scope(tool_name, meta)
     approved_gate_id = ""  # set below iff a re-dispatched (gate-approved) call executes
 
     if _rank(risk) >= _rank(_GATE_RISK_THRESHOLD):
-        gate_state, gate_id = _resolve_action_gate(project_id, run_id, tool_name)
+        # B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件④：建 Gate【之前】先过白名单。
+        # 注定被挡的命令直接诚实 blocked，【不建 Gate】、不请用户签核。
+        blocked_precheck = _precheck_command_allowed(tool_name, args, write_scope, risk)
+        if blocked_precheck is not None:
+            _write_trace(tracer, project_id, tool_name, args, blocked_precheck)
+            return blocked_precheck
+        gate_state, gate_id = _resolve_action_gate(project_id, run_id, tool_name, args)
         approved = confirmed or gate_state == "approved"
         if not approved:
             if gate_state == "pending" and gate_id:
@@ -579,7 +694,7 @@ async def execute_tool(
                                 f"action_approval Gate（{gate_id}），审批通过后方可执行。"),
                 }
             else:
-                result = _create_risk_gate(project_id, run_id, stage, tool_name, risk)
+                result = _create_risk_gate(project_id, run_id, stage, tool_name, risk, args)
             _write_trace(tracer, project_id, tool_name, args, result)
             return result
         # approved → fall through to real execution (re-dispatch). Remember the gate id
@@ -587,6 +702,46 @@ async def execute_tool(
         # confirmed=True is a direct-thread with no gate_id → nothing to consume.
         if not confirmed and gate_state == "approved":
             approved_gate_id = gate_id
+
+    # Code-layer D-032/D-099① enforcement — UNCONDITIONAL, not Registry-gated
+    # (B-R21-HOOK-DISABLE-BYPASS). `run_hooks()` below only dispatches a hook whose
+    # `ResourceEntry.enabled` is True; `PATCH /resources/{id}/disable` can flip that flag
+    # (for most resources, with zero risk-gating of its own — see routes_registry). Without
+    # this call, disabling the single `"pre-write Policy check"` row would silently switch
+    # off the ONLY content-level D-032 secret-write detector, with no audit trail. This
+    # calls `hook_engine.enforce_pre_write_policy()`, which delegates to the exact same
+    # check body the Registry-driven hook uses (`_impl_pre_write_policy`), so the two call
+    # sites can never behaviorally drift apart — but this call always runs.
+    hook_ctx = {"project_id": project_id, "tool_name": tool_name,
+                "write_scope": write_scope, "args": args, "stage": stage}
+    try:
+        from app.services.hook_engine import enforce_pre_write_policy
+        hard_action, hard_reason = enforce_pre_write_policy(hook_ctx)
+    except Exception:
+        # 发声：强制检查本体异常必须可见；但引擎自身故障不应 fail-open 放行（安全关键路径，
+        # 与下方 Registry 驱动 hook 的"引擎故障 fail-open"策略不同——这是不可关闭的最后一道防线）。
+        logger.error("tool_registry: 代码层 pre-write 强制检查异常 tool=%s", tool_name, exc_info=True)
+        hard_action, hard_reason = "block", "pre-write 强制检查执行异常，按安全优先拦截（fail-closed）"
+    if hard_action == "block":
+        result = {
+            "status": "blocked_by_hook",
+            "tool_name": tool_name,
+            "hook_point": "PreToolUse",
+            "reason": hard_reason,
+            "hooks_run": ["pre_write_policy(code-layer，不受 ResourceEntry.enabled 影响)"],
+        }
+        _write_trace(tracer, project_id, tool_name, args, result)
+        try:
+            from app.dependencies import get_services
+            get_services().audit_writer.write(
+                audit_type="hook_block", risk_level="L3",
+                action=f"PreToolUse:{tool_name}", decision="blocked",
+                reason=hard_reason[:300], project_id=project_id,
+            )
+        except Exception:
+            logger.warning("tool_registry: 代码层强制检查的 audit 写入失败 tool=%s",
+                           tool_name, exc_info=True)
+        return result
 
     # PreToolUse hooks (WP-4 / GAP-SEC-2): run the Registry-registered PreToolUse hooks
     # before the real dispatch. A block-mode hook returning "block" (e.g. pre-write policy
@@ -599,12 +754,16 @@ async def execute_tool(
         try:
             from app.dependencies import get_services
             _svc_wr = get_services()
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-09）：控制流不变（_svc_wr=None → 下方 tracer/auditor 传 None）。
+            # 但那意味着**本次 PreToolUse hook 的 Trace 与 Audit 都不落盘**，事后无法归因，
+            # 这正是"静默降级"最伤的一类。不改 hook 判定、不改 fail-open 口径，只发声。
+            logger.warning("tool_registry: 取 services 失败（%s: %s）—— 本次 PreToolUse hook "
+                           "的 Trace/Audit 不落盘 tool=%s", type(e).__name__, e, tool_name)
             _svc_wr = None
         pre = run_hooks(
             "PreToolUse",
-            {"project_id": project_id, "tool_name": tool_name,
-             "write_scope": write_scope, "args": args, "stage": stage},
+            hook_ctx,
             db,
             tracer=tracer or (getattr(_svc_wr, "trace_writer", None) if _svc_wr else None),
             auditor=(getattr(_svc_wr, "audit_writer", None) if _svc_wr else None),
@@ -623,9 +782,10 @@ async def execute_tool(
         # 发声：Hook 引擎异常必须可见，但不因引擎故障阻断已授权的合法工具（fail-open 仅限引擎自身故障）。
         logger.warning("tool_registry: PreToolUse hook 引擎异常 tool=%s", tool_name, exc_info=True)
 
-    # Execute by scope. run_safe_command / execute-scope tools are checked first because
-    # run_safe_command carries no write_scope (defaults to "none") yet must run via provider.
-    if tool_name == "run_safe_command" or write_scope in ("execute", "system"):
+    # Execute by scope. execute/system-scope tools are checked first.
+    # （B-ACC-NO-READONLY-FILEGLOB ②：原先此处还有 `tool_name == "run_safe_command" or`
+    #  的工具名特判，已收敛进 _effective_write_scope() —— 判定点只剩 write_scope 一个。）
+    if write_scope in ("execute", "system"):
         result = await _execute_via_provider(tool_name, args, project_id, tool_entry)
     elif write_scope in ("none",):
         result = await _execute_read(tool_name, args, project_id)
@@ -677,7 +837,21 @@ async def execute_tool(
     return result
 
 async def _execute_builtin(tool_name: str, args: dict, project_id: str, stage: str) -> dict:
-    """Handle the three built-in tool implementations."""
+    """Handle the built-in tool implementations（_BUILTIN_SCHEMAS 里那一组）。
+
+    注：原 docstring 写的是 "the three built-in tools"，而本函数早已分派 8 个；
+    R24 再加 find_files 后为 9 个。此处只把数量措辞改为不写死数字（写死数字必然过期），
+    不动任何分派逻辑。权威清单 = 模块级 `_BUILTIN_SCHEMAS`。
+    """
+    # B-ACC-NO-READONLY-FILEGLOB：find_files 的实现**只有一份**（在 _execute_read 里，
+    # 与 fs_read/list_files/code_grep 同处），此处只做转发。
+    # 为什么它同时出现在 _BUILTIN_SCHEMAS 与 seed.py：`seed_all()` 只在 ResourceEntry 表为空
+    # 时插入（seed.py:317），已 seed 过的库拿不到新增工具行 ⇒ `execute_tool` 查不到
+    # tool_entry 会落到本函数。列进 _BUILTIN_SCHEMAS 才能让**既有库**里的 agent 也看得见、
+    # 用得上这个只读工具；seed.py 那份则服务全新库（届时走 registry 分派，风险位/参数
+    # schema 由 Registry 权威提供）。两条路径共用同一实现，不存在第二份逻辑。
+    if tool_name == "find_files":
+        return await _execute_read(tool_name, args, project_id)
     if tool_name == "get_project_info":
         from app.services import workspace_service
         ws = workspace_service.workspace_path(project_id)
@@ -868,6 +1042,78 @@ async def _execute_read(tool_name: str, args: dict, project_id: str) -> dict:
             entries.append({"name": p.name, "type": "dir" if p.is_dir() else "file"})
         return {"path": rel, "count": len(entries), "entries": entries}
 
+    # ── find_files: 递归按【文件名】模式检索（B-ACC-NO-READONLY-FILEGLOB 解除条件 ①）──
+    #
+    # 为什么必须有这个工具：本仓 L1 只读工具此前存在一个能力洞 ——
+    #   · list_files 用 `full.iterdir()`，**不递归**（且上限 500 条）；
+    #   · code_grep 搜的是**文件内容**，不搜文件名；
+    #   · fs_read 需要已知确切路径。
+    # ⇒ "在整棵源码树里按多个文件名模式递归检索"这个**纯只读**操作在 L1 里没有对应能力，
+    # 模型要找 `*.csproj` / `*.sln` / `*.master` 只能去调 **L4** 的 run_safe_command 跑
+    # `find`（真跑中的 gate-22343c 即由此产生：平台请用户为一条只读命令签核，还因 find 不在
+    # 白名单而注定失败）。本工具把该能力补在 L1，使按名检索不必再碰 L4。
+    #
+    # 【绝不降 run_safe_command 的风险位】它是通用命令执行器（白名单含 python3 ⇒ 可任意代码
+    # 执行），L4 由能力本身决定，与某次调用的内容无关（Q-ACC-2 复核已推翻降级方向）。
+    # 本工具是"补只读能力"，**不触碰任何安全边界**。
+    #
+    # 安全约束（与既有只读工具同源，不另造）：
+    #   · 路径经同一个 `_confine()` 约束在 workspace 内（越界即拒）；
+    #   · 只返回**路径名**，不读任何文件内容 ⇒ 天然无内容泄漏面；
+    #   · 结果条数与扫描条数双上限，truncated 如实回报（与 code_grep 同款诚实截断）；
+    #   · 用 `fnmatch` 做 glob 匹配而不是 `re`：模型写的是 `*.csproj` 这类 glob，
+    #     交给 re.compile 会得到意外语义；且 glob 不存在灾难性回溯。
+    if tool_name == "find_files":
+        import fnmatch
+        raw_patterns = args.get("pattern") or args.get("patterns") or args.get("name") or ""
+        if isinstance(raw_patterns, str):
+            patterns = [s.strip() for s in raw_patterns.split(",") if s.strip()]
+        elif isinstance(raw_patterns, (list, tuple)):
+            patterns = [str(s).strip() for s in raw_patterns if str(s).strip()]
+        else:
+            patterns = []
+        if not patterns:
+            return {"error": "需要 pattern 参数（文件名 glob，如 *.csproj；多个用逗号分隔）"}
+        rel = args.get("path") or "source"
+        base = _confine(rel)
+        if base is None:
+            return {"error": "路径越界: 仅允许检索 workspace 内目录"}
+        if not base.exists() or not base.is_dir():
+            return {"error": f"目录不存在: {rel}"}
+        skip = {".git", "node_modules", "__pycache__", ".venv", "bin", "obj"}
+        try:
+            max_results = int(args.get("max_results", _FIND_FILES_MAX_RESULTS)
+                              or _FIND_FILES_MAX_RESULTS)
+        except (TypeError, ValueError):
+            max_results = _FIND_FILES_MAX_RESULTS
+        max_results = max(1, min(max_results, _FIND_FILES_MAX_RESULTS))
+        hits: list[dict] = []
+        scanned = 0
+        scan_capped = False
+        for p in base.rglob("*"):
+            if any(s in p.parts for s in skip):
+                continue
+            if not p.is_file():
+                continue
+            scanned += 1
+            if scanned > _FIND_FILES_MAX_SCAN:
+                scan_capped = True
+                break
+            if any(fnmatch.fnmatch(p.name, pat) for pat in patterns):
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    size = None
+                hits.append({"path": str(p.relative_to(ws_root)), "bytes": size})
+                if len(hits) >= max_results:
+                    break
+        return {"patterns": patterns, "path": rel, "match_count": len(hits),
+                "files": hits, "files_scanned": scanned,
+                "truncated": len(hits) >= max_results or scan_capped,
+                # 诚实标注截断原因，避免读者把"命中 300 条"误读为"总共就 300 条"
+                "truncation_reason": ("result_cap" if len(hits) >= max_results
+                                      else ("scan_cap" if scan_capped else None))}
+
     # ── code_grep: search a pattern under a directory ──
     if tool_name == "code_grep":
         import re
@@ -897,7 +1143,12 @@ async def _execute_read(tool_name: str, args: dict, project_id: str) -> dict:
                         matches.append({"file": str(p.relative_to(ws_root)), "line": i, "text": line.strip()[:200]})
                         if len(matches) >= 100:
                             break
-            except Exception:
+            except Exception as e:
+                # R24 第二遍（Q2-10）：控制流不变（跳过该文件继续扫）。这是**逐文件扫描循环**
+                # （上限 5000 个），单文件读不动（权限/特殊文件/IO）属常规现象，升 warning 会刷屏，
+                # 故 debug 发声 —— 关键是不再"完全无痕"，排查"为什么某文件没被检索到"时有据可查。
+                logger.debug("tool_registry grep_files 跳过不可读文件 %s（%s: %s）",
+                             p, type(e).__name__, e)
                 continue
             if len(matches) >= 100:
                 break
@@ -975,9 +1226,36 @@ async def _execute_workspace_write(tool_name: str, args: dict, project_id: str, 
     except Exception as e:
         return {"error": f"workspace 写入解析失败: {e}"}
 
+    data = content if isinstance(content, str) else str(content)
+
+    # D-P0-01 内容合法性硬拦（落盘之前，连目录都不创建）：真跑实测 5 个 output_code 文件的
+    # 内容是模型 function-call 协议原文而非代码，而节点仍报 completed —— 因为写盘路径此前
+    # 只校验路径合法性、零校验内容合法性。此处只拦确定性协议哨兵（判据与零误伤设计见
+    # content_validity 模块 docstring），命中即拒写并发声，不降级为"写了打个标记"。
+    from app.services.content_validity import (
+        PROTOCOL_LEAK_REASON_CODE,
+        detect_protocol_leak,
+    )
+    leaked_marker = detect_protocol_leak(data)
+    if leaked_marker:
+        logger.warning(
+            "tool_registry: 拒写——待写入内容含模型工具协议标记（D-P0-01） "
+            "tool=%s path=%s marker=%r bytes=%d",
+            tool_name, rel, leaked_marker, len(data.encode("utf-8")),
+        )
+        return {
+            "status": "rejected",
+            "tool_name": tool_name,
+            "path": rel,
+            "reason_code": PROTOCOL_LEAK_REASON_CODE,
+            "error": (
+                f"拒写：待写入内容是模型工具调用协议原文而非文件内容（命中标记 {leaked_marker!r}）。"
+                "请重新输出该文件的真实内容后再写盘。"
+            ),
+        }
+
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        data = content if isinstance(content, str) else str(content)
         target.write_text(data, encoding="utf-8")
     except Exception as e:
         return {"error": f"workspace 写入失败: {e}"}
@@ -1027,6 +1305,33 @@ async def _execute_generate_patch(tool_name: str, args: dict, project_id: str, e
         return {"status": "rejected", "tool_name": tool_name, "path": patch_rel, "error": str(e)}
     except Exception as e:
         return {"error": f"patch 草案路径解析失败: {e}"}
+
+    # D-P0-01 内容合法性硬拦（漏网入口①，落盘之前）：真实规模真跑实测 11 个 patches/ 草稿
+    # 命中同一污染（如 `patches/tn-c2e7271a.diff` 含 `<｜｜DSML｜｜ …>`）——generate_patch 把模型
+    # 给的 diff 原样封装写进 patches/，此前未过 _execute_workspace_write 已接的同一检查。
+    # 复用同一 detect_protocol_leak（不抄第二份，B-R20-REDACT-THREE-IMPLS 的教训），返回形态
+    # 与 _execute_workspace_write 的拒写分支一致（同带 reason_code）。
+    from app.services.content_validity import (
+        PROTOCOL_LEAK_REASON_CODE,
+        detect_protocol_leak,
+    )
+    leaked_marker = detect_protocol_leak(diff)
+    if leaked_marker:
+        logger.warning(
+            "tool_registry: 拒写——patch 草案内容含模型工具协议标记（D-P0-01） "
+            "tool=%s path=%s marker=%r bytes=%d",
+            tool_name, patch_rel, leaked_marker, len(diff.encode("utf-8")),
+        )
+        return {
+            "status": "rejected",
+            "tool_name": tool_name,
+            "path": patch_rel,
+            "reason_code": PROTOCOL_LEAK_REASON_CODE,
+            "error": (
+                f"拒写：待写入 diff 是模型工具调用协议原文而非补丁内容（命中标记 {leaked_marker!r}）。"
+                "请重新输出该文件的真实 diff/内容后再生成补丁。"
+            ),
+        }
 
     import json as _json
     envelope = {
@@ -1080,8 +1385,13 @@ async def _execute_apply_patch(tool_name: str, args: dict, project_id: str, entr
         env = _json.loads(raw)
         drafted_target = env.get("target_path") or ""
         new_content = env.get("diff") or ""
-    except Exception:
+    except Exception as e:
         # Draft is not our envelope — treat the raw draft as the new content.
+        # R24 第二遍（Q2-11）：控制流与语义完全不变（这是**设计内的两种草案格式兼容**：
+        # 信封 JSON / 裸内容），但"落到裸内容分支"会导致 drafted_target 为空 ⇒ 目标路径
+        # 只能靠显式 target_path，此前完全无痕。故 debug 发声（非故障，不升 warning）。
+        logger.debug("tool_registry apply_patch 草案非信封 JSON（%s: %s）—— 按裸内容处理，"
+                     "target_path 只能来自显式入参 patch_ref=%s", type(e).__name__, e, patch_ref)
         drafted_target = ""
         new_content = raw
 
@@ -1144,6 +1454,34 @@ async def _execute_apply_patch(tool_name: str, args: dict, project_id: str, entr
         final_content = new_content
         note = "补丁草案为整文件内容，已整体写入 output_code/（source/ 始终只读，D-099①）。"
 
+    # D-P0-01 内容合法性硬拦（漏网入口②，落盘之前）：apply_patch 把 patch 草案内容写进
+    # output_code/ 之前，此前未过 _execute_workspace_write 已接的同一检查——无论 unified diff
+    # 应用结果还是整文件内容，只要落盘前最终文本含模型工具协议标记即拒写。复用同一
+    # detect_protocol_leak（不抄第二份），返回形态与 _execute_workspace_write 拒写分支一致。
+    from app.services.content_validity import (
+        PROTOCOL_LEAK_REASON_CODE,
+        detect_protocol_leak,
+    )
+    leaked_marker = detect_protocol_leak(final_content)
+    if leaked_marker:
+        logger.warning(
+            "tool_registry: 拒写——待应用到 output_code/ 的补丁内容含模型工具协议标记（D-P0-01） "
+            "tool=%s path=%s marker=%r bytes=%d",
+            tool_name, out_rel, leaked_marker, len(final_content.encode("utf-8")),
+        )
+        return {
+            "status": "rejected",
+            "tool_name": tool_name,
+            "patch_ref": patch_ref,
+            "path": out_rel,
+            "apply_mode": apply_mode,
+            "reason_code": PROTOCOL_LEAK_REASON_CODE,
+            "error": (
+                f"拒写：待写入 output_code/ 的补丁应用结果是模型工具调用协议原文而非文件内容"
+                f"（命中标记 {leaked_marker!r}）。请重新输出该文件的真实内容后再应用补丁。"
+            ),
+        }
+
     try:
         out_target.parent.mkdir(parents=True, exist_ok=True)
         out_target.write_text(final_content, encoding="utf-8")
@@ -1191,8 +1529,42 @@ async def _execute_via_provider(tool_name: str, args: dict, project_id: str, ent
         return {"error": f"ExecutionProvider failed: {e}"}
 
 
-def _resolve_action_gate(project_id: str, run_id: str, tool_name: str) -> tuple[str, str]:
-    """Resolve the single action_approval Gate for (project_id, run_id, tool_name).
+def _canonical_action_args_json(args: dict | None) -> str:
+    """入参的**唯一**规范化实现：键排序 + 紧凑分隔符。指纹与 Gate 展示都调用它。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件②点名的坑：指纹若用与展示【不同源】的
+    规范化结果（典型是"展示脱敏后、比对未脱敏"），会造成永不匹配、反复弹 Gate。
+    故规范化只写这一份：`_redacted_action_payload`（展示）在此结果上再做脱敏，
+    `action_args_fingerprint`（比对）在此结果上做 sha256。
+
+    【只做两件事】键排序 + 紧凑分隔符。**不做**大小写折叠、空白折叠、路径规范化、
+    值裁剪 —— 刻意偏"规范化不足"一侧：宁可多弹一次 Gate（入参只差一个空格也重新审批），
+    不可少拦一次（把两条语义不同的命令认成同一条）。
+    """
+    import json as _json
+    return _json.dumps(args or {}, sort_keys=True, ensure_ascii=False,
+                       separators=(",", ":"))
+
+
+def action_args_fingerprint(tool_name: str, args: dict | None) -> str:
+    """「这次要执行的动作」的指纹 = sha256(工具名 \\x00 规范化入参 JSON) 的 hex。
+
+    建 Gate 时持久化到 `Gate.action_fingerprint`，取授权时（`_resolve_action_gate`）
+    比对。工具名与入参之间用 `\\x00` 分隔：它不可能出现在 JSON 文本里，因此
+    ("ab", {"c":1}) 与 ("a", {"b":1}) 之类的拼接歧义不可能发生。
+
+    args 无法 JSON 序列化时**抛异常**（不返回退化指纹）：调用方在建 Gate 前就会失败，
+    绝不能出现"指纹算不出来就当作匹配"的 fail-open（安全检查不给旁路，见 §2.2）。
+    """
+    import hashlib as _hashlib
+    canonical = _canonical_action_args_json(args)
+    return _hashlib.sha256(
+        f"{tool_name}\x00{canonical}".encode("utf-8")).hexdigest()
+
+
+def _resolve_action_gate(project_id: str, run_id: str, tool_name: str,
+                         args: dict | None) -> tuple[str, str]:
+    """Resolve the single action_approval Gate for (project_id, run_id, tool_name, args).
 
     WP-C3 / B-R17.2-TOOL-DOUBLEGATE: returns ("approved", gate_id) when an approved gate
     for this action exists (either one execute_tool created, or one the agent_loop
@@ -1200,6 +1572,21 @@ def _resolve_action_gate(project_id: str, run_id: str, tool_name: str) -> tuple[
     re-dispatched call executes instead of opening a SECOND gate. Returns ("pending",
     gate_id) when a waiting gate exists (reuse it, no duplicate). Returns ("none", "")
     otherwise. Never fabricates a gate.
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND（P1）：`_matches` 原先是 `return tool_name in blob`
+    —— **只比工具名，内容盲**。后果是机制层的、不是偶发：用户看到入参 X 并批准，该 Gate
+    转 approved 后一直挂账，直到本 run 内**下一次**同名工具调用把它消费掉，而那次调用的
+    入参是当时新传入的 Y ⇒ **人工签核的是 X，实际授权的是 Y**。现增加入参指纹比对：
+    指纹不一致 ⇒ 不认这个 Gate ⇒ 上层照常新建 Gate 重新请人审批。
+
+    指纹缺失（NULL）的 Gate **一律不匹配**（fail-closed）。它包括：本改动前建的历史
+    Gate、以及 routes_registry / routes_toggle / ACP HITL 等**不是工具调用**的
+    action_approval Gate（那些 Gate 从不代表"批准了某工具的某份入参"，被 tool_name 子串
+    偶然命中过就是误授权）。代价是升级后已批准但未消费的旧 Gate 需重新审批一次 —— 取
+    "宁可多弹一次 Gate，不可少拦一次"（吸收②§5.3）。
+
+    比对**不可关闭**：无 enabled 开关、无环境变量旁路、无 try/except 静默跳过
+    （沿用 `detect_protocol_leak` 确立的"安全检查不给开关 + fail-closed"模式）。
     """
     try:
         from app.dependencies import get_services
@@ -1209,13 +1596,20 @@ def _resolve_action_gate(project_id: str, run_id: str, tool_name: str) -> tuple[
         logger.warning("_resolve_action_gate: gate lookup failed for %s: %s", tool_name, e)
         return ("none", "")
 
+    # 指纹在【比对前】算出：算不出来（入参不可序列化）就让异常向上抛，
+    # 绝不退化为"不比对"。
+    expected_fingerprint = action_args_fingerprint(tool_name, args)
+
     def _matches(g) -> bool:
         if g.gate_type != "action_approval":
             return False
         if run_id and (g.run_id or "") != run_id:
             return False
         blob = f"{g.reason or ''} {g.summary or ''}"
-        return tool_name in blob
+        if tool_name not in blob:
+            return False
+        # 授权必须绑定到被审阅的那一份入参（本条是 B-ACC-GATE-APPROVAL-NOT-BOUND 的修复本体）
+        return (g.action_fingerprint or "") == expected_fingerprint
 
     approved = [g for g in gates if _matches(g) and g.gate_status == "approved"]
     if approved:
@@ -1227,8 +1621,118 @@ def _resolve_action_gate(project_id: str, run_id: str, tool_name: str) -> tuple[
 
 
 
+def _redacted_action_payload(tool_name: str, args: dict | None, max_chars: int = 600) -> str:
+    """把工具入参渲染为可供人工审批阅读的一行摘要，**必过密钥脱敏**。
+
+    B-R20-GATE-NO-PAYLOAD（用户 2026-09-06 批准修法）：此前 action_approval Gate 只写
+    工具名、不写入参，决策者无从知道 Agent 究竟要执行什么，D-034「L4 须用户确认」在实践中
+    被降级为形式 —— 只能在闭眼授权与一律拒绝之间二选一（R20-4 信创回归真跑中主窗口即因此
+    拒绝了 gate-ec10a8）。
+
+    两条硬约束同时成立才可落地（用户批准语明确要求）：
+      1. 入参须进入 Gate，使审批可知情；
+      2. **须过密钥脱敏** —— 命令行/参数极可能含凭据（如 `--password=`、连接串、token），
+         Gate 与其审计记录都会持久化，原样落盘等于把凭据写进审计（违 AGENTS §8 / D-032）。
+
+    复用既有 `security_authorization.redact_secrets()`，**不另造脱敏实现**（单一事实源）。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件②：入参的**规范化**同样只有一份实现
+    （`_canonical_action_args_json`）—— 本函数展示的、`action_args_fingerprint` 比对的，
+    是同一个规范化结果，只是本函数在其上再做一次脱敏。这样不会出现"展示脱敏后、比对未
+    脱敏"导致永不匹配、反复弹 Gate 的情形。
+    """
+    if not args:
+        return "（无入参）"
+    try:
+        raw = _canonical_action_args_json(args)
+    except Exception as e:
+        # R24 第二遍（Q2-12）：控制流与返回值不变（退化为 str(args)，**且下方仍强制过
+        # redact_secrets 脱敏** —— 不存在凭据原样落盘的口子）。发声的理由是根因需要被看见：
+        # 规范化失败后，紧接的 `action_args_fingerprint()` 会**直接抛异常**（其 docstring 明写
+        # "args 无法 JSON 序列化时抛异常，绝不返回退化指纹"），即建 Gate 会整体失败（fail-closed）。
+        # 那个异常的现场在 fingerprint 里，看不出根因在规范化；本条 warning 就是补这个根因。
+        # 不改 fail-closed 口径、不改 Gate 阈值、不改脱敏调用顺序。
+        logger.warning("tool_registry: action 入参规范化失败（%s: %s）—— 展示文本退化为 str(args)；"
+                       "同一入参的指纹计算随后会 fail-closed 抛错（脱敏仍强制执行）", type(e).__name__, e)
+        raw = str(args)
+    try:
+        from app.services.security_authorization import redact_secrets
+        raw = redact_secrets(raw)
+    except Exception:
+        # 脱敏不可用时 fail-closed：宁可不展示入参，也不得原样落盘（公理3：发声而非静默放行）
+        logger.warning("redact_secrets 不可用，action_approval Gate 不展示入参（fail-closed）",
+                       exc_info=True)
+        return "（入参未展示：脱敏组件不可用，为避免凭据落盘已省略）"
+    if len(raw) > max_chars:
+        raw = raw[:max_chars] + f"…［已截断，原长 {len(raw)} 字符］"
+    return raw
+
+
+def _precheck_command_allowed(tool_name: str, args: dict | None,
+                              write_scope: str, risk: str) -> dict | None:
+    """建 action_approval Gate【之前】的白名单预检：注定被挡回 → 返回 blocked 结果；否则 None。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件④。真跑坐实的问题：`gate-22343c` 请用户签核
+    `find source -name "*.dll" … | head -50`，而 `find` 不在 `ALLOWED_COMMANDS` ⇒ 即便
+    批准也会被挡回 `{"blocked": true, "stderr": "命令不在允许列表中: find"}`。
+    **平台在请用户为一条注定无法执行的命令签核** —— 既浪费人工裁决成本，也会训练用户
+    "反正批了也没事"的习惯，与 Gate 的设计目的相反。
+
+    三条边界（都刻意收窄，避免把预检做成第二道安全策略）：
+      ① 只对"会走 ExecutionProvider 执行命令"的工具生效，判据与下方真实分发条件同构；
+      ② 只在**真正会执行白名单检查的 provider** 下生效：container / remote /
+         workspace_local 档不走 `ALLOWED_COMMANDS`（后者显式 `enforce_whitelist=False`），
+         对它们预检会变成凭空拦截合法命令；
+      ③ 判定复用 `execution_provider.bash_whitelist_violation`（同一份首词解析与同一份
+         名单），**不在本文件复制白名单**。本批次不改名单内容（加 `find` 属
+         `B-ACC-NO-READONLY-FILEGLOB`，归批次三）。
+
+    预检自身故障时 fail-open（返回 None，照旧建 Gate）：这不是安全检查 —— 白名单的
+    **权威执行点仍在 provider 内**，预检只是"别拿注定失败的命令去打扰用户"的前置优化。
+    与之相对，入参指纹比对是安全检查，因此**没有**任何 except 旁路（见
+    `_resolve_action_gate`）。两者性质不同，处置也不同，勿混。
+    """
+    if write_scope not in ("execute", "system"):
+        return None
+    code = (args or {}).get("code") or (args or {}).get("command") or ""
+    if not code:
+        return None
+    try:
+        from app.services.execution_provider import (
+            LocalSubprocessExecutionProvider,
+            bash_whitelist_violation,
+            get_execution_provider,
+        )
+        provider = get_execution_provider()
+        if not isinstance(provider, LocalSubprocessExecutionProvider):
+            return None
+        first_word = bash_whitelist_violation(code)
+    except Exception:
+        logger.warning("tool_registry: 建 Gate 前白名单预检失败 tool=%s（照旧建 Gate，"
+                       "白名单仍由 ExecutionProvider 权威执行）", tool_name, exc_info=True)
+        return None
+    if not first_word:
+        return None
+    return {
+        # 与 provider 的 blocked 结果同形（调用方已在按这些字段判断），另加 status/tool_name
+        "status": "blocked_not_allowed",
+        "tool_name": tool_name,
+        "risk_level": risk,
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": f"命令不在允许列表中: {first_word}",
+        "blocked": True,
+        "provider": "local_subprocess",
+        "fallback": False,
+        "timed_out": False,
+        "signal": None,
+        "message": (f"命令首词 {first_word!r} 不在允许列表中，即便人工批准也会被执行层挡回，"
+                    f"因此**未创建** action_approval Gate（不请用户为注定无法执行的命令签核）。"),
+    }
+
+
 def _create_risk_gate(project_id: str, run_id: str, stage: str,
-                      tool_name: str, risk: str) -> dict:
+                      tool_name: str, risk: str, args: dict | None = None) -> dict:
     """OD-06: an L3+ tool requires human approval before it runs. Create a real
     action_approval Gate through the existing GateService kernel (DB-persisted +
     audited — the same kernel as agent_loop._create_action_gate). action_approval
@@ -1237,15 +1741,32 @@ def _create_risk_gate(project_id: str, run_id: str, stage: str,
     Honest degradation (红线：不得伪造 gate)：when no GateService is available in the
     current runtime context, return an explicit risk_flagged status explaining why —
     never fabricate a gate_id / awaiting_approval.
+
+    `args`（B-R20-GATE-NO-PAYLOAD，用户 2026-09-06 批准）：工具入参经 `_redacted_action_payload`
+    脱敏后写入 Gate 的 summary，使审批者能在知情前提下决策。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND：同时把**被审阅的这一份入参的指纹**持久化到 Gate
+    （`action_fingerprint`），使 `_resolve_action_gate` 取授权时能比对"要执行的入参是不是
+    用户批准过的那一份"。指纹与上面展示用的入参同源（同一个规范化函数）。
     """
+    payload = _redacted_action_payload(tool_name, args)
+    fingerprint = action_args_fingerprint(tool_name, args)
     try:
         from app.dependencies import get_services
         gs = get_services().gate_service
     except Exception as e:
+        # R24 第二遍（Q2-13）：返回值一字不改（诚实 risk_flagged = 不伪造 gate、工具不执行，
+        # 方向 fail-closed）。原实现把原因写进了给调用方的 message，但**服务端日志里没有任何
+        # 痕迹** —— "Gate 服务整体不可用"是基础设施级事件，必须在日志侧也能被发现。
+        # 不改阈值 `_GATE_RISK_THRESHOLD`、不改 fail-closed 语义。
+        logger.warning("tool_registry: 无可用 GateService（%s: %s）—— 高风险工具 %s（%s）"
+                       "未创建审批门并诚实返回 risk_flagged（不伪造 gate、工具不执行）",
+                       type(e).__name__, e, tool_name, risk)
         return {
             "status": "risk_flagged",
             "risk_level": risk,
             "tool_name": tool_name,
+            "action_payload": payload,
             "message": (f"工具风险等级 {risk} ≥ {_GATE_RISK_THRESHOLD}，需人工审批；"
                         f"但当前运行上下文无可用 Gate 服务（{e}），未创建审批门。"),
         }
@@ -1254,8 +1775,10 @@ def _create_risk_gate(project_id: str, run_id: str, stage: str,
             project_id=project_id, run_id=run_id or "", stage=stage,
             gate_type="action_approval", risk_level=risk,
             reason=f"高风险工具 {tool_name}（风险 {risk}）执行前需人工审批",
-            summary=f"Agent 拟执行高风险工具 {tool_name}（{risk}），请审批",
+            summary=(f"Agent 拟执行高风险工具 {tool_name}（{risk}），请审批。"
+                     f"\n待执行入参（已脱敏）：{payload}"),
             options=["approve", "reject"],
+            action_fingerprint=fingerprint,
         )
     except Exception as e:
         logger.warning("action_approval gate create failed for tool %s: %s", tool_name, e)

@@ -104,6 +104,21 @@ class P5VerificationService:
                     extras={"slot_id": r.slot_id, "passed": r.passed,
                             "status": r.status, "issues": [i.get("type") for i in r.issues]},
                 )
+
+        # R22-4 代码量观察指标（**纯旁路**）：源码/产出体量对比只落观察产物
+        # artifacts/p5/_code_volume.json，【不并入任何 SlotVerificationResult、不影响
+        # results、不参与任何判定分支、不进 Gate、不参与 P4→P5 晋级判定】。
+        # 整段包 try/except 且只告警：连度量/落盘失败也不得阻断（承 _persist_build_log
+        # 的"写失败只告警不阻断"范式，公理 3 发声但非阻断）—— 观察者不得弄坏被观察对象。
+        # 边界详述源：产物/草稿/R22-③完善方案.md §1.1；机器化锁定见
+        # backend/tests/test_r22_code_volume.py 的非阻断锁定断言。
+        try:
+            from app.services.code_volume_service import measure_and_persist
+            measure_and_persist(project_id)
+        except Exception:
+            logger.warning("P5 代码量观察指标失败（非阻断，验证结论逐字不受影响）",
+                           exc_info=True)  # 公理 3
+
         return results
 
     # ── 1. output_code 存在且非空 ─────────────────────────────────────────
@@ -261,10 +276,22 @@ class P5VerificationService:
         missing = []
         invalid_basis = []
         verified = []
+        superseded = []
         for eid in ev_refs:
             ev = ev_map.get(eid)
             if ev is None:
                 missing.append(eid)
+                continue
+            # R21 / B-R20-EVIDENCE-SHA-STALE: 一个文件在 P4 多节点执行中被后续
+            # 节点合法覆写是正常行为——早先写入的 Evidence 记录的 sha256 只反映
+            # 它写入当时的文件版本，文件被覆写后自然与"现在"的内容不一致。这不是
+            # 证据基准被篡改，是 aet_service.write_evidence() 在检测到同一
+            # output_code_ref 被新 Evidence 覆盖式引用时打上的 superseded_by 标记。
+            # 跳过这些历史记录，只用未被标记（即最新）的记录做 sha256 校验——
+            # 真正的篡改（最新记录 sha256 与文件不一致）仍然会被下面的校验判失败，
+            # 不会因为"存在历史记录"而被绕过。
+            if ev.get("superseded_by"):
+                superseded.append(eid)
                 continue
             # Evidence basis 真实性：检查 output_code_ref 的 sha256 是否与文件一致
             sha_ok = self._check_evidence_sha256(ws, ev)
@@ -276,6 +303,7 @@ class P5VerificationService:
         result.details["verified"] = verified
         result.details["missing"] = missing
         result.details["invalid_basis"] = invalid_basis
+        result.details["superseded"] = superseded
 
         if missing:
             result.issues.append({"type": "evidence_missing",

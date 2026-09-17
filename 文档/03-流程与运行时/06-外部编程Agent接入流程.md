@@ -3,9 +3,8 @@
 > 文档路径：`文档/03-流程与运行时/06-外部编程Agent接入流程.md`
 > 文档状态：**accepted**
 > 平台名称：rebuild
-> 当前版本：V26.1.1
-> 来源草稿：`产物/草稿/外部编程Agent接入流程.md`（v0.1）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程
+> 当前版本：V26.3
+> 来源草稿：`产物/已完成/R1/外部编程Agent接入流程.md`（v0.1）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：定义 rebuild 当前版本外部编程 Agent 接入流程，覆盖 OpenCode、外部编程 Agent、Tool、MCP、Expert Agent、确定性转换器等外部执行资源的接入、注册、上下文传递、权限边界、执行动作、Patch / 文件写入 / 命令执行、Artifact / Evidence / Trace / Audit、Policy / Gate、失败处理和 R 阶段落地关系。

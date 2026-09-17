@@ -32,6 +32,170 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── P5 返工信号（V26.2 返工修复第 8 项，Q-RW-4）───────────────────────────
+# 背景：P5 判定 rework_required 时，用户批准其 stage_promotion Gate 的真实语义是
+# "接受返工、退回 P4 重跑"，不是"晋级到 P6"。这个决策必须同时被两处独立消费：
+#   ① 图路由 make_router("p5")（app/graph/nodes.py）——决定图走到哪个节点；
+#   ② 本文件 _apply_promotion——图未在跑时（drive_promotion=True 的直连路径）
+#     独立推进 project.current_stage / run.stage_status。
+# 这两处是两套完全独立的代码路径（一个走 GraphState，一个只有 Gate 行 g 可用，
+# Gate 表没有自由格式的 metadata 列可持久化"这是一次返工批准"），若各自从
+# verdict/文案等模糊信号反推，分支逻辑一旦漂移（比如日后新增一种失败类型），两处
+# 就可能给出矛盾结论——图已经在跑 p4_work，但 DB 里 project.current_stage 却被
+# 写成了 p6，状态撕裂。
+#
+# 解法：显式落盘一份"这个 gate_id 一旦被批准 = 退回某阶段"的标记文件，由判定
+# rework 的一方（nodes.py 的 make_work_node，在 P5FailureRouter.route() 明确算出
+# p4_rework_required=True 时）写入；两个消费方都读同一份文件，且都用 gate_id
+# 精确匹配才采信——不匹配（比如文件是上一轮返工留下的旧标记，这一轮 P5 已经真正
+# 通过）就当没有信号，走原有的"正常晋级"逻辑。文件路径落在 P5 的产物目录下，是
+# 因为这个机制目前只服务 P5→P4 这一条路径（Q-RW-4 裁决的范围），不做成任意阶段
+# 通用的返工机制。
+_P5_REWORK_MARKER_REL = "artifacts/p5/p5_rework_decision.json"
+
+
+def write_p5_rework_marker(project_id: str, *, gate_id: str, run_id: str,
+                            target_stage: str, reason: str,
+                            plan_delta_id: Optional[str] = None) -> None:
+    """P5 判定需要返工时落盘"这个 gate_id 批准 = 退回 target_stage"的显式标记。
+
+    由 nodes.py 的 make_work_node 在创建该 Gate 之后调用（此时 gate_id 已知）。
+    失败只降级发声（不抛）：标记写入失败不该让 Gate 创建整体失败——退回路由会走不
+    动，但至少不会误判为"正常晋级"（read 侧找不到匹配文件时同样保守地判无信号）。
+    """
+    import json
+    from app.services import workspace_service
+    try:
+        p = workspace_service.workspace_path(project_id) / _P5_REWORK_MARKER_REL
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "gate_id": gate_id,
+            "run_id": run_id or "",
+            "rework_target_stage": target_stage,
+            "reason": reason,
+            "plan_delta_id": plan_delta_id,
+            "created_at": _now(),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        _logger.warning("写入 P5 返工标记失败 project=%s gate=%s target=%s",
+                        project_id, gate_id, target_stage, exc_info=True)
+
+
+def read_p5_rework_marker(project_id: str, gate_id: str) -> Optional[dict]:
+    """读取（若存在且 gate_id 精确匹配）本次批准是否携带"退回上一阶段"的标记。
+
+    gate_id 不匹配（标记来自另一个 Gate，通常是上一轮返工留下的旧文件）→ 视为无
+    信号，返回 None——这是防止旧标记误伤之后真正通过的同阶段 Gate 的唯一手段
+    （文件本身不会在消费后删除，见模块顶部说明；匹配失败即安全，无需再显式清理）。
+    """
+    import json
+    from app.services import workspace_service
+    try:
+        p = workspace_service.workspace_path(project_id) / _P5_REWORK_MARKER_REL
+        if not p.exists():
+            return None
+        marker = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        _logger.warning("读取 P5 返工标记失败 project=%s gate=%s", project_id, gate_id,
+                        exc_info=True)
+        return None
+    if not gate_id or marker.get("gate_id") != gate_id:
+        return None
+    return marker
+
+
+# ── 共享守卫：晋级前的「阶段有无真实产物」判据（R17-2 V-R17-1B-2）────────────
+#
+# B-ACC-PROMOTION-DECISION-NOGUARD 解除条件③：该判据原本是 `app/api/routes_gates.py`
+# 的模块私有函数，只有 `/gates/{gate_id}/decision` 一条路由能用；`/stages/{stage}/
+# promotion-decision` 的图分支因此【完全没有】空壳晋级校验（该端点在图活跃时构造合成结果
+# 直接返回，根本不调 stage_service.promote()，promote() 内的 422 校验整条不执行）。
+#
+# 处置（用户 2026-09-15 裁决 Q-B：放本文件的模块级函数，不新增 _gate_guards.py）：
+# 提取到此处，`routes_gates` 与 `routes_stages` **import 同一份**。抄第二份等于制造
+# 第三处需要同步的判据 —— 本批次两条缺陷的共同教训正是"同一件事有两份判据必然漂移"。
+#
+# 【勿改函数体】提取时函数体逐字未变（含下面 `logging.getLogger("rebuild.routes_gates")`
+# 这个日志器名 —— 保留它是为了让"提取是纯移动、无行为变化"这一点可被 `git show` 逐行核对，
+# 也让既有日志过滤规则不因本次移动而失效）。422 语义与错误文案同样逐字保留在两个调用点。
+#
+# 注意与本文件内 `GateService._stage_has_real_artifact`（方法，2 参数）的区别：那是
+# `_apply_promotion` 内部用的既有判据（只看 task_graph，不看 artifact_refs，错误文案也不同）。
+# 两者的合并【不在本批次范围】—— 合并会改动 R17-2 的既有 422 文案与语义，属独立议题。
+def _stage_has_real_artifact(svc, run_id: str, stage: str, artifact_refs: list | None) -> bool:
+    """校验某 run 在某阶段是否有真实产物（task_graph 存在 OR artifact_refs 非空）。"""
+    # 1) artifact_refs 非空（gate 自身携带的产物引用）
+    if artifact_refs:
+        return True
+    # 2) task_graph 表存在该 run+stage
+    try:
+        db = svc.run_service._db()
+        try:
+            from app.models.task_graph import TaskGraph
+            return (
+                db.query(TaskGraph)
+                .filter(TaskGraph.run_id == run_id, TaskGraph.stage == stage)
+                .limit(1)
+                .count()
+                > 0
+            )
+        finally:
+            db.close()
+    except Exception as exc:
+        import logging
+        logging.getLogger("rebuild.routes_gates").warning("_stage_has_real_artifact 降级放行: %s", exc)
+        return True
+
+
+# ── B-V262-ACTIVEGATE-NOORDER：`get_active()` 的语义定义（本注释即该语义的详述源）──────
+#
+# 【语义】`get_active(project_id)` 返回「本项目当前**阻塞流程推进**的那一个待决 Gate」。
+#   不是"最新的待决 Gate"，也不是"任意一个待决 Gate"。要列举全部待决 Gate 用
+#   `list_by_project()` / `GET /api/projects/{id}/gates`——本方法是单槽位，天然只能返一个。
+#
+# 【为什么按"阻塞性"而不是按时间】待决 Gate 分两类，**性质不同**：
+#   ① 流程阻塞类：图在它上面 interrupt 了，不决策则阶段无法推进
+#      （stage_promotion / plan_review / plan_presentation / source_pending / model_unavailable）；
+#   ② 动作审批类：只挂住**一次工具调用**，阶段本身继续跑，且**按设计可能长期挂着不批**
+#      （action_approval / l5_high_risk_command / high_risk_action /
+#        community_resource_introduction / desensitization_release）。
+#   两类混在一个槽位里抢占，无论按"最早"还是"最新"排序都会互相遮蔽（台账 ⚠ 修法警示）。
+#   ⇒ 唯一正确的修法是按类分流：①  永远优先于 ②。
+#
+# 【判据为何取 checkpoint_ref 而不是 gate_type 名单】`checkpoint_ref` 只由
+#   `gate_backend.RealGateBackend.create()`（本仓唯一的图侧建 Gate 入口，:120
+#   `checkpoint_ref=run_id or None`）写入 ⇒ **"有 checkpoint_ref" 等价于"这是图的一个暂停点"**，
+#   这是结构事实，不随 gate_type 名单漂移；日后新增任何图暂停类型自动落进 ① 类，无名单可维护
+#   （与 routes_stages._promotion_gate_candidates 用"图暂停点"做判据的既有取向一致）。
+#   `_FLOW_BLOCKING_GATE_TYPES` 只作**补充**，覆盖 run_id 为空（checkpoint_ref 因此为 NULL）
+#   或经 `POST /gates` / 测试夹具直建的流程类 Gate ——两个条件取并集，只做"提升"不做"降级"，
+#   故不会把任何现有流程类 Gate 误判成动作类。
+#
+# 【同类内的取序】保持既有 `ORDER BY gate_id` 升序，**刻意不改**。理由：`Gate.gate_id` 是
+#   `gate-{uuid4().hex[:6]}`（models/gate.py:12），与创建时间**无关**，且 Gate 表**没有
+#   created_at 列** ⇒ "最新优先"在当前 schema 下根本无法表达。硬加 DESC 只是换一个同样与
+#   时间无关的任意序，却会改变所有既有单 Gate 之外场景的返回值。同类内出现多个待决 Gate
+#   本身是异常（B-R22-GATE-REDECIDE-REDRIVE 曾实测产生 5 个重复 p1 晋级 Gate），已由
+#   routes_stages 的 409「有 N 个待决 Gate，请传 gate_id」正面处理，不靠本方法猜。
+#   ⇒ 「按创建时间取最新」须先加 created_at 列（Alembic 迁移），已作为待确认项上报，不在本次范围。
+_FLOW_BLOCKING_GATE_TYPES = frozenset({
+    "stage_promotion", "plan_review", "plan_presentation",
+    "source_pending", "model_unavailable",
+})
+
+
+def _is_flow_blocking(g) -> bool:
+    """该 Gate 是否属于「不决策则流程无法推进」的一类（语义详述见上方注释块）。
+
+    入参刻意不标注具体类型：本函数同时被喂 ORM `Gate`（本文件 `get_active` 内）与
+    `GateResponse`（`services/held_actions` 走 `list_by_project()` 的返回值）。两者都有
+    `checkpoint_ref` / `gate_type` 两个字段，判据只用这两个 ⇒ 一份实现服务两种载体，
+    不为了类型标注而复制第二份判据（那正是本仓反复登记的"同一件事两份判据必然漂移"）。
+    """
+    return bool(getattr(g, "checkpoint_ref", None)) or \
+        (getattr(g, "gate_type", "") or "") in _FLOW_BLOCKING_GATE_TYPES
+
+
 def _gate_to_response(g: Gate) -> GateResponse:
     # P2-C: graph capability must be a REAL probe, never the schema default
     # "not_connected" (state.py 红线：不得写死 not_connected). "live" when the
@@ -39,7 +203,12 @@ def _gate_to_response(g: Gate) -> GateResponse:
     try:
         from app.graph.runtime import graph_capability_probe
         graph_cap = graph_capability_probe()
-    except Exception:
+    except Exception as e:
+        # R24 第二遍（Q2-20）：控制流不变（"degraded" 就是本探针失败时的**诚实答案**，公理 4，
+        # 不得写死 "not_connected"、也不得谎报 "live"）。但"图编译不出来"是需要被看见的事件：
+        # 前端只会显示一个 degraded 徽标，日志里此前没有任何原因。发声不改探针语义。
+        _logger.warning("gate_service: 图能力探针异常（%s: %s）—— graph_capability 诚实记为 degraded",
+                        type(e).__name__, e)
         graph_cap = "degraded"
     return GateResponse(
         gate_id=g.gate_id,
@@ -60,6 +229,7 @@ def _gate_to_response(g: Gate) -> GateResponse:
         evidence_refs=g.evidence_refs or [],
         trace_refs=g.trace_refs or [],
         audit_ref=g.audit_ref,
+        action_fingerprint=g.action_fingerprint,
         source_status="real",
         transition_mode=g.transition_mode or "real",
         graph_capability_status=graph_cap,
@@ -93,13 +263,36 @@ class GateService:
             db.close()
 
     def get_active(self, project_id: str) -> Optional[GateResponse]:
+        """返回本项目**当前最该由用户处理的那一个**待决 Gate。见 _is_flow_blocking 的语义定义。
+
+        B-V262-ACTIVEGATE-NOORDER：旧实现是无 `ORDER BY` 的 `.first()`，SQLite 下实际返回
+        **最早**那条 `waiting_decision` Gate。而 `action_approval` 类 Gate **按设计会长期挂着
+        不批**（没人会为一条只读的 `find` 命令签核），它建得早就**永久占据**本方法这个槽位 ⇒
+        之后所有阶段晋级 Gate 在本端点上永不可见，而前端 StagePageP4/P5/P6 消费的正是本端点。
+
+        **不能**只加 `ORDER BY ... DESC` 收口（台账 ⚠ 修法警示）：那只是把遮蔽方向从"旧遮蔽新"
+        翻成"新遮蔽旧"，新建的 action_approval 反过来遮蔽晋级 Gate，问题类型不变。故按
+        **阻塞性语义分流**（解除条件 ②），两类不再互相抢占同一槽位。
+        """
         db = self._db()
         try:
-            g = db.query(Gate).filter(
-                Gate.project_id == project_id,
-                Gate.gate_status == "waiting_decision",
-            ).first()
-            return _gate_to_response(g) if g else None
+            pending = (
+                db.query(Gate)
+                .filter(Gate.project_id == project_id,
+                        Gate.gate_status == "waiting_decision")
+                .order_by(Gate.gate_id)   # 同类内取序确定化，见 _is_flow_blocking 注释末段
+                .all()
+            )
+            if not pending:
+                return None
+            blocking = [g for g in pending if _is_flow_blocking(g)]
+            chosen = blocking[0] if blocking else pending[0]
+            if len(pending) > 1:
+                _logger.info(
+                    "get_active(project=%s)：%d 个待决 Gate，按阻塞性语义选中 %s"
+                    "（type=%s，阻塞类 %d 个）；其余待决 Gate 仍可经 GET /gates 列举",
+                    project_id, len(pending), chosen.gate_id, chosen.gate_type, len(blocking))
+            return _gate_to_response(chosen)
         finally:
             db.close()
 
@@ -109,7 +302,15 @@ class GateService:
                artifact_refs: list[str] | None = None,
                evidence_refs: list[str] | None = None,
                checkpoint_ref: str | None = None,
-               interrupt_ref: str | None = None) -> GateResponse:
+               interrupt_ref: str | None = None,
+               action_fingerprint: str | None = None) -> GateResponse:
+        """创建 Gate。
+
+        action_fingerprint（B-ACC-GATE-APPROVAL-NOT-BOUND）：动作审批类 Gate 须传入
+        「被审阅的那一份入参」的指纹，使批准可绑定到具体内容而不是仅绑定工具名。
+        由调用方用 `tool_registry.action_args_fingerprint()` 计算（**只有一份实现**，
+        与 Gate 展示用的入参规范化同源）。非动作审批类 Gate 传 None。
+        """
         db = self._db()
         try:
             g = Gate(
@@ -126,6 +327,7 @@ class GateService:
                 evidence_refs=evidence_refs or [],
                 checkpoint_ref=checkpoint_ref,
                 interrupt_ref=interrupt_ref,
+                action_fingerprint=action_fingerprint,
             )
             db.add(g)
             db.commit()
@@ -173,6 +375,17 @@ class GateService:
             db.commit()
             db.refresh(g)
 
+            # D-07 / B-R22-GATE-REDECIDE-REDRIVE 次级项：Gate 一旦被决策，
+            # project.active_gate 必须立刻不再指向它。该字段语义是「当前待决 Gate」，
+            # 客户端（前端 GatePanel、轮询脚本）据此判断"是否还需要提交决策"。
+            # 此前只有 stage_promotion 的 _apply_promotion 分支清理它，而：
+            #   ① plan_presentation / plan_review / action_approval 等 gate_type 从不清理；
+            #   ② 图驱动路径要等后台图整段跑完才由 routes_stages._run_graph_bg 更新，
+            #      阶段执行期内（真实规模项目可达数分钟）该字段仍指向已决 Gate。
+            # ⇒ 轮询客户端在这段窗口里会反复提交决策，正是 D-01 的诱因。故在决策落库后
+            # 立即同步清理（此处是所有决策路径的唯一必经点：REST 路由与图内部重放都经 decide）。
+            self._clear_active_gate_if_current(g)
+
             # Drive stage transition
             if g.gate_type == "stage_promotion" and drive_promotion:
                 self._apply_promotion(g, decision)
@@ -215,6 +428,37 @@ class GateService:
             return _gate_to_response(g), audit
         finally:
             db.close()
+
+    def _clear_active_gate_if_current(self, g: Gate) -> None:
+        """决策生效后把 project.active_gate 从本 Gate 上摘掉（D-07）。
+
+        只在它确实指向本 Gate 时清理 —— 否则会误清另一个真实待决 Gate（例如后台图已
+        创建下一阶段 Gate 并把 active_gate 指向了它）。
+        比较用的 project 走本服务自己的新 session 读取（`_db()`），不用
+        `svc.project_service` 那个长生命周期单例 session —— 后者的 identity map 可能持有
+        别的 session 早前写入前加载的旧 Project，据此比较会错判。写入仍复用
+        ProjectService.update（保持与 _apply_promotion 同一条写路径，不另开第二条）。
+        置空值用 `""` 而非 `None`：ProjectService.update 会过滤 None（那是"本次不更新该
+        字段"的通用语义，不得为了本需求放宽它，否则影响所有字段的更新行为），`""` 是本文件
+        _apply_promotion 既有的置空写法（同一约定，不另立第二种）。
+        失败只降级发声（不抛）：清理失败不该让一个已成功落库的决策变成 4xx/5xx；
+        客户端仍可用 gate_status 判断待决状态。
+        """
+        try:
+            from app.models.project import Project
+            _db = self._db()
+            try:
+                project = _db.get(Project, g.project_id)
+                points_at_this_gate = (project is not None
+                                       and (project.active_gate or "") == g.gate_id)
+            finally:
+                _db.close()
+            if points_at_this_gate:
+                self._svc.project_service.update(g.project_id, active_gate="")
+        except Exception:
+            _logger.warning("Gate %s 决策后清理 project.active_gate 失败（project=%s）——"
+                            "该字段可能仍指向已决 Gate，客户端须以 gate_status 判断待决状态",
+                            g.gate_id, g.project_id, exc_info=True)
 
     def _persist_tech_selection(self, g: Gate, override: dict | None) -> None:
         """D-109：把批准的技术路线选型落 project.tech_selection（项目红线）。
@@ -315,6 +559,26 @@ class GateService:
                         f"阶段 {cur} 晋级被拒绝：run {g.run_id} 在该阶段无真实产物"
                         f"（task_graph 未创建）。请先完成阶段执行再申请晋级。"
                     )
+            # V26.2 返工修复第 8 项（Q-RW-4）：这条是"直连"晋级路径（drive_promotion=
+            # True，图未在跑或图驱动检测失败时的兜底）。cur=="p5" 时必须检查这个 Gate
+            # 是否携带落盘的返工标记——检查方式、判据来源与图路由 make_router("p5")
+            # 完全相同（同一份文件、同一个 gate_id 精确匹配规则，见
+            # read_p5_rework_marker 顶部注释），这是保证两条独立代码路径不给出矛盾
+            # 结论的唯一手段。非 p5 阶段完全不做这个检查，不影响其它阶段既有行为。
+            rework_target: Optional[str] = None
+            if cur == "p5":
+                _marker = read_p5_rework_marker(g.project_id, g.gate_id)
+                rework_target = _marker.get("rework_target_stage") if _marker else None
+            if rework_target:
+                if g.run_id:
+                    self._svc.run_service.set_stage_status(g.run_id, cur, "rework_required")
+                    self._svc.run_service.set_stage_status(g.run_id, rework_target, "in_progress")
+                if project is not None:
+                    try:
+                        ps.update(g.project_id, current_stage=rework_target, active_gate="")
+                    except Exception:
+                        _logger.warning(f"_apply_promotion: rework update failed for project {g.project_id}", exc_info=True)
+                return
             try:
                 nxt = STAGE_ORDER[STAGE_ORDER.index(cur) + 1]
             except (ValueError, IndexError):

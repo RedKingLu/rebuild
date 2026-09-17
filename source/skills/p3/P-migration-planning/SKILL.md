@@ -9,6 +9,7 @@ metadata:
   source: rebuild R17.5（D-108；吸收参考轨 2A/2B P3 + ECC agentic-engineering/dynamic-workflow-mode 语境）
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-migration-planning（迁移规划工作流）
 
@@ -51,7 +52,7 @@ metadata:
 - 验证计划映射 P5 既有结构，不臆造 slot。
 - 无有效模型 Key 时诚实 blocked，不降级为规则/模板规划。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 目标库选型/路线是高影响决策 → 承接 P2 的 adr_candidates + 用户 P3 Gate 裁决落定，P3 不越权预判终局。
 - 国产环境（麒麟/统信 + 达梦/人大金仓/openGauss + TongWeb/宝兰德）不确定项进风险/evidence_gap，勿臆测。
 - P2→P3→P4 路线风险接受由 Audit risk_acceptance 承载，复用 stage_promotion，不新增 gate_type。

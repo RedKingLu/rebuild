@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/deployment-patterns (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-deployment-patterns（交付部署模式）
 
@@ -47,7 +48,7 @@ P6 交付阶段，迁移产物通过 P5 验证后进入上线。本 skill 重新
 - 上线检查清单全项通过并留签署记录
 - 制品已签名 + 漏洞扫描通过（等保合规）
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 内网/离线是常态，部署脚本与依赖必须自包含，禁止上线时临时联网下载。
 - ARM64 节点须验证全部依赖已为目标架构构建，避免 x86 制品误部署。
 - 国产中间件（东方通/宝兰德）部署配置与 Tomcat/WebLogic 不同，连接池、类加载、JVM（毕昇 JDK）参数须按目标中间件适配。

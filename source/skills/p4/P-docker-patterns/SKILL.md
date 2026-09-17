@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/docker-patterns (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-docker-patterns（容器化施工模式）
 
@@ -44,7 +45,7 @@ P4 执行阶段，当迁移方案确定以容器形态承载目标系统时触�
 - 国产 DB 驱动可被应用加载并完成一次连通性探测
 - 镜像基于官方国产基础镜像，FROM 锁定 digest，无 latest 漂移
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 国产服务器多为 ARM64（鲲鹏/飞腾）或申威架构，构建机与运行环境架构必须一致，避免在 x86 开发机产出无法运行的镜像；必要时用 buildx 跨架构构建。
 - 达梦容器需 libaio、字符集（GBK/UTF-8）与时区配置；openGauss 容器对内存与 huge page 有要求，compose 须显式声明。
 - 内网/离线环境无法拉取公网镜像，所有基础镜像与驱动必须先入私有镜像仓库（Harbor 国产化部署）。

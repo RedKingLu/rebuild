@@ -28,9 +28,12 @@ FAMILY_KEY_ENV: dict[str, str] = {
 }
 
 # ── API format → litellm model prefix ───────────────────────────────
+# B-R20-NO-RESPONSES-CHANNEL: "responses" (Codex/OpenAI Responses API，经
+# litellm.aresponses()) 复用 openai-compatible 自定义端点路由，故沿用 "openai/" 前缀。
 API_FORMAT_PREFIX: dict[str, str] = {
     "openai": "openai",
     "anthropic": "anthropic",
+    "responses": "openai",
 }
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "model_profiles.yaml"
@@ -46,9 +49,14 @@ class ProviderInfo:
     provider_id: str
     provider_name: str
     provider_type: str  # openai / anthropic / openai_compatible
-    api_format: str     # openai / anthropic
+    api_format: str     # openai / anthropic / responses (Provider 级默认；见 ModelProfileInfo.api_format_override)
     endpoint_openai: str = ""
     endpoint_anthropic: str = ""
+    # B-R20-NO-RESPONSES-CHANNEL: Codex/OpenAI Responses API 端点（litellm.aresponses()
+    # 消费）。约定与 endpoint_openai/endpoint_anthropic 一致：存"base URL"，不带
+    # "/responses" 路径后缀 —— litellm 会自动拼接该后缀，若这里存了带后缀的完整路径会变成
+    # ".../responses/responses" 触发 404（真实调用实测确认）。
+    endpoint_responses: str = ""
     env_key_var: str = ""
     credential_status: str = "not_checked"  # configured / missing / redacted / not_checked
     key_source: str = ""  # env / generic_fallback / none / in_memory
@@ -68,6 +76,11 @@ class ModelProfileInfo:
     provider_id: str
     model_name: str
     api_model_name: str = ""  # 发送时原样使用（不走 normalize 加前缀）；用于不接受 litellm 前缀的自定义端点（如 LongCat）
+    # B-R20-NO-RESPONSES-CHANNEL: 单个 model profile 覆盖所属 Provider 的默认 api_format
+    # （""=沿用 provider.api_format）。使同一 provider 能对不同 profile 混用不同通道
+    # （如 maas-icompify 大多数 profile 走 openai chat completions，同时新增一个 profile
+    # 走 responses），不需要整 provider 切换、不影响既有 fallback 链行为。
+    api_format_override: str = ""
     display_name: str = ""
     capability_tags: list[str] = field(default_factory=list)
     cost_tier: str = "medium"
@@ -216,6 +229,7 @@ class ProviderRegistry:
             api_format=p.get("api_format", "openai"),
             endpoint_openai=p.get("endpoint_openai", ""),
             endpoint_anthropic=p.get("endpoint_anthropic", ""),
+            endpoint_responses=p.get("endpoint_responses", ""),
             env_key_var=env_key_var,
             credential_status=cred_status,
             key_source=key_source if cred_status == "configured" else "none",
@@ -234,6 +248,7 @@ class ProviderRegistry:
                 provider_id=p["provider_id"],
                 model_name=m["model_name"],
                 api_model_name=m.get("api_model_name", ""),
+                api_format_override=m.get("api_format_override", ""),
                 display_name=m.get("display_name", m["model_name"]),
                 capability_tags=m.get("capability_tags", []),
                 cost_tier=m.get("cost_tier", "medium"),
@@ -477,7 +492,7 @@ class ProviderRegistry:
 
         # 更新简单字段
         for field in ("provider_name", "api_format", "endpoint_openai",
-                      "endpoint_anthropic", "env_key_var", "note", "homepage"):
+                      "endpoint_anthropic", "endpoint_responses", "env_key_var", "note", "homepage"):
             if field in kwargs and kwargs[field] is not None:
                 setattr(provider, field, kwargs[field])
 
@@ -551,6 +566,7 @@ class ProviderRegistry:
                 "api_format": p.api_format,
                 "endpoint_openai": p.endpoint_openai,
                 "endpoint_anthropic": p.endpoint_anthropic,
+                "endpoint_responses": p.endpoint_responses,
                 "env_key_var": p.env_key_var,
                 "note": p.note,
                 "homepage": p.homepage,

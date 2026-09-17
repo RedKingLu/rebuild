@@ -16,6 +16,9 @@ class ProjectCreate(BaseModel):
     description: str = ""
     source_type: Literal["local_dir", "git", "zip", "github", "manual"] = "local_dir"
     source_config: Optional[dict] = None
+    # R20-2-01 (D-117③): 项目重构场景 id，自由文本。刻意 Optional[str]，禁 Literal —— 取值集合
+    # 由 source/skills/scenarios/<id>/ 目录动态决定，非平台封闭定义（AGENTS §10-27）。
+    scenario: Optional[str] = None
 
 
 class ProjectUpdate(BaseModel):
@@ -26,6 +29,8 @@ class ProjectUpdate(BaseModel):
     # D-098: per-project model strategy (global_unified / custom) + global model ref
     model_strategy_mode: Optional[str] = None
     global_model_ref: Optional[str] = None
+    # R20-2-01：允许后续修改场景（如项目创建时未选择，后补上或改选）。
+    scenario: Optional[str] = None
 
 
 class ProjectSourceUpdate(BaseModel):
@@ -52,6 +57,7 @@ class ProjectResponse(BaseModel):
     model_strategy_mode: str = "global_unified"
     global_model_ref: Optional[str] = None
     migration_target: Optional[dict] = None  # R17.5 WP-6: 目标运行环境约束（引导点选）
+    scenario: Optional[str] = None  # R20-2-01: 项目重构场景 id（自由文本，NULL=未选择）
     updated_at: str = ""
     created_at: str = ""
 

@@ -9,6 +9,7 @@ metadata:
   source: rebuild R17.5-P6-R1（D-108；GAP-P6-1 skill-first + LLM 交付叙述/验收建议 advisory 层；对称已 accepted 的 P5 P-migration-verification；吸收参考轨 2A P6-1~P6-10 + 2B 双向门禁/许可 Gate/ACCEPTANCE_RESULTS + 契约 §8）
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-migration-delivery（迁移交付工作流）
 
@@ -66,7 +67,7 @@ metadata:
 - 所有"可交付 / accepted"结论可追溯到**确定性门禁 + 用户 final Gate**；LLM 建议显式 `analysis_only`，无证据处显式 evidence_gap。
 - 只准备 P6 final Gate，不发明新 artifact / Gate / 槽位。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 目标库 / 运行时 / 中间件（麒麟 / 统信 + 达梦 / 人大金仓 / openGauss + TongWeb / 宝兰德等）以 P0-P5 落定为准，P6 按其结论整理交付，不越权重判。
 - 目标环境不具备真实交付验证（物理打包 / 部署冒烟 / 许可网络核验）→ 诚实标 evidence_gap（"能力已接线待环境真验"），不臆测"已交付 / 已部署验证通过"。
 - 高风险交付动作（L4/L5 写 / 命令）走既有 L0-L5 分级 + Gate；脱敏放行走 L5 `desensitization_release`；本 skill 不放宽风险门。

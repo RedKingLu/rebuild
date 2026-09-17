@@ -9,6 +9,7 @@ metadata:
   source: rebuild R17.5（D-108；纠正 P4 标题驱动臆造 + 验收盖章真 P0 塌陷；吸收参考轨 2A/2B P4 + 同目录 6 领域执行 skill）
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-migration-execution（迁移执行工作流）
 
@@ -62,7 +63,7 @@ metadata:
 - **数据访问 / 集成 / 部署**：ADO.NET/EF 版本迁移、认证方式迁移、Dockerfile/compose/nginx 部署承载。
 - 具体转换点由领域执行 skill（见§参考）提供，本 skill 只规定「必须落到真实源、覆盖真实转换点、诚实分级」。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - 目标库/运行时/中间件（麒麟/统信 + 达梦/人大金仓/openGauss + TongWeb/宝兰德等）以 P2 adr + 用户裁决为准，P4 不越权重选。
 - 国产环境不确定项标 evidence_gap，不臆测「已兼容/已通过」。
 - 高风险节点（L4/L5 写/命令）走既有 L0-L5 分级 + action_approval Gate；本 skill 不放宽风险门。

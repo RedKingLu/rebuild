@@ -50,6 +50,10 @@ class ValidationResult:
     recommendations: list = field(default_factory=list)
     claim_evidence_verification: dict = field(default_factory=dict)
     read_from_disk_only: bool = True
+    # B-ACC-HELD-ACTION-INVISIBLE 解除条件 ①：本阶段因待审批而未执行的动作。
+    # 【勿删】没有它，`{stage}_validation.json` 会在有 L4 动作被 fail-closed 拦下的情况下
+    # 仍然只写 `issues: []`，读报告的人必须去翻 Trace 才能知道"有动作没跑"。
+    held_actions: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -63,6 +67,8 @@ class ValidationResult:
             "recommendations": self.recommendations,
             "claim_evidence_verification": self.claim_evidence_verification,
             "read_from_disk_only": self.read_from_disk_only,
+            "held_actions": self.held_actions,
+            "held_action_count": len(self.held_actions),
             "validated_at": _now(),
         }
 
@@ -91,18 +97,39 @@ class ValidationAgent:
         return workspace_service.workspace_path(self.project_id)
 
     def _sha256(self, rel_path: str) -> str:
+        # R24 第二遍（Q2-01）：原为 `except Exception: return ""` 静默吞掉。控制流保持不变
+        # （仍返 ""，由调用点判为"证据不可校验"），但必须发声——否则"产物没产出"与
+        # "产物存在却读不动/权限不足"在日志里无法区分（AGENTS §10-21 / 公理 3）。
         try:
             return hashlib.sha256((self._ws_root() / rel_path).read_bytes()).hexdigest()
-        except Exception:
+        except FileNotFoundError:
+            # 产物不存在是本方法的**正常语义**：调用点（如 :555 sha 对账）先判 _exists 再比对，
+            # 空串即"无法校验"。故只 debug，不升级为 warning。
+            logger.debug("validation_agent 取 sha256 的产物不存在：%s（返回空串）", rel_path)
+            return ""
+        except Exception as e:
+            # 文件在但读不出来 = 真问题（权限 / 目录 / IO），必须 warning。
+            logger.warning("validation_agent 取 sha256 失败：%s（%s: %s）—— 按不可校验处理",
+                           rel_path, type(e).__name__, e)
             return ""
 
     def _exists(self, rel_path: str) -> bool:
         return (self._ws_root() / rel_path).exists()
 
     def _read_json(self, rel_path: str) -> Optional[dict]:
+        # R24 第二遍（Q2-02）：同上，控制流不变（仍返 None），只把静默变成有声。
         try:
             return json.loads((self._ws_root() / rel_path).read_text(encoding="utf-8"))
-        except Exception:
+        except FileNotFoundError:
+            # "产物不存在 → None" 是本方法的契约：调用点普遍 `or {}` 兜底，或按 fallback 链
+            # 依次试多个候选路径（见 :816 p3_stage_plan.json / stage_plan.json）。故只 debug。
+            logger.debug("validation_agent 读产物不存在：%s（返回 None，由调用点判定）", rel_path)
+            return None
+        except Exception as e:
+            # 文件在但解析不出（JSON 损坏 / 编码错 / 权限）= 真问题。控制流仍返 None
+            # （由调用点降级为证据缺失），但不得静默——损坏产物必须能在日志里被认出来。
+            logger.warning("validation_agent 产物解析失败：%s（%s: %s）—— 按证据缺失处理",
+                           rel_path, type(e).__name__, e)
             return None
 
     # ── main entry（review_fn） ─────────────────────────────────────────
@@ -142,7 +169,12 @@ class ValidationAgent:
             try:
                 from app.graph.nodes import get_handler
                 handler = get_handler(self.stage)
-            except Exception:
+            except Exception as e:
+                # R24 第二遍（Q2-03）：控制流不变（handler=None → 下方跳过域规则校验），
+                # 但拿不到 handler 意味着 **①基线域校验被整段跳过**，这是验收强度的实质下降，
+                # 静默是不可接受的（AGENTS §10-21）。降级本身是设计内的（handler 可选注入）。
+                logger.warning("validation_agent 未能取到 %s 的 handler（%s: %s）—— "
+                               "本次跳过域规则校验，验收强度下降", self.stage, type(e).__name__, e)
                 handler = None
         disk_view = self._disk_review_input(work_result)
         if handler is not None and hasattr(handler, "review"):
@@ -224,6 +256,18 @@ class ValidationAgent:
                         recs.append("依据独立验收语义结论修正/重做迁移产物后重跑"
                                     "（禁止照节点标题臆造通用样例）")
 
+        # ④'' D-05（V26.2 批次B）：P1 领域产物集完整性 + acceptance_criteria 第 4 条核验。
+        #     诚实降级本身不是惩罚对象——占位是「未伪造」的正面表现（D-097）；本检查只把「客观
+        #     事实」如实写进验收报告：哪些产物是占位、对应哪条验收标准未达成（缺陷分级思路，
+        #     借鉴 R 阶段验收标准 §0.1 的四档口径，不照搬用词）。判 passed=False（→ rework_
+        #     required，既有机制）仅限两种客观未达标情形，详见 _p1_domain_completeness_check。
+        p1_domain_gate_ok = True
+        if self.stage == "p1" and declared == "completed":
+            p1_checks, p1_issues, p1_hard_fail = self._p1_domain_completeness_check()
+            checks += p1_checks
+            issues += p1_issues
+            p1_domain_gate_ok = not p1_hard_fail
+
         # ④'（D-109）P2/P3 技术路线红线符合性【advisory】校验：项目已批准 project.tech_selection
         #    时，记录红线治理状态并对明显偏离发声（recommendation，不 flip passed——P0-P3 advisory；
         #    P4 由上面 _semantic_gate_p4 依红线作门禁拦截）。
@@ -236,7 +280,8 @@ class ValidationAgent:
 
         # ⑤ 综合裁决：pass = 域基线通过 且 无反伪造违规 且 独立结构核验门控通过
         #    且（P4）LLM 内容保真语义门控通过（P0-P3 语义/内联仍为 advisory）
-        passed = base_passed and antifake_ok and acc_gate_ok and sem_gate_ok
+        #    且（P1）领域产物集完整性门控通过（D-05）
+        passed = base_passed and antifake_ok and acc_gate_ok and sem_gate_ok and p1_domain_gate_ok
         if declared != "completed":
             passed = False
             # WP-6 (Q-R17.3-6-2): 未完成且系模型全失败强制中断 → 结构化 model_unavailable issue，
@@ -255,11 +300,33 @@ class ValidationAgent:
                     }})
         verdict = self._verdict_for(passed, acc, declared)
 
+        # ⑥ B-ACC-HELD-ACTION-INVISIBLE 解除条件 ①②：把"本阶段有 N 个动作因待审批未执行"
+        #    写进验收报告。采集实现与 stage_reports.gate_brief 共用同一份
+        #    （services/held_actions），不抄第二份判据。
+        #    **刻意不 flip passed、也不塞进 issues**（理由见 held_actions 模块 docstring：
+        #    动作被挂起是设计如此，公理 6；而 review_pass 会拿 issues 驱动整阶段返工重跑）。
+        #    走 `held_actions` 独立段 + 一条 checks 记录两条可见通道。
+        held: list = []
+        try:
+            from app.services.held_actions import collect_held_actions
+            held = collect_held_actions(self.project_id, self.run_id or "", self.stage)
+        except Exception:
+            logger.warning("独立验收：挂起动作采集不可用 stage=%s —— held_actions 段为空"
+                           "【不代表无挂起动作】", self.stage, exc_info=True)
+        checks.append({
+            "item": "挂起动作可见性（因待审批未执行的动作）",
+            # passed 语义 = "本项检查本身完成了"，不是"没有挂起动作"——有挂起动作是合法状态。
+            "passed": True,
+            "reason": (f"{len(held)} 个动作因待审批未执行："
+                       f"{[h['gate_id'] for h in held]}" if held else "无挂起动作"),
+            "evidence_ref": None,
+        })
+
         result = ValidationResult(
             stage=self.stage, passed=passed, verdict=verdict,
             agent_id=acc.get("agent_id"), checks=checks, issues=issues,
             recommendations=recs, claim_evidence_verification=cev_verification,
-            read_from_disk_only=True,
+            read_from_disk_only=True, held_actions=held,
         )
         self.last_result = result
         self._persist(result)
@@ -304,6 +371,12 @@ class ValidationAgent:
                               "_work_plan.json", "_gate_brief.json",
                               "_claim_evidence_map.json", "_validation.json")
 
+    # D-05（V26.2 批次B）：P1 领域产物集里，诚实占位数达到/超过此阈值（8 项里 4 项，即半数）
+    # 视为识别产出整体性缺失（非个别字段问题）——判定该阶段客观未达标。阈值取半数，与"逐条核对
+    # acceptance_criteria"的思路一致：不因单一次要字段占位就判失败（缺陷分级）。
+    _P1_MAJOR_GAP_THRESHOLD = 4
+    _P1_UNCERTAINTY_KEY = "uncertainty_manifest"
+
     def _disk_domain_artifacts(self) -> list:
         """从盘重读的【领域产物】refs（r3 约束 3）：排除 WorkAgent 编排报告；P4 追加
         AET 登记的 output_code/patch 真实产物 ref。供 handler.review 域校验使用。"""
@@ -312,16 +385,20 @@ class ValidationAgent:
             name = r.split("/")[-1]
             if not any(name.endswith(sfx) for sfx in self._AGENT_REPORT_SUFFIXES):
                 refs.append(r)
-        if self.stage == "p4":
-            try:
-                from app.services.aet_service import AETService
-                for e in AETService(None).list_evidence(self.project_id, stage="p4"):
-                    for k in ("output_code_ref", "patch_ref"):
-                        v = e.get(k)
-                        if v and v not in refs:
-                            refs.append(v)
-            except Exception:
-                logger.debug("validation_agent P4 域产物 AET 读取失败（advisory）", exc_info=True)
+        if self.stage != "p4":
+            return refs
+        # R24 第二遍（Q2-24，降嵌套 d5→d4）：原为 `if self.stage == "p4": <整块>` 收尾，
+        # 该 if 是本函数**最后一个语句**（其后只有 `return refs`），故倒转为早返回、块整体退一格。
+        # 纯早返回：零提取、零新名字、块内代码逐字未变 ⇒ `git diff -w` 只显示这一行守卫的变化。
+        try:
+            from app.services.aet_service import AETService
+            for e in AETService(None).list_evidence(self.project_id, stage="p4"):
+                for k in ("output_code_ref", "patch_ref"):
+                    v = e.get(k)
+                    if v and v not in refs:
+                        refs.append(v)
+        except Exception:
+            logger.debug("validation_agent P4 域产物 AET 读取失败（advisory）", exc_info=True)
         return refs
 
     def _disk_review_input(self, work_result: dict) -> dict:
@@ -351,6 +428,11 @@ class ValidationAgent:
             intake = self._read_json("artifacts/p0/intake_report.json") or {}
             view["source_type"] = intake.get("source_type")
             view["file_count"] = intake.get("file_count", 0)
+            # `B-ACC-P0-PARSEERROR-STILL-ACCEPTED` 解除条件 ②：P0 域校验新增"识别键大面积为空"
+            # 的确定性检查，其输入同样**从盘重读**（与 read_from_disk_only 一致），不取
+            # WorkAgent 进程内推理 dict。缺该键时 review 侧不判（不误伤），故只在存在时传。
+            if isinstance(intake.get("identification"), dict):
+                view["identification"] = intake["identification"]
         elif self.stage == "p1":
             # P1 域校验（RealP1Handler.review）判定建档识别产物 + 原始验收基准存在性；
             # 从盘重读 artifacts 已在 view["artifacts"]。status 反映是否 completed。
@@ -360,6 +442,121 @@ class ValidationAgent:
             view["assessment_report"] = rep.get("report", rep.get("assessment_report", {}))
             view["analysis_only"] = rep.get("analysis_only", True)
         return view
+
+    # ── D-05（V26.2 批次B）：P1 领域产物集完整性 + acceptance_criteria 第 4 条核验 ──────
+    @staticmethod
+    def _is_p1_honest_placeholder(data) -> bool:
+        """识别 stage_handlers.RealP1Handler 写盘的诚实占位形态：
+        `{"identification_note": "LLM 未产出 {key}（诚实标注，未伪造）"}`（见 stage_handlers.py
+        执行路径，只读参照，不改动）。产物缺失/不可解析同样代表该产物未真实产出，一并计入占位。
+
+        ── B-ACC-ONBOARD 系列之外的一条：B-ACC-P1-LIST-FALSE-PLACEHOLDER（P2）────────
+        原实现首句是 `if not isinstance(data, dict): return True` —— **任何非 dict 产物
+        （含内容充实的合法 JSON 数组）一律判为"未产出"**。真跑实测 `p1_validation.json`
+        因此写下事实错误的断言「1/8 项为诚实占位（LLM 未产出）：['entry_points']」，
+        而 `artifacts/p1/entry_points.json` 是 4878 字节、15 条、每条带 path/kind/why 的
+        充实数组。方向是"过度报告"（把真实产物报成未产出），触及"声称与产出不符"。
+
+        修法（解除条件 ①）：非 dict 时只有**真正缺失/为空**才算占位：
+          · None（`_read_json` 读不到或不可解析）→ 占位；
+          · 空 list / 空 tuple / 空 set / 空 str → 占位（无实质内容）；
+          · **非空** list / str / 标量 → 不是占位（有实质内容）。
+        **dict 分支逐字不变**（含"空 dict 不算占位"这一既有行为）—— 台账登记的缺陷只在
+        非 dict 这一支；顺手改 dict 分支会让 `_P1_MAJOR_GAP_THRESHOLD` 的触发面发生
+        未登记的变化（空 dict 会新增计入占位 ⇒ 更容易 hard_fail），属本轮明令禁止的
+        "顺手重构"，不做。
+        """
+        if isinstance(data, dict):
+            if set(data.keys()) == {"identification_note"}:
+                return "LLM 未产出" in str(data.get("identification_note", ""))
+            return False
+        if data is None:
+            return True
+        if isinstance(data, (list, tuple, set, str, bytes)):
+            return len(data) == 0
+        return False
+
+    def _p1_domain_completeness_check(self) -> tuple[list, list, bool]:
+        """D-05 核心修复：P1 有一组固定领域产物 key（_LLM_ARTIFACT_KEYS，定义于
+        stage_handlers.RealP1Handler，只读引用不复制维护第二份清单——DRY），逐一从盘重读；
+        若干为「LLM 未产出（诚实标注）」占位时，如实记入 checks/issues，并逐条核对
+        work_plan.acceptance_criteria 第 4 条「盲区主动发声（uncertainty 非 0-gap）」是否达成。
+
+        边界（不惩罚诚实降级）：占位本身不是失败——它是「未伪造」的正面表现（D-097/公理3）。
+        本方法只把客观事实如实写进验收报告；返回的 hard_fail 只在两种情形为 True（均只触发
+        既有 rework_required 机制重跑 WorkAgent，非阶段 blocked/failed）：
+          ① uncertainty_manifest 是占位——它是 acceptance_criteria 里【明确点名】的第 4 条，
+             该条客观未达成（盲区清单本身缺失，不是"盲区数=0"）；
+          ② 占位数达到/超过 _P1_MAJOR_GAP_THRESHOLD（半数）——已非个别字段缺失，是识别产出的
+             整体性缺失。
+        单一次要字段占位（非 uncertainty_manifest、未达半数）→ 仅记入 issues 如实反映，不
+        flip passed（对应"诚实降级不代表阶段判定失败"）。
+        """
+        try:
+            from app.graph.stage_handlers import RealP1Handler
+            artifact_keys = list(RealP1Handler._LLM_ARTIFACT_KEYS)
+            static_criteria = list(RealP1Handler.acceptance_criteria)
+        except Exception:
+            logger.debug("validation_agent 读取 RealP1Handler 领域产物锚点失败（advisory）",
+                        exc_info=True)
+            artifact_keys = ["tech_stack", "dependency_draft", "entry_points", "config_inventory",
+                             "infra_clues", "test_inventory", "module_structure",
+                             self._P1_UNCERTAINTY_KEY]
+            static_criteria = []
+
+        work_plan = self._read_json("artifacts/p1/p1_work_plan.json") or {}
+        wp_criteria = work_plan.get("acceptance_criteria") or static_criteria
+
+        empty_keys = [key for key in artifact_keys
+                     if self._is_p1_honest_placeholder(self._read_json(f"artifacts/p1/{key}.json"))]
+
+        checks: list = []
+        issues: list = []
+        if not empty_keys:
+            checks.append({"item": f"P1 领域产物集完整性（{len(artifact_keys)} 项识别产物）",
+                           "passed": True,
+                           "reason": f"{len(artifact_keys)} 项识别产物均非诚实占位（LLM 已实质产出）",
+                           "evidence_ref": None})
+            return checks, issues, False
+
+        checks.append({"item": f"P1 领域产物集完整性（{len(artifact_keys)} 项识别产物）",
+                       "passed": False,
+                       "reason": f"{len(empty_keys)}/{len(artifact_keys)} 项为诚实占位（LLM 未产出）："
+                                f"{empty_keys}", "evidence_ref": None})
+        issues.append({
+            "type": "p1_domain_artifacts_incomplete",
+            "detail": (f"P1 领域产物集不完整：{empty_keys} 为「LLM 未产出（诚实标注，未伪造）」占位，"
+                      f"共 {len(empty_keys)}/{len(artifact_keys)} 项——占位本身未伪造（D-097 正面"
+                      "表现），但验收须如实记录，不得以 issues:[] 掩盖"),
+        })
+
+        hard_fail = False
+        uncertainty_missing = self._P1_UNCERTAINTY_KEY in empty_keys
+        if uncertainty_missing:
+            hard_fail = True
+            blind_spot_criterion = next(
+                (c for c in wp_criteria if "盲区主动发声" in c or "uncertainty" in c.lower()), None)
+            issues.append({
+                "type": "acceptance_criterion_unmet",
+                "detail": (
+                    (f"work_plan.acceptance_criteria「{blind_spot_criterion}」未达成：" if
+                     blind_spot_criterion else
+                     "acceptance_criteria 第 4 条「盲区主动发声（uncertainty 非 0-gap）」未达成："
+                     "（未在 work_plan 中定位到对应文案，按产物本身判定）：")
+                    + "uncertainty_manifest.json 是「LLM 未产出」诚实占位，无真实盲区清单内容"
+                    "（uncertainty 非 0-gap 要求未满足）"),
+            })
+
+        if len(empty_keys) >= self._P1_MAJOR_GAP_THRESHOLD:
+            hard_fail = True
+            issues.append({
+                "type": "p1_identification_major_gap",
+                "detail": (f"{len(empty_keys)}/{len(artifact_keys)} 项领域产物为诚实占位，已达/超过"
+                          f"半数阈值（{self._P1_MAJOR_GAP_THRESHOLD}）——识别产出整体性缺失（非个别"
+                          "字段问题），判定该阶段客观未达标"),
+            })
+
+        return checks, issues, hard_fail
 
     def _verify_generic_evidence_map(self, cem_ref, declared) -> tuple[bool, dict, list]:
         """通用 evidence map 磁盘可解析校验（claim/fact 通用）。declared!=completed 时不苛求。"""
@@ -441,7 +638,12 @@ class ValidationAgent:
             try:
                 from app.dependencies import get_services
                 gw = get_services().model_gateway
-            except Exception:
+            except Exception as e:
+                # R24 第二遍（Q2-04）：控制流不变（gw=None → 下方诚实 evidence_gap，D-097 不假 pass），
+                # 但"网关取不到"的**原因**此前完全丢失，运维只看到 evidence_gap 而不知是无 Key
+                # 还是依赖装配坏了。发声不改判定。
+                logger.warning("validation_agent 取 ModelGateway 失败（%s: %s）—— "
+                               "LLM 语义验收降级为 evidence_gap", type(e).__name__, e)
                 gw = None
         if gw is None:
             return {"status": "evidence_gap",
@@ -456,6 +658,26 @@ class ValidationAgent:
                   + "\n".join(f"- {c}" for c in claims))
         return self._run_semantic_call(gw, prompt)
 
+    def _project_scenario_block(self) -> str:
+        """R20-2-04（Q-R20-2-3 方案 B′）：读取 project.scenario，经与 C1 层共用的渲染器产出
+        场景块，供不经 context_assembler 装配的 P4 独立验收 prompt 使用（DRY，避免第二份措辞）。
+        缺失/异常 → 渲染器自身对 None 的诚实回落（"未提供场景信息"），不在此另写分支。"""
+        scenario = None
+        try:
+            from app.core.database import get_session
+            from app.models.project import Project
+            db = get_session()
+            try:
+                proj = db.get(Project, self.project_id)
+                scenario = getattr(proj, "scenario", None) if proj else None
+            finally:
+                db.close()
+        except Exception:
+            logger.debug("validation_agent 读取 project.scenario 失败（advisory）", exc_info=True)
+        from app.services.context_layers import render_scenario_block
+        from app.services.scenario_loader import resolve_scenario_pack
+        return render_scenario_block(resolve_scenario_pack(scenario))
+
     def _llm_semantic_check_p4(self, gw) -> dict:
         """T3.1：P4 内容保真语义验收——给源根路径 + 迁移产物路径，读真实产出内容与其引用的真实
         源片段，判「真实源的真实迁移 / 内部自洽 / 遵守上游裁决路线」。该 Agent 无工具循环范式
@@ -468,15 +690,18 @@ class ValidationAgent:
                                "（疑空壳/臆造，No Evidence No Completed）")}
         prod_blocks, src_blocks = self._p4_read_products_and_sources(products)
         route = self._p4_route_summary()
+        scenario_block = self._project_scenario_block()
         prompt = (
-            "你是 rebuild 信创迁移平台 P4 执行阶段的【独立验收 Agent】。只依据下面提供的真实内容"
+            "你是 rebuild 软件重构平台 P4 执行阶段的【独立验收 Agent】。只依据下面提供的真实内容"
             "判定，不得脑补或臆测未提供的信息。判定迁移产物是否达标，须同时判三点：\n"
             "① 真实源的真实迁移：产物是否可追溯到 source/ 的真实文件与真实结构，而非与源无关的"
             "通用臆造样例（例如凭空的通用 EMPLOYEE 表、与源栈无关的 Vue3/Java 样板）；\n"
             "② 内部自洽：产物自身是否一致、无自相矛盾；\n"
-            "③ 遵守上游裁决路线：是否迁移到上游裁决的目标技术栈/库（见【上游裁决路线】）。\n"
+            "③ 遵守上游裁决路线：是否迁移到上游裁决的目标技术栈/库（见【上游裁决路线】），"
+            "并参考项目场景包的目标态与验收锚点（见【场景层】）。\n"
             "任一不满足（脱离真实源臆造 / 违反目标路线 / 不自洽）→ verdict=rework，且 grounded=false。\n"
             "仅输出 JSON：{\"verdict\":\"accepted|rework\",\"grounded\":true|false,\"reason\":\"...\"}\n\n"
+            f"【场景层】\n{scenario_block}\n\n"
             f"【源根路径】source/（真实文件样本清单）：\n{self._p4_source_manifest()}\n\n"
             f"【上游裁决路线（目标栈/库）】\n{route}\n\n"
             f"【迁移产物内容（output_code/ 与 patches/，路径已标注）】\n{prod_blocks}\n\n"
@@ -488,15 +713,30 @@ class ValidationAgent:
         parse_verdict=True 时解析结构化 verdict/grounded/reason（P4 门禁用）。"""
         try:
             from app.services.work_agent import _run_coro
+            # V26.2 返工批次二（甲 ⑤ 的逐处评估结论）：本处 512 **保留现值**，不纳入"取消 P 环节硬
+            # 预算"的范围。依据：产出是**定长小裁决**（`{"verdict","grounded","reason"}`），体量不随
+            # 项目规模增长；且一旦因任何原因拿不到结论，下方一律走**诚实 evidence_gap**，而 P4 的语义
+            # 门禁对 evidence_gap 是 **fail-closed**（诚实不通过，见 `_semantic_gate_p4`）——
+            # 即截断的方向是"更严"而不是"放行"，与本次缺陷（把不可用谎报为可用）方向相反。
             resp = _run_coro(gw.call(messages=[{"role": "user", "content": prompt}],
                                      source="api", max_tokens=512))
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-05）：返回值字符串一字不改（有测试与前端读它），只补日志。
+            # 此前异常对象被整个丢弃 —— 超时、鉴权失败、网关装配错误在报告里长得一模一样。
+            logger.warning("validation_agent LLM 语义验收调用异常（%s: %s）—— 诚实降级为 evidence_gap"
+                           "（P4 门禁对 evidence_gap 为 fail-closed，方向更严）", type(e).__name__, e)
             return {"status": "evidence_gap", "detail": "LLM 语义验收调用异常（需有效 Key 复验）"}
         if not resp or resp.get("status") != "completed":
             cat = (resp or {}).get("error_category", "unknown")
             return {"status": "evidence_gap",
                     "detail": f"LLM 语义验收未完成（{cat}）：需有效模型 Key 端到端验证"}
         content = resp.get("content", "") or ""
+        if not content.strip():
+            # D-05 附带修复：模型响应 status=completed 但正文为空，此前直接报
+            # {"status":"completed","raw":""}——把"响应完成"误当成"验收内容已产出"。
+            # 空正文本身就是证据缺口（诚实降级，非伪造），不应冒充 completed（公理3/D-097）。
+            return {"status": "evidence_gap",
+                    "detail": "LLM 语义验收响应 completed 但正文为空（诚实降级为证据缺口，不冒充 completed）"}
         out = {"status": "completed", "raw": content[:200]}
         if parse_verdict:
             verdict, grounded, reason = self._parse_verdict(content)
@@ -527,10 +767,18 @@ class ValidationAgent:
 
     # ── P4 内容保真：给路径 + 读关键文件（真实源 + 迁移产物 + 上游裁决路线）────────
     def _read_text_capped(self, rel_path: str) -> Optional[str]:
+        # R24 第二遍（Q2-06）：控制流不变（仍返 None → 语义 prompt 里少一段材料），只补发声。
         try:
             data = (self._ws_root() / rel_path).read_bytes()[:self._MAX_SEMANTIC_BYTES]
             return data.decode("utf-8", errors="replace")
-        except Exception:
+        except FileNotFoundError:
+            # 调用点是"尽力取材料"（产物/源片段可能就是没有），不存在属正常语义 ⇒ debug。
+            logger.debug("validation_agent 取语义材料的文件不存在：%s（本段材料留空）", rel_path)
+            return None
+        except Exception as e:
+            # 文件在却读不出：语义验收会**少喂一段真实源**，会实质影响 P4 保真判定 ⇒ warning。
+            logger.warning("validation_agent 取语义材料失败：%s（%s: %s）—— 本段材料留空，"
+                           "语义验收材料完整度下降", rel_path, type(e).__name__, e)
             return None
 
     def _p4_product_files(self) -> list:
@@ -707,8 +955,12 @@ class ValidationAgent:
                 return (str(v).lower() if v else None,
                         (bool(g) if isinstance(g, bool) else None),
                         str(obj.get("reason", "")))
-            except Exception:
-                pass
+            except Exception as e:
+                # R24 第二遍（Q2-07）：此处的吞是**设计内的两级容错**（docstring 自陈"优先 JSON，
+                # 退化关键词扫描"）—— 模型没吐合法 JSON 属常规现象，不是故障，故 debug 而非 warning；
+                # 且下游对"verdict 解析不出"本身就是 fail-closed（:759 诚实不通过）。控制流不变。
+                logger.debug("validation_agent verdict JSON 解析失败（%s: %s）—— 退化为关键词扫描",
+                             type(e).__name__, e)
         low = text.lower()
         if "rework" in low or "reject" in low:
             return "rework", None, text[:200]

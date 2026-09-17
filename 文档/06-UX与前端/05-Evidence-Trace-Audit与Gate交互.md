@@ -3,9 +3,8 @@
 > 文档路径：`文档/06-UX与前端/05-Evidence-Trace-Audit与Gate交互.md`
 > 文档状态：**accepted**
 > 平台名称：rebuild
-> 当前版本：V26.1.1
-> 来源草稿：`产物/草稿/05-Evidence-Trace-Audit与Gate交互.md`（Copilot v0.1，2026-06-23）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程
+> 当前版本：V26.3
+> 来源草稿：`产物/已完成/R1/05-Evidence-Trace-Audit与Gate交互.md`（Copilot v0.1，2026-06-23）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：定义 rebuild 当前版本前端中 Evidence/Trace/Audit/Gate 四对象交互的 R1 正式候选规范——覆盖四对象边界（Evidence 证明结果/Trace 解释过程/Audit 记录审计/Gate 承载决策）、右侧检视分区与优先级、Gate 卡片（17 字段+10 状态+9 决策动作）、阶段晋级 Gate/高风险动作 Gate/Policy 阻断三种场景、Evidence 卡片+Evidence Gap 卡片+6 验证状态、Trace/Audit 卡片、联合时间线、Artifact-Evidence 联动、阶段页/Workspace 联动、用户决策确认体验、SSE 事件 17 种、状态恢复、安全脱敏、mock 边界，以及 R2/R3/R4/R9-R12 校准项。

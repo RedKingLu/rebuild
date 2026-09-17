@@ -87,6 +87,10 @@ def test_build_system_prompt_from_layers():
     assert len(prompt) > 100
     # C0 governance content should appear
     assert "C0" in prompt or "治理" in prompt or "禁止" in prompt
+    # R20-3: 平台身份句与 C1 产品层不得再写死信创口径（J-5 判据的测试化）
+    assert "信创" not in prompt
+    # R20-3: 未提供场景时须诚实标注，不得假设目标技术栈
+    assert "未提供场景信息" in prompt or "尚未选择重构场景" in prompt
 
 
 # ─────────────────────────────────────────────────────────────────────────────

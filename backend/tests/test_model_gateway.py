@@ -167,14 +167,31 @@ class TestStrategyResolution:
     """Tests for model resolution with strategy priority."""
 
     def test_resolve_returns_default(self):
-        """With no override, should return strategy default."""
+        """With no override, should return strategy default.
+
+        判据为**结构性**而非硬编码具体 provider（2026-09-06 改）：原写法把
+        `fallback:maas-icompify/deepseek-v4-flash` 钉成常量，一旦 provider 清单变化
+        （本轮按用户指令删除美团 BYOK provider 后 fallback 顺序即改变，实际落到
+        `fallback:deepseek-official/deepseek-v4-flash`）测试就假失败。
+        该用例的真实意图是"resolve 必须给出一个合理且可解释的选择理由"，
+        与"落在哪个具体 provider"无关 —— 后者本就随环境配置变化。
+        与 `test_r14_6_migrated_integration` / `test_r17_2_migration_drift` 硬编码
+        Alembic head 属同一类维护点：**把可变的运行期结果钉成常量**。
+        """
         from app.providers.provider_registry import get_provider_registry
 
         registry = get_provider_registry()
         profile, reason, provider = registry.resolve_model()
         # May return None if no keys configured, but in test env there may be keys
         if profile:
-            assert reason in ("strategy_default", "fallback:maas-icompify/deepseek-v4-flash", "first_available")
+            assert reason in ("strategy_default", "first_available") or \
+                reason.startswith("fallback:"), \
+                f"resolve 理由须为已知类别之一，实际={reason!r}"
+            if reason.startswith("fallback:"):
+                # fallback 必须指向一个真实存在的 provider/model，不得是空壳
+                assert "/" in reason.split("fallback:", 1)[1], \
+                    f"fallback 理由须含 provider/model，实际={reason!r}"
+                assert provider, "fallback 时 provider 不得为空"
 
     def test_resolve_user_override_preferred(self):
         """User override should take priority over default."""
@@ -1102,16 +1119,22 @@ class TestStreamReasoningFallback:
         assert captured["max_tokens"] == 32768
 
     def test_stage_and_planning_max_tokens_raised(self):
-        """(c) The stage loop default + P3 planning cap are raised so reasoning + large JSON
-        产物 fit (was 8192 → truncated at the cap producing empty_content)."""
+        """(c) 原口径：把 stage loop 默认值与 P3 planning 上限**抬高**到 32768（8192 会截断）。
+
+        V26.2 返工批次二（用户裁决 Q-B2-1，2026-09-16）改为**取消平台侧硬预算**：抬高天花板只是
+        把撞顶推迟到更大的样本（本缺陷第二次出现正因如此 —— 抬到 32768 后，未抬的四处又在 16384
+        撞顶）。故断言口径随实现前移为"默认不设上限"（None）。这是**更强**的保证而非放宽：
+        None 的含义是请求体里根本没有 max_tokens 键，不存在平台侧天花板可撞。
+        逃生阀仍可用，见 `test_max_tokens_forwarded_to_litellm`（显式传值照旧生效）。
+        """
         import inspect
         from app.services import stage_agent_loop, planning_service
         sig = inspect.signature(stage_agent_loop.run_stage_tool_loop)
-        assert sig.parameters["max_tokens"].default == 32768
-        assert planning_service._PLANNING_MAX_TOKENS >= 32768
+        assert sig.parameters["max_tokens"].default is None
+        assert planning_service._PLANNING_MAX_TOKENS is None
 
     def test_p4_gen_max_tokens_raised(self):
-        """(c) P4 generation cap raised above the former hardcoded 16384 so reasoning models
-        don't truncate the migrated code / multi-file product mid-output."""
+        """(c) 原口径：P4 生成上限抬高到 32768。同上，V26.2 返工批次二改为默认不设上限
+        （`P4_GEN_MAX_TOKENS` 不设 ⇒ None）。P4 是单次输出体量最大的阶段，最不该有平台天花板。"""
         from app.services import p4_execution_worker
-        assert p4_execution_worker._GEN_MAX_TOKENS >= 32768
+        assert p4_execution_worker._GEN_MAX_TOKENS is None

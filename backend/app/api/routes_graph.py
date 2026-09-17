@@ -34,6 +34,12 @@ class GraphStartRequest(BaseModel):
 class GraphResumeRequest(BaseModel):
     run_id: str
     decision: str
+    # B-ACC-PROMOTION-DECISION-NOGUARD 站点②：决策必须指名被决策的 Gate。
+    # 【勿删】不指名时无法判定决策会落到哪个 Gate 上——图恢复后会把它写到【图自己
+    # 暂停的那个】Gate 上（真跑已坐实同族缺陷造成一次未授权状态变更）。
+    # Optional 是为了让"图停在工作节点/无图线程"的既有调试用法不必改；但图正暂停在
+    # 某个 Gate 上时，不指名（或指名了别的 Gate）一律 409，见 graph_resume 守卫。
+    gate_id: str | None = None
 
 
 def _summary(state: dict) -> dict:
@@ -89,13 +95,40 @@ async def graph_start(project_id: str, req: GraphStartRequest, db: Session = Dep
 
 @router.post("/{project_id}/graph/resume")
 async def graph_resume(project_id: str, req: GraphResumeRequest, db: Session = Depends(get_db)):
-    """Resume a paused graph with a Gate decision (approve / reject / request_changes)."""
+    """Resume a paused graph with a Gate decision (approve / reject / request_changes).
+
+    **测试/调试端点，无生产调用方（2026-09-15 全仓实测）**：命中的调用方只有
+    `tests/test_graph_api.py`。生产路径请用 `POST /gates/{gate_id}/decision` 或
+    `POST /runs/{run_id}/stages/{stage}/promotion-decision`。
+
+    B-ACC-PROMOTION-DECISION-NOGUARD 站点②守卫：图正暂停在某个 Gate 上时，本端点要求
+    请求体用 `gate_id` **指名**被决策的那个 Gate，且它必须就是图的暂停点；不指名或指名
+    另一个 Gate ⇒ 409，决策不注入。理由：不指名的决策会被图写到【它自己暂停的那个】Gate
+    上，与调用方的意图无关——这正是本缺陷的形态。"""
     decision = (req.decision or "").strip().lower()
     if decision not in _VALID_DECISIONS:
         raise HTTPException(400, f"非法决策：{req.decision!r}（允许 {sorted(_VALID_DECISIONS)}）")
     svc = ProjectService(db)
     if svc.get(project_id) is None:
         raise HTTPException(404, f"Project {project_id} not found")
+
+    # 同一性判据复用 graph_pending_gate_ids（与 routes_gates / routes_stages / routes_runs
+    # 同一份，不另造）。读失败 → 空集：退回"图未暂停在 Gate 上"的既有语义，不臆断。
+    from app.graph.runtime import graph_pending_gate_ids
+    try:
+        paused_gate_ids = await graph_pending_gate_ids(req.run_id)
+    except Exception:
+        paused_gate_ids = frozenset()
+    requested_gate_id = (req.gate_id or "").strip()
+    if paused_gate_ids and requested_gate_id not in paused_gate_ids:
+        raise HTTPException(
+            409,
+            f"run {req.run_id} 的图当前暂停在 Gate {sorted(paused_gate_ids)} 上，"
+            f"而本次请求" + (f"指名的是 {requested_gate_id}" if requested_gate_id else "未指名任何 gate_id")
+            + "：拒绝注入决策——不指名（或指名另一个 Gate）的决策会被应用到图自己暂停的那个 "
+            f"Gate 上（B-ACC-PROMOTION-DECISION-NOGUARD 站点②）。请在请求体带上 "
+            f"gate_id，或改用 POST /api/projects/{project_id}/gates/{{gate_id}}/decision。")
+
     state = await get_flow_runtime().resume(req.run_id, decision)
     return SuccessEnvelope(data={"run_id": req.run_id, **_summary(state)}, meta=Meta())
 

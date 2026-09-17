@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Icon } from '../../components/ui/Icon';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { createProject } from '../../services/projectService';
+import { listScenarios, type ScenarioOption } from '../../services/scenarioService';
 import {
   listGitAccounts, listAccountRepos,
   type GitAccountInfo, type GitRepoInfo,
@@ -24,6 +25,24 @@ export function ProjectCreatePage() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
   const [createdId, setCreatedId] = useState<string | null>(null);
+
+  // R20-2-03 (D-117③): 重构场景（可选）。开放输入 + 建议列表，非封闭下拉 —— 建议项来源于
+  // 运行期 GET /api/scenarios（零前端场景常量，AGENTS §10-27）。
+  const [scenario, setScenario] = useState('');
+  const [scenarioOptions, setScenarioOptions] = useState<ScenarioOption[]>([]);
+  const [scenarioLoadError, setScenarioLoadError] = useState(false);
+  const [scenarioDiscoveryStatus, setScenarioDiscoveryStatus] = useState('');
+  const [scenarioInvalidCount, setScenarioInvalidCount] = useState(0);
+
+  useEffect(() => {
+    listScenarios()
+      .then((r) => {
+        setScenarioOptions(r.scenarios);
+        setScenarioInvalidCount(r.invalid.length);
+        setScenarioDiscoveryStatus(r.discovery_status);
+      })
+      .catch(() => setScenarioLoadError(true));
+  }, []);
 
   // ZIP state
   const [zipFile, setZipFile] = useState<File | null>(null);
@@ -83,6 +102,7 @@ export function ProjectCreatePage() {
         form.append('name', name.trim());
         form.append('description', desc.trim());
         form.append('file', zipFile!);
+        if (scenario.trim()) form.append('scenario', scenario.trim());
         const resp = await fetch('/api/projects/upload', { method: 'POST', body: form });
         if (!resp.ok) {
           const data = await resp.json().catch(() => ({}));
@@ -103,6 +123,7 @@ export function ProjectCreatePage() {
             repo_id: repo?.repo_id,
             account_id: selectedAccount,
           },
+          scenario: scenario.trim() || null,
         });
       }
       setCreatedId(project.project_id);
@@ -172,9 +193,31 @@ export function ProjectCreatePage() {
       <div className="card" style={{ marginBottom: 14 }}>
         <label>项目名称 *</label>
         <input value={name} onChange={e => { setName(e.target.value); setErr(''); }}
-          placeholder="例如：MicroOA 信创迁移" style={{ marginBottom: 10 }} />
+          placeholder="例如：MicroOA 客户管理系统重构" style={{ marginBottom: 10 }} />
         <label>项目描述（可选）</label>
-        <input value={desc} onChange={e => setDesc(e.target.value)} placeholder="简要描述" />
+        <input value={desc} onChange={e => setDesc(e.target.value)} placeholder="简要描述" style={{ marginBottom: 10 }} />
+        {/* R20-2-03 (D-117③)：重构场景（可选）。开放输入 + 建议列表（非封闭下拉），
+            建议项来自运行期 GET /api/scenarios —— 前端不写死任何场景常量（AGENTS §10-27）。 */}
+        <label>重构场景（可选）</label>
+        <input list="project-create-scenario-options" value={scenario}
+          onChange={e => setScenario(e.target.value)}
+          placeholder="可从建议中选择，也可自由填写；留空则后续引导阶段再确认" />
+        <datalist id="project-create-scenario-options">
+          {scenarioOptions.map(s => (
+            <option key={s.scenario_id} value={s.scenario_id} label={
+              `${s.display_name}${s.tier === 'typical' ? '（典型场景 · 配套资源更丰富）' : '（自定义场景）'}`
+            } />
+          ))}
+        </datalist>
+        {scenarioLoadError && (
+          <div className="meta" style={{ marginTop: 4 }}>场景列表加载失败，可手动填写场景标识。</div>
+        )}
+        {!scenarioLoadError && scenarioDiscoveryStatus === 'root_missing' && (
+          <div className="meta" style={{ marginTop: 4 }}>未发现场景包目录，可留空或手动填写场景标识。</div>
+        )}
+        {!scenarioLoadError && scenarioInvalidCount > 0 && (
+          <div className="meta" style={{ marginTop: 4 }}>{scenarioInvalidCount} 个场景包目录不完整，已跳过。</div>
+        )}
       </div>
 
       {/* Source mode */}

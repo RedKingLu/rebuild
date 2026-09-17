@@ -1,0 +1,18 @@
+tier: typical
+display_name: 信创切换
+summary: 从国外/传统技术栈切换到国产化技术栈（国产数据库 / OS / CPU / 中间件）
+selection_candidates:
+  - name: 达梦 DM8
+    note: Oracle 兼容模式兼容度较高，但系统包、ROWNUM 分页与 hint 行为需逐项验证
+  - name: 人大金仓 KingbaseES
+    note: PostgreSQL 系内核，提供 Oracle / MySQL 兼容模式
+  - name: openGauss / GaussDB
+    note: PostgreSQL 系语义，与 Oracle / MSSQL 方言差异明显，须专门覆盖测试
+related_skills:
+  - P-database-migrations
+  - P-dotnet-patterns
+  - P-docker-patterns
+  - P-documentation-lookup
+  - P-deployment-patterns
+related_resources:
+  - oracle-to-dm

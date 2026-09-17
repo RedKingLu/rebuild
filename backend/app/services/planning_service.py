@@ -30,6 +30,8 @@ from typing import Any, Optional
 from app.core.status import RISK_LEVELS
 from app.services.task_graph_service import EDGE_TYPES
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+# V26.2 返工批次二（Q-B2-5）："不设即无上限"的 env 旋钮解析（共享实现）。
+from app.services.stage_agent_loop import optional_int_env
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +95,12 @@ def classify_node_type(title: str, output_target: str | None = None) -> str:
 # emitted; at 8192 the forced-final synthesis hit the cap (real call_log: completion_tokens
 # =8192, final_text empty → P3 failed empty_content). 32768 leaves room for reasoning + the
 # large JSON product. Still env-tunable; context window (1M) easily accommodates it.
-_PLANNING_MAX_TOKENS = int(os.environ.get("P3_PLANNING_MAX_TOKENS", "32768"))
+#
+# ⚠ V26.2 返工批次二（用户裁决 Q-B2-1 / Q-B2-5，2026-09-16）：上面 4096→8192→32768 这条
+# "一次次抬高天花板"的历史正是本次改法的反面教材（每次抬高都只是把撞顶推迟到下一个更大的
+# 样本）。现口径：**默认不设平台侧上限**（`P3_PLANNING_MAX_TOKENS` 不设 ⇒ None ⇒ 请求体无
+# max_tokens 键），旋钮保留作成本失控时的逃生阀。原文保留作实测依据留痕。
+_PLANNING_MAX_TOKENS = optional_int_env("P3_PLANNING_MAX_TOKENS")
 
 # §5.2 Stage Plan content fields the model must produce (id/status/audit cols are set by us)
 STAGE_PLAN_FIELDS = [
@@ -658,7 +665,17 @@ class PlanningService:
                              system_prompt: Optional[str] = None,
                              project_id: Optional[str] = None):
         """Ask the LLM to propose edges (by node index) + strategy. Returns
-        (edges, model_used, parse_error, status, reason)."""
+        (edges, model_used, parse_error, status, reason).
+
+        V26.2 返工批次二（甲 ⑤ 的逐处评估结论）：本调用原为硬编码 `max_tokens=2048`，评估结论是
+        **纳入取消范围**（不是"小裁决可以保留"那一类），依据三点：
+          ① 它产出的是**结构化产物**（edges 数组），体量随任务节点数增长，不是定长小裁决；
+          ② 本仓已实测过"推理模型的推理链会在最终 JSON 之前吃掉预算 ⇒ final_text 为空"这一失败
+             模式（见 `_PLANNING_MAX_TOKENS` 上方 R17.5-P4-FIX 批2.8 注释），小预算尤其容易触发；
+          ③ 失败后果是**静默降级**：edges 解析失败/为空 → `_build_validated_edges` 退化为单链
+             TaskGraph（见其 docstring），即"图变成一条链"而现场只看到 parse_error。
+        故与 P3 主调用共用同一旋钮（默认不设上限）。
+        """
         gw = self._get_gateway()
         node_list = [{"index": n["index"], "title": n["title"], "risk_level": n["risk_level"]}
                      for n in nodes]
@@ -671,7 +688,7 @@ class PlanningService:
                 f"（edge_type ∈ {EDGE_TYPES}）。仅表达任务依赖顺序，不得越过 Gate。")},
         ]
         result = await gw.call(messages=messages, strategy_id=strategy_id,
-                               max_tokens=2048, temperature=0.2, source="api",
+                               max_tokens=_PLANNING_MAX_TOKENS, temperature=0.2, source="api",
                                timeout=_PLANNING_TIMEOUT, project_id=project_id)
         if result.get("status") != "completed":
             reason = result.get("error_message") or result.get("error_category") or "model_call_failed"

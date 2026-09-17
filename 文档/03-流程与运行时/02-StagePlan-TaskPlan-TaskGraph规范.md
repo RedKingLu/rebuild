@@ -3,9 +3,8 @@
 > 文档路径：`文档/03-流程与运行时/02-StagePlan-TaskPlan-TaskGraph规范.md`
 > 文档状态：**accepted**
 > 平台名称：rebuild
-> 当前版本：V26.1.1
-> 来源草稿：`产物/草稿/02-StagePlan-TaskPlan-TaskGraph规范.md`（v0.1，~1059 行；去重 ~55%，主要移除 ~150 个字段建议 + 执行模式/Gate 复述）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R2
+> 当前版本：V26.3
+> 来源草稿：`产物/已完成/R1/02-StagePlan-TaskPlan-TaskGraph规范.md`（v0.1，~1059 行；去重 ~55%，主要移除 ~150 个字段建议 + 执行模式/Gate 复述）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：`03-流程与运行时/` 专题的第 2 份子文档。定义 Stage Plan / Task Plan / Task Plan Batch / Plan Delta / TaskGraph / Task Node / Task Edge 的操作规范——对象层次、核心规则、边策略细化、版本替代、冲突处理。**状态字段的权威源见 `02-架构设计/03-Project-Run-TaskGraph状态架构.md`**，本文只定义操作规则不重复字段定义。

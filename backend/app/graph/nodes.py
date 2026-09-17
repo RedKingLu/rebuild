@@ -161,8 +161,18 @@ def _finalize_agent_gate_material(stage: str, project_id: str, run_id: str,
             honest_notes=partial.get("honest_notes", ""),
             validation_verdict=verdict,
             claim_evidence_summary=cem_summary,
+            # B-ACC-HELD-ACTION-INVISIBLE：这一份是**覆写**到同一路径的最终 Gate Brief
+            # （见本函数 docstring）。run_id 必须传下去，否则 held_actions 段会按 project
+            # 级采集，可能带上别的 run 的挂起动作。
+            run_id=run_id or "",
         )
-    except Exception:
+    except Exception as e:
+        # R24 第二遍（Q2-19）：控制流不变（回退到 WorkAgent 早先写的那份 gate_brief_ref）。
+        # 但这个回退有**实质后果**：用户 Gate 上看到的会是**未含验收结论 / 未含 held_actions
+        # 的旧简报**（本次覆写没成功），而界面上看不出区别 ⇒ 必须 warning 而非静默。
+        logger.warning("nodes: 最终 Gate Brief 覆写失败（%s: %s）—— 回退到 WorkAgent 早先那份"
+                       "（不含本次验收结论/挂起动作）stage=%s project=%s",
+                       type(e).__name__, e, stage, project_id, exc_info=True)
         gb_ref = wa.gate_brief_ref
     for r in (wa.work_plan_ref, gb_ref, wa.claim_evidence_map_ref):
         if r and r not in refs:
@@ -408,13 +418,79 @@ def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
                     except Exception:
                         logger.debug("model_unavailable 中断 Audit 写入失败（advisory）", exc_info=True)
 
+            # V26.2 返工修复第 8 项（Q-RW-4）：P5FailureRouter 判定 p4_rework_required=True
+            # 时，stage_handlers.py 的 P5 review() 已把该显式布尔值（连同 plan_delta_type/
+            # plan_delta_reason）塞进它返回的 issue dict——这是唯一能原样穿过
+            # ValidationAgent.validate() 聚合、活到这里 res.rounds 的通道（该方法把
+            # review.issues 逐条原样 append，见 review_pass.py:110）。检测方式与上面
+            # _has_empty_source / _is_model_unavailable 完全同构：只认这一个显式字段，
+            # 不从 escalation_reason 文本或 failure_type 字符串反推（该信号必须显式设置
+            # 才触发，不能从模糊信号推断——否则新增一种失败类型时逻辑会悄悄漂移）。
+            _p4_rework_required = False
+            _rework_plan_delta_type: Optional[str] = None
+            _rework_plan_delta_reason = ""
+            for _rnd in (res.rounds or []):
+                for _iss in (_rnd.get("issues") or []):
+                    if isinstance(_iss, dict) and _iss.get("p4_rework_required"):
+                        _p4_rework_required = True
+                        _rework_plan_delta_type = _iss.get("plan_delta_type")
+                        _rework_plan_delta_reason = _iss.get("plan_delta_reason") or ""
+                        break
+                if _p4_rework_required:
+                    break
+            if _p4_rework_required:
+                _metadata = dict(_metadata or {})
+                _metadata["rework_target_stage"] = "p4"
+                _metadata["rework_reason"] = _rework_plan_delta_reason or escalation_reason
+
+            # A 部分根因修复：升级到 Gate 的分支此前只把 res.report_refs（start_plan/
+            # construction/acceptance 三份编排报告）作 artifact_refs，从不调
+            # _finalize_agent_gate_material 补挂 {stage}_gate_brief.json（那是下方
+            # "passed → create promotion Gate" 分支才做的事）。gate_backend._read_gate_brief
+            # 靠
+            # ref.endswith("_gate_brief.json") 找真实 brief，找不到就落入误导性罐头话——
+            # gate-401a97 正是撞在这里：P5 判定 rework_required 走的正是这条升级分支，
+            # brief 文件确实已被 WorkAgent 写到盘上，只是从没被带进这个 Gate 的
+            # artifact_refs。这里补挂后，无论正常通过还是升级为 Gate，brief 都会被带上，
+            # 且 ValidationAgent 此时已跑完（res 已算出 passed=False），
+            # _finalize_agent_gate_material 用的是这轮真实 verdict，比 WorkAgent 在
+            # execute() 里先写的那份（verdict 还是 None）更准确。
+            _escalation_refs = list(res.report_refs)
+            if _agent_workflow_enabled(stage) and _work_agent is not None:
+                for _r in _finalize_agent_gate_material(stage, project_id, run_id,
+                                                        _work_agent, _validation_agent):
+                    if _r not in _escalation_refs:
+                        _escalation_refs.append(_r)
+
             gate_id = ""
             if _gate_backend is not None:
                 gate_id = _gate_backend.create(
                     project_id=project_id, run_id=run_id, stage=stage,
-                    artifact_refs=res.report_refs,
+                    artifact_refs=_escalation_refs,
                     gate_type=_gate_type,
                     metadata=_metadata)
+            if _p4_rework_required and gate_id:
+                # 复用既有 p5_failure_router.create_plan_delta_for_failure（不改其内部、
+                # 不新造服务）持久化这次返工决策；用一个只携带路由要用到的字段的
+                # P5FailureRoute 构造，不改 P5FailureRouter 本身。delta_type 沿用
+                # P5FailureRouter.route() 已经选好的值（构建/测试失败/产物缺失这几类
+                # 唯一会置 p4_rework_required=True 的失败类型，其 plan_delta_type 恒为
+                # "blocking_adjustment"——"出现阻塞项导致计划调整"，语义上正对应"执行
+                # 遇到阻塞、需要退回 P4 重新执行"，故此处不新选值，忠实沿用）。
+                from app.services.p5_failure_router import P5FailureRoute, create_plan_delta_for_failure
+                from app.services.gate_service import write_p5_rework_marker
+                _plan_delta_id = create_plan_delta_for_failure(
+                    P5FailureRoute(
+                        failure_type="p4_rework_approved", action=escalation_reason,
+                        p4_rework_required=True,
+                        plan_delta_type=_rework_plan_delta_type or "blocking_adjustment",
+                        plan_delta_reason=_rework_plan_delta_reason or escalation_reason,
+                    ),
+                    project_id, stage="p4", run_id=run_id, auditor=_auditor)
+                write_p5_rework_marker(
+                    project_id, gate_id=gate_id, run_id=run_id, target_stage="p4",
+                    reason=_rework_plan_delta_reason or escalation_reason,
+                    plan_delta_id=_plan_delta_id)
             # 模型全失败 → stage_status=blocked（明确失败态）；其余升级仍为 waiting_gate。
             _stage_state = "blocked" if _is_model_unavailable else "waiting_gate"
             _extra_pending = {}
@@ -488,6 +564,7 @@ def make_work_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
 
 def make_gate_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
     async def gate(state: GraphState) -> dict:
+        project_id = state.get("project_id", "")
         pg = state.get("pending_gate") or {}
         gate_id = pg.get("gate_id", "")
         gate_type = pg.get("gate_type", "stage_promotion")
@@ -516,19 +593,46 @@ def make_gate_node(stage: str) -> Callable[[GraphState], Awaitable[dict]]:
             if gate_type == "plan_presentation":
                 upd["stage_status"] = {stage: "plan_approved"}
             else:
-                nxt = next_stage(stage)
-                ss = {stage: "completed"}
-                if nxt:
-                    ss[nxt] = "in_progress"
-                    upd["current_stage"] = nxt
+                # V26.2 返工修复第 8 项（Q-RW-4）：P5 的 stage_promotion Gate 批准可能是
+                # "正常晋级"，也可能是"接受 P4 rework 建议、退回 P4 重跑"——两者共用同一个
+                # gate_type，无法只凭 gate_type 区分。真正的判据是 make_work_node 在判定
+                # p4_rework_required=True 时落盘的显式标记（gate_service.write/
+                # read_p5_rework_marker），且必须 gate_id 精确匹配本次被批准的 Gate（防止
+                # 旧一轮返工的标记误伤之后真正通过的同阶段 Gate）。只在 stage=="p5" 时
+                # 检查——其它阶段完全不读这个标记，rework_target 恒为 None，下面
+                # `if rework_target: ... else: ...` 必然走 else 分支，即原有逐字节不变的
+                # 晋级逻辑（防回归）。gate_service._apply_promotion 读的是同一份文件、同一
+                # 个 gate_id 匹配规则（见该文件模块注释）——两条独立代码路径靠"读同一个
+                # 真实来源"而不是"各自从 verdict 反推"来保证不给出矛盾结论。
+                rework_target: Optional[str] = None
+                if stage == "p5" and gate_id:
+                    from app.services.gate_service import read_p5_rework_marker
+                    _marker = read_p5_rework_marker(project_id, gate_id)
+                    rework_target = _marker.get("rework_target_stage") if _marker else None
+                if stage == "p5":
+                    # 标量字段必须每次都显式写（哪怕是 None）：last-write-wins，若本轮
+                    # 不写会残留上一轮的旧值，误导 make_router 对本轮的判断。
+                    upd["rework_target_stage"] = rework_target
+                if rework_target:
+                    upd["current_stage"] = rework_target
+                    upd["stage_status"] = {stage: "rework_required", rework_target: "in_progress"}
                 else:
-                    upd["run_status"] = "completed"
-                upd["stage_status"] = ss
+                    nxt = next_stage(stage)
+                    ss = {stage: "completed"}
+                    if nxt:
+                        ss[nxt] = "in_progress"
+                        upd["current_stage"] = nxt
+                    else:
+                        upd["run_status"] = "completed"
+                    upd["stage_status"] = ss
                 # EG-WP2A-1: 进入新阶段时重置 plan 门控。plan_approved 是「当前阶段的接入
                 # 计划已通过」的标记；stage_promotion 批准晋级后必须复位，否则 make_router
                 # 因 plan_approved 残留恒真而路由回本阶段 {stage}_work（形成循环 / 跳过下一
                 # 阶段独立 plan_presentation gate）。复位后 manual/plan 模式下每个阶段都能
                 # 到达各自的 plan_presentation gate；auto 模式该值本就为假，复位无副作用。
+                # 返回 P4 重跑同样需要复位——P4 的接入计划本已在上一轮通过，但"进入新一轮
+                # 执行"复用的是同一套 plan_presentation 语义（P4 是否要重新展示计划由 P4
+                # 自己的 work 节点按 mode 决定，这里只保证标记被正确复位，不额外特判）。
                 upd["plan_approved"] = False
         elif decision == "reject":
             upd["stage_status"] = {stage: "blocked"}
@@ -550,6 +654,17 @@ def make_router(stage: str) -> Callable[[GraphState], str]:
             #（work 节点检测到 plan_approved=True 会跳过 plan_review/plan_presentation，直接执行）
             if state.get("plan_approved"):
                 return f"{stage}_work"
+            # V26.2 返工修复第 8 项（Q-RW-4）：P5 判定 rework_required 时，批准其
+            # promotion Gate 的语义是"退回上一阶段重跑"而不是"晋级到下一阶段"。
+            # rework_target_stage 由 {p5}_gate 节点在读到落盘的返工标记（gate_id 精确
+            # 匹配）后才显式写入，未匹配到时该节点也会显式写 None——本处只信这一个
+            # 显式字段，不做任何推断；只在 stage=="p5" 时检查，其它阶段 state 里
+            # 根本不会有这个字段（或恒为 None），下面这行对它们是纯粹的 no-op，
+            # 逐字节走回原有逻辑（防回归）。
+            if stage == "p5":
+                rework_target = state.get("rework_target_stage")
+                if rework_target:
+                    return f"{rework_target}_work"
             nxt = next_stage(stage)
             return f"{nxt}_work" if nxt else "__end__"
         if decision == "reject":

@@ -694,7 +694,7 @@ class FusionExecutionEngine:
 
 # ── Message builder helpers (prompt engineering) ───────────────────────
 
-PANEL_SYSTEM = """你是一位资深信创迁移专家。请从 {perspective} 角度，对下面的用户请求/材料进行分析。
+PANEL_SYSTEM = """你是一位资深软件重构与迁移专家。请从 {perspective} 角度，对下面的用户请求/材料进行分析。
 给出结构化、可操作的分析意见（不超过 800 字）。用中文回答。"""
 
 JUDGE_SYSTEM = """你是一位客观的评审官。下面是一段用户请求和多个模型的分析意见。
@@ -715,7 +715,7 @@ SYNTHESIZER_SYSTEM = """你是一位综合分析专家。下面是用户请求�
 请综合以上内容，生成一段完整的最终回复（中文，不超过 1200 字）。
 要求：吸收共识、标注矛盾点、指出盲区。不要发起任何工具调用或命令，只输出综合文本。"""
 
-MOA_SYSTEM = """你是一位资深信创迁移专家（采样视角 {sample}）。请针对下面的用户请求给出分析（中文，不超过 800 字）。"""
+MOA_SYSTEM = """你是一位资深软件重构与迁移专家（采样视角 {sample}）。请针对下面的用户请求给出分析（中文，不超过 800 字）。"""
 
 
 def _build_panel_messages(messages: list[dict], perspective: str) -> list[dict]:

@@ -2,7 +2,7 @@
 
 背景：批2 已把 P0-P3 (intake/profiling/assessment/planning) 与 tech_selection 改为
 【工具循环 Node Worker Agent】(run_stage_tool_loop / call_stream + 工具)。这些阶段都
-依赖模型支持 tool_calling。若用户选了不支持工具调用的模型(如 minimax-m3 / agnes-2.0-flash)，
+依赖模型支持 tool_calling。若用户选了不支持工具调用的模型，
 应在上游 readiness 预检时【诚实 blocked + 明确提示】，而非运行时崩/空转。
 
 本测试验证（全部 mock/真实注册表逻辑，禁跑 P0-P4 长链）：
@@ -84,9 +84,31 @@ def _tool_calling_registry():
     return r
 
 
+def _force_no_tool_calling(registry, profile_ref: str) -> None:
+    """把指定 profile 在【本测试专属的 registry 实例】内显式覆盖为 supports_tool_calling=False。
+
+    受控测试替身，不依赖真实配置里"某个模型恰好不支持工具调用"这一**易变事实**：
+    原实现挑 minimax-m3（当时配置记为 false）作场景素材，本轮实测更正为 true 后
+    该用例赖以成立的前提直接消失。改为显式构造能力缺失的候选，场景意图与配置解耦。
+    用 dataclasses.replace 生成新对象（不原地改写），只作用于 fixture 内 new 出来的
+    ProviderRegistry 实例，不触碰 model_profiles.yaml、不影响其他测试。
+    """
+    from dataclasses import replace
+    original = registry.get_profile(profile_ref)
+    assert original is not None, f"profile 不存在于配置：{profile_ref}"
+    patched = replace(original, supports_tool_calling=False)
+    registry._profiles[profile_ref] = patched
+    provider = registry.get_provider(patched.provider_id)
+    if provider is not None:
+        provider.models = [patched if m.profile_id == profile_ref else m for m in provider.models]
+
+
 def _non_tool_calling_registry():
-    """已配置且【具凭据】但【不支持 tool_calling】的模型（minimax-m3 supports_tool_calling=false，
-    回退亦为 agnes-2.0-flash false）→ 凭据充足，唯独能力不满足。"""
+    """已配置且【具凭据】但【不支持 tool_calling】的模型 → 凭据充足，唯独能力不满足。
+
+    默认档与回退档均由 _force_no_tool_calling 显式覆盖为不支持工具调用（受控替身），
+    不再依赖真实配置中这两个模型的 supports_tool_calling 取值。
+    """
     from app.providers.provider_registry import ProviderRegistry
     r = ProviderRegistry()
     r.load()
@@ -95,6 +117,9 @@ def _non_tool_calling_registry():
     r.update_strategy("system-default",
                       default_profile_ref="maas-icompify/minimax-m3",
                       fallback_profile_refs=["agnes-ai/agnes-2.0-flash"])
+    # set_credential 先跑（把 profile.status 置 configured），再覆盖能力位。
+    _force_no_tool_calling(r, "maas-icompify/minimax-m3")
+    _force_no_tool_calling(r, "agnes-ai/agnes-2.0-flash")
     return r
 
 

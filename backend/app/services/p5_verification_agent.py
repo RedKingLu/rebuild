@@ -23,10 +23,41 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 logger = logging.getLogger("rebuild.p5_verification_agent")
+
+# V26.2 返工批次二（Q-B2-2）：截断诊断与"不设即无上限"的 env 旋钮解析改用共享实现。
+from app.services.stage_agent_loop import (
+    diagnose_parse_failure as _diagnose_parse_failure_shared,
+    log_parse_failure as _log_parse_failure,
+    optional_int_env,
+    scan_json_shape,
+)
+
+# D-06（V26.2 总验收真实规模真跑，2026-09-11，批次B）：真实规模下本调用的 completion
+# **1 次触顶原硬编码 max_tokens=8192**（存档响应头部为 `{"validation_strategy":
+# {"applicable_dimensions"…` 即被砍断）→ advisory（维度适用性/失败解读/修复建议）解析失败。
+# 复用 acceptance_baseline_service 已建立的 env 可调范式（不新造机制）。
+#
+# 默认值依据（实测，非拍脑袋）：
+#   · 16384 = 触顶值 8192 的 2 倍，同时落在本批修复（acceptance_baseline_service /
+#     profiling_service）已使用的同一档预算上——advisory 层输出 4 个锚点（validation_strategy/
+#     failure_interpretation/repair_suggestions/structure_mapping），体量与 acceptance_
+#     baseline 的静态基线（3 个数组字段）同级，故直接复用同一档，不再新增一个只比 8192
+#     略高的中间数字。
+#   · 240s：与 acceptance_baseline_service 对同一 16384 预算的取值一致（依据实测 60-120s
+#     单次调用延迟 ×2 余量）；本调用同为单轮 run_stage_tool_loop（advisory 层按已有确定性
+#     事实解读，无需像 profiling 那样多轮读源），故沿用该量级，不再另加时长。
+# 二者只调请求超时与输出预算，不涉及模型/endpoint 选择（策略仍由 ModelGateway 解析，D-098）。
+#
+# ⚠ V26.2 返工批次二（用户裁决 Q-B2-1 / Q-B2-5，2026-09-16）：**上面 16384 的推导已不再作为默认值
+# 使用**（原文保留：它记录了触顶实测与"×2 抬高"路线的依据）。现口径：**默认不设平台侧上限**
+# （`P5_VERIFICATION_MAX_TOKENS` 不设 ⇒ None ⇒ 请求体无 max_tokens 键），旋钮保留作逃生阀。
+_P5_VERIFICATION_MAX_TOKENS = optional_int_env("P5_VERIFICATION_MAX_TOKENS")
+_P5_VERIFICATION_TIMEOUT = float(os.environ.get("P5_VERIFICATION_TIMEOUT", "240"))
 
 # 编排 + 锚点字段（skill-first，D-108）：验证方法论/维度/反伪造红线随 P5 stage skill
 # (P-migration-verification) 正文走，此处只保留"怎么编排 + 输出什么锚点键 + 不可越权红线"。
@@ -141,7 +172,8 @@ class P5VerificationAgent:
             loop = await run_stage_tool_loop(
                 gw, system_content=system_content, user_content=user_content,
                 project_id=project_id, run_id=run_id or "", stage=stage,
-                strategy_id=strategy_id, max_tokens=8192, temperature=0.3, tracer=self.tracer)
+                strategy_id=strategy_id, max_tokens=_P5_VERIFICATION_MAX_TOKENS, temperature=0.3,
+                timeout=_P5_VERIFICATION_TIMEOUT, tracer=self.tracer)
             if loop["status"] != "completed":
                 reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
                 return P5AdvisoryResult(
@@ -182,11 +214,32 @@ class P5VerificationAgent:
             "严禁产出「通过」结论、严禁改写上述事实或 can_be_completed。"
         )
 
+    @staticmethod
+    def _scan_json_shape(text: str) -> tuple[int, bool]:
+        """扫描 JSON 文本的结构收敛状态：返回 (未闭合的括号深度, 是否停在字符串内部)。
+
+        V26.2 返工批次二（Q-B2-2）：实现已提取到 `stage_agent_loop.scan_json_shape`（全平台
+        唯一一份），此处仅为薄转发，保留方法名以不破坏既有调用/测试。
+        """
+        return scan_json_shape(text)
+
+    def _diagnose_parse_failure(self, text: str) -> dict:
+        """构造可诊断信息（D-06）：响应字符长度 + 是否疑似截断 + 本次上限取值。
+
+        V26.2 返工批次二（Q-B2-2）：算法共享化，本方法只喂本服务的上限/超时/旋钮名。
+        """
+        return _diagnose_parse_failure_shared(
+            text, max_tokens=_P5_VERIFICATION_MAX_TOKENS, timeout_s=_P5_VERIFICATION_TIMEOUT,
+            env_knobs="P5_VERIFICATION_MAX_TOKENS / P5_VERIFICATION_TIMEOUT")
+
     def _parse(self, content: str) -> dict:
         from app.services.stage_agent_loop import extract_json_object
         data = extract_json_object(content)
-        if not isinstance(data, dict):
-            return {"validation_strategy": {"raw": (content or "").strip()[:1500],
-                                            "parse_error": True},
-                    "failure_interpretation": [], "repair_suggestions": []}
-        return data
+        if isinstance(data, dict):
+            return data
+        text = (content or "").strip()
+        diagnosis = self._diagnose_parse_failure(text)
+        _log_parse_failure(logger, "P5 advisory", diagnosis)
+        return {"validation_strategy": {"raw": text[:1500], "parse_error": True,
+                                        "parse_diagnosis": diagnosis},
+                "failure_interpretation": [], "repair_suggestions": []}

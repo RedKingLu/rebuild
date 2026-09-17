@@ -30,12 +30,15 @@ export async function createProject(params: {
   description?: string;
   source_type?: string;
   source_config?: Record<string, unknown>;
+  scenario?: string | null;
 }): Promise<Project> {
   const resp = await post<Project>('/projects', {
     name: params.name,
     description: params.description ?? '',
     source_type: params.source_type ?? 'local_dir',
     source_config: params.source_config ?? {},
+    // R20-2-03: 留空则不传具体值（后端诚实缺省为 null，不猜场景 —— R20-2-06）。
+    scenario: params.scenario?.trim() || null,
   });
   return resp.data;
 }

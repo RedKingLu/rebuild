@@ -25,6 +25,19 @@ from typing import Optional
 logger = logging.getLogger("rebuild.tech_selection_service")
 
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+# V26.2 返工批次二（Q-B2-1 / Q-B2-2）：共享截断诊断 + "不设即无上限"的 env 旋钮解析。
+from app.services.stage_agent_loop import (
+    DEFAULT_STAGE_TIMEOUT_SECONDS as _STAGE_TIMEOUT,
+    diagnose_parse_failure as _diagnose_parse_failure_shared,
+    log_parse_failure as _log_parse_failure,
+    optional_int_env,
+)
+
+# `B-V262-TOKENBUDGET-UNFIXED-4`（P0）：本调用原为硬编码 max_tokens=16384，与已实测撞顶的
+# P0 intake / P2 assessment 同值同族（选型要产出多方案对比，体量与 P2 评估同级）；真实规模真跑
+# 未走到本阶段，属**同类高危未验证**。用户 2026-09-16 裁决 Q-B2-1：取消平台侧硬预算。
+# 默认 None ⇒ 请求体无 max_tokens 键；旋钮 `P1_TECHSEL_MAX_TOKENS` 保留作逃生阀。
+_TECHSEL_MAX_TOKENS = optional_int_env("P1_TECHSEL_MAX_TOKENS")
 
 # 通用锚点键（结构固定，样本值由 LLM 按项目生成）。维度需求/原则在 skill 正文，不在此硬编码。
 TECH_SELECTION_KEYS = [
@@ -33,9 +46,10 @@ TECH_SELECTION_KEYS = [
 ]
 
 # 瘦身编排提示词（skill-first）：只声明身份 + 锚点键 + 接地/服从目标环境/脱敏的硬约束。
-# 详细选型维度/原则/信创替代清单等一律走 skill 正文（P-tech-selection SKILL.md），此处不复制。
+# 详细选型维度/原则/场景目标态与选型候选等一律走 skill 正文（P-tech-selection SKILL.md）
+# 与项目场景包（source/skills/scenarios/<scenario>/），此处不复制。
 _SYSTEM_PROMPT = (
-    "你是 rebuild 信创迁移平台的【P1→P2 技术路线选型 Agent】（Node Worker Agent）。平台已用确定性"
+    "你是 rebuild 软件重构平台的【P1→P2 技术路线选型 Agent】（Node Worker Agent）。平台已用确定性"
     "工具采集并由上游 LLM 识别了目标项目的真实源码事实（技术栈/依赖/入口/配置/基础设施线索），并"
     "提供了项目【目标运行环境 migration_target】（目标 CPU 架构 + 目标 OS，引导期用户点选的硬约束）。\n"
     "你的职责：基于【真实源码事实 + 目标运行环境 + 约束】综合推荐迁移的目标技术路线，供用户裁决。\n"
@@ -45,7 +59,8 @@ _SYSTEM_PROMPT = (
     "key_arch_decisions（数组 [{decision, recommendation, reasoning, alternatives}]）、"
     "overall_rationale（字符串）、open_questions（数组[字符串]）。\n"
     "硬约束：①每项 reasoning 必须援引输入事实中【真实存在】的信号，禁止输出与源无关的通用模板；"
-    "②选型必须能在 migration_target 的 CPU/OS 上运行（信创优先国产化替代但以真实源+目标环境为准）；"
+    "②选型必须能在 migration_target 的 CPU/OS 上运行（优先遵循项目场景包的目标态词表与选型候选，"
+    "并以真实源+目标环境为准）；"
     "③证据不足项在 reasoning 标注不确定性并列入 open_questions，不臆造确定性；④连接串/密钥/口令值"
     "一律不输出。详细选型维度与原则见随附的选型 skill 正文，遵循之。"
 )
@@ -116,9 +131,16 @@ class TechSelectionService:
         run_id: Optional[str] = None,
         stage: str = "p1",
         strategy_id: str = "system-default",
+        scenario: Optional[str] = None,
     ) -> TechSelectionResult:
         """产出技术路线选型建议。identification=P1 建档识别（tech_stack/dependency/entry_points/
-        config/infra），upstream=P0 识别结论，migration_target=目标 CPU/OS 红线。无 Key → blocked。"""
+        config/infra），upstream=P0 识别结论，migration_target=目标 CPU/OS 红线。无 Key → blocked。
+
+        scenario（R20-2-04, Q-R20-2-3 方案 B′）：项目重构场景 id，带默认值的关键字参数 ——
+        既有调用零改动仍合法。本服务不经 context_assembler 装配（自建 skill-first 编排提示词），
+        故场景知识经 render_scenario_block(resolve_scenario_pack(scenario)) 独立注入，
+        与 C1 层共用同一渲染器，避免出现第二份场景文本措辞。
+        """
         gw = self._get_gateway()
 
         readiness = gw.stage_model_readiness(strategy_id=strategy_id, project_id=project_id,
@@ -134,15 +156,20 @@ class TechSelectionService:
                 model_user_actions=readiness.get("user_actions", []))
 
         skill_body = self._skill_body()
+        from app.services.context_layers import render_scenario_block
+        from app.services.scenario_loader import resolve_scenario_pack
+        scenario_block = render_scenario_block(resolve_scenario_pack(scenario))
         system_content = ((skill_body.strip() + "\n\n---\n\n" + _SYSTEM_PROMPT)
                           if skill_body.strip() else _SYSTEM_PROMPT)
+        system_content = system_content + "\n\n---\n\n" + scenario_block
 
         from app.services.stage_agent_loop import run_stage_tool_loop
         loop = await run_stage_tool_loop(
             gw, system_content=system_content,
             user_content=self._build_user_prompt(identification, upstream or {}, migration_target),
             project_id=project_id, run_id=run_id or "", stage=stage,
-            strategy_id=strategy_id, max_tokens=16384, temperature=0.3, tracer=self.tracer)
+            strategy_id=strategy_id, max_tokens=_TECHSEL_MAX_TOKENS, temperature=0.3,
+            tracer=self.tracer)
         if loop["status"] != "completed":
             reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P1 tech_selection model call not completed: {reason}", project_id, run_id, stage)
@@ -175,7 +202,7 @@ class TechSelectionService:
               if upstream.get(k) is not None}
         up_blob = json.dumps(up, ensure_ascii=False, default=str)
         mt_blob = json.dumps(migration_target, ensure_ascii=False, default=str) if migration_target \
-            else "（未采集到 migration_target；请在 reasoning/open_questions 中声明目标环境未定，并给出与常见信创目标环境兼容的稳妥推荐）"
+            else "（未采集到 migration_target；请在 reasoning/open_questions 中声明目标环境未定，并依项目场景包的目标态词表给出稳妥推荐；无场景包时诚实说明无场景知识、不臆造目标栈）"
         return (
             "以下是平台采集并由上游 LLM 识别的目标项目【真实源码事实】、上游 P0 识别结论，以及项目"
             "【目标运行环境 migration_target】。请据此产出迁移的目标技术路线选型建议（严格输出契约 JSON）。\n\n"
@@ -188,12 +215,19 @@ class TechSelectionService:
         )
 
     def _parse(self, content: str) -> dict:
+        """V26.2 返工批次二（甲 ②）：接入共享截断诊断 —— 本处此前只报"无法解析为 JSON"，
+        看不出是否被砍断。日志措辞同步订正：本方法只产出诚实的 parse_error 标记，是否返工由
+        上层图编排决定（不再自称"返工重试"这一本方法并不负责的行为）。"""
         from app.services.stage_agent_loop import extract_json_object
         data = extract_json_object(content)
         if data is not None:
             return data
-        logger.warning("P1 tech_selection: LLM 输出无法解析为 JSON（返工重试结构化输出）")
-        return {"parse_error": True, "raw": (content or "").strip()[:2000]}
+        text = (content or "").strip()
+        diagnosis = _diagnose_parse_failure_shared(
+            text, max_tokens=_TECHSEL_MAX_TOKENS, timeout_s=_STAGE_TIMEOUT,
+            env_knobs="P1_TECHSEL_MAX_TOKENS")
+        _log_parse_failure(logger, "P1 tech_selection", diagnosis)
+        return {"parse_error": True, "raw": text[:2000], "parse_diagnosis": diagnosis}
 
     def _trace(self, summary: str, project_id, run_id, stage) -> None:
         if self.tracer is None:

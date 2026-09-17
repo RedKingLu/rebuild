@@ -131,20 +131,91 @@ npm run lint     # oxlint
 
 ```bash
 cd backend
-R176_MOCK_LLM=1 uv run pytest -q
+uv run pytest -q
 ```
 
-### `R176_MOCK_LLM=1` 是必需的
+**不需要在命令前加任何环境变量前缀。** 运行前提已由 `backend/tests/conftest.py` 机器化处理——要么自动补齐，要么在输出里显式声明。历史上本项目因"运行前提未设"产生过 4 次假失败（缺 `PATH` 3 次、缺 `R176_MOCK_LLM` 1 次），其中 1 次还被误归因为"其它 agent 并发改动"，让一个正确的修复白挨了怀疑。教训不是"下次记得带那个变量"——**运行前提是一个集合**，靠人记住集合里的某一项必然再犯。所以现在由代码保证，不由约定保证。
 
-**不加这个环境变量，测试会挂住不返回。** 原因是流式模型调用缺少读超时（已登记为阻塞项 `B-R18-1-STREAM-HANG`），涉及流式路径的测试会一直等待。`R176_MOCK_LLM=1` 会把 `litellm.acompletion` 打成即时返回的桩，绕开真实网络调用。
+### 运行前提完整清单
 
-这不是"测试跳过了真实调用所以不算数"——它是当前已知缺陷的规避手段，缺陷本身在待修列表里。如果你想修它，欢迎。
+这是**可查清单**，不是口口相传的经验。分三类，处理方式不同：
+
+#### A 类 · 自动补齐（你什么都不用做）
+
+| 前提 | 谁需要它 | 机器化处理 |
+|---|---|---|
+| `PATH` 含当前解释器的 `bin` 目录 | `test_r175_p5_r4_organic_green.py` 等**真起子进程**跑 `python3 -m compileall` / `python3 -m pytest`（`p5_command_service.py:160`）的用例；`execution_provider.py:163` 明确继承宿主 `PATH` | `conftest.py::_selfheal_path()` 把 `sys.executable` 所在目录前置进 `PATH`。已在其中时是幂等空操作，所以**带不带前缀结果一致** |
+| `SKILL_SOURCE_ROOT` | skill/scenario 读盘（`skill_loader.py:109`、`scenario_loader.py:104`） | `conftest.py::isolated_data` 每例设置并在 teardown 还原 |
+
+为什么这类可以静默补：补进去的东西**不改变"在测什么"**。`PATH` 补的就是**正在跑本次 pytest 的那个解释器自己的 bin**，只是把父子进程的解释器视图对齐。
+
+#### B 类 · 有缺省值 + 强制声明（会改变"在测什么"，绝不静默）
+
+| 前提 | 缺省 | 作用 |
+|---|---|---|
+| `R176_MOCK_LLM` | **未设置 = 桩模式** | 把 `litellm.acompletion` / `completion` 打成即时返回的桩 |
+
+- **不设置**（推荐）→ 桩模式。不发起任何真实模型调用：不需要有效 Key、不产生 token 费用、不依赖外网、可离线复现。本文的基线数字就是这个模式下的数字。
+- `R176_MOCK_LLM=0`（或 `false` / `no` / `off`）→ **真实模型模式**。会真打外网、需要有效 Key、产生费用、耗时受对端速率限制。**那次运行的数字不得当作本文基线。**
+- `R176_MOCK_LLM=1`（或 `true` / `yes` / `on`）→ 显式桩模式，与缺省等价。
+- 其它取值 → **启动即报错退出**，不猜。修此缺陷前 `!= "1"` 即真实模式，于是 `R176_MOCK_LLM=true` 会静默落到真实模型模式并真花钱——一个字面表达"要桩"的取值产生了完全相反的效果。
+
+**每次运行的开头与结尾都会打印当前模式横幅**，形如：
+
+```
+══════════════════════════════════════════════════════════════════════════════
+  LLM 模式 = 桩 / MOCK —— 本次运行不发起任何真实模型调用
+  定档来源：缺省（未设置 R176_MOCK_LLM）
+  ...
+══════════════════════════════════════════════════════════════════════════════
+```
+
+结尾那一处不是冗余：全量套件输出上千行、耗时 40-80 分钟，读日志的人读的是 `tail`。横幅紧贴通过/失败计数上方，把「在测什么」与「测出了什么」钉在同一屏——**任何 `tail -n 20` 都带得到**。看到 `1797 passed` 时，它是桩还是真实模型跑出来的就在旁边写着，不可能误解。
+
+桩模式不是"绕过了真实调用所以不算数"——桩只替换模型调用这一层，被测的路由、图编排、状态机与持久化逻辑都是真实执行的。
+
+#### C 类 · 不满足则诚实 skip（不是失败，不用补）
+
+| 前提 | 不满足时 |
+|---|---|
+| 后端在 `LIVE_BASE`（默认 `http://localhost:8000`）运行，且 `real_available` provider ≥ 2 | `test_r13_5_live_e2e.py` skip 1 条 |
+| `OPENCODE_INTEGRATION=1` | `test_opencode_acp.py` skip 2 条 |
+| 真实 `LLM_API_KEY` **且**处于真实模型模式 | `test_r20_responses_channel.py::TestRealResponsesChannelCall` skip 2 条 |
+| Docker daemon 可用 | 工具链容器相关用例走诚实降级路径 |
+| `/proc` 可读 | `test_r21_git_command_timeout_orphan_kill.py` skip 1 条（Linux 上恒可读） |
+
+看到 skip **不要**去"修"它——skip 是诚实结论。对账只看**用例总数**与 **failed**。
+
+#### D 类 · 纯调优旋钮（都有安全缺省，正常不用动）
+
+`R176_GRAPH_WAIT_TIMEOUT`(120) · `LLM_MAX_RETRIES`(3) · `LLM_RETRY_BASE_DELAY`(2.0) · `LLM_REQUEST_TIMEOUT`(60) · `LLM_STREAM_TOTAL_TIMEOUT`(240) · `STAGE_TRANSIENT_MAX_RETRIES`(2) · `STAGE_TRANSIENT_RETRY_BASE_DELAY`(3.0) · `EXECUTION_MODE`(local) · `P5_EXECUTION_MODE`(workspace_local) · `REBUILD_TOOLCHAIN_CONTAINER_ENABLED` · `REBUILD_TOOLCHAIN_CACHE_DIR` · `REBUILD_TOOLCHAIN_IMAGES_CONFIG` · `LITELLM_LOG`
+
+**P 阶段输出上限旋钮（V26.2 返工批次二起：默认全部"不设"= 无平台侧上限）**：`P0_INTAKE_MAX_TOKENS` · `P1_PROFILING_MAX_TOKENS` · `P1_BASELINE_MAX_TOKENS` · `P1_TECHSEL_MAX_TOKENS` · `P2_ASSESSMENT_MAX_TOKENS` · `P3_PLANNING_MAX_TOKENS` · `P4_GEN_MAX_TOKENS` · `P5_VERIFICATION_MAX_TOKENS` · `P6_DELIVERY_MAX_TOKENS` —— 用户 2026-09-16 裁决 Q-B2-1：P 环节**不再设硬 token 预算**（此前的 32768/16384 等默认值已取消；抬高天花板只是把撞顶推迟到更大的样本）。不设时请求体不含 `max_tokens` 键，上限由模型自身最大输出长度 + 上面三层时间护栏决定；设值仍然生效，作为成本失控时的**逃生阀**。相关调用超时旋钮不变：`P1_PROFILING_TIMEOUT`(300) · `P1_BASELINE_TIMEOUT`(240) · `P3_PLANNING_TIMEOUT`(240) · `P5_VERIFICATION_TIMEOUT`(240)。另有 `LLM_ANTHROPIC_FALLBACK_MAX_TOKENS`(32768)，仅当某 provider 的 `api_format` 为 `anthropic`（该协议 `max_tokens` 必填）时作回落上限。
+
+`REBUILD_MASTER_KEY` **不是**测试前提——唯一需要它的用例自己 `monkeypatch.setenv`（`test_r175_followup_credential_autolink.py:23`）。它只在真实启动后端做 BYOK 加解密时必需。
+
+> **这份清单是下限，不是全集。** 若你发现新的运行前提，请**把它机器化进 `conftest.py` 并补进本表**，不要只在交接材料里写一句提醒——提醒治不住这个坑，已实测 4 次。
 
 ### 当前基线
 
 ```
-1145 passed / 3 skipped / 0 failed
+1810 passed / 5 skipped / 0 failed        # 用例总数 1815，耗时约 43 分钟
 ```
+
+**这个数字对运行环境敏感，允许 ±1 的浮动。** 仓库里有一条 live 端到端用例要求「后端正在运行 + 可达的模型提供方 ≥ 2 个」，条件不满足时它会诚实跳过：
+
+| 环境条件 | 结果 | 证据强度 |
+|---|---|---|
+| 满足 | `1811 passed / 4 skipped / 0 failed` | **算术推导**（由下一行实测值 + 该用例跳过转通过推得），未在本次直接实测 |
+| 不满足 | `1810 passed / 5 skipped / 0 failed` | **本次实测**（2026-09-14，43:16，`.venv/bin/python -m pytest tests -q -p no:cacheprovider`，**未带任何环境变量前缀**；当次后端未运行 ⇒ `real_available` provider = 0） |
+
+两种情况下**用例总数恒为 1815、failed 恒为 0**。所以你跑出 1810/5 并不说明你的环境有问题——对照总数与 failed 即可。
+
+> **⚠ 这是 2026-09-14 的时点基线，不是当前值。** 此后 V26.2 返工批次陆续新增了锁定测试（每批都会抬高总数），**总数只增不减**。⇒ 判断标准不是"等于 1815"，而是：**`failed` 必须为 0**，且 `passed` 与**你改动之前在同一环境跑出的数字**对照不得减少。当前实际总数请以 `证据/进度追踪/05-验收与证据索引.md` 中最近一次权威全量回归的记录为准；本文不追着回填这个数字（追不上，且回填不及时反而制造第二个错误事实源）。
+
+> **口径纪律**：上表刻意区分「实测」与「算术推导」。本项目奉行 No Evidence No Completed，**不把推导值写成实测值**。若你在后端运行且 ≥2 provider 可达的环境下跑出了 1811/4/0，欢迎把该行的证据强度改为实测并注明环境。
+
+> **注意一个静默减弱验证的场景**：「后端在运行」这条前提**无法由 `conftest.py` 自愈**（测试进程起不了一个服务器）。它缺失时，那条 live 端到端用例会**静默从"真跑通过"降级为"跳过"**——用 `-q` 只能看到 skip 计数 +1，看不出少验了什么。跑全量时若你在意该用例，请用 `-rs` 查看跳过原因，或先确认后端已在 8000 端口运行。
 
 **修改前后都要跑一遍。** 如果修改前就有失败，请在 PR 里明确说明，不要让你的改动背锅。如果你的改动让通过数下降，请在 PR 中解释清楚。
 
@@ -319,7 +390,8 @@ refactor: 抽出重复的校验逻辑为独立函数，便于单独测试
 
 ### 提交前自查
 
-- [ ] 后端测试通过：`cd backend && R176_MOCK_LLM=1 uv run pytest -q`（不低于 1145 passed / 3 skipped / 0 failed）
+- [ ] 后端测试通过：`cd backend && uv run pytest -q`（**不需要任何环境变量前缀**，运行前提已机器化，口径见 §6「运行前提完整清单」；**failed 必须为 0**；passed 数与你改动**之前**在同一环境跑出的数字对照，不得减少——新增用例会让总数上升，口径见 §6「当前基线」）
+- [ ] 确认输出结尾的模式横幅显示的是你**以为**自己在跑的模式（桩 / 真实模型）
 - [ ] 前端可构建：`cd frontend && npm run build`
 - [ ] 新功能有对应测试
 - [ ] 没有硬编码密钥、没有提交 `.env`

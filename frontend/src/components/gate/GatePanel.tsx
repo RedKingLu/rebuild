@@ -211,7 +211,10 @@ export function GatePanel({ gate, projectId, onDecided }: Props) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // UX-5: pass the real user reason (used downstream for rework-notes artifact).
-        body: JSON.stringify({ decision, reason: reason.trim() || `User ${decision} via GatePanel` }),
+        // B-ACC-PROMOTION-DECISION-NOGUARD：决策必须指名被决策的 Gate。不带 gate_id 时
+        // 后端只能按 run+stage 猜，猜不出（0 个或 ≥2 个待决 Gate）会 409。本组件本来就
+        // 持有 gateId（安全 Gate 分支一直在用），晋级分支此前只是把它丢了。【勿删】
+        body: JSON.stringify({ decision, reason: reason.trim() || `User ${decision} via GatePanel`, gate_id: gateId }),
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 

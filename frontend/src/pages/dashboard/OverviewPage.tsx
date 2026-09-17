@@ -204,7 +204,7 @@ export function OverviewPage() {
   return (
     <div>
       <h1>概览</h1>
-      <p className="sub">面向软件重构与迁移的工程平台 · 首期聚焦信创迁移 · 用户主路径 P0–P6</p>
+      <p className="sub">面向软件重构与迁移的工程平台 · 典型场景：信创切换 / 软件现代化 / 软件移植（包括但不限于） · 用户主路径 P0–P6</p>
       <span className="tag" style={{ marginBottom: 8, background: 'var(--green)', color: '#fff' }}>真实数据</span>
 
       {/* ═══ Stat Grid (4 cards) ═══ */}

@@ -33,6 +33,9 @@ export interface Project {
   onboarding_done: boolean;
   coding_agent_ref?: string | null;  // D-078/R9-3A
   external_platform_scope?: 'none' | 'coding_only' | 'all_stages';  // D-088 / R11-2 B-6
+  // R20-2-01 (D-117③): 项目重构场景 id（自由文本，NULL=未选择）。取值集合由场景包目录动态
+  // 决定，非平台封闭定义 —— 前端不得为其声明字面量联合类型（AGENTS §10-27）。
+  scenario?: string | null;
   mock_level: MockLevel;
 }
 

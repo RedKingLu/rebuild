@@ -116,11 +116,17 @@ def introduce_ep(body: IntroduceRequest, svc: RegistryService = Depends(_svc)) -
     """
     # project_id 必须来自请求的真实项目上下文，避免 Gate/审计错归属。
     # graph 驱动路径由 agent_loop 传真实 id（见 tool_registry），不走本 REST 入口。
-    from app.models.project import Project
+    # R24 第二遍（Q2-22，架构偏离 A-1 里唯一被判"明显、低风险"的一处）：原实现是
+    # `from app.models.project import Project` + `svc.db.get(Project, project_id)`，即
+    # 路由直连 ORM 模型、绕过 service 层（`routes_* → *_service → models` 规范的反例）。
+    # 改走 ProjectService.get()。**行为可证等价**：`ProjectService.get` 的函数体逐字就是
+    # `return self.db.get(Project, project_id)`（app/services/project_service.py:54-55），
+    # 同一个 Session、同一个表达式，只多一层调用 ⇒ 返回值与 None 语义完全不变。
+    from app.services.project_service import ProjectService
     project_id = (body.project_id or "").strip()
     if not project_id:
         raise HTTPException(status_code=422, detail="project_id 不能为空：社区资源引入需真实项目上下文")
-    if svc.db.get(Project, project_id) is None:
+    if ProjectService(svc.db).get(project_id) is None:
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     result = introduce(svc.db, query=body.query, type=body.resource_type,
                        project_id=project_id, stage="p4")

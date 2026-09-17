@@ -1,4 +1,11 @@
-"""Test health, version, meta endpoints."""
+"""Test health, version, meta endpoints.
+
+R22 批次六（R22-07）：version 断言不再写死字面量（原为 "V26.1.1"，每次升版都得改测试，
+只是把过期时间往后推）。改为断言响应值等于 settings.app_version —— 后端版本号的唯一事实源，
+这样断言验证的是"接口确实透出单一事实源"这个不变量，不会因版本升级而失败。
+"""
+
+from app.core.config import settings
 
 
 def test_health(client):
@@ -7,9 +14,9 @@ def test_health(client):
     data = resp.json()
     assert data["status"] == "ok"
     assert data["platform"] == "rebuild"
-    assert data["version"] == "V26.1.1"
-    # R17-2 V-R17-1B-1/P1-4：r_stage 改为动态读 settings.r_stage（config.py 默认 R17），
-    # 不再硬编码 R10。测试只验证值在合法 R_STAGES 枚举内。
+    assert data["version"] == settings.app_version
+    # R17-2 V-R17-1B-1/P1-4：r_stage 改为动态读 settings.r_stage，不再硬编码 R10。
+    # 测试只验证值在合法 R_STAGES 枚举内。
     from app.core.status import R_STAGES
     assert data["r_stage"] in R_STAGES
 
@@ -19,7 +26,7 @@ def test_version(client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["platform"] == "rebuild"
-    assert data["version"] == "V26.1.1"
+    assert data["version"] == settings.app_version
 
 
 def test_meta(client):

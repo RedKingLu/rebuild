@@ -7,6 +7,33 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# ── Q-R22-9：路径类默认值从仓库位置推导，不写死开发者主目录 ─────────────────────
+#
+# 缺陷原文（本文件旧 :21/:31/:34/:68 四处）：
+#     database_url        = "sqlite:////home/king/rebuild/backend/.data/rebuild.db"
+#     source_dir          = "/home/king/rebuild/source"
+#     workspace_dir       = "/home/king/rebuild/工作区"
+#     toolchain_cache_dir = "/home/king/rebuild/backend/.data/toolchain-cache"
+# 四者都可由 `REBUILD_*` 环境变量覆盖（`env_prefix="REBUILD_"`），故对本机运行无影响，
+# 但有两个真实问题：① 把开发者用户名与本机目录结构带进将要公开的代码（AGENTS §10-28
+# 转公开前置）；② 任何其他克隆者拿到的默认值都是**失效路径** —— 与 README 的开箱预期不符
+# （需先设 4 个环境变量才能跑，而文档并未这样要求）。
+#
+# 修法 = Q-R22-9 选项 A：从本文件位置推导仓库根，保留 `REBUILD_*` 覆盖能力。
+# 本文件位于 `<repo>/backend/app/core/config.py`，故 parents[2]=backend、parents[3]=repo 根。
+# **本机实测四个推导值与原字面量逐字相同**（见 R24 报告的对照命令输出）⇒ 行为不变。
+#
+# 为什么用 parents[N] 而不是向上搜 `.git` / 标记文件：搜索会在"仓库被重命名/被嵌套进另一个
+# 仓库/以 zip 形式解包（无 .git）"时给出不同答案，即引入一个随环境变化的行为；
+# 而 `parents[N]` 只依赖**本文件在包内的固定位置**，这个位置由 Python 包结构本身保证。
+# 相对路径（如 "../../工作区"）同样被排除：它随进程 cwd 变化，而 `.gitignore` 里专门有
+# 「防误 cwd 运行把 .data 落到非后端目录产生游离物」的条目，说明此类问题历史上真出过。
+_CONFIG_FILE = Path(__file__).resolve()
+BACKEND_DIR = _CONFIG_FILE.parents[2]     # <repo>/backend
+REPO_ROOT = _CONFIG_FILE.parents[3]       # <repo>
+_DEFAULT_DB_FILE = BACKEND_DIR / ".data" / "rebuild.db"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -18,7 +45,8 @@ class Settings(BaseSettings):
 
     # Data
     data_dir: str = "./.data"
-    database_url: str = "sqlite:////home/king/rebuild/backend/.data/rebuild.db"
+    # 注意 sqlite 的四斜杠形式：`sqlite:///` + 绝对路径（绝对路径本身以 / 开头）。
+    database_url: str = f"sqlite:///{_DEFAULT_DB_FILE}"
 
     # CORS — allow BOTH dev (Vite 5173) and container (nginx 8080) frontends.
     # 端口标准单一事实源：文档/02-架构设计/06-容器化部署与执行隔离规范.md §1.1
@@ -28,14 +56,21 @@ class Settings(BaseSettings):
     debug: bool = True
 
     # Source resources base directory (skills, agents, mcp, resources, cases, knowledge)
-    source_dir: str = "/home/king/rebuild/source"
+    source_dir: str = str(REPO_ROOT / "source")
 
     # Workspace root — per-project isolated directories (D-050)
-    workspace_dir: str = "/home/king/rebuild/工作区"
+    workspace_dir: str = str(REPO_ROOT / "工作区")
 
     # R19-3-05 硬编码收敛：对外声明的平台版本号单一来源（MCP clientInfo 等协议握手复用）。
-    # main.py / routes_health.py 的版本号属 FastAPI/health 合理声明，按验收口径不动。
-    app_version: str = "V26.1.1"
+    #
+    # R22 批次六（R22-07）**有意推翻 R19-3-05 的取舍**，此处记录理由以免后人误判为无意改动：
+    #   R19-3-05 原注释写的是「main.py / routes_health.py 的版本号属 FastAPI/health 合理声明，
+    #   按验收口径不动」——即当时刻意保留了那三处字面量。但到发布冻结节点该取舍已不自洽：
+    #   文档侧已切 V26.2，而运行期实测 GET /api/health 仍自报 {"version":"V26.1.1"}，
+    #   FastAPI 应用元数据同样停在 V26.1.1。"合理自声明"在实践中等于"必然漏改的第二事实源"。
+    #   故本轮把 main.py / routes_health.py 全部改为读本字段，版本号在后端只出现这一次。
+    #   配套：测试不再断言版本字面量，改为断言等于本字段（否则每次升版都要改测试）。
+    app_version: str = "V26.3"
 
     # R19-3-05 硬编码收敛：P6 出网能力探测目标（原硬编码 1.1.1.1:53）。
     # 内网/离线部署可经 env 改指内部可达地址；仅做 TCP 连通探测，不携带凭据。
@@ -44,7 +79,9 @@ class Settings(BaseSettings):
 
     # R17-2 V-R17-1B-1/P1-4：当前建设阶段（单一事实源，供 /api/health 与 /api/version 输出）。
     # 随 R 阶段推进手动更新；未知时返 "unknown"（不硬编码过期值）。
-    r_stage: str = "R17"
+    # R22 批次六：此前停在 "R17"，而实际已推进到 R22（阶段权威源 文档/00-项目治理/
+    # 06-R阶段总计划.md §R0-R22）→ 校正为 R22。取值须落在 core/status.py 的 R_STAGES 枚举内。
+    r_stage: str = "R24"
 
     # R15-4 Community Connector：独立社区服务 base URL（可切换本地/未来远程官方社区）。
     # 端口标准：community-backend 8001（见 06-容器化部署与执行隔离规范 §1.1）。
@@ -56,7 +93,7 @@ class Settings(BaseSettings):
     # toolchain_cache_dir：包缓存目录（跨轮复用）。**不复用宿主 ~/.nuget**（可能带私有源凭据）。
     # toolchain_build_timeout_s：单个构建阶段（restore / build）的超时上限。
     toolchain_container_enabled: bool = True
-    toolchain_cache_dir: str = "/home/king/rebuild/backend/.data/toolchain-cache"
+    toolchain_cache_dir: str = str(BACKEND_DIR / ".data" / "toolchain-cache")
     toolchain_build_timeout_s: int = 900
 
     # R19-2 G2 依赖真实性校验（dependency_registry_service.py）。只读查询公共 registry
@@ -74,6 +111,12 @@ class Settings(BaseSettings):
     dependency_check_timeout_s: float = 8.0
     dependency_check_budget_s: float = 60.0
     dependency_check_max_retries: int = 2
+
+    # R21 长时任务心跳监视（B-R20-NO-LONGTASK-MONITOR）。最小心跳注册表：只发现挂起并诚实
+    # 标记，不做自动重试/自动接管（D-037 硬约束：LangGraph 仍是唯一编排）。不新建任务队列/DB
+    # 表（D-065 NIH）；心跳落 workspace artifacts/ 文件，经现有 WorkspaceMediator 写盘中介
+    # （D-099）。此阈值判定"心跳距今多久算 stalled"，可经 env 覆盖，不在各处散落魔法数字。
+    p4_heartbeat_stall_threshold_s: float = 300.0
 
     # R7 GitHub OAuth
     # redirect_uri 必须与 GitHub OAuth App 注册的回调一致，且在 dev/容器两套拓扑下不变：

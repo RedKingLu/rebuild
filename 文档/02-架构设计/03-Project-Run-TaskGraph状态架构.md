@@ -3,9 +3,8 @@
 > 文档路径：`文档/02-架构设计/03-Project-Run-TaskGraph状态架构.md`
 > 文档状态：**accepted**
 > 平台名称：rebuild
-> 当前版本：V26.1.1
-> 来源草稿：`产物/草稿/03-Project-Run-TaskGraph状态架构.md`（v0.1）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R2
+> 当前版本：V26.3
+> 来源草稿：`产物/已完成/R1/03-Project-Run-TaskGraph状态架构.md`（v0.1）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：在 `00-架构总纲.md`、`01-系统分层与技术栈基准.md`、`02-LangGraph主编排架构.md` 基础上，定义 Project、Run、Stage、Task Plan、TaskGraph、NodeLoop、Artifact、Evidence、Trace、Audit、Gate 与状态恢复之间的状态边界和状态流转关系。本文是 `02-LangGraph主编排架构.md` 的状态层补充——后者定义"如何流转"，本文定义"流转什么状态"。

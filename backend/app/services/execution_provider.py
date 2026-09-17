@@ -19,17 +19,23 @@ R19-1 (G1 容器真构建)：新增 "toolchain_container" → ToolchainContainer
   （network=none / read_only / cap_drop=ALL / 256m / uid 10002 / 纯 Python 沙箱镜像）
   **一字不改**；新档用厂商官方 SDK 镜像跑真实项目构建，仅 3 处最小挂载，出网为
   **如实标注的弱化项**（经用户批准的 C2 变更，Q-R19-1-1）。绝不挂 docker.sock。
+
+R21：子进程生命周期原语（起/等/超时终止/收尾）已抽到 `subprocess_runner.py` ——
+  `git_service.run_git_command` 有同一个孤儿进程缺陷，两处必须共用**一份**清理实现
+  （`B-R20-REDACT-THREE-IMPLS` 的教训），同时让本文件回到 800 行上限内。
+  本文件保留的是**安全策略**（DENY 名单 / 白名单 / 环境清洗 / 风险分级）与 provider 接线。
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
 import tempfile
 from pathlib import Path
 from typing import Protocol
+
+from app.services.subprocess_runner import run_subprocess_command
 
 logger = logging.getLogger("rebuild.execution_provider")
 
@@ -83,6 +89,25 @@ def _strip_url_credentials(value: str) -> str:
     （避免为 parse 失败写静默 except，公理3）。
     """
     return _URL_CREDENTIAL_RE.sub(r"\1", value, count=1)
+
+
+def bash_whitelist_violation(code: str) -> str | None:
+    """bash 命令首词是否被 ALLOWED_COMMANDS 挡下：违规返回该首词，合规返回 None。
+
+    B-ACC-GATE-APPROVAL-NOT-BOUND 解除条件④：`tool_registry` 需要在**创建
+    action_approval Gate 之前**知道"这条命令即便批准了也会被白名单挡回"，以免请用户为
+    一条注定无法执行的命令签核（真跑坐实：`gate-22343c` 请签核 `find source -name …`，
+    而 `find` 不在白名单 ⇒ 批准后仍返回 `命令不在允许列表中: find`）。
+
+    判据只写这一份：`_run_subprocess` 的 bash 分支与上述预检**调用同一个函数**，
+    避免"预检用一套首词解析、真执行用另一套"造成漂移（多一处判据就多一处会漂的地方）。
+    本函数只做判定，不改变 ALLOWED_COMMANDS 的内容（加 `find` 属
+    `B-ACC-NO-READONLY-FILEGLOB`，归批次三，本批次明确不做）。
+    """
+    first_word = (code.strip().split() or [""])[0].split("/")[-1]
+    if first_word and first_word not in ALLOWED_COMMANDS:
+        return first_word
+    return None
 
 
 def _match_deny_regex(code: str) -> str | None:
@@ -206,6 +231,9 @@ class LocalSubprocessExecutionProvider:
                 # D-034（R18-1 P1-02）：L5 不再静默 block —— 上报 gate_required，
                 # 由调用侧（stage_handlers）创建可裁决的用户 Gate。
                 "gate_required": True,
+                # R21 循环卫生②：timed_out/signal 独立于 exit_code 真实上报——安检拒绝
+                # 不是超时，也没有进程可归因信号。
+                "timed_out": False, "signal": None,
             }
 
         risk = _classify_risk(code, language)
@@ -225,6 +253,11 @@ async def _run_subprocess(code: str, language: str, timeout: int,
     R9-3A: Accepts optional cwd to bind execution to project workspace (WP-A1.1).
     R12-10: enforce_whitelist=False allows platform-internal P5 commands
     (mvn/go/npm/cargo/make/cmake) while keeping DENY_SUBSTRINGS L5 check.
+    R21: 超时/异常/取消三条退出路径都**真正终止子进程并等它停稳**，不再留下孤儿进程。
+    该清理机制已抽到 `subprocess_runner.run_subprocess_command`（与
+    `git_service.run_git_command` 共用同一份实现，避免第二份副本悄悄漂移）；本函数
+    只保留**安全策略**：语言 → argv 映射、ALLOWED_COMMANDS 白名单、`_clean_env`
+    环境清洗，以及 provider/fallback/blocked 这几个既有返回字段。
     """
     clean_env = _clean_env()
 
@@ -232,44 +265,44 @@ async def _run_subprocess(code: str, language: str, timeout: int,
         cmd = ["python3", "-c", code]
     elif language in ("bash", "sh", "shell"):
         if enforce_whitelist:
-            first_word = (code.strip().split() or [""])[0].split("/")[-1]
-            if first_word and first_word not in ALLOWED_COMMANDS:
+            # 判据与 tool_registry 建 Gate 前的预检共用同一个函数（不写第二份首词解析）
+            first_word = bash_whitelist_violation(code)
+            if first_word:
                 return {
                     "exit_code": 1, "stdout": "",
                     "stderr": f"命令不在允许列表中: {first_word}",
                     "provider": "local_subprocess", "fallback": False, "blocked": True,
+                    "timed_out": False, "signal": None,
                 }
         cmd = ["bash", "-c", code]
     else:
         cmd = ["python3", "-c", code]
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=clean_env,
-            cwd=cwd,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return {
-            "exit_code": proc.returncode or 0,
-            "stdout": stdout.decode("utf-8", errors="replace")[:65536],
-            "stderr": stderr.decode("utf-8", errors="replace")[:65536],
-            "provider": "local_subprocess",
-            "fallback": False,
-            "blocked": False,
-        }
-    except asyncio.TimeoutError:
-        return {
-            "exit_code": -1, "stdout": "", "stderr": f"Timeout after {timeout}s",
-            "provider": "local_subprocess", "fallback": False, "blocked": False,
-        }
+        outcome = await run_subprocess_command(cmd, timeout=timeout, cwd=cwd, env=clean_env)
     except Exception as e:
+        # 起不来（命令不存在 / cwd 不存在 …）：没有进程需要清理。
+        # 注：CancelledError 在 py3.8+ 继承 BaseException，不会被这里吞掉 ——
+        # 取消语义由 run_subprocess_command 处理（SIGKILL 后继续向上传播）。
         return {
             "exit_code": -1, "stdout": "", "stderr": str(e),
             "provider": "local_subprocess", "fallback": False, "blocked": False,
+            "timed_out": False, "signal": None,
         }
+
+    # R21 循环卫生②：timed_out / exit_code / signal 三个事实各自独立上报，不嵌套
+    # 依赖——signal 从 POSIX returncode 约定（负数 -N = 被信号 N 终止）派生，不猜测；
+    # 正常退出（returncode>=0）则 signal 诚实报 None（没有信号可归因）。
+    return {
+        "exit_code": outcome.exit_code,
+        "stdout": outcome.stdout,
+        "stderr": outcome.stderr,
+        "provider": "local_subprocess",
+        "fallback": False,
+        "blocked": False,
+        "timed_out": outcome.timed_out,
+        "signal": outcome.signal,
+    }
 
 
 class ContainerExecutionProvider:
@@ -314,6 +347,7 @@ class ContainerExecutionProvider:
                 "execution_mode": "container", "fallback": False, "blocked": True,
                 "risk_level": "L5", "audited": False,
                 "gate_required": True,   # D-034（R18-1 P1-02）：L5 须可裁决，不静默 block
+                "timed_out": False, "signal": None,
             }
 
         # Write code to a temp file that will be mounted into the container.
@@ -328,6 +362,9 @@ class ContainerExecutionProvider:
         is_python = language in ("python", "python3")
         cmd = ["python3", "/workspace/code.py"] if is_python else ["bash", "/workspace/script.sh"]
 
+        # R21 循环卫生②：timed_out/signal 独立于 exit_code 上报，不嵌套依赖。
+        timed_out = False
+        signal_num = None
         try:
             import docker
             client = docker.from_env()
@@ -352,7 +389,9 @@ class ContainerExecutionProvider:
                 stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")[-8000:]
                 stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")[-4000:]
             except Exception:
+                timed_out = True
                 container.kill()
+                signal_num = 9  # docker kill 默认发 SIGKILL——kill() 未抛异常即真实发生
                 exit_code = -1
                 stdout = ""
                 stderr = f"Container execution timed out after {timeout}s"
@@ -387,6 +426,8 @@ class ContainerExecutionProvider:
             "blocked": False,
             "risk_level": risk,
             "audited": False,
+            "timed_out": timed_out,
+            "signal": signal_num,
         }
 
 
@@ -528,6 +569,7 @@ class ToolchainContainerExecutionProvider:
                 "execution_mode": self.name, "fallback": False, "blocked": True,
                 "risk_level": "L5", "audited": False,
                 "gate_required": True,   # D-034：L5 须可裁决，不静默 block
+                "timed_out": False, "signal": None,
                 **{k: v for k, v in meta.items() if k not in ("provider", "execution_mode")},
             }
 
@@ -547,7 +589,7 @@ class ToolchainContainerExecutionProvider:
                 "stderr": f"构建工作目录准备失败：{type(e).__name__}: {e}",
                 "elapsed_ms": int((time.time() - start) * 1000),
                 "fallback": False, "blocked": False, "risk_level": risk, "audited": False,
-                "toolchain_unavailable": True, **meta,
+                "toolchain_unavailable": True, "timed_out": False, "signal": None, **meta,
             }
 
         limits = self.limits
@@ -572,6 +614,9 @@ class ToolchainContainerExecutionProvider:
             run_kwargs["nano_cpus"] = int(float(cpu_count) * 1_000_000_000)
 
         unavailable = False
+        # R21 循环卫生②：timed_out/signal 独立于 exit_code 上报，不嵌套依赖。
+        timed_out = False
+        signal_num = None
         try:
             import docker
             client = docker.from_env()
@@ -584,8 +629,10 @@ class ToolchainContainerExecutionProvider:
             except Exception:
                 logger.warning("toolchain_container 执行超时/中断（%ss），已 kill 容器", timeout,
                                exc_info=True)
+                timed_out = True
                 try:
                     container.kill()
+                    signal_num = 9  # docker kill 默认发 SIGKILL——kill() 未抛异常即真实发生
                 except Exception:
                     logger.debug("容器 kill 失败（best-effort）", exc_info=True)
                 exit_code = -1
@@ -616,6 +663,8 @@ class ToolchainContainerExecutionProvider:
             "audited": False,
             "toolchain_unavailable": unavailable,
             "cwd_mismatch": cwd_mismatch,
+            "timed_out": timed_out,
+            "signal": signal_num,
             **meta,
         }
 
@@ -657,6 +706,7 @@ class WorkspaceLocalExecutionProvider:
                 "execution_mode": "workspace_local", "fallback": True, "blocked": True,
                 "risk_level": "L5", "audited": False,
                 "gate_required": True,   # D-034（R18-1 P1-02）：L5 须可裁决，不静默 block
+                "timed_out": False, "signal": None,
             }
 
         risk = _classify_risk(code, language)

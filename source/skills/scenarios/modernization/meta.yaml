@@ -1,0 +1,16 @@
+tier: typical
+display_name: 软件现代化
+summary: 旧框架 / 旧运行时升级到当前受支持版本（目标态为上游受支持版本，不含国产化替代）
+selection_candidates:
+  - name: .NET 8 (LTS)
+    note: .NET Framework 4.x 的主流目标；WebForms / WCF 服务端须改为 ASP.NET Core
+  - name: JDK 21 (LTS)
+    note: JDK 8 的主流目标；伴随 javax.* → jakarta.* 与模块化反射限制
+  - name: Python 3.12
+    note: Python 2.7 的目标；字节与字符串分离需在全部 I/O 边界显式指定编码
+related_skills:
+  - P-dotnet-patterns
+  - P-backend-patterns
+  - P-error-handling
+  - P-architecture-decision-records
+related_resources: []

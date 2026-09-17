@@ -13,8 +13,12 @@ source_priority (裁剪超 budget 时保留顺序): C0 > C1 > C2 > C3 > C4 > C5 
 
 from __future__ import annotations
 
+import logging
+import re
 from enum import Enum
 from typing import Any, Optional
+
+logger = logging.getLogger("rebuild.context_layers")
 
 
 class ContextLayer(str, Enum):
@@ -46,6 +50,105 @@ DEFAULT_CONTEXT_RECIPE = {
     "max_chars_per_skill": 4000,
 }
 
+# ── R20-3 场景块字符上限（命名常量，禁魔数）────────────────────────────────────
+# 场景包的三份文本是【真注入内容】（不是条数统计），故须设显式上限 + 截断标注。
+# SCENARIO_SKILL_MAX_CHARS 直接对齐既有 max_chars_per_skill 默认值与 assemble_c3 的
+# body[:4000]，保持同一量级心智；锚点与风险各 1500 使场景块总量 ≤7000 字符。
+# 截断由 scenario_loader 施加（它负责 IO），本模块只负责渲染与常量的单一事实源。
+SCENARIO_SKILL_MAX_CHARS = 4000
+SCENARIO_ANCHORS_MAX_CHARS = 1500
+SCENARIO_RISKS_MAX_CHARS = 1500
+
+# ── R21: max_context_budget 估算 + 预算裁剪（首次真正接线，此前只是声明字段）───────
+#
+# 局限性诚实声明：本仓不引入 tiktoken 等真实分词依赖，所以这里没有、也不冒充有真实
+# token 计数。下面的估算只是"声明的 token 数 × 固定字符/token 系数"的粗略近似——真实
+# 分词器对中文/英文/代码混排的字符-token 比差异很大（英文常见 ~4 字符/token，中文常见
+# ~1.5-2 字符/token）。系数取偏保守的低值，让裁剪"宁可提前裁一点"而不是"实际已超预算
+# 却因为估算过于宽松而不知道"。如需精确计数，应换成真实 tokenizer，而不是调大这个系数。
+CHARS_PER_TOKEN_ESTIMATE = 2.0
+
+# 解析失败（配置写坏/单位认不出）时的保守回落，对齐 DEFAULT_CONTEXT_RECIPE 的默认声明值。
+_DEFAULT_TOKEN_BUDGET_FALLBACK = 100_000
+
+_TOKEN_BUDGET_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kKmM]?)\s*(?:tokens?|tok)?\s*$")
+_BUDGET_UNIT_MULTIPLIER = {"": 1, "k": 1_000, "K": 1_000, "m": 1_000_000, "M": 1_000_000}
+
+
+def parse_token_budget(spec: "str | int | float | None") -> int:
+    """把 ``max_context_budget`` 的原始声明解析为 token 数上限。
+
+    支持形态："100k tokens" / "100K" / "50000 tok" / 纯数字字符串 / int / float。
+    解析失败不抛异常（公理3：advisory 降级须可见而非中断主流程）——记录 warning 并
+    回落到 `_DEFAULT_TOKEN_BUDGET_FALLBACK`，避免一条写坏的配置打断整条装配链路。
+    """
+    if isinstance(spec, (int, float)):
+        return int(spec)
+    if not spec:
+        return _DEFAULT_TOKEN_BUDGET_FALLBACK
+    m = _TOKEN_BUDGET_RE.match(str(spec))
+    if not m:
+        logger.warning(
+            "max_context_budget 无法解析：%r，回落默认 %d tokens",
+            spec, _DEFAULT_TOKEN_BUDGET_FALLBACK,
+        )
+        return _DEFAULT_TOKEN_BUDGET_FALLBACK
+    number = float(m.group(1))
+    multiplier = _BUDGET_UNIT_MULTIPLIER.get(m.group(2), 1)
+    return int(number * multiplier)
+
+
+def estimate_char_budget(spec: "str | int | float | None") -> int:
+    """把 token 预算声明换算成字符数上限，供裁剪逐层比较用。
+
+    独立、可替换：只依赖 `parse_token_budget` + `CHARS_PER_TOKEN_ESTIMATE`，不内联进
+    `build_system_prompt_from_layers`，换真实 tokenizer 时只需替换这一处。
+    """
+    tokens = parse_token_budget(spec)
+    return int(tokens * CHARS_PER_TOKEN_ESTIMATE)
+
+
+# 治理/产品/架构层是硬约束：不管预算多紧都不裁剪；即便保留它们仍超预算，也照样超预算。
+PROTECTED_LAYERS = frozenset({
+    ContextLayer.C0_GOVERNANCE, ContextLayer.C1_PRODUCT, ContextLayer.C2_ARCHITECTURE,
+})
+
+
+def plan_budget_trim(layers: dict[str, dict], max_chars: int) -> list[dict]:
+    """按 `LAYER_PRIORITY` 反序规划预算裁剪：从 C6 开始丢整层，直到总字符数 <= max_chars。
+
+    - C0/C1/C2 永远不裁剪（PROTECTED_LAYERS）。
+    - 只在总字符数超预算时才裁剪；不超预算时全部保留（与改动前行为一致）。
+    - 只覆盖 ``layers`` 中已实际装配的层；未装配的层不出现在返回列表里。
+
+    返回按 `LAYER_PRIORITY` 顺序排列的清单：
+      [{"layer": "C0", "chars": 123, "dropped_by_budget": False}, ...]
+    纯函数、无副作用——不修改传入的 ``layers``，调用方按需据此过滤。
+    """
+    total = sum((v or {}).get("chars", 0) for v in layers.values())
+    dropped: set[str] = set()
+    if total > max_chars:
+        for layer in reversed(LAYER_PRIORITY):
+            if layer in PROTECTED_LAYERS:
+                continue
+            key = layer.value
+            if key not in layers:
+                continue
+            if total <= max_chars:
+                break
+            total -= (layers[key] or {}).get("chars", 0)
+            dropped.add(key)
+    return [
+        {
+            "layer": layer.value,
+            "chars": (layers[layer.value] or {}).get("chars", 0),
+            "dropped_by_budget": layer.value in dropped,
+        }
+        for layer in LAYER_PRIORITY
+        if layer.value in layers
+    ]
+
+
 # ── Static layer content (C0-C2 are platform-level constants) ────────────────
 
 _C0_GOVERNANCE_TEXT = """【C0 治理层 — 平台治理约束】
@@ -57,8 +160,8 @@ _C0_GOVERNANCE_TEXT = """【C0 治理层 — 平台治理约束】
 - 失败必发声（公理3）：错误不静默，必须显式报告或降级标注
 - 单一事实源原则（D-085）：状态读写经统一路径，不得双写/伪造"""
 
-_C1_PRODUCT_TEXT = """【C1 产品层 — 平台场景与 P0-P6 主流程语义】
-- 平台定位：信创迁移 AI 平台，辅助企业完成应用从传统/国外技术栈到信创/国产技术栈的迁移。
+_C1_PLATFORM_TEXT = """【C1 产品层 — 平台场景与 P0-P6 主流程语义】
+- 平台定位：软件重构平台，辅助企业完成应用的重构 / 迁移 / 现代化。具体目标技术栈由项目的场景与 migration_target 决定，平台不预设。
 - P0 接入：导入源码、登记材料与初始风险，产出可信接入输入
 - P1 识别：全量技术栈识别（14 分析维度），产出识别清单与 P2 输入 Manifest
 - P2 评估：风险/可行性/成本评估，产出评估报告
@@ -78,6 +181,85 @@ _C2_ARCHITECTURE_TEXT = """【C2 架构层 — 核心架构约束】
 - 单一装配器原则（X-4-5）：context_assembler 是唯一装配入口，路由层不得另起一套"""
 
 
+# ── R20-3 场景层渲染（所有 prompt 文案集中在本模块，loader 只产 manifest）──────
+
+_SCENARIO_ABSENT_TEXT = (
+    "【场景层：未提供场景信息】\n"
+    "本项目尚未提供可用的重构场景包。**不得假设任何目标技术栈**；"
+    "目标态须以项目的 migration_target 与用户明确输入为准，证据不足处诚实声明。"
+)
+
+_SCENARIO_TRUNCATED_TMPL = "［本节内容已截断，完整内容见 source/skills/scenarios/{sid}/{filename}］"
+
+_SCENARIO_FOOTER = (
+    "（以上为本项目场景包的内容：须与真实源码事实和真实目标环境比对后取用，"
+    "不得无条件套用；与真实源冲突时以真实源为准。）"
+)
+
+
+def render_scenario_block(pack: Optional[dict]) -> str:
+    """把 scenario_loader 的 manifest 渲染为【场景层】文本块（R20-2-04, Q-R20-2-3 方案 B′）。
+
+    公开面：`tech_selection_service.select()`（P1 选型）与 `validation_agent`（P4 独立验收）
+    不经 context_assembler 装配（各自拼自己的领域 prompt），但两者都需要场景知识送达。为避免
+    场景文本出现第二/第三份措辞（DRY，与 R20-3 ③§7.1「所有 prompt 文案集中在 context_layers」
+    一致），把原私有 `_render_scenario_block` 提升为公开函数，供三处消费者共用同一渲染器。
+
+    真注入三份文本内容（skill_body / anchors_text / risks_text），缺失与截断均显式标注
+    （公理3：信息丢失须发声）。不含任何场景值字面量，不做任何以场景值为条件的分支。
+    """
+    return _render_scenario_block(pack)
+
+
+def _render_scenario_block(pack: Optional[dict]) -> str:
+    """把 scenario_loader 的 manifest 渲染为 C1 的【场景层】文本块。
+
+    真注入三份文本内容（skill_body / anchors_text / risks_text），缺失与截断均显式标注
+    （公理3：信息丢失须发声）。不含任何场景值字面量，不做任何以场景值为条件的分支。
+    """
+    if not pack:
+        return _SCENARIO_ABSENT_TEXT
+
+    sid = pack.get("scenario_id", "")
+    lines = [
+        "【场景层 — 本项目重构场景（按场景包内容取用）】",
+        f"场景标识: {sid}",
+        f"场景名称: {pack.get('display_name', '') or sid}",
+        f"场景层级: {pack.get('tier', '')}"
+        "（typical = 平台典型场景，配套资源相对更丰富；open = 用户扩展场景，平台同等支持）",
+    ]
+    summary = (pack.get("summary") or "").strip()
+    if summary:
+        lines.append(f"场景摘要: {summary}")
+    if pack.get("capability_status") != "real":
+        lines.append(f"能力标记: {pack.get('capability_status', '')}（场景包正文未能读取，以下内容可能不完整）")
+
+    fallback = pack.get("fallback")
+    if fallback:
+        lines.append(f"场景状态: {fallback.get('code', '')} —— {fallback.get('message', '')}")
+    for notice in pack.get("notices") or []:
+        lines.append(f"场景提示: {notice.get('code', '')}：{notice.get('message', '')}")
+
+    for title, text_key, trunc_key, filename, absent in (
+        ("场景知识", "skill_body", "skill_body_truncated", "SKILL.md",
+         "本场景包未提供场景知识正文"),
+        ("场景验收锚点", "anchors_text", "anchors_truncated", "acceptance-anchors.md",
+         "本场景包未提供验收锚点"),
+        ("场景风险清单", "risks_text", "risks_truncated", "risk-catalog.md",
+         "本场景包未提供风险清单"),
+    ):
+        body = (pack.get(text_key) or "").strip()
+        lines.append("")
+        lines.append(f"── {title}（scenarios/{sid}/{filename}）──")
+        lines.append(body if body else f"[{absent}]")
+        if pack.get(trunc_key):
+            lines.append(_SCENARIO_TRUNCATED_TMPL.format(sid=sid, filename=filename))
+
+    lines.append("")
+    lines.append(_SCENARIO_FOOTER)
+    return "\n".join(lines)
+
+
 def assemble_c0(agent_forbidden: str = "") -> dict:
     """C0 治理层：平台治理约束 + Agent 禁止项。"""
     content = _C0_GOVERNANCE_TEXT
@@ -86,9 +268,19 @@ def assemble_c0(agent_forbidden: str = "") -> dict:
     return {"layer": "C0", "content": content, "chars": len(content)}
 
 
-def assemble_c1() -> dict:
-    """C1 产品层：平台场景与 P0-P6 主流程语义（静态摘要）。"""
-    return {"layer": "C1", "content": _C1_PRODUCT_TEXT, "chars": len(_C1_PRODUCT_TEXT)}
+def assemble_c1(scenario_pack: Optional[dict] = None) -> dict:
+    """C1 产品层：平台场景与 P0-P6 主流程语义（静态摘要）+ 项目重构场景块（R20-3）。
+
+    ``scenario_pack`` 为 ``scenario_loader.resolve_scenario_pack()` 返回的 manifest：
+      - 非空 → 追加【场景层】块，真注入 SKILL.md / 验收锚点 / 风险清单三份【文本内容】
+        （不是条数统计），并带截断标注与回落状态行。
+      - None → 追加"未提供场景信息"诚实标注，明确要求不得假设任何目标技术栈。
+    两条路径都不含任何场景值字面量 —— 场景值只经 manifest 原样插入文本。
+    参数带默认值且为唯一位置参数，故既有 ``assemble_c1()`` 调用零改动仍可用。
+    """
+    parts = [_C1_PLATFORM_TEXT, "", _render_scenario_block(scenario_pack)]
+    content = "\n".join(parts)
+    return {"layer": "C1", "content": content, "chars": len(content)}
 
 
 def assemble_c2() -> dict:
@@ -216,15 +408,36 @@ def assemble_c6(cases: Optional[list[dict]] = None,
 
 def build_system_prompt_from_layers(layers: dict[str, dict], stage: str,
                                     agent_name: str = "Node Worker Agent",
-                                    user_message: str = "") -> str:
+                                    user_message: str = "",
+                                    scenario_line: str = "",
+                                    max_context_budget: "str | int | float | None" = None) -> str:
     """Combine assembled layers into a single system prompt string.
 
     Priority order for content: C0 > C1 > C2 > C3 > C4 > C5 > C6.
     Each layer's 'content' field is concatenated with section headers.
+
+    ``scenario_line``（R20-3）由 context_assembler 依场景 manifest 生成并附在身份句之后；
+    身份句本身**不得承载任何场景限定**。新参数带默认值且置于末位，故既有位置参数调用
+    ``(layers, stage, agent_name, user_message)`` 零改动仍合法。
+
+    ``max_context_budget``（R21）：真正读取 `max_context_budget` 声明做预算裁剪 ——
+    未传时回落 `DEFAULT_CONTEXT_RECIPE["max_context_budget"]`（"100k tokens"）。裁剪按
+    `plan_budget_trim`（反序丢整层，C0/C1/C2 永不裁剪）执行；正常项目上下文远小于该预算，
+    不会触发裁剪，行为与改动前一致。
     """
-    parts = [f"你是 rebuild 平台的 {agent_name}，当前协助用户完成信创迁移项目。\n"]
+    identity = f"你是 rebuild 平台的 {agent_name}。"
+    if scenario_line:
+        identity += scenario_line
+    parts = [identity + "\n"]
+    budget_spec = (max_context_budget if max_context_budget is not None
+                   else DEFAULT_CONTEXT_RECIPE["max_context_budget"])
+    max_chars = estimate_char_budget(budget_spec)
+    trim_plan = plan_budget_trim(layers, max_chars)
+    dropped_keys = {entry["layer"] for entry in trim_plan if entry["dropped_by_budget"]}
     for layer in LAYER_PRIORITY:
         key = layer.value
+        if key in dropped_keys:
+            continue
         if key in layers and layers[key].get("content"):
             parts.append(layers[key]["content"])
             parts.append("")  # blank line between layers

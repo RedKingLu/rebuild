@@ -19,11 +19,13 @@ import logging
 from typing import Optional
 
 from app.services.context_layers import (
-    ContextLayer, DEFAULT_CONTEXT_RECIPE,
+    ContextLayer, DEFAULT_CONTEXT_RECIPE, LAYER_PRIORITY,
     assemble_c0, assemble_c1, assemble_c2, assemble_c3,
     assemble_c4, assemble_c5, assemble_c6,
     build_system_prompt_from_layers,
+    estimate_char_budget, plan_budget_trim,
 )
+from app.services.scenario_loader import resolve_scenario_pack
 from app.services.workspace_service import workspace_path
 
 logger = logging.getLogger("rebuild.context_assembler")
@@ -95,6 +97,8 @@ def assemble_context(
             "workspace_status": project.get("workspace_status", ""),
             "onboarding_done": project.get("onboarding_done", False),
             "coding_agent_ref": project.get("coding_agent_ref"),
+            # R20-3: 场景值必须进白名单，否则它到不了下游（C1 场景块 / 身份句 / trace）。
+            "scenario": project.get("scenario") or "",
         }
     if run:
         ctx["run"] = {
@@ -169,11 +173,16 @@ def assemble_context(
     # ── Assemble C0-C6 layers ──────────────────────────────────────────────
     layers: dict[str, dict] = {}
 
+    # R20-3: 解析项目场景包（每次真读盘，无缓存 —— 用户改写后下次装配即生效）。
+    # 场景值只做两件事：拼路径（loader 内已做形状 + 归属校验）与原样进 prompt 文本；
+    # 此处没有、也不得有任何以场景值为条件的分支。
+    scenario_pack = resolve_scenario_pack((project or {}).get("scenario"))
+
     if "C0" in active_layers:
         layers["C0"] = assemble_c0(agent.get("forbidden", "") if agent else "")
 
     if "C1" in active_layers:
-        layers["C1"] = assemble_c1()
+        layers["C1"] = assemble_c1(scenario_pack=scenario_pack)
 
     if "C2" in active_layers:
         layers["C2"] = assemble_c2()
@@ -235,9 +244,51 @@ def assemble_context(
     if "C6" in active_layers:
         layers["C6"] = assemble_c6(cases, knowledge)
 
+    # ── R21: 装配清单（layers_manifest）——本次装配了哪些层/每层字符数/是否截断/
+    # 是否因预算裁剪未纳入。清单只含元数据（层名/整数/布尔/skill 名单），不含任何层的
+    # 正文原文（体积 + 脱敏，测试 test_assemble_context_carries_scenario_into_prompt_and_trace
+    # 钉住"trace 不得携带正文原文"），故无需过 redact_secrets（无自由文本字段可能夹带 Key）。
+    max_context_budget = recipe.get("max_context_budget", DEFAULT_CONTEXT_RECIPE["max_context_budget"])
+    max_chars_budget = estimate_char_budget(max_context_budget)
+    trim_plan = plan_budget_trim(layers, max_chars_budget)
+    dropped_by_budget = {entry["layer"] for entry in trim_plan if entry["dropped_by_budget"]}
+    skill_names_hit = [s.get("name") or s.get("skill_id") or "" for s in skills_with_body]
+
+    layers_manifest: list[dict] = []
+    for layer in LAYER_PRIORITY:
+        key = layer.value
+        entry = layers.get(key)
+        item = {
+            "layer": key,
+            "assembled": entry is not None,
+            "chars": entry.get("chars", 0) if entry else 0,
+            "dropped_by_budget": key in dropped_by_budget,
+        }
+        if key == "C3":
+            # 复用 skill_loader 已有的 body_truncated 标记（不新造截断判定）。
+            item["truncated"] = any(s.get("body_truncated") for s in skills_with_body)
+            item["skills_hit"] = skill_names_hit
+        elif key == "C1":
+            # 复用场景块已有的三份 truncated 标记（skill_body/anchors/risks）。
+            item["truncated"] = any(scenario_pack.get(k) for k in
+                                    ("skill_body_truncated", "anchors_truncated", "risks_truncated"))
+        else:
+            # 该层目前没有可复用的既有截断标记（如 C5 的 [:1000]/[:500] 是硬字符切片，
+            # 未落标记）——如实标 None（未跟踪），不假称 False（公理3：不冒充精确）。
+            item["truncated"] = None
+        layers_manifest.append(item)
+
     # Assembly trace stats (for Trace writing + Evidence)
     ctx["assembly_trace"] = {
         "layers_assembled": list(layers.keys()),
+        "layers_manifest": layers_manifest,
+        "budget": {
+            "spec": max_context_budget,
+            "estimated_max_chars": max_chars_budget,
+            "total_chars_before_trim": sum(v.get("chars", 0) for v in layers.values()),
+            "trimmed": bool(dropped_by_budget),
+            "dropped_layers": sorted(dropped_by_budget),
+        },
         "skill_count": len(skills_with_body),
         "skills_with_body": sum(1 for s in skills_with_body if s.get("body")),
         "skills_not_connected": sum(1 for s in skills_with_body if s.get("capability_status") == "not_connected"),
@@ -246,7 +297,31 @@ def assemble_context(
         "total_layer_chars": sum(v.get("chars", 0) for v in layers.values()),
         "case_count": len(cases),
         "knowledge_count": len(knowledge),
+        # R20-3: 把"场景没接上"从隐性失败变成显性字段。assemble_context 有多个调用方各自构造
+        # project dict；缺 scenario 键时该阶段会静默拿不到场景，症状是"场景没生效"而非报错。
+        # scenario_source 让这种漏接线在 /context 响应里直接可见。
+        # trace 只记标识/状态/字符数，【不写入】SKILL.md / 锚点 / 风险的正文原文（体积 + 脱敏）。
+        "scenario": scenario_pack.get("scenario_id", ""),
+        "scenario_status": (scenario_pack.get("fallback") or {}).get("code", "ok"),
+        "scenario_source": "project_dict" if "scenario" in (project or {}) else "absent",
+        "scenario_tier": scenario_pack.get("tier", ""),
+        "scenario_chars": {
+            "skill_body": len(scenario_pack.get("skill_body", "")),
+            "anchors": len(scenario_pack.get("anchors_text", "")),
+            "risks": len(scenario_pack.get("risks_text", "")),
+        },
+        "scenario_truncated": {
+            "skill_body": bool(scenario_pack.get("skill_body_truncated")),
+            "anchors": bool(scenario_pack.get("anchors_truncated")),
+            "risks": bool(scenario_pack.get("risks_truncated")),
+        },
+        "scenario_notices": [
+            {"code": n.get("code", ""), "message": n.get("message", "")}
+            for n in (scenario_pack.get("notices") or [])
+        ],
     }
+    # 供 build_system_prompt 生成身份句附加语（不含正文，故可安全出现在 /context 响应）
+    ctx["scenario_line"] = _scenario_line(scenario_pack)
 
     return ctx
 
@@ -281,16 +356,60 @@ def build_system_prompt(
     )
     agent_name = (ctx.get("selected_agent") or {}).get("name", "AI 助手")
     layers = ctx.get("layers", {})
-    return build_system_prompt_from_layers(layers, current_stage, agent_name, user_message)
+    recipe = ctx.get("context_recipe", {}) or {}
+    return build_system_prompt_from_layers(
+        layers, current_stage, agent_name, user_message,
+        scenario_line=ctx.get("scenario_line", ""),
+        max_context_budget=recipe.get("max_context_budget"),
+    )
+
+
+def _scenario_line(pack: dict) -> str:
+    """依场景 manifest 生成身份句的场景附加语（R20-3）。
+
+    分支只看"是否发生了回落"（`fallback` 字段是否存在），**不看场景值本身** —— 故不构成
+    以场景值为条件的分派面（R20-2-05）。场景名一律取自 manifest，代码内无任何场景值字面量。
+    """
+    if not pack:
+        return "当前项目尚未选择重构场景，请勿假设目标技术栈。"
+    if pack.get("fallback"):
+        return "当前项目尚未选择可用的重构场景包，请勿假设目标技术栈。"
+    name = pack.get("display_name") or pack.get("scenario_id") or ""
+    if not name:
+        return "当前项目尚未选择重构场景，请勿假设目标技术栈。"
+    return f"当前协助用户完成【{name}】重构项目。"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _resolve_recipe(agent: Optional[dict]) -> dict:
-    """Get the effective context_recipe, falling back to DEFAULT_CONTEXT_RECIPE."""
+    """Get the effective context_recipe, falling back to DEFAULT_CONTEXT_RECIPE.
+
+    公理3（R21 卫生）：Agent 定义里 `context_recipe` 的**未知键必须发声**。下游只逐个
+    `.get()` 少数已知键（`required_context_layers` / `optional_layers` /
+    `max_chars_per_skill` / `max_context_budget` …），而 `update()` 会把任意键合并进来 ⇒
+    键名拼错或写了个不存在的配置项时，配置"看起来生效了"但实际完全没作用，且没有任何提示。
+
+    已知键集合**从 `DEFAULT_CONTEXT_RECIPE` 的键派生**（单一事实源；不在此处另抄一份会
+    随时间漂移的键名清单）。
+
+    只发 warning，**不抛异常、不硬失败**：存量 DB 的 Agent 定义可能已带历史遗留的未知键，
+    改成报错会让这些 Agent 直接加载失败（真实爆炸半径）。返回值行为保持不变 —— 未知键
+    仍原样合并进结果，本次改动只多一条警告。
+    """
     if agent and agent.get("context_recipe"):
+        overrides = agent["context_recipe"]
         recipe = dict(DEFAULT_CONTEXT_RECIPE)
-        recipe.update(agent["context_recipe"])
+        recipe.update(overrides)
+        unknown = sorted(k for k in overrides if k not in DEFAULT_CONTEXT_RECIPE) \
+            if isinstance(overrides, dict) else []
+        if unknown:
+            logger.warning(
+                "context_recipe 含未被识别的键，这些键不会生效（下游只消费已知键）："
+                "agent=%s(%s) unknown_keys=%s known_keys=%s",
+                agent.get("name") or "?", agent.get("agent_id") or "?",
+                unknown, sorted(DEFAULT_CONTEXT_RECIPE),
+            )
         return recipe
     return dict(DEFAULT_CONTEXT_RECIPE)
 

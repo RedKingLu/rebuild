@@ -28,6 +28,24 @@ logger = logging.getLogger("rebuild.intake_service")
 
 # 模型全失败中断时前端可采取操作（复用 gateway 单一事实源）。
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+# V26.2 返工批次二（Q-B2-1 / Q-B2-2）：共享的截断诊断 + "不设即无上限"的 env 旋钮解析。
+from app.services.stage_agent_loop import (
+    DEFAULT_STAGE_TIMEOUT_SECONDS as _STAGE_TIMEOUT,
+    diagnose_parse_failure as _diagnose_parse_failure_shared,
+    log_parse_failure as _log_parse_failure,
+    optional_int_env,
+)
+
+# `B-V262-TOKENBUDGET-UNFIXED-4`（P0）：真实规模真跑（MicroOA 1018 文件 / 197,447 行）实测
+# 本调用的 completion **触顶原硬编码 max_tokens=16384**（call_log `scall_1470a9bb8b35`
+# completion_tokens=16383）→ P0 识别 JSON 中途截断 → `identification` 只剩
+# `{"parse_error": true, "raw": "```json\n{…"}` → 12 个识别键全落 null。
+# 用户 2026-09-16 裁决 Q-B2-1：**不再抬高天花板，直接取消平台侧硬预算**（批次 F 把另外几处抬到
+# 32768/16384 后，未抬的四处又在 16384 撞顶 —— 抬高只是把天花板挪一格）。
+# 现口径：默认 None ⇒ 请求体无 max_tokens 键；上限交还给模型自身最大输出长度 + adapter 三层
+# 时间护栏。旋钮 `P0_INTAKE_MAX_TOKENS` 保留作成本失控时的逃生阀（不设即不设上限）。
+# 实测触顶值 16383 保留在此仅作**历史依据留痕**，不再作为默认值。
+_INTAKE_MAX_TOKENS = optional_int_env("P0_INTAKE_MAX_TOKENS")
 
 # LLM-produced identification fields (通用锚点，样本值由 LLM 生成)。materialization/
 # repository_metadata/file_count 等由采集提供，不在此列。
@@ -172,7 +190,8 @@ class IntakeService:
         loop = await run_stage_tool_loop(
             gw, system_content=system_content, user_content=self._build_user_prompt(facts),
             project_id=project_id, run_id=run_id or "", stage=stage,
-            strategy_id=strategy_id, max_tokens=16384, temperature=0.3, tracer=self.tracer)
+            strategy_id=strategy_id, max_tokens=_INTAKE_MAX_TOKENS, temperature=0.3,
+            tracer=self.tracer)
         if loop["status"] != "completed":
             reason = loop.get("error_message") or loop.get("error_category") or "model_call_failed"
             self._trace(f"P0 intake model call not completed: {reason}", project_id, run_id, stage)
@@ -184,6 +203,35 @@ class IntakeService:
 
         parsed = self._parse(loop.get("content", ""))
         model_used = loop.get("model_used")
+        # ── 解析失败守卫（`B-ACC-P0-PARSEERROR-STILL-ACCEPTED` 解除条件 ①）────────────
+        # 真实规模真跑实测：识别输出不可解析时本方法此前**无条件** return status="completed"，
+        # 于是 12 个识别键全落 null、阶段却报 `verdict: accepted / issues: []` —— 把"不可用"
+        # 谎报为"可用"。参照实现是 P2 侧 `stage_handlers.py` 的 `unparseable_output` 守卫
+        # （同一失败模式，P2 有守卫、P0 没有）。
+        # 这里返回**非完成态**：图编排据此触发真返工 —— ValidationAgent 见 declared !=
+        # "completed" 即 passed=False（`validation_agent.py` 的综合裁决），ReviewPass 因此重跑
+        # 一轮 WorkAgent（真的重新识别，不是只记一笔），仍不通过才升级为 Gate。
+        # reason 前缀 `unparseable_output:` 与既有 `no_model_key:` 同范式（机器可判、人可读）；
+        # **不含** "no_model_key" 字样、attempted_chain 留空 ⇒ 不会被误判为模型全失败中断。
+        # identification 原样带出（含 parse_error / raw / parse_diagnosis），使失败现场能直接
+        # 指认"是不是被截断"，而不是只留一句"解析失败"。
+        # ⚠ 有意**不设** `model_error_category="output_contract_parse_error"`：该分类会让
+        # `stage_retry.is_transient_stage_failure()` 把本次失败判为可重试，于是整个 P0 阶段会先被
+        # 自动重跑最多 2 次（`STAGE_TRANSIENT_MAX_RETRIES`），再叠加 ReviewPass 的 2 轮返工 ⇒ 最坏
+        # 6 次完整 P0（每次都是真实 LLM 成本）。ReviewPass 的返工已经覆盖"重试结构化输出"这一诉求，
+        # 故不再叠加阶段级重试。若将来判定 P0 也应像 P3 那样走阶段级重试，须连同成本一并评估后再加。
+        if parsed.get("parse_error"):
+            diagnosis = parsed.get("parse_diagnosis") or {}
+            truncated = bool(diagnosis.get("suspected_truncation"))
+            self._trace("P0 intake identification unparseable（非完成态，触发返工）",
+                        project_id, run_id, stage)
+            return IntakeResult(
+                status="failed",
+                reason=("unparseable_output: P0 识别输出无法解析为结构化 JSON"
+                        f"（疑似截断={truncated}；诊断见 identification.parse_diagnosis）"
+                        "——不得据此判阶段完成（D-097/公理3）"),
+                identification=parsed, model_used=model_used,
+                context_refs=context_refs, skill_refs=skill_refs)
         # 目标运行环境是用户输入采集（非识别），由采集直接透传进 intake（migration_target）。
         parsed.setdefault("migration_target", facts.get("migration_target"))
         self._trace("P0 intake completed (LLM identification)", project_id, run_id, stage)
@@ -221,14 +269,29 @@ class IntakeService:
         """Parse the LLM JSON output defensively into the identification fields.
 
         批2: uses the robust extractor (handles prose-wrapped / fenced JSON from the tool
-        loop). Unparseable → honest parse_error marker (NodeLoop ReviewPass retries).
+        loop).
+
+        `B-ACC-P0-PARSEERROR-STILL-ACCEPTED` 解除条件 ③（声称与实现不符的订正）：本 docstring
+        原文自称 `Unparseable → honest parse_error marker (NodeLoop ReviewPass retries)`，
+        日志原文亦印"（返工重试结构化输出）"—— 但实测**当时并没有那个重试**：`identify()` 无条件
+        置 status="completed"，图直接进 Gate。现已改为**真的**返非完成态（见 `identify()` 的解析
+        失败守卫），返工由 ValidationAgent → ReviewPass 真实触发。措辞按"实现什么就说什么"订正：
+        本方法只负责**产出可诊断的 parse_error 标记**，返工与否由 `identify()` 的守卫与图编排决定。
+
+        V26.2 返工批次二（甲 ②）：本处此前**完全没有截断诊断**，失败现场只能看到"输出非合法
+        JSON"，看不出"因为被砍断" —— 这正是验收 agent 把真因误归为"模型输出质量问题"的直接原因。
+        现接入共享诊断（`suspected_truncation` / `truncation_signals`）。
         """
         from app.services.stage_agent_loop import extract_json_object
         data = extract_json_object(content)
         if data is not None:
             return data
-        logger.warning("P0 intake: LLM 输出无法解析为 JSON（返工重试结构化输出）")
-        return {"parse_error": True, "raw": (content or "").strip()[:2000]}
+        text = (content or "").strip()
+        diagnosis = _diagnose_parse_failure_shared(
+            text, max_tokens=_INTAKE_MAX_TOKENS, timeout_s=_STAGE_TIMEOUT,
+            env_knobs="P0_INTAKE_MAX_TOKENS")
+        _log_parse_failure(logger, "P0 intake", diagnosis)
+        return {"parse_error": True, "raw": text[:2000], "parse_diagnosis": diagnosis}
 
     def _trace(self, summary: str, project_id, run_id, stage) -> None:
         if self.tracer is None:

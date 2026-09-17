@@ -117,8 +117,11 @@ export function exportResource(resourceId: string, name: string): void {
   a.click();
 }
 
-/** 切换 Resource 启用/禁用 */
-export async function toggleResource(resourceId: string): Promise<{ data: { enabled: boolean } }> {
+/** 切换 Resource 启用/禁用。安全关键资源从启用→禁用需人工审批，此时返回
+ * `status: 'awaiting_approval'`（`enabled` 仍为 true，尚未真正生效）而不是直接翻转。 */
+export async function toggleResource(
+  resourceId: string,
+): Promise<{ data: { enabled: boolean; status?: string; gate_id?: string; message?: string } }> {
   const resp = await fetch(`/api/toggle/resource/${resourceId}`, { method: 'PATCH' });
   if (!resp.ok) throw new Error('切换失败');
   return resp.json();

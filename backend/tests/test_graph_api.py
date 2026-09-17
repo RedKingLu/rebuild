@@ -43,6 +43,7 @@ def test_graph_http_drive_p0_p1(tmp_path, monkeypatch, isolated_data):
         run_id = d["run_id"]
         assert d["paused"] is True
         assert d["pending_gate"]["stage"] == "p0"
+        p0_gate_id = d["pending_gate"]["gate_id"]
         assert d["graph_capability_status"] == "live"
         art = workspace_service.workspace_path(pid) / "artifacts"
         assert (art / "p0" / "intake_report.json").exists(), "P0 real intake artifact via HTTP"
@@ -54,11 +55,17 @@ def test_graph_http_drive_p0_p1(tmp_path, monkeypatch, isolated_data):
                       json={"run_id": run_id, "decision": "bogus"}).status_code == 400
 
         # resume approve → P1 real profiling, pause at P1 Gate
+        # B-ACC-PROMOTION-DECISION-NOGUARD 站点②：图正暂停在某个 Gate 上时，本端点要求
+        # 请求体指名 gate_id（否则 409，见 routes_graph.graph_resume）。改前这里不传
+        # gate_id 也能通过，是因为守卫加固前"决策会被写到图自己暂停的那个 Gate 上"这个
+        # 后果被当成了"能跑通"——这正是缺陷本身的形态，测试依赖了它。指名 p0 Gate 自己
+        # 的 gate_id（图确实暂停在它上面），行为与改前完全一致，不改变本用例的验证意图。
         r = c.post(f"/api/projects/{pid}/graph/resume",
-                   json={"run_id": run_id, "decision": "approve"})
+                   json={"run_id": run_id, "decision": "approve", "gate_id": p0_gate_id})
         d = r.json()["data"]
         assert d["paused"] is True
         assert d["pending_gate"]["stage"] == "p1"
+        p1_gate_id = d["pending_gate"]["gate_id"]
         assert (art / "p1" / "profiling_summary.md").exists(), "P1 real profiling via HTTP"
         assert (art / "p1" / "p2_input_manifest.json").exists()
 
@@ -81,7 +88,7 @@ def test_graph_http_drive_p0_p1(tmp_path, monkeypatch, isolated_data):
         monkeypatch.setattr(get_services().model_gateway, "get_status",
                             lambda: SimpleNamespace(overall_status="not_configured"))
         r = c.post(f"/api/projects/{pid}/graph/resume",
-                   json={"run_id": run_id, "decision": "approve"})
+                   json={"run_id": run_id, "decision": "approve", "gate_id": p1_gate_id})
         d = r.json()["data"]
         assert d["stage_status"].get("p1") == "completed"
         # p2 ran real business (blocked, not a future_r10 stub)

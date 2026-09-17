@@ -50,6 +50,10 @@ logs/
 # 用户导入供应商（仅非敏感配置，Key 不落盘）
 backend/app/config/user_providers.yaml
 backend/app/config/user_strategies.yaml
+# 运行期 self-test 连通性状态（B-R20-SELFTEST-STATE-TRACKED，R21 修复）：纯运行时缓存，
+# 不含密钥（仅 status/capability_marker/last_checked_at/credential_status），代码缺失时
+# 优雅降级（provider_registry._load_self_test_state 文件不存在即 return，不报错）。
+backend/app/config/self_test_state.json
 
 # Runtime data (mounted as a volume in containers — not source)
 backend/.data/project-sources/

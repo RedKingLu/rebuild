@@ -3,9 +3,8 @@
 > 文档路径：`文档/05-API与集成契约/09-外部执行器与远程环境API建议契约.md`
 > 文档状态：**accepted**
 > 平台名称：rebuild
-> 当前版本：V26.1.1
-> 来源草稿：`产物/草稿/外部执行器与远程环境API契约.md`（v0.1）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R1 文档正式化流程（补录）
+> 当前版本：V26.3
+> 来源草稿：`产物/已完成/R1/外部执行器与远程环境API契约.md`（v0.1）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：定义外部执行器、Tool/MCP/Expert Agent、确定性转换器、Environment Profile、Execution Session、命令/构建/测试/运行、Patch、Output 的 API 建议契约。本文是 05-API 目录中覆盖"执行与运行"域的 API 详述源，与 02（Project-Run-阶段）、03（TaskPlan-TaskGraph）、04（AETA）、05（Gate）、06（Model-Resource）、07（SSE）、08（源码接入与Git操作）互补。

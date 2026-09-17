@@ -98,7 +98,11 @@ class AgentLoop:
         # instead of the former hardcoded _build_prompt string concatenation.
         try:
             from app.services.context_assembler import build_system_prompt
-            project_dict = {"name": project_name}
+            from app.services.project_service import ProjectService
+            # R20-2-04（本轮新发现的第 15 处断链，§5.2）：此前只传 {"name": project_name}
+            # 1 键，scenario 到不了 Workspace 对话路径。build_project_context_dict 失败/项目
+            # 不存在时退化为原 1 键 dict（诚实降级，行为不劣于此前现状）。
+            project_dict = ProjectService.build_project_context_dict(project_id) or {"name": project_name}
             run_dict = {"execution_mode": mode} if mode else None
             node_state = {}
             if profiling_summary:
@@ -225,7 +229,8 @@ class AgentLoop:
                         if authz["decision"] == "require_confirmation":
                             # Park the action behind a REAL Gate; surface via gate.request.
                             gate_id = self._create_action_gate(
-                                project_id, run_id, stage, fn_name, risk, authz["reason"])
+                                project_id, run_id, stage, fn_name, risk, authz["reason"],
+                                fn_args)
                             yield ("event: gate.request\ndata: " + json.dumps({
                                 "gate_id": gate_id, "action": fn_name, "risk_level": risk,
                                 "mode": mode,
@@ -284,21 +289,36 @@ class AgentLoop:
         yield f"event: done\ndata: {json.dumps({'done': True, 'summary': full_response[:300]}, ensure_ascii=False)}\n\n"
 
     def _create_action_gate(self, project_id: str, run_id: str, stage: str,
-                            fn_name: str, risk: str, reason: str) -> str:
+                            fn_name: str, risk: str, reason: str,
+                            args: dict | None = None) -> str:
         """Create a real action_approval Gate for a parked controlled action (T10).
 
         Reuses GateService.create — the same DB-persisted + audited Gate kernel as
         stage_promotion (公理6). action_approval Gates do NOT drive stage promotion.
+
+        `args`（B-R20-GATE-NO-PAYLOAD，用户 2026-09-06 批准）：工具入参经
+        `tool_registry._redacted_action_payload` **脱敏后**写入 summary，使审批者可知情决策。
+        与 `tool_registry._create_risk_gate` 共用同一个脱敏渲染器（单一事实源，避免两处措辞漂移）。
+
+        B-ACC-GATE-APPROVAL-NOT-BOUND：同时持久化**被审阅入参的指纹**。本方法创建的 Gate
+        正是 `tool_registry._resolve_action_gate` 会拿去授权 re-dispatch 的那一类，若这里不写
+        指纹，比对必然不通过（fail-closed）⇒ 用户批准后工具仍会再弹一次 Gate。指纹用与
+        tool_registry 完全相同的那一个函数计算（`action_args_fingerprint`），不另算一份。
         """
         try:
             from app.dependencies import get_services
+            from app.services.tool_registry import (
+                _redacted_action_payload, action_args_fingerprint)
+            payload = _redacted_action_payload(fn_name, args)
             gate = get_services().gate_service.create(
                 project_id=project_id, run_id=run_id or "", stage=stage,
                 gate_type="action_approval",
                 reason=reason or f"Manual/HITL 授权：Agent 拟执行 {fn_name}",
                 risk_level=risk,
-                summary=f"Agent 拟执行受控动作 {fn_name}",
+                summary=(f"Agent 拟执行受控动作 {fn_name}（{risk}）。"
+                         f"\n待执行入参（已脱敏）：{payload}"),
                 options=["approve", "reject"],
+                action_fingerprint=action_args_fingerprint(fn_name, args),
             )
             return gate.gate_id
         except Exception as e:

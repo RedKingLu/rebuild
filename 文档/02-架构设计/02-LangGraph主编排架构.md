@@ -3,9 +3,8 @@
 > 文档路径：`文档/02-架构设计/02-LangGraph主编排架构.md`
 > 文档状态：**accepted**
 > 平台名称：rebuild
-> 当前版本：V26.1.1
-> 来源草稿：`产物/草稿/02-LangGraph主编排架构.md`（v0.1）
-> 本次处理人 / Agent：Claude (deepseek-v4-pro) / R2
+> 当前版本：V26.3
+> 来源草稿：`产物/已完成/R1/02-LangGraph主编排架构.md`（v0.1）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
 > 文档定位：在 `00-架构总纲.md` 与 `01-系统分层与技术栈基准.md` 基础上，定义 rebuild 当前版本中 LangGraph 作为主编排底座的职责、边界、图结构、状态流转、checkpoint、interrupt/resume、Gate、Run、TaskGraph、NodeLoop、事件、证据与审计关系。

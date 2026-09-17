@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/code-tour (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-code-tour（代码导览）
 
@@ -46,7 +47,7 @@ metadata:
 - P6 差异导览每条变更可追溯到 ADR / 蓝图步骤 / P5 验证证据。
 - 导览叙述与代码实际一致，不描述代码中不存在的逻辑。
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 
 - 数据访问层改造导览：重点标注 Oracle/MSSQL 方言 SQL → 达梦 DM/openGauss/GaussDB 的改写点（函数 / 分页 / 序列 / 类型），Gotcha 写清精度 / 排序 / 空值语义差异。
 - 中间件适配导览：标注 WebLogic/WebSphere → 东方通 / 宝兰德 的数据源、JNDI、类加载改动点。

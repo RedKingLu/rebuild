@@ -27,16 +27,54 @@ import difflib
 import hashlib
 import json
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any, Optional
 
 from app.services.workspace_service import workspace_path
 from app.services.workspace_mediator import WorkspaceMediator
+from app.services.heartbeat_service import write_heartbeat
 from app.services.model_gateway import MODEL_UNAVAILABLE_USER_ACTIONS as _MODEL_USER_ACTIONS
+# V26.2 返工批次二（Q-B2-5）："不设即无上限"的 env 旋钮解析（共享实现）。
+from app.services.stage_agent_loop import optional_int_env
+# B-RW-P4WORKER-WRITE-UNGUARDED（D-P0-01 第三入口）：`_write()` 是工具循环结束后模型最终轮次
+# 原始文本直写落盘的路径，此前零校验内容合法性。复用同一 content_validity 模块（不抄第二份
+# 判据，B-R20-REDACT-THREE-IMPLS 的教训），与 tool_registry.py 已接的三处工具调用入口共享
+# 唯一事实源。
+from app.services.content_validity import PROTOCOL_LEAK_REASON_CODE, detect_protocol_leak
 
 logger = logging.getLogger(__name__)
+
+
+class ProtocolLeakRejected(ValueError):
+    """`_write()` 因内容含模型工具调用协议标记而拒写（D-P0-01 第三入口）的可区分信号。
+
+    继承 `ValueError` 而不是另立互不相关的异常体系——理由：`_write()` 早已有一个既定的
+    "mediator 拒绝越权写 → raise ValueError → 调用方 except ValueError 转 blocked" 范式
+    （D-099① source/ 边界问题）。若协议泄漏信号与它完全不相关（比如继承 Exception），
+    任何遗漏专门处理这条新分支的调用方（本文件当前有 7 个 `_write()` 调用点，多数只做
+    `except ValueError` 或完全没有 try/except）会让这个新异常直接向上炸穿、变成未捕获异常，
+    这比"两类拒绝暂时无法区分"更糟（AGENTS 公理3：不得静默 except，但也不能制造新的
+    未捕获异常缺口）。继承 ValueError 使遗漏专门分支的调用方仍能被已有的 `except ValueError`
+    兜底捕获（安全的失败模式），同时把本类放在 except 链更靠前的位置就能被需要区分的调用方
+    （本次改动的 :1049/:1194 两处关键点）优先捕获、区分对待——不复用同一个裸 ValueError
+    类型（02-阻塞项.md B-RW-P4WORKER-WRITE-UNGUARDED 已指出的教训：否则调用方无法区分
+    "越权写 source/"（D-099①边界问题）与"协议文本污染"（内容合法性问题），这两类在日志、
+    审计、以及 partial/blocked 判据上都应该能区分）。
+
+    属性 `reason_code` 恒等于 `content_validity.PROTOCOL_LEAK_REASON_CODE`（单一事实源，
+    与 tool_registry.py 三处工具调用入口返回给模型的 `reason_code` 字段同值），供调用方
+    按码识别、不靠文案匹配；`marker`/`rel_path` 供日志与拒写清单（`rejected_writes`）定位。
+    """
+
+    def __init__(self, marker: str, rel_path: str):
+        self.reason_code = PROTOCOL_LEAK_REASON_CODE
+        self.marker = marker
+        self.rel_path = rel_path
+        super().__init__(
+            f"拒写：待写入内容是模型工具调用协议原文而非文件内容"
+            f"（命中标记 {marker!r}，path={rel_path}，reason_code={PROTOCOL_LEAK_REASON_CODE}）"
+        )
 
 _MAX_SOURCE_BYTES = 200_000  # read cap for a single source reference (advisory)
 
@@ -45,7 +83,13 @@ _MAX_SOURCE_BYTES = 200_000  # read cap for a single source reference (advisory)
 # reasoning chain consumes budget before the migrated code / multi-file JSON is emitted,
 # so a too-small cap truncates the real product mid-output (same failure class as P3's
 # empty task_plans). Env-tunable; the model's large context window accommodates it.
-_GEN_MAX_TOKENS = int(os.environ.get("P4_GEN_MAX_TOKENS", "32768"))
+#
+# ⚠ V26.2 返工批次二（用户裁决 Q-B2-1 / Q-B2-5，2026-09-16）：现口径 **默认不设平台侧上限**
+# （`P4_GEN_MAX_TOKENS` 不设 ⇒ None ⇒ 请求体无 max_tokens 键），旋钮保留作逃生阀。P4 是本平台
+# 单次输出体量最大的阶段（多文件迁移代码），也是最需要"没有平台天花板"的阶段。原文保留作留痕。
+# 台账补正：本处**属于批次 F 已建旋钮范式的第 5 处**，`B-V262-TOKENBUDGET-UNFIXED-4` 登记的
+# "已修 4 处"漏登了它。
+_GEN_MAX_TOKENS = optional_int_env("P4_GEN_MAX_TOKENS")
 
 
 def _get_services():
@@ -197,11 +241,34 @@ class P4ExecutionWorker:
     # ── writes (all routed through the mediator) ────────────────────────────
 
     def _write(self, rel_path: str, content: str, run_id: str, node_id: str,
-               action: str) -> tuple[str, str, Optional[str]]:
+               action: str, *, check_content: bool = True) -> tuple[str, str, Optional[str]]:
         """Write content to rel_path via the mediator. Returns (rel_path, risk, audit_id).
 
         Raises ValueError (re-raised) when the mediator rejects the target
         (e.g. source/). The caller turns that into an honest blocked + Audit.
+
+        Raises ProtocolLeakRejected (a distinct ValueError subclass, D-P0-01 第三入口 /
+        B-RW-P4WORKER-WRITE-UNGUARDED) when `content` itself carries a model tool-call
+        protocol marker — this is the ONLY write closure the worker uses, so the check
+        defaults to ON for every call site (all model-generated-text writes and all
+        content provably derived from already-checked content — diffs, fence-cleaned
+        re-writes — get it uniformly; none of those has a genuine reason to skip it).
+
+        `check_content=False` is the ONE deliberate opt-out, used only by
+        `_write_node_marker`: the resume-marker JSON is structured metadata (schema/
+        run_id/node_id/sha256/bytes/status flags), but when a node is `partial` due to
+        a protocol-leak rejection, its package legitimately embeds a diagnostic quote
+        of the very marker that was rejected (`rejected_writes[i]["marker"]`) — dumping
+        THAT into JSON and running detect_protocol_leak on the dump would self-trigger
+        (verified: `detect_protocol_leak(json.dumps(pkg_with_rejected_writes))` matches
+        the embedded quote) and silently drop the resume marker for an otherwise-healthy
+        partial node. The underlying content was already checked (accepted or rejected)
+        through its OWN `_write()` call before ever reaching the marker — re-checking a
+        diagnostic quote of that decision is not a second independent content-legality
+        gate, it is a false positive on our own audit trail. A missing marker only
+        forgoes resume (the node re-executes honestly next time, per `_load_node_marker`
+        docstring) — never fakes state — so skipping the check here does not weaken the
+        content-legality gate itself, only its own resume bookkeeping.
         """
         # D-114: 与 fs_write_artifact 同口径清洗路径（治文件名中文/括注污染）——worker 直写
         # 路径也过同一 sanitizer，避免绕过工具层写盘时留下非法文件名。
@@ -216,6 +283,22 @@ class P4ExecutionWorker:
             self._audit(run_id, node_id, action=action, decision="rejected",
                         risk_level="L4", reason=str(e))
             raise
+        # B-RW-P4WORKER-WRITE-UNGUARDED（D-P0-01 第三入口）：路径合法性通过之后，内容合法性
+        # 硬拦——命中即不落盘、不创建目录，发声（公理3），并向调用方抛出可区分信号（不复用
+        # 上面的裸 ValueError，理由见 ProtocolLeakRejected docstring）。check_content=False
+        # 仅供 _write_node_marker 使用，见本方法 docstring。
+        leaked_marker = detect_protocol_leak(content) if check_content else None
+        if leaked_marker:
+            data_len = len((content or "").encode("utf-8"))
+            logger.warning(
+                "P4ExecutionWorker._write: 拒写——待写入内容含模型工具协议标记（D-P0-01 第三入口，"
+                "B-RW-P4WORKER-WRITE-UNGUARDED） path=%s marker=%r action=%s bytes=%d",
+                rel_path, leaked_marker, action, data_len,
+            )
+            self._audit(run_id, node_id, action=action, decision="rejected",
+                        risk_level="L4",
+                        reason=f"{PROTOCOL_LEAK_REASON_CODE}:{leaked_marker}")
+            raise ProtocolLeakRejected(leaked_marker, rel_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         audit_id = self._audit(run_id, node_id, action=action, decision="allowed",
@@ -287,9 +370,19 @@ class P4ExecutionWorker:
                                    rel, exc_info=True)
             marker = {"schema": self._MARKER_SCHEMA, "run_id": run_id,
                       "node_id": node_id, "package": package, "file_facts": file_facts}
+            # check_content=False（B-RW-P4WORKER-WRITE-UNGUARDED 施工过程中核实发现）：这是
+            # 结构化续跑元数据（schema/run_id/node_id/真实文件 sha256+bytes/状态标志），不是
+            # 模型生成内容——但 partial 节点的 package 里合法携带一条对"刚被拒写的协议标记"
+            # 的诊断引用（`rejected_writes[i]["marker"]`），把它连同 package 整体 JSON 化后
+            # 若仍跑 detect_protocol_leak，会命中自己刚记录的诊断引用而自我拒写（已用真实
+            # detect_protocol_leak 验证：对含 rejected_writes 的 package JSON dump 确实命中）。
+            # 该内容早已在它自己的 `_write()` 调用里过了一次合法性判定（被接受或被拒绝），
+            # marker 只是复述这个既有判定的审计痕迹，不是第二道独立内容关卡——对审计痕迹本身
+            # 再跑一次同一检查只会产生误伤，不会带来额外的漏检防护。丢失 resume 标记只是让该
+            # 节点在重启后诚实重新执行（不会伪造完成状态，见 `_load_node_marker` docstring）。
             self._write(self._node_marker_rel(run_id, node_id),
                         json.dumps(marker, ensure_ascii=False, indent=2),
-                        run_id, node_id, action="write_node_marker")
+                        run_id, node_id, action="write_node_marker", check_content=False)
         except Exception:
             logger.warning("P4 resume: failed to write done marker for node %s (advisory)",
                            node_id, exc_info=True)
@@ -492,7 +585,7 @@ class P4ExecutionWorker:
             sys_content = self.skill_body.strip()
         else:
             sys_content = (
-                "你是信创迁移平台 P4 执行阶段的执行器。按需读取真实源代码后，将其迁移/改造为"
+                "你是 rebuild 软件重构平台 P4 执行阶段的执行器。按需读取真实源代码后，将其迁移/改造为"
                 "上游裁决的目标技术栈。禁止照节点标题臆造通用样例；无法定位/读取真实源时诚实"
                 "说明而不臆造。")
         # WP-B: prepend C6 retrieved case/knowledge reference so migration cases inform
@@ -642,6 +735,9 @@ class P4ExecutionWorker:
         final_text = ""
         model_used: Optional[str] = None
         written_files: list[str] = []  # 批2.5: output_code/ files the model wrote via tools
+        # D-P0-02: 本轮被 detect_protocol_leak 拒写的写入动作（fs_write_artifact/generate_patch/
+        # apply_patch_with_confirm 任一被拒即记录），供节点完成判定如实反映"哪些被拒、哪些成功"。
+        rejected_writes: list[dict] = []
         completeness_nudged = False    # 批2.5: one-shot "write remaining files" nudge (multi-file)
         try:
             for _round in range(self._MAX_TOOL_ROUNDS):
@@ -725,6 +821,7 @@ class P4ExecutionWorker:
                         fn_args = {}
                     result = await self._run_tool(fn_name, fn_args, run_id)
                     self._collect_written(result, written_files)
+                    self._collect_rejected_write(result, fn_name, rejected_writes)
                     messages.append({"role": "tool", "tool_call_id": tc["id"],
                                      "content": json.dumps(result, ensure_ascii=False)})
             else:
@@ -774,9 +871,17 @@ class P4ExecutionWorker:
             # (a summary sentence like "已生成脚手架文件…" must NOT become a stray output file).
             final_body = content if (stripped and _looks_like_code_start(first_line)) else ""
             return {"status": "completed", "content": final_body,
-                    "tool_written_files": written_files, "model_used": model_used}
+                    "tool_written_files": written_files, "model_used": model_used,
+                    "rejected_writes": rejected_writes}
         if not stripped:
-            return {"status": "blocked", "reason": "模型工具循环未产出有效代码内容", "content": ""}
+            reason = "模型工具循环未产出有效代码内容"
+            if rejected_writes:
+                # D-P0-02: 本轮尝试的写入全部被 D-P0-01 内容合法性检查拒写，且无其它真实产出——
+                # 如实标注拒写次数，而非笼统一句"未产出有效代码内容"。
+                reason += (f"（本轮 {len(rejected_writes)} 次写入被拒写：内容含模型工具调用"
+                           "协议标记，D-P0-01）")
+            return {"status": "blocked", "reason": reason, "content": "",
+                    "rejected_writes": rejected_writes}
         # Final safety net (task D): the forced-final synthesis (tools disabled) can still
         # emit interstitial narration ("Now let me read the full MicroDBHelper.cs file…")
         # when the model spent its round budget chunk-reading a large source and never wrote
@@ -786,8 +891,9 @@ class P4ExecutionWorker:
             return {"status": "blocked",
                     "reason": ("模型工具循环耗尽回合仍只产出旁白/计划而非迁移代码本体"
                                "（诚实 blocked，不把旁白当产物）"),
-                    "content": ""}
-        return {"status": "completed", "content": content, "model_used": model_used}
+                    "content": "", "rejected_writes": rejected_writes}
+        return {"status": "completed", "content": content, "model_used": model_used,
+                "rejected_writes": rejected_writes}
 
     async def _run_tool(self, fn_name: str, fn_args: dict, run_id: str) -> dict:
         """Execute one tool via tool_registry.execute_tool (L0-L5 enforced). confirmed=False:
@@ -823,12 +929,40 @@ class P4ExecutionWorker:
             if path not in sink:
                 sink.append(path)
 
+    @staticmethod
+    def _collect_rejected_write(result: dict, tool_name: str, sink: list) -> None:
+        """D-P0-02: record a write this round that content_validity.detect_protocol_leak
+        (D-P0-01) rejected, so node-level completion判定 can see it downstream.
+
+        Covers all three write-scope tools a node's model can call during the loop —
+        fs_write_artifact（_execute_workspace_write）/ generate_patch（_execute_generate_patch）/
+        apply_patch_with_confirm（_execute_apply_patch）— since 批次 B 把同一 detect_protocol_leak
+        接到全部三处（不抄第二份判据，只认 tool_registry 回填的 reason_code，不重复正则匹配）。
+        只认这一种拒写原因：其它拒写（D-099 越界、hook 拦截等）已有既定 blocked 路径，不在此收集，
+        以免混淆"内容合法性拒写"与其它既有拒写语义（AGENTS §10-23 精准修改）。
+        """
+        if not isinstance(result, dict) or result.get("status") != "rejected":
+            return
+        from app.services.content_validity import PROTOCOL_LEAK_REASON_CODE
+        if result.get("reason_code") != PROTOCOL_LEAK_REASON_CODE:
+            return
+        sink.append({
+            "tool_name": tool_name,
+            "path": result.get("path") or result.get("patch_ref") or "",
+            "marker": (result.get("error") or "")[:200],
+        })
+
     async def _generate_single(self, node: dict, source_ref: Optional[str],
                                source_content: Optional[str]) -> dict:
         """Legacy single-call generation (deterministic stubs without call_stream).
 
         Grounded when source_content was pre-read; honest blocked when there is no real
         source bound — the former title-only臆造 else-branch is REMOVED (不照标题臆造).
+
+        V26.2 返工批次二（甲 ⑤ 的逐处评估结论）：本调用原为硬编码 `max_tokens=4096`，评估结论是
+        **纳入取消范围** —— 它产出的是**一整个迁移后代码文件的正文**，4096 对代码文件明显偏小，
+        与 P4 主路径同属"结构化/大体量产物被平台天花板砍断"这一缺陷类；且截断后果是写盘一个
+        半截的代码文件（比解析失败更难发现）。故与 P4 主调用共用同一旋钮（默认不设上限）。
         """
         title = node.get("title") or node.get("node_id") or "execution"
         if source_content is None:
@@ -844,7 +978,7 @@ class P4ExecutionWorker:
             {"role": "user", "content": user},
         ]
         try:
-            result = await self.gateway.call(messages=messages, max_tokens=4096,
+            result = await self.gateway.call(messages=messages, max_tokens=_GEN_MAX_TOKENS,
                                              temperature=0.2, source="api",
                                              project_id=self.project_id, stage="p4")
         except Exception as e:
@@ -877,7 +1011,25 @@ class P4ExecutionWorker:
 
         Never fabricates completed: unreadable input / no model / rejected write
         all yield an honest blocked package.
+
+        R21 / B-R20-NO-LONGTASK-MONITOR: this is the actual per-node unit of progress
+        for BOTH call paths — the simple run() loop below and the real driving path
+        (RealP4Handler → TaskGraphEngine → NodeLoop, which calls execute_node directly
+        per node, never run()). A heartbeat is recorded here, after every node — completed,
+        blocked, resumed, or delegated alike — so a stuck multi-round tool loop inside one
+        node still updates the heartbeat's current_node/timestamp on the NEXT node it
+        reaches, and (once wired into node-internal progress in a later batch, out of
+        scope here) so the registry always reflects the most recent unit of real progress.
+        This call is advisory-only bookkeeping: no retry/resume/reschedule (D-037).
         """
+        try:
+            return await self._execute_node_impl(node, run_id=run_id)
+        finally:
+            if run_id:
+                write_heartbeat(self.project_id, run_id, "p4_execution",
+                                current_node=node.get("node_id"))
+
+    async def _execute_node_impl(self, node: dict, run_id: str = "") -> dict:
         node_id = node.get("node_id") or "node"
         title = node.get("title") or node_id
         risk_level = node.get("risk_level") or "L0"
@@ -961,7 +1113,7 @@ class P4ExecutionWorker:
             t = self._trace(run_id, node_id, "blocked", f"节点 {node_id} 未完成：{gen['reason']}")
             if t:
                 trace_refs.append(t)
-            return {"node_id": node_id, "title": title, "risk_level": risk_level,
+            pkg = {"node_id": node_id, "title": title, "risk_level": risk_level,
                     "node_status": "blocked", "reason": gen["reason"],
                     "criteria_met": False, "artifacts": [], "evidence_refs": [],
                     "output_code_refs": [], "patch_refs": [],
@@ -970,10 +1122,18 @@ class P4ExecutionWorker:
                     "model_error_category": gen.get("model_error_category", ""),
                     "model_user_actions": gen.get("model_user_actions", []),
                     "trace_refs": trace_refs, "audit_refs": audit_refs}
+            # D-P0-02: 本轮若发生过 detect_protocol_leak 拒写（这条既有 blocked 路径本身不因本次
+            # 改动而改变——本轮零真实产出时 blocked 就是正确判定），如实附带拒写清单（诊断用）。
+            if gen.get("rejected_writes"):
+                pkg["rejected_writes"] = gen["rejected_writes"]
+            return pkg
         # 批2.5: multi-file node — the model wrote several output_code/ files via tools
         # (scaffolding / multi-source packages). Collect each real on-disk file as a node
         # deliverable (mirrors the delegation path), instead of forcing one final-text file.
         written_files = [f for f in (gen.get("tool_written_files") or []) if isinstance(f, str)]
+        # D-P0-02: 本轮被 detect_protocol_leak 拒写的写入（若有），随节点全程携带，供下方
+        # completed/blocked 判定如实反映（只处理这一种拒写原因，见 _collect_rejected_write）。
+        rejected_writes = list(gen.get("rejected_writes") or [])
         if written_files:
             return await self._finalize_multifile(
                 node, run_id, node_id, title, risk_level, written_files,
@@ -985,16 +1145,44 @@ class P4ExecutionWorker:
         try:
             out_ref, out_risk, out_audit = self._write(out_target, output_code, run_id,
                                                        node_id, action="write_output_code")
+        except ProtocolLeakRejected as e:
+            # B-RW-P4WORKER-WRITE-UNGUARDED: the model's turn-final text (not a tool call)
+            # itself carries a protocol marker. This is the node's ONLY write attempt on the
+            # single-file path (written_files was empty, else we'd be in _finalize_multifile)
+            # → zero real output this round → blocked, distinct from the D-099① boundary
+            # branch below (policy_forbidden, not scope_violation) and funneled into the same
+            # rejected_writes/policy_forbidden bookkeeping the tool-call rejections use, so
+            # downstream partial/blocked judgement sees this rejection uniformly.
+            rejected_writes.append({"tool_name": "write_output_code", "path": out_target,
+                                    "marker": e.marker})
+            t = self._trace(run_id, node_id, "rejected",
+                            f"节点 {node_id} 主产物写盘被拒（D-P0-01 内容合法性）：{e}")
+            if t:
+                trace_refs.append(t)
+            pkg = {"node_id": node_id, "title": title, "risk_level": risk_level,
+                    "node_status": "blocked",
+                    "reason": (f"主产物写盘被拒：内容含模型工具调用协议标记，非 D-099 越权写"
+                               f"（D-P0-01 第三入口）：{e}"),
+                    "criteria_met": False, "policy_forbidden": True,
+                    "artifacts": [], "evidence_refs": [], "output_code_refs": [],
+                    "patch_refs": [], "trace_refs": trace_refs, "audit_refs": audit_refs,
+                    "rejected_writes": rejected_writes}
+            return pkg
         except ValueError as e:
-            # rejection already audited inside _write
+            # rejection already audited inside _write. D-P0-02: 本轮若还有更早被拒写的工具调用，
+            # 此处的 D-099 写盘拒绝意味着本轮"零真实产出"——如实附带拒写清单，不改变既有 blocked
+            # 判定（这条 D-099 blocked 路径本身与本次改动无关，只是补充诊断信息）。
             t = self._trace(run_id, node_id, "rejected", f"节点 {node_id} 写盘被拒：{e}")
             if t:
                 trace_refs.append(t)
-            return {"node_id": node_id, "title": title, "risk_level": risk_level,
+            pkg = {"node_id": node_id, "title": title, "risk_level": risk_level,
                     "node_status": "blocked", "reason": f"写盘被拒（D-099）：{e}",
                     "criteria_met": False, "scope_violation": True,
                     "artifacts": [], "evidence_refs": [], "output_code_refs": [],
                     "patch_refs": [], "trace_refs": trace_refs, "audit_refs": audit_refs}
+            if rejected_writes:
+                pkg["rejected_writes"] = rejected_writes
+            return pkg
         if out_audit:
             audit_refs.append(out_audit)
 
@@ -1032,8 +1220,27 @@ class P4ExecutionWorker:
             except Exception:
                 logger.warning("P4 evidence persist failed for %s", node_id, exc_info=True)
 
-        t = self._trace(run_id, node_id, "completed",
-                        f"节点 {node_id} 完成：{out_ref} + {patch_ref}",
+        # D-P0-02：本轮若发生过 detect_protocol_leak 拒写（即便最终这一次文本成功落盘），也不得
+        # 掩盖"曾经发生的拒写"、笼统报 completed —— 判据：本轮除拒写外还有真实成功产出（out_ref
+        # 已落盘验证）→ partial（不是 blocked：blocked 专留给"本轮零真实产出"，见上面 D-099 分支
+        # 与 _generate_with_tools 的"零 written_files+空文本"分支）。policy_forbidden 复用
+        # AcceptanceService 既有检查#7（_route 第一优先级 → gate_required，不入 accepted/
+        # completed）——不新增/不改 acceptance_service.py 本身，只是喂给它已理解的既有信号
+        # （精准修改，AGENTS §10-23；不改动其它任何完成判定路径）。
+        node_status = "completed"
+        trace_kind = "completed"
+        extra: dict = {}
+        if rejected_writes:
+            node_status = "partial"
+            trace_kind = "partial"
+            extra["rejected_writes"] = rejected_writes
+            extra["policy_forbidden"] = True
+            extra["reason"] = (f"本轮 {len(rejected_writes)} 次写入被 D-P0-01 内容合法性检查拒写"
+                               "（模型工具调用协议文本），其余写入已产出真实文件（partial）")
+        t = self._trace(run_id, node_id, trace_kind,
+                        f"节点 {node_id} 完成：{out_ref} + {patch_ref}"
+                        + (f"（本轮 {len(rejected_writes)} 次写入被拒写，partial）"
+                           if rejected_writes else ""),
                         output_code_ref=out_ref, patch_ref=patch_ref,
                         output_sha256=out_facts["sha256"])
         if t:
@@ -1045,12 +1252,12 @@ class P4ExecutionWorker:
             crit, output_code_refs=[out_ref], patch_refs=[patch_ref],
             evidence_real=bool(evidence_refs)) if crit else True
         pkg = {"node_id": node_id, "title": title, "risk_level": risk_level,
-                "node_status": "completed", "criteria_met": criteria_met,
+                "node_status": node_status, "criteria_met": criteria_met,
                 "artifacts": [out_ref, patch_ref], "evidence_refs": evidence_refs,
                 "output_code_refs": [out_ref], "patch_refs": [patch_ref],
                 "source_refs": [source_ref] if source_ref else [],
                 "trace_refs": trace_refs, "audit_refs": audit_refs,
-                "model_used": gen.get("model_used")}
+                "model_used": gen.get("model_used"), **extra}
         # BG-01/02: persist a done marker so a restart can resume this node.
         self._write_node_marker(run_id, node_id, pkg)
         return pkg
@@ -1077,6 +1284,10 @@ class P4ExecutionWorker:
         # (rel_path, source_for_diff, source_ref_for_evidence)
         produced: list[tuple[str, Optional[str], Optional[str]]] = []
         seen: set[str] = set()
+        # D-P0-02: 本轮被 detect_protocol_leak 拒写的写入（若有）。多文件节点的 written_files
+        # 本身已只含通过 D-P0-01 检查的真实文件（_collect_written 只收 status=written/applied），
+        # 被拒的调用永远不会出现在 written_files 里——但仍需如实记录"本轮还发生过拒写"。
+        rejected_writes = list(gen.get("rejected_writes") or [])
         for rel in written_files:
             rel = rel.replace("\\", "/")
             if rel in seen:
@@ -1090,6 +1301,22 @@ class P4ExecutionWorker:
                 if cleaned != body:
                     # Re-write the fence/prose-free body through the write gate (task C).
                     self._write(rel, cleaned, run_id, node_id, action="clean_output_code")
+            except ProtocolLeakRejected as e:
+                # B-RW-P4WORKER-WRITE-UNGUARDED: the fence-stripped rewrite itself carries a
+                # protocol marker (the original tool-written body already passed the
+                # detect_protocol_leak check in tool_registry — this would only fire if
+                # stripping fences/prose exposed a marker that was previously split across
+                # a removed line, an edge case worth catching rather than assuming impossible).
+                # Record it into rejected_writes (same bookkeeping as tool-call rejections) so
+                # the node's partial/blocked judgement below sees it — do NOT silently fold it
+                # into the generic "cannot read" advisory log below, which would mislabel a
+                # content-legality rejection as an I/O failure (公理3: distinguishable, not
+                # silently absorbed).
+                rejected_writes.append({"tool_name": "clean_output_code", "path": rel,
+                                        "marker": e.marker})
+                logger.warning("P4 multifile: tool-written %s rejected on re-write "
+                               "(D-P0-01 protocol leak, not an I/O failure): %s", rel, e)
+                continue
             except Exception:
                 logger.warning("P4 multifile: cannot read tool-written %s (skip)", rel,
                                exc_info=True)  # 公理3
@@ -1107,6 +1334,20 @@ class P4ExecutionWorker:
                 if out_ref not in seen:
                     seen.add(out_ref)
                     produced.append((out_ref, source_content, source_ref))
+            except ProtocolLeakRejected as e:
+                # B-RW-P4WORKER-WRITE-UNGUARDED: the extra "final text kept as one file" write
+                # (the flagged path, :1194 in the original defect report) carries a protocol
+                # marker. Do NOT add it to produced/seen — it never lands on disk. Fold it into
+                # the SAME rejected_writes list the tool-call rejections use, so the existing
+                # partial/blocked decision further below (which only checks `if rejected_writes`)
+                # picks it up uniformly: other tool-written files already in `produced` → partial;
+                # none → the `if not produced` branch below yields blocked (see there).
+                rejected_writes.append({"tool_name": "write_output_code", "path": out_target,
+                                        "marker": e.marker})
+                t = self._trace(run_id, node_id, "rejected",
+                                f"多文件节点主产物写盘被拒（D-P0-01 内容合法性）：{e}")
+                if t:
+                    trace_refs.append(t)
             except ValueError as e:
                 t = self._trace(run_id, node_id, "rejected",
                                 f"多文件节点主产物写盘被拒（D-099）：{e}")
@@ -1118,12 +1359,17 @@ class P4ExecutionWorker:
                             f"节点 {node_id} 工具写入未落任何可验证的 output_code/ 产物 → blocked")
             if t:
                 trace_refs.append(t)
-            return {"node_id": node_id, "title": title, "risk_level": risk_level,
+            pkg = {"node_id": node_id, "title": title, "risk_level": risk_level,
                     "node_status": "blocked",
                     "reason": "多文件节点未产出可验证的 output_code/ 产物（诚实 blocked，不臆造）",
                     "criteria_met": False, "artifacts": [], "evidence_refs": [],
                     "output_code_refs": [], "patch_refs": [],
                     "trace_refs": trace_refs, "audit_refs": audit_refs}
+            if rejected_writes:
+                # D-P0-02: 本轮零真实产出且还发生过拒写——如实附带拒写清单（诊断用，不改变
+                # 已经是 blocked 的判定：blocked 本身就是这种"完全没有真实产出"场景的正确判定）。
+                pkg["rejected_writes"] = rejected_writes
+            return pkg
 
         output_code_refs: list[str] = []
         patch_refs: list[str] = []
@@ -1174,9 +1420,27 @@ class P4ExecutionWorker:
                     logger.warning("P4 multifile evidence persist failed for %s", rel,
                                    exc_info=True)
 
-        t = self._trace(run_id, node_id, "completed",
+        # D-P0-02：本轮除已落盘的 produced 文件外，若还发生过被拒写的调用（如实反映"哪些被拒、
+        # 哪些成功"）——判据同单文件路径：本轮存在真实成功产出（produced 非空）+ 存在拒写记录
+        # → partial（不是 blocked：blocked 专留给"本轮零真实产出"，即上面 not produced 分支）。
+        # policy_forbidden 复用 AcceptanceService 既有检查#7（_route 第一优先级 → gate_required），
+        # 不新增/不改 acceptance_service.py 本身。
+        node_status = "completed"
+        trace_kind = "completed"
+        extra: dict = {}
+        if rejected_writes:
+            node_status = "partial"
+            trace_kind = "partial"
+            extra["rejected_writes"] = rejected_writes
+            extra["policy_forbidden"] = True
+            extra["reason"] = (f"本轮 {len(rejected_writes)} 次写入被 D-P0-01 内容合法性检查拒写"
+                               "（模型工具调用协议文本），其余写入已产出真实文件（partial）")
+        t = self._trace(run_id, node_id, trace_kind,
                         f"节点 {node_id} 完成（多文件）：{len(output_code_refs)} 产物 + "
-                        f"{len(patch_refs)} patch", output_code_refs=output_code_refs)
+                        f"{len(patch_refs)} patch"
+                        + (f"，另有 {len(rejected_writes)} 次写入被拒写（partial）"
+                           if rejected_writes else ""),
+                        output_code_refs=output_code_refs)
         if t:
             trace_refs.append(t)
         crit = node.get("acceptance_criteria") or []
@@ -1184,12 +1448,12 @@ class P4ExecutionWorker:
             crit, output_code_refs=output_code_refs, patch_refs=patch_refs,
             evidence_real=bool(evidence_refs)) if crit else True
         pkg = {"node_id": node_id, "title": title, "risk_level": risk_level,
-               "node_status": "completed", "criteria_met": criteria_met,
+               "node_status": node_status, "criteria_met": criteria_met,
                "artifacts": artifacts, "evidence_refs": evidence_refs,
                "output_code_refs": output_code_refs, "patch_refs": patch_refs,
                "source_refs": [source_ref] if source_ref else [],
                "trace_refs": trace_refs, "audit_refs": audit_refs,
-               "model_used": gen.get("model_used"), "multi_file": True}
+               "model_used": gen.get("model_used"), "multi_file": True, **extra}
         # BG-01/02: persist a done marker so a restart can resume this multi-file node.
         self._write_node_marker(run_id, node_id, pkg)
         return pkg

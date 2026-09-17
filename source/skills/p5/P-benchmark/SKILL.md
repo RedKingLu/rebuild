@@ -9,6 +9,7 @@ metadata:
   source: ECC skills/benchmark (MIT, https://github.com/affaan-m/ECC)
   license: MIT
 ---
+> **场景适用性说明**：本文档中的具体技术栈举例（国产化数据库 / OS / CPU、中间件替换候选等）**以信创切换场景为例**——它是平台典型场景**之一**，不是唯一场景。请以本项目实际的场景包（`source/skills/scenarios/<scenario>/`）与 `migration_target` 为准；**本文举例不得无条件套用**。
 
 # P-benchmark（性能基准与回归）
 
@@ -44,7 +45,7 @@ P5 验证阶段，当迁移目标对性能有验收要求、或需在多个信�
 - 关键业务指标满足验收阈值，否则不得判 completed
 - 测量可复现（参数、环境、脚本齐全）
 
-## 信创迁移要点
+## 场景要点（按项目场景取用）
 - ARM64（鲲鹏/飞腾）与源系统 x86 在单核性能与 NUMA 行为上不同，对比须标注架构差异，避免误判为迁移缺陷。
 - 国产 DB 执行计划与索引策略与 Oracle/MSSQL 不同，慢查询常源于计划退化而非硬件；归因须查执行计划。
 - 字符集（GBK↔UTF-8）转换、达梦/openGauss 连接池与会话开销可能引入额外延迟，需纳入测量。
