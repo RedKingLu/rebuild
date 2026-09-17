@@ -112,7 +112,11 @@ def _project_name(project_id: str) -> str:
         from app.dependencies import get_services
         p = get_services().project_service.get(project_id)
         return p.name if p else None
-    except Exception:
+    except Exception as e:
+        # R24 第二遍（Q2-18）：控制流不变（返 None → 欢迎语退化为不带项目名的措辞）。
+        # 这是纯文案降级、不影响任何 Gate 判定，故 debug 级即足够；关键是不再完全无痕。
+        logger.debug("gate_backend 取项目名失败（%s: %s）—— 欢迎语不带项目名 project=%s",
+                     type(e).__name__, e, project_id)
         return None
 
 

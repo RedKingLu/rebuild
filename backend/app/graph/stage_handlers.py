@@ -1682,7 +1682,13 @@ class RealP4Handler:
             return {"path": rel_path,
                     "sha256": hashlib.sha256(raw).hexdigest(),
                     "bytes": len(raw)}
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-16）：控制流与返回形状完全不变（sha256="" / bytes=0，调用方据此
+            # 判"证据基础不可用"）。但 sha256 为空是**证据链上的空洞**，静默会让"文件本来就没有"
+            # 与"文件在却读不动/被 mediator 挡回"长得一模一样 —— 必须发声（AGENTS §10-21）。
+            # 不改 mediator 的 guard_read 越界判定，不改任何返回字段。
+            logger.warning("stage_handlers._file_facts 读文件失败：%s（%s: %s）—— "
+                           "本条证据以空 sha256/0 字节记入（诚实标记不可校验）", rel_path, type(e).__name__, e)
             return {"path": rel_path, "sha256": "", "bytes": 0}
 
     def _write_pending_review(self, project_id, review_nodes, node_type_dist,
@@ -2824,6 +2830,28 @@ class RealP6Handler:
             logger.warning("P6: P5 report load failed: %s", e, exc_info=True)
             return {}
 
+    def _scan_stage_artifact_paths(self, ws, stage: str) -> list[str]:
+        """列举 `artifacts/{stage}/` 下最多 30 个真实文件的**相对路径**（只读、只记路径）。
+
+        R24 第二遍（Q2-25）：从 `_gather_upstream_facts` 原地抽出，使那个函数从嵌套 d6 降到 d3。
+        搬入的代码**逐字未变**（含 30 个上限、`p.is_file()` 过滤、以及扫描失败时的 warning 文案）；
+        「扫描中途异常 → 返回已收集到的部分结果」这一语义也逐字保留（原实现同样是把异常吞在
+        内层、`found` 保持已填内容继续往下走）。只读、非门禁，与 Gate / 风险分级无关。
+        """
+        d = ws / "artifacts" / stage
+        if not (d.exists() and d.is_dir()):
+            return []
+        found: list[str] = []
+        try:
+            for p in sorted(d.rglob("*")):
+                if len(found) >= 30:
+                    break
+                if p.is_file():
+                    found.append(str(p.relative_to(ws)))
+        except Exception:
+            logger.warning("P6: upstream scan failed for %s", stage, exc_info=True)
+        return found
+
     def _gather_upstream_facts(self, project_id: str) -> dict:
         """GAP-P6-5：确定性列举 P2/P3/P4 上游产物可用性（只读、非门禁）。
 
@@ -2835,17 +2863,7 @@ class RealP6Handler:
             from app.services.workspace_service import workspace_path
             ws = workspace_path(project_id)
             for stage in ("p2", "p3", "p4"):
-                d = ws / "artifacts" / stage
-                found: list[str] = []
-                if d.exists() and d.is_dir():
-                    try:
-                        for p in sorted(d.rglob("*")):
-                            if len(found) >= 30:
-                                break
-                            if p.is_file():
-                                found.append(str(p.relative_to(ws)))
-                    except Exception:
-                        logger.warning("P6: upstream scan failed for %s", stage, exc_info=True)
+                found = self._scan_stage_artifact_paths(ws, stage)
                 facts[stage] = {"available": bool(found), "artifacts": found}
         except Exception as e:
             logger.warning("P6: gather upstream facts failed (non-blocking): %s", e, exc_info=True)
@@ -2861,6 +2879,11 @@ class RealP6Handler:
         try:
             p4_input = input_svc.read_p4_input(project_id, run_id)
         except Exception as e:
+            # R24 第二遍（Q2-17）：返回值一字不改（blocked = fail-closed，P6 不执行，方向更严）。
+            # 但 reason 里只有 `type(e).__name__`，**异常消息与堆栈全部丢失** —— 运维看到
+            # "P5 输入读取异常：KeyError" 无从定位是哪个 key。发声补齐，不改判定。
+            logger.warning("P6: 读 P5 输入异常（%s: %s）—— P6 诚实 blocked（fail-closed）"
+                           "project=%s run=%s", type(e).__name__, e, project_id, run_id, exc_info=True)
             return {"status": "blocked",
                     "reason": f"P5 输入读取异常：{type(e).__name__}",
                     "artifacts": [], "evidence_refs": []}

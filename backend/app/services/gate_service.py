@@ -203,7 +203,12 @@ def _gate_to_response(g: Gate) -> GateResponse:
     try:
         from app.graph.runtime import graph_capability_probe
         graph_cap = graph_capability_probe()
-    except Exception:
+    except Exception as e:
+        # R24 第二遍（Q2-20）：控制流不变（"degraded" 就是本探针失败时的**诚实答案**，公理 4，
+        # 不得写死 "not_connected"、也不得谎报 "live"）。但"图编译不出来"是需要被看见的事件：
+        # 前端只会显示一个 degraded 徽标，日志里此前没有任何原因。发声不改探针语义。
+        _logger.warning("gate_service: 图能力探针异常（%s: %s）—— graph_capability 诚实记为 degraded",
+                        type(e).__name__, e)
         graph_cap = "degraded"
     return GateResponse(
         gate_id=g.gate_id,

@@ -166,7 +166,13 @@ def _finalize_agent_gate_material(stage: str, project_id: str, run_id: str,
             # 级采集，可能带上别的 run 的挂起动作。
             run_id=run_id or "",
         )
-    except Exception:
+    except Exception as e:
+        # R24 第二遍（Q2-19）：控制流不变（回退到 WorkAgent 早先写的那份 gate_brief_ref）。
+        # 但这个回退有**实质后果**：用户 Gate 上看到的会是**未含验收结论 / 未含 held_actions
+        # 的旧简报**（本次覆写没成功），而界面上看不出区别 ⇒ 必须 warning 而非静默。
+        logger.warning("nodes: 最终 Gate Brief 覆写失败（%s: %s）—— 回退到 WorkAgent 早先那份"
+                       "（不含本次验收结论/挂起动作）stage=%s project=%s",
+                       type(e).__name__, e, stage, project_id, exc_info=True)
         gb_ref = wa.gate_brief_ref
     for r in (wa.work_plan_ref, gb_ref, wa.claim_evidence_map_ref):
         if r and r not in refs:

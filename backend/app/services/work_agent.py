@@ -731,10 +731,18 @@ class WorkAgent:
 
     # ── sha256 校验（通用 evidence map / gate brief 用） ─────────────────
     def _sha256(self, rel_path: str) -> str:
+        # R24 第二遍（Q2-21）：与 validation_agent._sha256 同构处理（Q2-01）。控制流不变
+        # （仍返 ""），只把静默变成有声：空 sha256 是 evidence map / gate brief 里的
+        # "不可校验"标记，必须能区分"产物不存在"与"产物在却读不出来"。
         try:
             raw = (self._ws_root() / rel_path).read_bytes()
             return hashlib.sha256(raw).hexdigest()
-        except Exception:
+        except FileNotFoundError:
+            logger.debug("work_agent 取 sha256 的产物不存在：%s（返回空串）", rel_path)
+            return ""
+        except Exception as e:
+            logger.warning("work_agent 取 sha256 失败：%s（%s: %s）—— 该条 evidence 以空 sha256 记入",
+                           rel_path, type(e).__name__, e)
             return ""
 
     # ── 批 B：通用 evidence map（fact/claim）+ LLM 内联引用合成 ────────────

@@ -535,7 +535,14 @@ def _build_schema(entry) -> Optional[dict]:
         try:
             import json
             params = json.loads(input_contract)
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-08）：控制流不变（params=None → 下方退化为空 schema
+            # `{"type":"object","properties":{},"required":[]}`）。但那意味着**该工具的入参约束
+            # 整段丢失**，模型会拿到一个没有参数的 schema —— 静默是不可接受的。
+            # 不触碰任何风险分级/write_scope 判定，只发声。
+            logger.warning("tool_registry 工具 %r 的 input_contract 不是合法 JSON（%s: %s）—— "
+                           "schema 退化为空参数对象，该工具的入参约束本次未生效",
+                           entry.name, type(e).__name__, e)
             params = None
     if not params:
         params = {"type": "object", "properties": {}, "required": []}
@@ -747,7 +754,12 @@ async def execute_tool(
         try:
             from app.dependencies import get_services
             _svc_wr = get_services()
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-09）：控制流不变（_svc_wr=None → 下方 tracer/auditor 传 None）。
+            # 但那意味着**本次 PreToolUse hook 的 Trace 与 Audit 都不落盘**，事后无法归因，
+            # 这正是"静默降级"最伤的一类。不改 hook 判定、不改 fail-open 口径，只发声。
+            logger.warning("tool_registry: 取 services 失败（%s: %s）—— 本次 PreToolUse hook "
+                           "的 Trace/Audit 不落盘 tool=%s", type(e).__name__, e, tool_name)
             _svc_wr = None
         pre = run_hooks(
             "PreToolUse",
@@ -1131,7 +1143,12 @@ async def _execute_read(tool_name: str, args: dict, project_id: str) -> dict:
                         matches.append({"file": str(p.relative_to(ws_root)), "line": i, "text": line.strip()[:200]})
                         if len(matches) >= 100:
                             break
-            except Exception:
+            except Exception as e:
+                # R24 第二遍（Q2-10）：控制流不变（跳过该文件继续扫）。这是**逐文件扫描循环**
+                # （上限 5000 个），单文件读不动（权限/特殊文件/IO）属常规现象，升 warning 会刷屏，
+                # 故 debug 发声 —— 关键是不再"完全无痕"，排查"为什么某文件没被检索到"时有据可查。
+                logger.debug("tool_registry grep_files 跳过不可读文件 %s（%s: %s）",
+                             p, type(e).__name__, e)
                 continue
             if len(matches) >= 100:
                 break
@@ -1368,8 +1385,13 @@ async def _execute_apply_patch(tool_name: str, args: dict, project_id: str, entr
         env = _json.loads(raw)
         drafted_target = env.get("target_path") or ""
         new_content = env.get("diff") or ""
-    except Exception:
+    except Exception as e:
         # Draft is not our envelope — treat the raw draft as the new content.
+        # R24 第二遍（Q2-11）：控制流与语义完全不变（这是**设计内的两种草案格式兼容**：
+        # 信封 JSON / 裸内容），但"落到裸内容分支"会导致 drafted_target 为空 ⇒ 目标路径
+        # 只能靠显式 target_path，此前完全无痕。故 debug 发声（非故障，不升 warning）。
+        logger.debug("tool_registry apply_patch 草案非信封 JSON（%s: %s）—— 按裸内容处理，"
+                     "target_path 只能来自显式入参 patch_ref=%s", type(e).__name__, e, patch_ref)
         drafted_target = ""
         new_content = raw
 
@@ -1623,7 +1645,15 @@ def _redacted_action_payload(tool_name: str, args: dict | None, max_chars: int =
         return "（无入参）"
     try:
         raw = _canonical_action_args_json(args)
-    except Exception:
+    except Exception as e:
+        # R24 第二遍（Q2-12）：控制流与返回值不变（退化为 str(args)，**且下方仍强制过
+        # redact_secrets 脱敏** —— 不存在凭据原样落盘的口子）。发声的理由是根因需要被看见：
+        # 规范化失败后，紧接的 `action_args_fingerprint()` 会**直接抛异常**（其 docstring 明写
+        # "args 无法 JSON 序列化时抛异常，绝不返回退化指纹"），即建 Gate 会整体失败（fail-closed）。
+        # 那个异常的现场在 fingerprint 里，看不出根因在规范化；本条 warning 就是补这个根因。
+        # 不改 fail-closed 口径、不改 Gate 阈值、不改脱敏调用顺序。
+        logger.warning("tool_registry: action 入参规范化失败（%s: %s）—— 展示文本退化为 str(args)；"
+                       "同一入参的指纹计算随后会 fail-closed 抛错（脱敏仍强制执行）", type(e).__name__, e)
         raw = str(args)
     try:
         from app.services.security_authorization import redact_secrets
@@ -1725,6 +1755,13 @@ def _create_risk_gate(project_id: str, run_id: str, stage: str,
         from app.dependencies import get_services
         gs = get_services().gate_service
     except Exception as e:
+        # R24 第二遍（Q2-13）：返回值一字不改（诚实 risk_flagged = 不伪造 gate、工具不执行，
+        # 方向 fail-closed）。原实现把原因写进了给调用方的 message，但**服务端日志里没有任何
+        # 痕迹** —— "Gate 服务整体不可用"是基础设施级事件，必须在日志侧也能被发现。
+        # 不改阈值 `_GATE_RISK_THRESHOLD`、不改 fail-closed 语义。
+        logger.warning("tool_registry: 无可用 GateService（%s: %s）—— 高风险工具 %s（%s）"
+                       "未创建审批门并诚实返回 risk_flagged（不伪造 gate、工具不执行）",
+                       type(e).__name__, e, tool_name, risk)
         return {
             "status": "risk_flagged",
             "risk_level": risk,

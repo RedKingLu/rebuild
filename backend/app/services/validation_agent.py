@@ -97,18 +97,39 @@ class ValidationAgent:
         return workspace_service.workspace_path(self.project_id)
 
     def _sha256(self, rel_path: str) -> str:
+        # R24 第二遍（Q2-01）：原为 `except Exception: return ""` 静默吞掉。控制流保持不变
+        # （仍返 ""，由调用点判为"证据不可校验"），但必须发声——否则"产物没产出"与
+        # "产物存在却读不动/权限不足"在日志里无法区分（AGENTS §10-21 / 公理 3）。
         try:
             return hashlib.sha256((self._ws_root() / rel_path).read_bytes()).hexdigest()
-        except Exception:
+        except FileNotFoundError:
+            # 产物不存在是本方法的**正常语义**：调用点（如 :555 sha 对账）先判 _exists 再比对，
+            # 空串即"无法校验"。故只 debug，不升级为 warning。
+            logger.debug("validation_agent 取 sha256 的产物不存在：%s（返回空串）", rel_path)
+            return ""
+        except Exception as e:
+            # 文件在但读不出来 = 真问题（权限 / 目录 / IO），必须 warning。
+            logger.warning("validation_agent 取 sha256 失败：%s（%s: %s）—— 按不可校验处理",
+                           rel_path, type(e).__name__, e)
             return ""
 
     def _exists(self, rel_path: str) -> bool:
         return (self._ws_root() / rel_path).exists()
 
     def _read_json(self, rel_path: str) -> Optional[dict]:
+        # R24 第二遍（Q2-02）：同上，控制流不变（仍返 None），只把静默变成有声。
         try:
             return json.loads((self._ws_root() / rel_path).read_text(encoding="utf-8"))
-        except Exception:
+        except FileNotFoundError:
+            # "产物不存在 → None" 是本方法的契约：调用点普遍 `or {}` 兜底，或按 fallback 链
+            # 依次试多个候选路径（见 :816 p3_stage_plan.json / stage_plan.json）。故只 debug。
+            logger.debug("validation_agent 读产物不存在：%s（返回 None，由调用点判定）", rel_path)
+            return None
+        except Exception as e:
+            # 文件在但解析不出（JSON 损坏 / 编码错 / 权限）= 真问题。控制流仍返 None
+            # （由调用点降级为证据缺失），但不得静默——损坏产物必须能在日志里被认出来。
+            logger.warning("validation_agent 产物解析失败：%s（%s: %s）—— 按证据缺失处理",
+                           rel_path, type(e).__name__, e)
             return None
 
     # ── main entry（review_fn） ─────────────────────────────────────────
@@ -148,7 +169,12 @@ class ValidationAgent:
             try:
                 from app.graph.nodes import get_handler
                 handler = get_handler(self.stage)
-            except Exception:
+            except Exception as e:
+                # R24 第二遍（Q2-03）：控制流不变（handler=None → 下方跳过域规则校验），
+                # 但拿不到 handler 意味着 **①基线域校验被整段跳过**，这是验收强度的实质下降，
+                # 静默是不可接受的（AGENTS §10-21）。降级本身是设计内的（handler 可选注入）。
+                logger.warning("validation_agent 未能取到 %s 的 handler（%s: %s）—— "
+                               "本次跳过域规则校验，验收强度下降", self.stage, type(e).__name__, e)
                 handler = None
         disk_view = self._disk_review_input(work_result)
         if handler is not None and hasattr(handler, "review"):
@@ -359,16 +385,20 @@ class ValidationAgent:
             name = r.split("/")[-1]
             if not any(name.endswith(sfx) for sfx in self._AGENT_REPORT_SUFFIXES):
                 refs.append(r)
-        if self.stage == "p4":
-            try:
-                from app.services.aet_service import AETService
-                for e in AETService(None).list_evidence(self.project_id, stage="p4"):
-                    for k in ("output_code_ref", "patch_ref"):
-                        v = e.get(k)
-                        if v and v not in refs:
-                            refs.append(v)
-            except Exception:
-                logger.debug("validation_agent P4 域产物 AET 读取失败（advisory）", exc_info=True)
+        if self.stage != "p4":
+            return refs
+        # R24 第二遍（Q2-24，降嵌套 d5→d4）：原为 `if self.stage == "p4": <整块>` 收尾，
+        # 该 if 是本函数**最后一个语句**（其后只有 `return refs`），故倒转为早返回、块整体退一格。
+        # 纯早返回：零提取、零新名字、块内代码逐字未变 ⇒ `git diff -w` 只显示这一行守卫的变化。
+        try:
+            from app.services.aet_service import AETService
+            for e in AETService(None).list_evidence(self.project_id, stage="p4"):
+                for k in ("output_code_ref", "patch_ref"):
+                    v = e.get(k)
+                    if v and v not in refs:
+                        refs.append(v)
+        except Exception:
+            logger.debug("validation_agent P4 域产物 AET 读取失败（advisory）", exc_info=True)
         return refs
 
     def _disk_review_input(self, work_result: dict) -> dict:
@@ -608,7 +638,12 @@ class ValidationAgent:
             try:
                 from app.dependencies import get_services
                 gw = get_services().model_gateway
-            except Exception:
+            except Exception as e:
+                # R24 第二遍（Q2-04）：控制流不变（gw=None → 下方诚实 evidence_gap，D-097 不假 pass），
+                # 但"网关取不到"的**原因**此前完全丢失，运维只看到 evidence_gap 而不知是无 Key
+                # 还是依赖装配坏了。发声不改判定。
+                logger.warning("validation_agent 取 ModelGateway 失败（%s: %s）—— "
+                               "LLM 语义验收降级为 evidence_gap", type(e).__name__, e)
                 gw = None
         if gw is None:
             return {"status": "evidence_gap",
@@ -685,7 +720,11 @@ class ValidationAgent:
             # 即截断的方向是"更严"而不是"放行"，与本次缺陷（把不可用谎报为可用）方向相反。
             resp = _run_coro(gw.call(messages=[{"role": "user", "content": prompt}],
                                      source="api", max_tokens=512))
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-05）：返回值字符串一字不改（有测试与前端读它），只补日志。
+            # 此前异常对象被整个丢弃 —— 超时、鉴权失败、网关装配错误在报告里长得一模一样。
+            logger.warning("validation_agent LLM 语义验收调用异常（%s: %s）—— 诚实降级为 evidence_gap"
+                           "（P4 门禁对 evidence_gap 为 fail-closed，方向更严）", type(e).__name__, e)
             return {"status": "evidence_gap", "detail": "LLM 语义验收调用异常（需有效 Key 复验）"}
         if not resp or resp.get("status") != "completed":
             cat = (resp or {}).get("error_category", "unknown")
@@ -728,10 +767,18 @@ class ValidationAgent:
 
     # ── P4 内容保真：给路径 + 读关键文件（真实源 + 迁移产物 + 上游裁决路线）────────
     def _read_text_capped(self, rel_path: str) -> Optional[str]:
+        # R24 第二遍（Q2-06）：控制流不变（仍返 None → 语义 prompt 里少一段材料），只补发声。
         try:
             data = (self._ws_root() / rel_path).read_bytes()[:self._MAX_SEMANTIC_BYTES]
             return data.decode("utf-8", errors="replace")
-        except Exception:
+        except FileNotFoundError:
+            # 调用点是"尽力取材料"（产物/源片段可能就是没有），不存在属正常语义 ⇒ debug。
+            logger.debug("validation_agent 取语义材料的文件不存在：%s（本段材料留空）", rel_path)
+            return None
+        except Exception as e:
+            # 文件在却读不出：语义验收会**少喂一段真实源**，会实质影响 P4 保真判定 ⇒ warning。
+            logger.warning("validation_agent 取语义材料失败：%s（%s: %s）—— 本段材料留空，"
+                           "语义验收材料完整度下降", rel_path, type(e).__name__, e)
             return None
 
     def _p4_product_files(self) -> list:
@@ -908,8 +955,12 @@ class ValidationAgent:
                 return (str(v).lower() if v else None,
                         (bool(g) if isinstance(g, bool) else None),
                         str(obj.get("reason", "")))
-            except Exception:
-                pass
+            except Exception as e:
+                # R24 第二遍（Q2-07）：此处的吞是**设计内的两级容错**（docstring 自陈"优先 JSON，
+                # 退化关键词扫描"）—— 模型没吐合法 JSON 属常规现象，不是故障，故 debug 而非 warning；
+                # 且下游对"verdict 解析不出"本身就是 fail-closed（:759 诚实不通过）。控制流不变。
+                logger.debug("validation_agent verdict JSON 解析失败（%s: %s）—— 退化为关键词扫描",
+                             type(e).__name__, e)
         low = text.lower()
         if "rework" in low or "reject" in low:
             return "rework", None, text[:200]

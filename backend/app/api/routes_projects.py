@@ -830,14 +830,23 @@ async def execute_onboarding(project_id: str, db: Session = Depends(get_db)):
         try:
             from app.services.workspace_service import get_execution_mode as _get_mode
             _exec_mode = _get_mode(project_id)
-        except Exception:
+        except Exception as e:
+            # R24 第二遍（Q2-14）：控制流不变（None → 下面走 Run 快照兜底）。发声的理由就写在
+            # 上方注释里：**这条链路上一次静默降级就是"auto/manual 被悄悄当 plan 跑"的原 bug**。
+            # 若权威控制源（workspace.json）读不出来而无人知晓，等于让那个 bug 原地复活。
+            logger.warning("graph_stream: 读 workspace 执行模式失败（%s: %s）—— 转用 Run 快照兜底 project=%s",
+                           type(e).__name__, e, project_id)
             _exec_mode = None
         if not _exec_mode:
             try:
                 from app.services.run_service import RunService as _RS
                 _run_now = _RS(svc_deps).get(run_id)
                 _exec_mode = getattr(_run_now, "execution_mode", None) or "plan"
-            except Exception:
+            except Exception as e:
+                # R24 第二遍（Q2-15）：控制流不变（最终兜底 "plan"）。但落到这里意味着**两级
+                # 控制源都没读到**，本次图执行用的是平台默认值而非用户选择 —— 必须留痕。
+                logger.warning("graph_stream: 读 Run 执行模式快照亦失败（%s: %s）—— 本次按默认 plan "
+                               "执行（非用户选择）project=%s run=%s", type(e).__name__, e, project_id, run_id)
                 _exec_mode = "plan"
         init_state = {
             "run_id": run_id,
