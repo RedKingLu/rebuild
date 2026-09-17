@@ -3,7 +3,7 @@
 > 文档路径：`文档/02-架构设计/04-Workspace-Environment-Execution架构.md`
 > 文档状态：**accepted**
 > 平台名称：rebuild
-> 当前版本：V26.2
+> 当前版本：V26.3
 > 来源草稿：`产物/已完成/R1/04-Workspace-Environment-Execution架构.md`（v0.1）
 > 最后更新时间：2026-06-24
 > 审核状态：经用户审核通过（2026-06-24）
