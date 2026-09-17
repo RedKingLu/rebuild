@@ -6,7 +6,7 @@
 
 **A software rebuilding platform** — it uses goal-driven AI agent orchestration to turn "convert an existing piece of software into another form" into a traceable, verifiable, evidence-backed engineering process.
 
-Current version `V26.2` · License [MIT](./LICENSE) · Language: English (this page, a translation) / [中文](./README.zh.md) (authoritative)
+Current version `V26.3` · License [MIT](./LICENSE) · Language: English (this page, a translation) / [中文](./README.zh.md) (authoritative)
 
 ---
 
