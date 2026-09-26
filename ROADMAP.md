@@ -158,13 +158,13 @@ None of these affect current runtime correctness, but they can mislead "someone 
 
 This section answers "where do I find people to discuss this with". **Please read the current state first, to avoid a wasted trip.**
 
-### 5.1 Current state: the discussion channel is not open yet
+### 5.1 Current state: the repository is public, Discussions is not open yet
 
-**The repository is still private at present, and GitHub Discussions is not open yet.**
+**The repository was made public (MIT) in September 2026, after a full git-history secret scan passed. GitHub Discussions is not open yet.**
 
-- **The plan**: use **GitHub Discussions as the transitional discussion community**, **to be opened once the repository is made public**, with a first post covering the project vision and how to take part.
+- **The plan**: use **GitHub Discussions as the transitional discussion community**, with a first post covering the project vision and how to take part.
 - **What cannot be done yet**: Discussions is not open, so **there is no usable public discussion entry point right now**, and this document provides no link either.
-- **Making the repository public is itself an action requiring explicit approval**, with preconditions (security fixes and a full-history secret scan completed); it will not be done casually.
+- **Enabling Discussions requires a repository admin to turn it on in settings**; it does not happen automatically.
 
 Until then, participation follows [CONTRIBUTING.md](./CONTRIBUTING.md); **for security issues use the private channel in [SECURITY.md](./SECURITY.md) and do not open a public issue**.
 
